@@ -2,8 +2,7 @@
 
 namespace systems::leal::gpu {
 
-    class RenderPass {
+    class Texture {
 
     };
-    
 }

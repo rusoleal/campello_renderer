@@ -2,7 +2,7 @@
 
 namespace systems::leal::gpu {
 
-    class Pipeline() {
+    class Pipeline {
 
     };
     
