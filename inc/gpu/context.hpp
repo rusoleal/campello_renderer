@@ -1,12 +1,14 @@
 #pragma once
 
-#include <memory>
-#include <gpu/texture.hpp>
+namespace systems::leal::gpu
+{
 
-namespace systems::leal::gpu {
+    class Context
+    {
+    private:
+        void *native;
 
-    class Context {
     public:
-        std::shared_ptr<Texture> createTexture();
+        Context();
     };
 }

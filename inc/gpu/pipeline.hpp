@@ -1,9 +1,10 @@
 #pragma once
 
-namespace systems::leal::gpu {
+namespace systems::leal::gpu
+{
 
-    class Pipeline {
-
+    class Pipeline
+    {
     };
-    
+
 }
