@@ -18,13 +18,9 @@ std::ostream& operator<<(std::ostream &os, const std::set<Feature> &obj) {
             case Feature::bcTextureCompression:
                 os << "bcTextureCompression, ";
                 break;
-            #if TARGET_OS_MACOS
-            if (@available(macOS 10.11, *)) {
-                case Feature::depth24Stencil8PixelFormat:
+            case Feature::depth24Stencil8PixelFormat:
                     os << "depth24Stencil8PixelFormat, ";
                     break;
-            }    
-            #endif
             default:
                 os << "unknown, ";
                 break;

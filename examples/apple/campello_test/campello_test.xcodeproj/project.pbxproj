@@ -88,10 +88,22 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		5931C1D92DF59C13001918ED /* campello */ = {
+			isa = PBXGroup;
+			children = (
+				59F1E5912DF41669001E8F13 /* buffer.cpp */,
+				59F1E58E2DF2EBD6001E8F13 /* device.cpp */,
+				59F1E58A2DF2D551001E8F13 /* texture.cpp */,
+				59F1E5892DF2D35C001E8F13 /* Metal.hpp */,
+				59F1E5852DF2D32D001E8F13 /* context.cpp */,
+			);
+			path = campello;
+			sourceTree = "<group>";
+		};
 		59F150B12DF0CCBC00F0D831 = {
 			isa = PBXGroup;
 			children = (
-				59F1E5882DF2D33D001E8F13 /* campello */,
+				5931C1D92DF59C13001918ED /* campello */,
 				59F150B62DF0CCBC00F0D831 /* campello_test Shared */,
 				59F150C22DF0CCBF00F0D831 /* campello_test iOS */,
 				59F150D62DF0CCBF00F0D831 /* campello_test macOS */,
@@ -106,18 +118,6 @@
 				59F150D52DF0CCBF00F0D831 /* campello_test.app */,
 			);
 			name = Products;
-			sourceTree = "<group>";
-		};
-		59F1E5882DF2D33D001E8F13 /* campello */ = {
-			isa = PBXGroup;
-			children = (
-				59F1E5912DF41669001E8F13 /* buffer.cpp */,
-				59F1E58E2DF2EBD6001E8F13 /* device.cpp */,
-				59F1E58A2DF2D551001E8F13 /* texture.cpp */,
-				59F1E5892DF2D35C001E8F13 /* Metal.hpp */,
-				59F1E5852DF2D32D001E8F13 /* context.cpp */,
-			);
-			path = campello;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */

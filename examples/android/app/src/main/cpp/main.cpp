@@ -6,6 +6,8 @@
 #include <game-activity/GameActivity.cpp>
 #include <game-text-input/gametextinput.cpp>
 
+#include <gpu/device.hpp>
+
 extern "C" {
 
 #include <game-activity/native_app_glue/android_native_app_glue.c>
@@ -62,6 +64,8 @@ bool motion_event_filter_func(const GameActivityMotionEvent *motionEvent) {
 void android_main(struct android_app *pApp) {
     // Can be removed, useful to ensure your code is running
     aout << "Welcome to android_main" << std::endl;
+
+    auto devices = systems::leal::gpu::Device::getDevices();
 
     // Register an event handler for Android events
     pApp->onAppCmd = handle_cmd;

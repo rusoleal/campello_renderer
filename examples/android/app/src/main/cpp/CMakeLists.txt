@@ -5,6 +5,13 @@ cmake_minimum_required(VERSION 3.22.1)
 
 project("test")
 
+include_directories(../../../../../../inc)
+
+find_package(Vulkan)
+message(STATUS "Vulkan FOUND = ${Vulkan_FOUND}")
+message(STATUS "Vulkan Include = ${Vulkan_INCLUDE_DIR}")
+message(STATUS "Vulkan Lib = ${Vulkan_LIBRARY}")
+
 # Creates your game shared library. The name must be the same as the
 # one used for loading in your Kotlin/Java or AndroidManifest.txt files.
 add_library(test SHARED
@@ -24,6 +31,8 @@ find_package(game-activity REQUIRED CONFIG)
 target_link_libraries(test
         # The game activity
         game-activity::game-activity
+
+        Vulkan::Vulkan
 
         # EGL and other dependent libraries required for drawing
         # and interacting with Android system
