@@ -3,7 +3,7 @@
 namespace systems::leal::gpu
 {
 
-    enum class UsageMode
+    enum class TextureUsage
     {
 
         /**

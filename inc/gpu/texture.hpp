@@ -1,7 +1,7 @@
 #pragma once
 
 #include <gpu/pixel_format.hpp>
-#include <gpu/usage_mode.hpp>
+#include <gpu/texture_usage.hpp>
 
 namespace systems::leal::gpu
 {
@@ -22,6 +22,6 @@ namespace systems::leal::gpu
         PixelFormat getPixelFormat();
         uint64_t getWidth();
         uint64_t getHeight();
-        UsageMode getUsageMode();
+        TextureUsage getUsageMode();
     };
 }

@@ -102,7 +102,7 @@ std::shared_ptr<Texture> Device::createTexture(
     uint32_t height, 
     PixelFormat pixelFormat,
     //TextureCoordinateSystem textureCoordinateSystem,
-    UsageMode usageMode) {
+    TextureUsage usageMode) {
 
     MTL::TextureDescriptor* pTextureDesc = MTL::TextureDescriptor::alloc()->init();
     pTextureDesc->setWidth( width );

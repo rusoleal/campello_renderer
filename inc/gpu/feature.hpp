@@ -9,5 +9,6 @@ namespace systems::leal::gpu
         msaa32bit,
         bcTextureCompression,
         depth24Stencil8PixelFormat,
+        geometryShader
     };
 }

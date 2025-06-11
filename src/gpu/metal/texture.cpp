@@ -25,6 +25,6 @@ uint64_t Texture::getHeight() {
     return ((MTL::Texture *)native)->height();
 }
 
-UsageMode Texture::getUsageMode() {
-    return UsageMode::renderTarget;
+TextureUsage Texture::getUsageMode() {
+    return TextureUsage::renderTarget;
 }

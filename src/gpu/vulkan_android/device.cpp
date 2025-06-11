@@ -8,8 +8,6 @@ VkInstance *instance = nullptr;
 
 VkInstance *getInstance() {
 
-    __android_log_print(ANDROID_LOG_DEBUG,"Campello","pepe");
-
     VkApplicationInfo appInfo;
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "test";
@@ -96,7 +94,7 @@ std::shared_ptr<Texture> Device::createTexture(
     uint32_t height, 
     PixelFormat pixelFormat,
     //TextureCoordinateSystem textureCoordinateSystem,
-    UsageMode usageMode) {
+    TextureUsage usageMode) {
 
     return nullptr;
 }
@@ -111,7 +109,22 @@ std::string Device::getName() {
 }
 
 std::set<Feature> Device::getFeatures() {
+
+    VkPhysicalDeviceProperties deviceProperties;
+    vkGetPhysicalDeviceProperties((VkPhysicalDevice)native, &deviceProperties);
+
+    VkPhysicalDeviceFeatures deviceFeatures;
+    vkGetPhysicalDeviceFeatures((VkPhysicalDevice)native, &deviceFeatures);
+
     std::set<Feature> toReturn;
+
+    if (deviceFeatures.textureCompressionBC) {
+        toReturn.insert(Feature::bcTextureCompression);
+    }
+
+    if (deviceFeatures.geometryShader) {
+        toReturn.insert(Feature::geometryShader);
+    }
 
     return toReturn;
 }

@@ -5,7 +5,7 @@
 #include <gpu/texture.hpp>
 #include <gpu/buffer.hpp>
 #include <gpu/storage_mode.hpp>
-#include <gpu/usage_mode.hpp>
+#include <gpu/texture_usage.hpp>
 #include <gpu/pixel_format.hpp>
 #include <gpu/feature.hpp>
 
@@ -30,7 +30,7 @@ namespace systems::leal::gpu
             uint32_t height,
             PixelFormat pixelFormat,
             // TextureCoordinateSystem textureCoordinateSystem,
-            UsageMode usageMode);
+            TextureUsage usageMode);
 
         std::shared_ptr<Buffer> createBuffer(uint64_t size, StorageMode storageMode);
 
