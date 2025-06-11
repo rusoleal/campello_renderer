@@ -2,6 +2,8 @@
 
 #include <memory>
 #include <set>
+#include <string>
+#include <vector>
 #include <gpu/texture.hpp>
 #include <gpu/buffer.hpp>
 #include <gpu/storage_mode.hpp>
