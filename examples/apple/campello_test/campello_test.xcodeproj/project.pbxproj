@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		59960CFF2DFC6FB700A4EDA1 /* campello.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 59960CFE2DFC6FB700A4EDA1 /* campello.cpp */; };
+		59960D002DFC6FB700A4EDA1 /* campello.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 59960CFE2DFC6FB700A4EDA1 /* campello.cpp */; };
 		59F1E5862DF2D32D001E8F13 /* context.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 59F1E5852DF2D32D001E8F13 /* context.cpp */; };
 		59F1E5872DF2D32D001E8F13 /* context.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 59F1E5852DF2D32D001E8F13 /* context.cpp */; };
 		59F1E58B2DF2D551001E8F13 /* texture.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 59F1E58A2DF2D551001E8F13 /* texture.cpp */; };
@@ -18,6 +20,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		59960CFE2DFC6FB700A4EDA1 /* campello.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = campello.cpp; path = ../../../src/campello/campello.cpp; sourceTree = SOURCE_ROOT; };
 		59F150C02DF0CCBF00F0D831 /* campello_test.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = campello_test.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		59F150D52DF0CCBF00F0D831 /* campello_test.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = campello_test.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		59F1E5852DF2D32D001E8F13 /* context.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = context.cpp; path = ../../../src/gpu/metal/context.cpp; sourceTree = SOURCE_ROOT; };
@@ -91,6 +94,7 @@
 		5931C1D92DF59C13001918ED /* campello */ = {
 			isa = PBXGroup;
 			children = (
+				59960CFE2DFC6FB700A4EDA1 /* campello.cpp */,
 				59F1E5912DF41669001E8F13 /* buffer.cpp */,
 				59F1E58E2DF2EBD6001E8F13 /* device.cpp */,
 				59F1E58A2DF2D551001E8F13 /* texture.cpp */,
@@ -226,6 +230,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				59960D002DFC6FB700A4EDA1 /* campello.cpp in Sources */,
 				59F1E5922DF41669001E8F13 /* buffer.cpp in Sources */,
 				59F1E5902DF2EBD6001E8F13 /* device.cpp in Sources */,
 				59F1E5872DF2D32D001E8F13 /* context.cpp in Sources */,
@@ -237,6 +242,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				59960CFF2DFC6FB700A4EDA1 /* campello.cpp in Sources */,
 				59F1E5932DF41669001E8F13 /* buffer.cpp in Sources */,
 				59F1E58F2DF2EBD6001E8F13 /* device.cpp in Sources */,
 				59F1E5862DF2D32D001E8F13 /* context.cpp in Sources */,

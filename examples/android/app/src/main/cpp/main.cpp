@@ -65,7 +65,7 @@ void android_main(struct android_app *pApp) {
     // Can be removed, useful to ensure your code is running
     aout << "Welcome to android_main" << std::endl;
 
-    auto devices = systems::leal::gpu::Device::getDevices();
+    //auto devices = systems::leal::gpu::Device::getDevices();
 
     // Register an event handler for Android events
     pApp->onAppCmd = handle_cmd;
