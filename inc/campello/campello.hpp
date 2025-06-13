@@ -1,6 +1,6 @@
 #pragma once
 
-namespace systems::leal::campello {
+namespace systems::leal::renderer {
 
     class Campello {
 
