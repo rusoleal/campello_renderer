@@ -6,7 +6,7 @@ include(FetchContent)
 
 FetchContent_Declare(
         extern_campello_renderer
-        SOURCE_DIR ../../../../../../../src/campello
+        SOURCE_DIR ../../../../../../..
         #GIT_REPOSITORY https://github.com/zeux/pugixml.git
         #GIT_TAG        v1.13
 )
@@ -19,7 +19,7 @@ if(NOT extern_campello_renderer_POPULATED)
     message(STATUS "Fetching campello_renderer...")
     FetchContent_Populate(extern_campello_renderer)
     message(STATUS ${extern_campello_renderer_SOURCE_DIR})
-    include_directories(${extern_campello_renderer_SOURCE_DIR}/../../inc)
+    include_directories(${extern_campello_renderer_SOURCE_DIR}/inc)
     add_subdirectory(
             ${extern_campello_renderer_SOURCE_DIR}
             ${extern_campello_renderer_BINARY_DIR}

@@ -4,7 +4,7 @@ project("campello_renderer")
 
 set(CMAKE_CXX_STANDARD 17)
 
-include_directories(../../../inc)
+include_directories(inc)
 
 message(STATUS ${PROJECT_NAME})
 
@@ -21,8 +21,9 @@ set(DEPENDENCIES
 )
 
 add_library(${PROJECT_NAME} SHARED
-    campello.cpp
+    src/campello_renderer.cpp
 )
+
 
 target_link_libraries(${PROJECT_NAME}
     ${DEPENDENCIES}

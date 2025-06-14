@@ -6,7 +6,9 @@
 #include <game-activity/GameActivity.cpp>
 #include <game-text-input/gametextinput.cpp>
 
-#include <gpu/device.hpp>
+#include <gltf/gltf.hpp>
+#include <campello_renderer/campello_renderer.hpp>
+#include <campello_gpu/device.hpp>
 
 extern "C" {
 

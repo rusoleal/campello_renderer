@@ -4,14 +4,11 @@ set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 
 include(FetchContent)
 
-message(STATUS "PEPITO3")
-message(STATUS ${PROJECT_SOURCE_DIR})
-
 FetchContent_Declare(
         extern_campello_gpu
-        SOURCE_DIR ../gpu/vulkan_android
-        #GIT_REPOSITORY https://github.com/zeux/pugixml.git
-        #GIT_TAG        v1.13
+        #SOURCE_DIR ../gpu/vulkan_android
+        GIT_REPOSITORY https://github.com/rusoleal/campello_gpu
+        GIT_TAG        v0.0.2
 )
 
 if(NOT extern_campello_gpu_POPULATED)
@@ -19,9 +16,6 @@ if(NOT extern_campello_gpu_POPULATED)
 
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-    message(STATUS "Fetching campello_gpu...")
-    message(STATUS ${extern_campello_gpu_SOURCE_DIR})
-    message(STATUS "pepito")
     FetchContent_Populate(extern_campello_gpu)
     include_directories(${extern_campello_gpu_SOURCE_DIR}/inc)
     add_subdirectory(

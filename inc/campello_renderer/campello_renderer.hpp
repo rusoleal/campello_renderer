@@ -4,9 +4,9 @@
 #include <gltf/gltf.hpp>
 //#include <gpu/device.hpp>
 
-namespace systems::leal::renderer {
+namespace systems::leal::campello_renderer {
 
-    class Campello {
+    class CampelloRenderer {
     private:
         //std::shared_ptr<Device> device;
         std::shared_ptr<systems::leal::gltf::GLTF> asset;
@@ -15,7 +15,7 @@ namespace systems::leal::renderer {
         //Camera camera;
 
     public:
-        Campello();
+        CampelloRenderer();
 
         void setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset);
         std::shared_ptr<systems::leal::gltf::GLTF> getAsset();

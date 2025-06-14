@@ -8,7 +8,7 @@ FetchContent_Declare(
         extern_gltf
         #SOURCE_DIR ../src/gpu/vulkan_android
         GIT_REPOSITORY https://github.com/rusoleal/gltf
-        GIT_TAG        v0.0.6
+        GIT_TAG        v0.0.9
 )
 
 
@@ -17,9 +17,6 @@ if(NOT extern_gltf_POPULATED)
     
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-    message(STATUS "Fetching gltf...")
-    message(STATUS ${extern_gltf_SOURCE_DIR})
-    message(STATUS "pepito2")
     FetchContent_Populate(extern_gltf)
     include_directories(${extern_gltf_SOURCE_DIR}/inc)
     add_subdirectory(
