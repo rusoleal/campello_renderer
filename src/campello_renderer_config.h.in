@@ -1,0 +1,4 @@
+// the configured options and settings for campello_cpu
+#define campello_renderer_VERSION_MAJOR @campello_renderer_VERSION_MAJOR@
+#define campello_renderer_VERSION_MINOR @campello_renderer_VERSION_MINOR@
+#define campello_renderer_VERSION_PATCH @campello_renderer_VERSION_PATCH@

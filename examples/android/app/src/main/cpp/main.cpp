@@ -67,7 +67,24 @@ void android_main(struct android_app *pApp) {
     // Can be removed, useful to ensure your code is running
     aout << "Welcome to android_main" << std::endl;
 
-    //auto devices = systems::leal::gpu::Device::getDevices();
+    auto devices = systems::leal::campello_gpu::Device::getDevices();
+    aout << "gltf version: " << systems::leal::gltf::getVersion() << std::endl;
+    aout << "campello_gpu version: " << systems::leal::campello_gpu::getVersion() << std::endl;
+    aout << "campello_renderer version: " << systems::leal::campello_renderer::getVersion() << std::endl;
+
+    // load glb model
+    auto assetManager = pApp->activity->assetManager;
+    auto glbModel = AAssetManager_open(
+            assetManager,
+            "DamagedHelmet.glb",
+            AASSET_MODE_BUFFER);
+    auto length = AAsset_getLength(glbModel);
+    auto p = AAsset_getBuffer(glbModel);
+    auto model = systems::leal::gltf::GLTF::loadGLB((uint8_t *)p,length);
+    AAsset_close(glbModel);
+
+    auto renderer = systems::leal::campello_renderer::Renderer(devices[0]);
+    renderer.setAsset(model);
 
     // Register an event handler for Android events
     pApp->onAppCmd = handle_cmd;
