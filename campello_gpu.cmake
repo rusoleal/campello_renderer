@@ -8,7 +8,7 @@ FetchContent_Declare(
         extern_campello_gpu
         #SOURCE_DIR ../gpu/vulkan_android
         GIT_REPOSITORY https://github.com/rusoleal/campello_gpu
-        GIT_TAG        v0.0.12
+        GIT_TAG        v0.0.13
 )
 
 if(NOT extern_campello_gpu_POPULATED)

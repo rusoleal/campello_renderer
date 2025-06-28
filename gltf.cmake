@@ -8,7 +8,7 @@ FetchContent_Declare(
         extern_gltf
         #SOURCE_DIR ../src/gpu/vulkan_android
         GIT_REPOSITORY https://github.com/rusoleal/gltf
-        GIT_TAG        v0.0.15
+        GIT_TAG        v0.1.0
 )
 
 
