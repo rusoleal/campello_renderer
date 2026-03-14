@@ -71,11 +71,14 @@ void Renderer::setScene(uint32_t index) {
                             void *img = stbi_load_from_memory(data, bufferView.byteLength, &x, &y, &comp, 4);
                             if (img != nullptr) {
                                 auto texture = device->createTexture(
-                                    systems::leal::campello_gpu::StorageMode::devicePrivate,
+                                    systems::leal::campello_gpu::TextureType::tt2d,
+                                    systems::leal::campello_gpu::PixelFormat::rgba8uint,
                                     x,
                                     y,
-                                    systems::leal::campello_gpu::PixelFormat::rgba8uint,
-                                    systems::leal::campello_gpu::TextureUsage::shaderRead
+                                    1,
+                                    1,
+                                    1,
+                                    systems::leal::campello_gpu::TextureUsage::textureBinding
                                 );
                                 gpuTextures[a] = texture;
                             }
