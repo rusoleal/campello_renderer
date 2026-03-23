@@ -1,3 +1,11 @@
 **.DS_Store
 /build
 examples/android/.idea/misc.xml
+
+# Intermediate shader compiler artifacts (kept out of git; sources are the
+# .metal / .vert / .frag files; embedded headers are in src/shaders/)
+shaders/metal/*.air
+shaders/metal/*.metallib
+shaders/metal/default_metallib.h
+shaders/vulkan/*.spv
+shaders/directx/*.dxil

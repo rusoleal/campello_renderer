@@ -32,7 +32,7 @@ namespace systems::leal::campello_renderer {
 
         ~Image() {
             if (data != nullptr) {
-                delete data;
+                free(data);
             }
         }
 

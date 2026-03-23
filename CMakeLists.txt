@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project(campello_renderer VERSION 0.1.0)
+project(campello_renderer VERSION 0.1.1)
 
 configure_file(src/campello_renderer_config.h.in campello_renderer_config.h)
 
@@ -10,16 +10,22 @@ include_directories(inc)
 
 message(STATUS ${PROJECT_NAME})
 
-include(${PROJECT_SOURCE_DIR}/campello_gpu.cmake)
+include(${PROJECT_SOURCE_DIR}/dependencies/campello_gpu.cmake)
 set(DEPENDENCIES
     ${DEPENDENCIES}
     campello_gpu
 )
 
-include(${PROJECT_SOURCE_DIR}/gltf.cmake)
+include(${PROJECT_SOURCE_DIR}/dependencies/gltf.cmake)
 set(DEPENDENCIES
     ${DEPENDENCIES}
     gltf
+)
+
+include(${PROJECT_SOURCE_DIR}/dependencies/webp.cmake)
+set(DEPENDENCIES
+    ${DEPENDENCIES}
+    webpdecoder
 )
 
 add_library(${PROJECT_NAME} SHARED
@@ -39,6 +45,13 @@ target_link_libraries(${PROJECT_NAME}
 target_include_directories(${PROJECT_NAME} PUBLIC
                            "${PROJECT_BINARY_DIR}"
                            )
+
+if(APPLE AND NOT IOS)
+    option(CAMPELLO_RENDERER_BUILD_MACOS_EXAMPLE "Build macOS example" OFF)
+    if(CAMPELLO_RENDERER_BUILD_MACOS_EXAMPLE)
+        add_subdirectory(examples/macos)
+    endif()
+endif()
 
 option(CAMPELLO_RENDERER_BUILD_TEST "Build unit tests" OFF)
 
