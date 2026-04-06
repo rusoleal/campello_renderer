@@ -9,8 +9,8 @@
 
 | Platform | Status | Artifacts |
 |----------|--------|-----------|
-| Linux | ✅ | `.so` library |
-| Windows | ✅ | `.dll` library |
+| Linux | ⚠️ (build only) | `.so` library — campello_gpu Vulkan backend is placeholder, tests disabled |
+| Windows | ⚠️ (build only) | `.dll` library — tests disabled (DLL export issue) |
 | macOS | ✅ | `.dylib` library + example app |
 | iOS | ✅ | `.a` static library |
 | Android | ✅ | `.so` library + APK |

@@ -24,8 +24,8 @@
 - Fixed Windows CI configure step — changed from PowerShell backticks to `cmd` shell with `^` line continuation
 
 ### CI/CD
-- ~~**Linux CI disabled** — `campello_gpu` dependency has missing `#include <cstdint>` causing build failures~~
-- **Linux CI enabled** — Fixed by upgrading `campello_gpu` to v0.5.1
+- **Linux CI partially enabled** — Upgraded `campello_gpu` to v0.5.1 (fixed `<cstdint>` issue), but Linux/Vulkan backend is still placeholder only; library builds but tests are disabled
+- **Windows CI build-only** — Tests disabled due to DLL import library (.lib) generation issue; library builds successfully
 
 ### Documentation
 - Added versioning checklist to `CLAUDE.md` — documents all files that must be updated when bumping version (CMakeLists.txt, test/main.cpp, etc.)
