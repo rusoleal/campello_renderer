@@ -834,7 +834,7 @@ void Renderer::renderToTarget(
         ds.stencilClearValue = 0;
         ds.stencilLoadOp     = GPU::LoadOp::clear;
         ds.stencilStoreOp    = GPU::StoreOp::discard;
-        ds.stencilRadOnly    = false;
+        ds.stencilReadOnly   = false;
         rpDesc.depthStencilAttachment = ds;
     }
 

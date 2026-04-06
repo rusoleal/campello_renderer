@@ -68,7 +68,7 @@ void android_main(struct android_app *pApp) {
     aout << "Welcome to android_main" << std::endl;
 
     // Get the default device for Android
-    auto device = systems::leal::campello_gpu::Device::getDefaultDevice();
+    auto device = systems::leal::campello_gpu::Device::createDefaultDevice(nullptr);
     aout << "gltf version: " << systems::leal::gltf::getVersion() << std::endl;
     aout << "campello_gpu version: " << systems::leal::campello_gpu::getVersion() << std::endl;
     aout << "campello_renderer version: " << systems::leal::campello_renderer::getVersion() << std::endl;

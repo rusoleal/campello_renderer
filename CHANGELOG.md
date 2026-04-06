@@ -12,19 +12,22 @@
   - Windows (MSVC x64) — `.dll` + `.lib`
   - macOS — `.dylib` library + example app bundle
   - iOS — static `.a` library (arm64)
-  - Android — `.so` for all ABIs (arm64-v8a, armeabi-v7a, x86_64, x86)
+  - Android — `.so` for arm64-v8a
 
 ### Changed
+- Upgraded `campello_gpu` dependency from v0.5.1 to v0.6.0
+- Restricted Android ABI targets to `arm64-v8a` only — `vector_math` (pulled in by campello_gpu v0.6.0) uses ARMv8 NEON intrinsics (`vfmaq_laneq_f32`, `vpaddq_f32`) unavailable on armeabi-v7a
 - Upgraded `gltf` dependency from v0.3.2 to v0.3.5
 - Upgraded `campello_image` dependency from v0.3.0 to v0.3.1
 - Enabled Unity Build for faster compilation (main library and test executable)
 
 ### Fixed
+- Fixed `stencilRadOnly` → `stencilReadOnly` in `src/campello_renderer.cpp` — field was renamed in campello_gpu v0.6.0 (`DepthStencilAttachment`)
 - Fixed version string in `test/main.cpp` — test expected "0.1.1" but library returned "0.1.2", causing CI failures
 - Fixed Windows CI configure step — changed from PowerShell backticks to `cmd` shell with `^` line continuation
 
 ### CI/CD
-- **Linux CI partially enabled** — Upgraded `campello_gpu` to v0.5.1 (fixed `<cstdint>` issue), but Linux/Vulkan backend is still placeholder only; library builds but tests are disabled
+- **Linux CI partially enabled** — Linux/Vulkan backend is still placeholder only; library builds but tests are disabled
 - **Windows CI build-only** — Tests disabled due to DLL import library (.lib) generation issue; library builds successfully
 
 ### Documentation
