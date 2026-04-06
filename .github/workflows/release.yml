@@ -1,0 +1,240 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # =============================================================================
+  # Build all platforms
+  # =============================================================================
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build build-essential
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/linux \
+            -DCMAKE_BUILD_TYPE=Release \
+            -G Ninja
+
+      - name: Build
+        run: cmake --build build/linux --config Release
+
+      - name: Package
+        run: |
+          mkdir -p package/campello_renderer-linux/include
+          mkdir -p package/campello_renderer-linux/lib
+          cp -r inc/* package/campello_renderer-linux/include/
+          cp build/linux/*.so package/campello_renderer-linux/lib/ 2>/dev/null || true
+          cd package && tar -czf campello_renderer-linux.tar.gz campello_renderer-linux
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-package
+          path: package/campello_renderer-linux.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: cmake -S . -B build/windows -A x64
+
+      - name: Build
+        run: cmake --build build/windows --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package/campello_renderer-windows/include
+          New-Item -ItemType Directory -Force -Path package/campello_renderer-windows/lib
+          Copy-Item -Path "inc/*" -Destination "package/campello_renderer-windows/include/" -Recurse
+          Copy-Item -Path "build/windows/Release/*.dll" -Destination "package/campello_renderer-windows/lib/" -ErrorAction SilentlyContinue
+          Copy-Item -Path "build/windows/Release/*.lib" -Destination "package/campello_renderer-windows/lib/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "package/campello_renderer-windows" -DestinationPath "package/campello_renderer-windows.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: package/campello_renderer-windows.zip
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -S . -B build/macos -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build/macos --config Release
+
+      - name: Package
+        run: |
+          mkdir -p package/campello_renderer-macos/include
+          mkdir -p package/campello_renderer-macos/lib
+          cp -r inc/* package/campello_renderer-macos/include/
+          cp build/macos/*.dylib package/campello_renderer-macos/lib/ 2>/dev/null || true
+          cd package && tar -czf campello_renderer-macos.tar.gz campello_renderer-macos
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-package
+          path: package/campello_renderer-macos.tar.gz
+
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/ios \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_OSX_ARCHITECTURES="arm64" \
+            -DCMAKE_IOS_INSTALL_COMBINED=NO
+
+      - name: Build
+        run: cmake --build build/ios --config Release
+
+      - name: Package
+        run: |
+          mkdir -p package/campello_renderer-ios/include
+          mkdir -p package/campello_renderer-ios/lib
+          cp -r inc/* package/campello_renderer-ios/include/
+          find build/ios -name "*.a" -exec cp {} package/campello_renderer-ios/lib/ \; 2>/dev/null || true
+          cd package && tar -czf campello_renderer-ios.tar.gz campello_renderer-ios
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-package
+          path: package/campello_renderer-ios.tar.gz
+
+  build-android:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: sdkmanager "ndk;26.1.10909125" "cmake;3.22.1"
+
+      - name: Build with Gradle
+        working-directory: examples/android
+        run: |
+          ./gradlew assembleRelease \
+            -Pandroid.native.buildOutput=Release \
+            -Pandroid.injected.build.abi=${{ matrix.abi }}
+
+      - name: Collect libraries
+        run: |
+          mkdir -p package/campello_renderer-android/${{ matrix.abi }}
+          find examples/android/app/build/intermediates/merged_native_libs/release/out/lib/${{ matrix.abi }} -name "*.so" -exec cp {} package/campello_renderer-android/${{ matrix.abi }}/ \; 2>/dev/null || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-package-${{ matrix.abi }}
+          path: package/campello_renderer-android/${{ matrix.abi }}/
+
+  # =============================================================================
+  # Combine Android packages
+  # =============================================================================
+  package-android:
+    needs: build-android
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: android-parts
+          pattern: android-package-*
+
+      - name: Package Android
+        run: |
+          mkdir -p package/campello_renderer-android/include
+          cp -r android-parts/android-package-arm64-v8a/* package/campello_renderer-android/ 2>/dev/null || true
+          cp -r android-parts/android-package-armeabi-v7a/* package/campello_renderer-android/ 2>/dev/null || true
+          cp -r android-parts/android-package-x86_64/* package/campello_renderer-android/ 2>/dev/null || true
+          cp -r android-parts/android-package-x86/* package/campello_renderer-android/ 2>/dev/null || true
+          cd package && tar -czf campello_renderer-android.tar.gz campello_renderer-android
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-package
+          path: package/campello_renderer-android.tar.gz
+
+  # =============================================================================
+  # Create Release
+  # =============================================================================
+  create-release:
+    needs: [build-linux, build-windows, build-macos, build-ios, package-android]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/linux-package/*.tar.gz
+            artifacts/windows-package/*.zip
+            artifacts/macos-package/*.tar.gz
+            artifacts/ios-package/*.tar.gz
+            artifacts/android-package/*.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false

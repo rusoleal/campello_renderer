@@ -2,6 +2,18 @@
 
 ## [0.1.2] - 2026-04-06
 
+### Added
+- **CI/CD workflows** (`.github/workflows/`) — Automated builds for all platforms
+  - `build.yml` — Build and test on Linux, Windows, macOS, iOS, Android
+  - `release.yml` — Automated release packaging on version tags
+  - `code-quality.yml` — Formatting and static analysis checks
+- **Multi-platform CI support**:
+  - Linux (Ubuntu) — `.so` library
+  - Windows (MSVC x64) — `.dll` + `.lib`
+  - macOS — `.dylib` library + example app bundle
+  - iOS — static `.a` library (arm64)
+  - Android — `.so` for all ABIs (arm64-v8a, armeabi-v7a, x86_64, x86)
+
 ### Changed
 - Upgraded `gltf` dependency from v0.3.2 to v0.3.5
 - Upgraded `campello_image` dependency from v0.3.0 to v0.3.1

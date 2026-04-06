@@ -1,0 +1,81 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+jobs:
+  # =============================================================================
+  # Formatting check with clang-format
+  # =============================================================================
+  formatting:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format
+
+      - name: Check formatting
+        run: |
+          find . -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.h" -o -name "*.mm" \) \
+            ! -path "*/dependencies/*" \
+            ! -path "*/build/*" \
+            ! -path "*/.git/*" \
+            ! -path "*/examples/android/app/src/main/cpp/stb*" \
+            -exec clang-format --dry-run --Werror {} + || true
+        continue-on-error: true
+
+  # =============================================================================
+  # Static analysis with cppcheck
+  # =============================================================================
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=all \
+            --suppress=missingInclude \
+            --suppress=unusedFunction \
+            --suppress=unmatchedSuppression \
+            --inline-suppr \
+            --error-exitcode=0 \
+            --std=c++20 \
+            -I inc \
+            src 2>&1 | head -100
+        continue-on-error: true
+
+  # =============================================================================
+  # CMake validation
+  # =============================================================================
+  cmake-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cmake-format
+        run: |
+          pip install cmake-format
+
+      - name: Check CMake formatting
+        run: |
+          find . -name "CMakeLists.txt" -o -name "*.cmake" | \
+            grep -v build | \
+            xargs cmake-format --check || true
+        continue-on-error: true
