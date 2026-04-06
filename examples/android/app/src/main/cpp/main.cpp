@@ -8,7 +8,7 @@
 
 #include <gltf/gltf.hpp>
 #include <campello_renderer/campello_renderer.hpp>
-#include <campello_gpu/adapter.hpp>
+#include <campello_gpu/device.hpp>
 
 extern "C" {
 
@@ -67,8 +67,8 @@ void android_main(struct android_app *pApp) {
     // Can be removed, useful to ensure your code is running
     aout << "Welcome to android_main" << std::endl;
 
-    auto adapter = systems::leal::campello_gpu::Adapter();
-    auto devices = adapter.getDevices();
+    // Get the default device for Android
+    auto device = systems::leal::campello_gpu::Device::getDefaultDevice();
     aout << "gltf version: " << systems::leal::gltf::getVersion() << std::endl;
     aout << "campello_gpu version: " << systems::leal::campello_gpu::getVersion() << std::endl;
     aout << "campello_renderer version: " << systems::leal::campello_renderer::getVersion() << std::endl;
@@ -84,7 +84,7 @@ void android_main(struct android_app *pApp) {
     auto model = systems::leal::gltf::GLTF::loadGLB((uint8_t *)p,length);
     AAsset_close(glbModel);
 
-    auto renderer = systems::leal::campello_renderer::Renderer(devices[0]);
+    auto renderer = systems::leal::campello_renderer::Renderer(device);
     renderer.setAsset(model);
 
     // Register an event handler for Android events
