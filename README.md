@@ -18,7 +18,7 @@
 ## Dependencies
 
 * [systems::leal::gltf](https://github.com/rusoleal/gltf) v0.2.1 — C++ glTF/GLB asset loader
-* [systems::leal::campello_gpu](https://github.com/rusoleal/campello_gpu) v0.5.1 — Low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
+* [systems::leal::campello_gpu](https://github.com/rusoleal/campello_gpu) v0.6.1 — Low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
 
 ## Building
 
