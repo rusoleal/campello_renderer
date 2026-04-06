@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2] - 2026-04-06
+
+### Changed
+- Upgraded `gltf` dependency from v0.3.2 to v0.3.5
+- Upgraded `campello_image` dependency from v0.3.0 to v0.3.1
+- Enabled Unity Build for faster compilation (main library and test executable)
+
 ## [0.1.1] - 2026-03-23
 
 ### Added

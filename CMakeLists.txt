@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project(campello_renderer VERSION 0.1.1)
+project(campello_renderer VERSION 0.1.2)
 
 configure_file(src/campello_renderer_config.h.in campello_renderer_config.h)
 
@@ -22,15 +22,18 @@ set(DEPENDENCIES
     gltf
 )
 
-include(${PROJECT_SOURCE_DIR}/dependencies/webp.cmake)
+include(${PROJECT_SOURCE_DIR}/dependencies/campello_image.cmake)
 set(DEPENDENCIES
     ${DEPENDENCIES}
-    webpdecoder
+    campello_image
 )
 
 add_library(${PROJECT_NAME} SHARED
     src/campello_renderer.cpp
 )
+
+# Enable Unity Build for faster compilation
+set_target_properties(${PROJECT_NAME} PROPERTIES UNITY_BUILD ON)
 
 
 if(ANDROID)
@@ -62,6 +65,7 @@ if(CAMPELLO_RENDERER_BUILD_TEST)
     add_executable(${PROJECT_NAME}_test
         test/main.cpp
     )
+    set_target_properties(${PROJECT_NAME}_test PROPERTIES UNITY_BUILD ON)
     target_link_libraries(${PROJECT_NAME}_test
         ${PROJECT_NAME}
         gtest

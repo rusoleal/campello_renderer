@@ -24,9 +24,7 @@
 #include "shaders/directx_default.h"
 #endif
 
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-#include <webp/decode.h>
+#include <campello_image/image.hpp>
 
 using namespace systems::leal::campello_renderer;
 
@@ -55,9 +53,11 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         return;
     }
 
-    images      = std::vector<std::shared_ptr<Image>>(asset->images->size(), nullptr);
-    gpuBuffers  = std::vector<std::shared_ptr<systems::leal::campello_gpu::Buffer>>(asset->buffers->size(), nullptr);
-    gpuTextures = std::vector<std::shared_ptr<systems::leal::campello_gpu::Texture>>(asset->images->size(), nullptr);
+    size_t imageCount = asset->images ? asset->images->size() : 0;
+    size_t bufferCount = asset->buffers ? asset->buffers->size() : 0;
+    images      = std::vector<std::shared_ptr<Image>>(imageCount, nullptr);
+    gpuBuffers  = std::vector<std::shared_ptr<systems::leal::campello_gpu::Buffer>>(bufferCount, nullptr);
+    gpuTextures = std::vector<std::shared_ptr<systems::leal::campello_gpu::Texture>>(imageCount, nullptr);
 
     if (asset->scenes->size() > 0) {
         if (asset->scene == -1) {
@@ -78,6 +78,7 @@ void Renderer::setCamera(uint32_t index) {
 
 void Renderer::setScene(uint32_t index) {
     if (asset == nullptr) return;
+    if (device == nullptr) return;
 
     auto info = asset->getRuntimeInfo(index);
     if (info == nullptr) return;
@@ -109,30 +110,18 @@ void Renderer::setScene(uint32_t index) {
                     auto &bufferView = (*asset->bufferViews)[image.bufferView];
                     auto &buffer     = (*asset->buffers)[bufferView.buffer];
                     if (!buffer.data.empty()) {
-                        uint8_t *src = const_cast<uint8_t *>(buffer.data.data()) + bufferView.byteOffset;
-                        int x, y;
-                        void *img = nullptr;
-                        bool isWebp = bufferView.byteLength >= 12 &&
-                                      src[0] == 'R' && src[1] == 'I' && src[2] == 'F' && src[3] == 'F' &&
-                                      src[8] == 'W' && src[9] == 'E' && src[10] == 'B' && src[11] == 'P';
-                        if (isWebp) {
-                            img = WebPDecodeRGBA(src, bufferView.byteLength, &x, &y);
-                        } else {
-                            int comp;
-                            img = stbi_load_from_memory(src, (int)bufferView.byteLength, &x, &y, &comp, 4);
-                        }
+                        const uint8_t *src = buffer.data.data() + bufferView.byteOffset;
+                        auto img = systems::leal::campello_image::Image::fromMemory(src, bufferView.byteLength);
                         if (img != nullptr) {
                             auto texture = device->createTexture(
                                 systems::leal::campello_gpu::TextureType::tt2d,
                                 systems::leal::campello_gpu::PixelFormat::rgba8unorm,
-                                x, y, 1, 1, 1,
+                                img->getWidth(), img->getHeight(), 1, 1, 1,
                                 systems::leal::campello_gpu::TextureUsage::textureBinding);
                             if (texture != nullptr) {
-                                texture->upload(0, (uint64_t)x * y * 4, img);
+                                texture->upload(0, img->getDataSize(), const_cast<uint8_t*>(img->getData()));
                                 gpuTextures[a] = texture;
                             }
-                            if (isWebp) WebPFree(img);
-                            else        stbi_image_free(img);
                         }
                     }
                 }
