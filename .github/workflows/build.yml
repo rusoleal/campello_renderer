@@ -68,10 +68,11 @@ jobs:
           arch: ${{ matrix.arch }}
 
       - name: Configure
+        shell: cmd
         run: |
-          cmake -S . -B build/windows `n
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `n
-            -DCAMPELLO_RENDERER_BUILD_TEST=ON `n
+          cmake -S . -B build/windows ^
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} ^
+            -DCAMPELLO_RENDERER_BUILD_TEST=ON ^
             -A ${{ matrix.arch }}
 
       - name: Build
