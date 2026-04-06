@@ -9,43 +9,43 @@ on:
 
 jobs:
   # =============================================================================
-  # Linux Build - DISABLED: campello_gpu dependency missing <cstdint> include
+  # Linux Build
   # =============================================================================
-  # build-linux:
-  #   runs-on: ubuntu-latest
-  #   strategy:
-  #     matrix:
-  #       build_type: [Debug, Release]
-  #   steps:
-  #     - name: Checkout repository
-  #       uses: actions/checkout@v4
-  #       with:
-  #         submodules: recursive
-  #
-  #     - name: Install dependencies
-  #       run: |
-  #         sudo apt-get update
-  #         sudo apt-get install -y cmake ninja-build build-essential
-  #
-  #     - name: Configure
-  #       run: |
-  #         cmake -S . -B build/linux \
-  #           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-  #           -DCAMPELLO_RENDERER_BUILD_TEST=ON \
-  #           -G Ninja
-  #
-  #     - name: Build
-  #       run: cmake --build build/linux --config ${{ matrix.build_type }}
-  #
-  #     - name: Test
-  #       run: ctest --test-dir build/linux --output-on-failure
-  #
-  #     - name: Upload artifacts
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: campello_renderer-linux-${{ matrix.build_type }}
-  #         path: build/linux/*.so
-  #         if-no-files-found: ignore
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build build-essential
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/linux \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCAMPELLO_RENDERER_BUILD_TEST=ON \
+            -G Ninja
+
+      - name: Build
+        run: cmake --build build/linux --config ${{ matrix.build_type }}
+
+      - name: Test
+        run: ctest --test-dir build/linux --output-on-failure
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: campello_renderer-linux-${{ matrix.build_type }}
+          path: build/linux/*.so
+          if-no-files-found: ignore
 
   # =============================================================================
   # Windows Build
@@ -201,7 +201,6 @@ jobs:
         working-directory: examples/android
         run: |
           ./gradlew assemble${{ matrix.build_type }} \
-            -Pandroid.native.buildOutput=${{ matrix.build_type }} \
             -Pandroid.injected.build.abi=${{ matrix.abi }}
 
       - name: Set build type lowercase

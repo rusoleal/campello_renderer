@@ -9,7 +9,7 @@
 
 | Platform | Status | Artifacts |
 |----------|--------|-----------|
-| Linux | ⚠️ (CI disabled) | `.so` library — blocked by campello_gpu dependency issue |
+| Linux | ✅ | `.so` library |
 | Windows | ✅ | `.dll` library |
 | macOS | ✅ | `.dylib` library + example app |
 | iOS | ✅ | `.a` static library |

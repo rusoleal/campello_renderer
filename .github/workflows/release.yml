@@ -13,42 +13,41 @@ jobs:
   # =============================================================================
   # Build all platforms
   # =============================================================================
-  # Linux build disabled: campello_gpu dependency missing <cstdint> include
-  # build-linux:
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - name: Checkout repository
-  #       uses: actions/checkout@v4
-  #       with:
-  #         submodules: recursive
-  #
-  #     - name: Install dependencies
-  #       run: |
-  #         sudo apt-get update
-  #         sudo apt-get install -y cmake ninja-build build-essential
-  #
-  #     - name: Configure
-  #       run: |
-  #         cmake -S . -B build/linux \
-  #           -DCMAKE_BUILD_TYPE=Release \
-  #           -G Ninja
-  #
-  #     - name: Build
-  #       run: cmake --build build/linux --config Release
-  #
-  #     - name: Package
-  #       run: |
-  #         mkdir -p package/campello_renderer-linux/include
-  #         mkdir -p package/campello_renderer-linux/lib
-  #         cp -r inc/* package/campello_renderer-linux/include/
-  #         cp build/linux/*.so package/campello_renderer-linux/lib/ 2>/dev/null || true
-  #         cd package && tar -czf campello_renderer-linux.tar.gz campello_renderer-linux
-  #
-  #     - name: Upload artifact
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: linux-package
-  #         path: package/campello_renderer-linux.tar.gz
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build build-essential
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/linux \
+            -DCMAKE_BUILD_TYPE=Release \
+            -G Ninja
+
+      - name: Build
+        run: cmake --build build/linux --config Release
+
+      - name: Package
+        run: |
+          mkdir -p package/campello_renderer-linux/include
+          mkdir -p package/campello_renderer-linux/lib
+          cp -r inc/* package/campello_renderer-linux/include/
+          cp build/linux/*.so package/campello_renderer-linux/lib/ 2>/dev/null || true
+          cd package && tar -czf campello_renderer-linux.tar.gz campello_renderer-linux
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-package
+          path: package/campello_renderer-linux.tar.gz
 
   build-windows:
     runs-on: windows-latest
@@ -172,7 +171,6 @@ jobs:
         working-directory: examples/android
         run: |
           ./gradlew assembleRelease \
-            -Pandroid.native.buildOutput=Release \
             -Pandroid.injected.build.abi=${{ matrix.abi }}
 
       - name: Collect libraries
@@ -218,7 +216,7 @@ jobs:
   # Create Release
   # =============================================================================
   create-release:
-    needs: [build-windows, build-macos, build-ios, package-android]
+    needs: [build-linux, build-windows, build-macos, build-ios, package-android]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -231,6 +229,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
+            artifacts/linux-package/*.tar.gz
             artifacts/windows-package/*.zip
             artifacts/macos-package/*.tar.gz
             artifacts/ios-package/*.tar.gz
