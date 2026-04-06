@@ -21,6 +21,10 @@
 
 ### Fixed
 - Fixed version string in `test/main.cpp` — test expected "0.1.1" but library returned "0.1.2", causing CI failures
+- Fixed Windows CI configure step — changed from PowerShell backticks to `cmd` shell with `^` line continuation
+
+### CI/CD
+- **Linux CI disabled** — `campello_gpu` dependency has missing `#include <cstdint>` causing build failures; Linux/Vulkan backend is placeholder anyway
 
 ### Documentation
 - Added versioning checklist to `CLAUDE.md` — documents all files that must be updated when bumping version (CMakeLists.txt, test/main.cpp, etc.)

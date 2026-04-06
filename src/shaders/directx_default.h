@@ -14,10 +14,10 @@
 
 namespace systems::leal::campello_renderer::shaders {
 
-static const unsigned char kDefaultDirectXVertShader[] = {};
+static const unsigned char kDefaultDirectXVertShader[1] = {0};
 static const unsigned int  kDefaultDirectXVertShaderSize = 0;
 
-static const unsigned char kDefaultDirectXPixelShader[] = {};
+static const unsigned char kDefaultDirectXPixelShader[1] = {0};
 static const unsigned int  kDefaultDirectXPixelShaderSize = 0;
 
 } // namespace systems::leal::campello_renderer::shaders
