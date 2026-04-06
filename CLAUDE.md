@@ -57,3 +57,18 @@ Located in `examples/android/`. The Kotlin `MainActivity` loads the native libra
 ## Versioning
 
 Version is defined in `CMakeLists.txt` (`project(campello_renderer VERSION 0.0.3)`) and propagated to `campello_renderer_config.h` via `configure_file`.
+
+**When upgrading the package version, update the version string in ALL of these locations:**
+1. `CMakeLists.txt` — `project(campello_renderer VERSION x.x.x)`
+2. `test/main.cpp` — `ReturnsExpectedVersion` test assertion
+3. `examples/android/app/build.gradle.kts` — `versionName` (if applicable)
+4. Any other files that hardcode the version string
+
+**CI Note:** The `ReturnsExpectedVersion` test in `test/main.cpp` expects an exact version string match. If the versions are out of sync, macOS Debug CI (and other test-enabled builds) will fail with:
+```
+Expected equality of these values:
+  systems::leal::campello_renderer::getVersion()
+    Which is: "0.1.2"
+  "0.1.1"
+```
+Always verify tests pass after version bumps.

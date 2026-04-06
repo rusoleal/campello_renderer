@@ -19,6 +19,12 @@
 - Upgraded `campello_image` dependency from v0.3.0 to v0.3.1
 - Enabled Unity Build for faster compilation (main library and test executable)
 
+### Fixed
+- Fixed version string in `test/main.cpp` — test expected "0.1.1" but library returned "0.1.2", causing CI failures
+
+### Documentation
+- Added versioning checklist to `CLAUDE.md` — documents all files that must be updated when bumping version (CMakeLists.txt, test/main.cpp, etc.)
+
 ## [0.1.1] - 2026-03-23
 
 ### Added

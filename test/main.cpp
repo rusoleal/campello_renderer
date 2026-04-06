@@ -71,7 +71,7 @@ static const char *kGltfWithMesh = R"({
 // ---------------------------------------------------------------------------
 
 TEST(VersionTest, ReturnsExpectedVersion) {
-    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.1.1");
+    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.1.2");
 }
 
 TEST(VersionTest, VersionIsNonEmpty) {
