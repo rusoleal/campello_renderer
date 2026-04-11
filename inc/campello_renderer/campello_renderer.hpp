@@ -22,8 +22,19 @@ namespace systems::leal::campello_renderer {
         static constexpr uint32_t VERTEX_SLOT_NORMAL    = 1;  // float3 NORMAL
         static constexpr uint32_t VERTEX_SLOT_TEXCOORD0 = 2;  // float2 TEXCOORD_0
         static constexpr uint32_t VERTEX_SLOT_TANGENT   = 3;  // float4 TANGENT
-        static constexpr uint32_t VERTEX_SLOT_MVP       = 16; // float4x4, row-major MVP matrix
-        static constexpr uint32_t VERTEX_SLOT_MATERIAL  = 17; // MaterialUniforms (baseColorFactor)
+        static constexpr uint32_t VERTEX_SLOT_MVP       = 16; // float4x4, row-major MVP matrix (per-instance)
+        static constexpr uint32_t VERTEX_SLOT_MATERIAL  = 17; // MaterialUniforms (80 bytes, 256 stride)
+        static constexpr uint32_t VERTEX_SLOT_CAMERA    = 18; // CameraPosition (float3 world space)
+                                                               //   [0..15]  baseColorFactor
+                                                               //   [16..31] uvTransformRow0 (.w = hasTransform)
+                                                               //   [32..47] uvTransformRow1
+                                                               //   [48..51] metallicFactor
+                                                               //   [52..55] roughnessFactor
+                                                               //   [56..59] normalScale
+                                                               //   [60..63] alphaMode (0=opaque,1=mask,2=blend)
+                                                               //   [64..67] alphaCutoff
+                                                               //   [68..71] unlit (0=lit,1=unlit)
+                                                               //   [72..75] hasNormalTexture (0=no,1=yes)
 
     private:
         std::shared_ptr<systems::leal::campello_gpu::Device> device;
@@ -35,19 +46,40 @@ namespace systems::leal::campello_renderer {
         std::vector<std::shared_ptr<systems::leal::campello_gpu::Buffer>>  gpuBuffers;
         std::vector<std::shared_ptr<systems::leal::campello_gpu::Texture>> gpuTextures;
 
-        // Per-GLTF-sampler GPU samplers and per-GLTF-texture bind groups.
+        // Per-GLTF-sampler GPU samplers and per-material bind groups.
         std::vector<std::shared_ptr<systems::leal::campello_gpu::Sampler>>        gpuSamplers;
-        std::vector<std::shared_ptr<systems::leal::campello_gpu::BindGroup>>      gpuBindGroups;
+        std::vector<std::shared_ptr<systems::leal::campello_gpu::BindGroup>>      materialBindGroups;
+
+        // Draco-compressed primitive GPU buffers (primitive pointer → index buffer + attribute buffers).
+        // Populated in setScene() after calling GLTF::decompressDraco().
+        struct DracoBuffers {
+            std::shared_ptr<systems::leal::campello_gpu::Buffer> indexBuffer;
+            std::unordered_map<std::string, std::shared_ptr<systems::leal::campello_gpu::Buffer>> attributeBuffers;
+            uint32_t indexCount = 0;  // Number of indices for drawing
+        };
+        std::unordered_map<const systems::leal::gltf::Primitive *, DracoBuffers> dracoPrimitiveBuffers;
 
         // Shared resources created on first setScene() call.
         std::shared_ptr<systems::leal::campello_gpu::Sampler>          defaultSampler;
-        std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultTexture;
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultTexture;        // White (1,1,1,1) for baseColor
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultMetallicRoughnessTexture; // (0,1,1,1) - G=roughness, B=metallic
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultNormalTexture;            // (0.5,0.5,1,1) - flat normal
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultEmissiveTexture;          // (0,0,0,1) - black (no emission)
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultOcclusionTexture;         // (1,1,1,1) - white (no occlusion)
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout>  bindGroupLayout;
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        defaultBindGroup;
 
         // Built-in pipeline variants created by createDefaultPipelines().
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlat;
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTextured;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineDebug;  // Flat shaded, no lighting
+        
+        // Double-sided pipeline variants (no back-face culling).
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlatDoubleSided;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTexturedDoubleSided;
+
+        // Debug rendering mode.
+        bool debugModeEnabled = false;
 
         // Per-draw buffers: material uniforms (baseColorFactor per material slot)
         // and a fallback zero-UV buffer for primitives without TEXCOORD_0.
@@ -61,9 +93,14 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::Texture>     depthTexture;
         std::shared_ptr<systems::leal::campello_gpu::TextureView> depthView;
 
-        // Per-node MVP matrices uploaded to the GPU at the start of each render().
+        // Per-node matrices uploaded to the GPU at the start of each render().
+        // Each node gets 32 floats: 16 for MVP (clip space), 16 for Model (world space).
         std::shared_ptr<systems::leal::campello_gpu::Buffer> transformBuffer;
-        std::vector<float> nodeTransforms;
+        std::vector<float> nodeTransforms; // 32 floats per node
+
+        // Camera position buffer — uploaded each frame for specular lighting.
+        // Contains float3 cameraPositionWorld.
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> cameraPositionBuffer;
 
         // Camera override — set by setCameraMatrices(), cleared by clearCameraOverride().
         bool hasCameraOverride = false;
@@ -78,7 +115,7 @@ namespace systems::leal::campello_renderer {
 
         // Tracks which pipeline variant is currently bound within a render pass
         // to avoid redundant setPipeline() calls.
-        // 0 = none, 1 = flat, 2 = textured
+        // 0 = none, 1 = flat, 2 = textured, 3 = debug, 4 = flat double-sided, 5 = textured double-sided
         int currentPipelineVariant = 0;
 
         static systems::leal::vector_math::Matrix4<double> nodeLocalMatrix(
@@ -110,6 +147,9 @@ namespace systems::leal::campello_renderer {
         // Core render implementation — shared by both render() overloads.
         void renderToTarget(
             std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView);
+
+        // Upload Draco-decompressed primitive data to GPU buffers.
+        void uploadDracoBuffers(std::shared_ptr<systems::leal::gltf::RuntimeInfo> &info);
 
     public:
         Renderer(std::shared_ptr<systems::leal::campello_gpu::Device> device);
@@ -147,6 +187,12 @@ namespace systems::leal::campello_renderer {
         // Returns the approximate bounding radius of the current scene,
         // computed from node world-space positions in setScene().
         float getBoundsRadius() const;
+
+        // Debug rendering mode.
+        // When enabled, renders geometry with flat shading (no textures, no lighting)
+        // to verify geometry loading and camera setup.
+        void setDebugMode(bool enabled);
+        bool isDebugModeEnabled() const;
 
         // Accessors for uploaded GPU resources.
         std::shared_ptr<systems::leal::campello_gpu::Buffer>  getGpuBuffer(uint32_t index) const;

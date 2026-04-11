@@ -4,4 +4,5 @@
 
 @interface ViewController : NSViewController <MTKViewDelegate>
 - (void)loadURL:(NSURL *)url;
+- (IBAction)toggleDebugMode:(id)sender;
 @end

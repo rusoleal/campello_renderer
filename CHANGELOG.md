@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **PBR metallic-roughness rendering** — Full metallic-roughness workflow with:
+  - `metallicRoughnessTexture` sampling (G=roughness, B=metallic)
+  - `metallicFactor` and `roughnessFactor` scalar multipliers
+  - Simple Lambert diffuse + Blinn-Phong specular approximation
+- **Normal mapping** — `normalTexture` with tangent-space decoding and TBN matrix
+  - `normalScale` intensity control from `NormalTextureInfo::scale`
+  - Falls back to vertex normals when no normal texture present
+- **Per-material bind groups** — Each material now has its own bind group with all three textures (baseColor, metallicRoughness, normal)
+- **Dual matrix upload** — Both MVP (clip space) and Model (world space) matrices uploaded per node for correct world-space lighting
+- **Camera uniform buffer** (slot 18) — Passes camera position and light direction to shaders for proper specular calculations
+- **Fixed lighting calculations** — World-space normals, proper view direction from camera position, lower ambient (0.05) for higher contrast
+- **Default textures** for missing material properties:
+  - White for baseColor
+  - (0,1,1,1) for metallicRoughness (roughness=1, metallic=1)
+  - (0.5,0.5,1,1) for normal (flat normal in tangent space)
+
+### Changed
+- Upgraded `gltf` dependency from v0.3.6 to v0.4.0
+  - **BREAKING**: `GLTF::loadGLTF()` now requires a callback for loading external resources
+  - Matrix transposition is now handled internally by the gltf library — removed manual transpose workarounds
+- Updated all `GLTF::loadGLTF()` calls in tests and examples to use the new callback-based API
+- **Bind group layout expanded** — Now supports 6 bindings (3 textures + 3 samplers)
+- **Material uniform buffer expanded** — New layout includes metallicFactor, roughnessFactor, normalScale, hasNormalTexture flag
+- Updated Metal shaders with new PBR lighting model
+
 ## [0.1.2] - 2026-04-06
 
 ### Added

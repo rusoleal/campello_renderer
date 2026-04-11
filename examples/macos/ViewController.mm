@@ -19,6 +19,8 @@
 #import <gltf/gltf.hpp>
 
 #import <simd/simd.h>
+#include <future>
+#include <vector>
 
 namespace gpu  = systems::leal::campello_gpu;
 namespace gltf = systems::leal::gltf;
@@ -37,6 +39,7 @@ namespace rend = systems::leal::campello_renderer;
     NSPoint _lastMousePos;
     BOOL    _mouseDown;
     BOOL    _rightMouseDown;
+    BOOL    _debugModeEnabled;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +89,8 @@ namespace rend = systems::leal::campello_renderer;
 
     CGSize sz = _metalView.drawableSize;
     _renderer->resize((uint32_t)sz.width, (uint32_t)sz.height);
+    
+    _debugModeEnabled = NO;
 }
 
 // ---------------------------------------------------------------------------
@@ -107,9 +112,24 @@ namespace rend = systems::leal::campello_renderer;
             reinterpret_cast<uint8_t *>(const_cast<void *>(data.bytes)),
             static_cast<uint64_t>(data.length));
     } else {
+        // Get the base directory of the GLTF file for resolving relative URIs.
+        NSString *baseDir = url.path.stringByDeletingLastPathComponent;
         asset = gltf::GLTF::loadGLTF(
             std::string(static_cast<const char *>(data.bytes),
-                        static_cast<size_t>(data.length)));
+                        static_cast<size_t>(data.length)),
+            [baseDir](const std::string &uri) -> std::future<std::vector<uint8_t>> {
+                return std::async(std::launch::deferred, [baseDir, uri]() {
+                    NSString *nsUri = [NSString stringWithUTF8String:uri.c_str()];
+                    NSString *fullPath = [baseDir stringByAppendingPathComponent:nsUri];
+                    NSData *fileData = [NSData dataWithContentsOfFile:fullPath];
+                    std::vector<uint8_t> result;
+                    if (fileData) {
+                        const uint8_t *bytes = (const uint8_t *)fileData.bytes;
+                        result.assign(bytes, bytes + fileData.length);
+                    }
+                    return result;
+                });
+            });
     }
 
     if (!asset) {
@@ -131,10 +151,15 @@ namespace rend = systems::leal::campello_renderer;
     if (!_renderer) return;
 
     id<CAMetalDrawable> drawable = view.currentDrawable;
-    if (!drawable) return;
+    if (!drawable || !drawable.texture) return;
+    
+    // Ensure drawable texture is valid before rendering
+    if (drawable.texture.pixelFormat == MTLPixelFormatInvalid) return;
 
     // Pass the orbit camera matrices to the renderer each frame.
     CGSize sz = view.drawableSize;
+    if (sz.width == 0 || sz.height == 0) return;
+    
     float aspect = (float)(sz.width / sz.height);
     simd_float4x4 viewMat = _camera.viewMatrix();
     simd_float4x4 projMat = _camera.projectionMatrix(aspect);
@@ -166,6 +191,21 @@ namespace rend = systems::leal::campello_renderer;
             [self loadURL:panel.URL];
         }
     }];
+}
+
+- (IBAction)toggleDebugMode:(id)sender {
+    if (!_renderer) return;
+    
+    _debugModeEnabled = !_debugModeEnabled;
+    _renderer->setDebugMode(_debugModeEnabled);
+    
+    // Update menu item state
+    if ([sender isKindOfClass:[NSMenuItem class]]) {
+        NSMenuItem *item = (NSMenuItem *)sender;
+        item.state = _debugModeEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    }
+    
+    NSLog(@"Debug mode: %@", _debugModeEnabled ? @"ON" : @"OFF");
 }
 
 // ---------------------------------------------------------------------------

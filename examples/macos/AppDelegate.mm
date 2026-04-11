@@ -57,6 +57,17 @@
                         action:@selector(openDocument:)
                  keyEquivalent:@"o"];
 
+    // View menu
+    NSMenuItem *viewItem = [[NSMenuItem alloc] init];
+    [menuBar addItem:viewItem];
+    NSMenu *viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
+    viewItem.submenu = viewMenu;
+    NSMenuItem *debugItem = [[NSMenuItem alloc] initWithTitle:@"Debug Mode"
+                                                       action:@selector(toggleDebugMode:)
+                                                keyEquivalent:@"d"];
+    debugItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+    [viewMenu addItem:debugItem];
+
     [NSApp setMainMenu:menuBar];
 }
 

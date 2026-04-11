@@ -1,9 +1,18 @@
 #include <gtest/gtest.h>
 #include <campello_renderer/campello_renderer.hpp>
 #include <gltf/gltf.hpp>
+#include <future>
+#include <vector>
 
 using namespace systems::leal::campello_renderer;
 using namespace systems::leal::gltf;
+
+// No-op resource loader for embedded GLTF data (no external resources).
+static auto kNoOpLoader = [](const std::string&) {
+    return std::async(std::launch::deferred, []() {
+        return std::vector<uint8_t>{};
+    });
+};
 
 // ---------------------------------------------------------------------------
 // Helpers — minimal valid GLTF JSON strings
@@ -120,7 +129,7 @@ TEST(SetAssetTest, SetNullIsIdempotent) {
 // ---------------------------------------------------------------------------
 
 TEST(SetAssetTest, SetAssetWithNoScenes) {
-    auto asset = GLTF::loadGLTF(kGltfNoScenes);
+    auto asset = GLTF::loadGLTF(kGltfNoScenes, kNoOpLoader);
     ASSERT_NE(asset, nullptr);
     Renderer renderer(nullptr);
     renderer.setAsset(asset);
@@ -128,7 +137,7 @@ TEST(SetAssetTest, SetAssetWithNoScenes) {
 }
 
 TEST(SetAssetTest, SetAssetWithOneEmptyScene) {
-    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene);
+    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
     ASSERT_NE(asset, nullptr);
     Renderer renderer(nullptr);
     EXPECT_NO_THROW(renderer.setAsset(asset));
@@ -136,7 +145,7 @@ TEST(SetAssetTest, SetAssetWithOneEmptyScene) {
 }
 
 TEST(SetAssetTest, SetAssetWithTwoScenes) {
-    auto asset = GLTF::loadGLTF(kGltfTwoEmptyScenes);
+    auto asset = GLTF::loadGLTF(kGltfTwoEmptyScenes, kNoOpLoader);
     ASSERT_NE(asset, nullptr);
     Renderer renderer(nullptr);
     EXPECT_NO_THROW(renderer.setAsset(asset));
@@ -144,7 +153,7 @@ TEST(SetAssetTest, SetAssetWithTwoScenes) {
 }
 
 TEST(SetAssetTest, SetAssetWithCameraNode) {
-    auto asset = GLTF::loadGLTF(kGltfWithCamera);
+    auto asset = GLTF::loadGLTF(kGltfWithCamera, kNoOpLoader);
     ASSERT_NE(asset, nullptr);
     Renderer renderer(nullptr);
     EXPECT_NO_THROW(renderer.setAsset(asset));
@@ -152,7 +161,7 @@ TEST(SetAssetTest, SetAssetWithCameraNode) {
 }
 
 TEST(SetAssetTest, SetAssetWithMeshNode) {
-    auto asset = GLTF::loadGLTF(kGltfWithMesh);
+    auto asset = GLTF::loadGLTF(kGltfWithMesh, kNoOpLoader);
     ASSERT_NE(asset, nullptr);
     Renderer renderer(nullptr);
     EXPECT_NO_THROW(renderer.setAsset(asset));
@@ -160,8 +169,8 @@ TEST(SetAssetTest, SetAssetWithMeshNode) {
 }
 
 TEST(SetAssetTest, SetAssetTwiceReplacesAsset) {
-    auto asset1 = GLTF::loadGLTF(kGltfOneEmptyScene);
-    auto asset2 = GLTF::loadGLTF(kGltfTwoEmptyScenes);
+    auto asset1 = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
+    auto asset2 = GLTF::loadGLTF(kGltfTwoEmptyScenes, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset1);
     renderer.setAsset(asset2);
@@ -169,7 +178,7 @@ TEST(SetAssetTest, SetAssetTwiceReplacesAsset) {
 }
 
 TEST(SetAssetTest, SetAssetThenClearWithNull) {
-    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene);
+    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset);
     EXPECT_EQ(renderer.getAsset(), asset);
@@ -178,7 +187,7 @@ TEST(SetAssetTest, SetAssetThenClearWithNull) {
 }
 
 TEST(SetAssetTest, SetAssetThenClearThenSetAgain) {
-    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene);
+    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset);
     renderer.setAsset(nullptr);
@@ -196,21 +205,21 @@ TEST(SetSceneTest, NullAssetDoesNotCrash) {
 }
 
 TEST(SetSceneTest, ValidAssetValidScene) {
-    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene);
+    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset);
     EXPECT_NO_THROW(renderer.setScene(0));
 }
 
 TEST(SetSceneTest, OutOfBoundsSceneIndexDoesNotCrash) {
-    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene);
+    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset);
     EXPECT_NO_THROW(renderer.setScene(99));
 }
 
 TEST(SetSceneTest, SwitchBetweenScenes) {
-    auto asset = GLTF::loadGLTF(kGltfTwoEmptyScenes);
+    auto asset = GLTF::loadGLTF(kGltfTwoEmptyScenes, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset);
     EXPECT_NO_THROW(renderer.setScene(0));
@@ -219,7 +228,7 @@ TEST(SetSceneTest, SwitchBetweenScenes) {
 }
 
 TEST(SetSceneTest, SetSceneAfterClearingAsset) {
-    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene);
+    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset);
     renderer.setAsset(nullptr);
@@ -227,7 +236,7 @@ TEST(SetSceneTest, SetSceneAfterClearingAsset) {
 }
 
 TEST(SetSceneTest, SetSceneWithMeshNode) {
-    auto asset = GLTF::loadGLTF(kGltfWithMesh);
+    auto asset = GLTF::loadGLTF(kGltfWithMesh, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset);
     EXPECT_NO_THROW(renderer.setScene(0));
@@ -255,7 +264,7 @@ TEST(SetCameraTest, SetCameraMultipleTimes) {
 }
 
 TEST(SetCameraTest, SetCameraWithAssetLoaded) {
-    auto asset = GLTF::loadGLTF(kGltfWithCamera);
+    auto asset = GLTF::loadGLTF(kGltfWithCamera, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset);
     EXPECT_NO_THROW(renderer.setCamera(0));
@@ -271,7 +280,7 @@ TEST(RenderTest, RenderDoesNotCrash) {
 }
 
 TEST(RenderTest, RenderWithAsset) {
-    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene);
+    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset);
     EXPECT_NO_THROW(renderer.render());
@@ -316,7 +325,7 @@ TEST(UpdateTest, UpdateCalledMultipleTimes) {
 // ---------------------------------------------------------------------------
 
 TEST(SequenceTest, FullLifecycleWithAsset) {
-    auto asset = GLTF::loadGLTF(kGltfWithCamera);
+    auto asset = GLTF::loadGLTF(kGltfWithCamera, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset);
     renderer.setScene(0);
@@ -327,8 +336,8 @@ TEST(SequenceTest, FullLifecycleWithAsset) {
 }
 
 TEST(SequenceTest, ReplaceAssetAndRender) {
-    auto asset1 = GLTF::loadGLTF(kGltfOneEmptyScene);
-    auto asset2 = GLTF::loadGLTF(kGltfWithMesh);
+    auto asset1 = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
+    auto asset2 = GLTF::loadGLTF(kGltfWithMesh, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset1);
     renderer.setScene(0);
@@ -339,7 +348,7 @@ TEST(SequenceTest, ReplaceAssetAndRender) {
 }
 
 TEST(SequenceTest, SimulateFrameLoop) {
-    auto asset = GLTF::loadGLTF(kGltfWithCamera);
+    auto asset = GLTF::loadGLTF(kGltfWithCamera, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset);
     renderer.setScene(0);
@@ -352,7 +361,7 @@ TEST(SequenceTest, SimulateFrameLoop) {
 }
 
 TEST(SequenceTest, ClearAssetBetweenRenders) {
-    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene);
+    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
     Renderer renderer(nullptr);
     renderer.setAsset(asset);
     renderer.render();

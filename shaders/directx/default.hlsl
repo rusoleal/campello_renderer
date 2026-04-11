@@ -41,12 +41,21 @@ struct VertexIn {
     float4 mvpRow1 : TEXCOORD17;   // slot 16, shaderLocation = 17
     float4 mvpRow2 : TEXCOORD18;   // slot 16, shaderLocation = 18
     float4 mvpRow3 : TEXCOORD19;   // slot 16, shaderLocation = 19
+
+    // Material uniforms arrive from buffer slot 17 (per-instance, stride = 256 bytes).
+    // Locations 20-23 follow the MVP (16-19) to avoid collision.
+    float4 baseColorFactor  : TEXCOORD20;  // slot 17, shaderLocation = 20
+    float4 uvTransformRow0  : TEXCOORD21;  // KHR_texture_transform row 0 [a, b, tx, hasTransform]
+    float4 uvTransformRow1  : TEXCOORD22;  // KHR_texture_transform row 1 [c, d, ty, 0]
+    float4 materialFlags    : TEXCOORD23;  // [alphaMode, alphaCutoff, unlit, 0]
 };
 
 struct PixelIn {
     float4 clipPosition : SV_Position;
     float3 objectNormal : TEXCOORD0;
     float2 uv           : TEXCOORD1;
+    float4 baseColor    : TEXCOORD2;
+    float3 materialParams : TEXCOORD3;  // [alphaMode, alphaCutoff, unlit]
 };
 
 // Bind group 0 — base color texture and sampler.
@@ -65,6 +74,16 @@ PixelIn vertexMain(VertexIn input)
     float4x4 mvp = float4x4(input.mvpRow0, input.mvpRow1,
                              input.mvpRow2, input.mvpRow3);
 
+    // Apply KHR_texture_transform only when the flag (uvTransformRow0.w > 0.5) is set.
+    float2 transformedUV;
+    if (input.uvTransformRow0.w > 0.5) {
+        float3 uv3   = float3(input.uv, 1.0);
+        transformedUV = float2(dot(input.uvTransformRow0.xyz, uv3),
+                               dot(input.uvTransformRow1.xyz, uv3));
+    } else {
+        transformedUV = input.uv;
+    }
+
     PixelIn output;
     output.clipPosition = mul(mvp, float4(input.position, 1.0));
 
@@ -72,8 +91,10 @@ PixelIn vertexMain(VertexIn input)
     // Limitation: correct only for uniformly scaled models. A proper normal
     // transform requires a separate normal matrix (transpose-inverse of M),
     // which will be added once campello_gpu supports constant buffers.
-    output.objectNormal = input.normal;
-    output.uv           = input.uv;
+    output.objectNormal   = input.normal;
+    output.uv             = transformedUV;
+    output.baseColor      = input.baseColorFactor;
+    output.materialParams = input.materialFlags.xyz; // [alphaMode, alphaCutoff, unlit]
 
     return output;
 }
@@ -84,8 +105,25 @@ PixelIn vertexMain(VertexIn input)
 // ---------------------------------------------------------------------------
 float4 pixelMain(PixelIn input) : SV_Target
 {
-    // Sample base color texture.
+    // Sample base color texture and multiply by baseColorFactor.
     float4 texColor = baseColorTexture.Sample(baseColorSampler, input.uv);
+    
+    // Material params: [alphaMode, alphaCutoff, unlit]
+    float alphaMode   = input.materialParams.x;
+    float alphaCutoff = input.materialParams.y;
+    float unlit       = input.materialParams.z;
+    
+    // Alpha mask: discard fragment when alphaMode == 1 (mask) and alpha < alphaCutoff
+    if (alphaMode > 0.5 && alphaMode < 1.5 && texColor.a < alphaCutoff) {
+        discard;
+    }
+    
+    float4 color = texColor * input.baseColor;
+
+    // KHR_materials_unlit: skip lighting when unlit flag is set
+    if (unlit > 0.5) {
+        return color;
+    }
 
     // Directional light pointing from upper-right-front (object space).
     float3 lightDir = normalize(float3(1.0, 2.0, 1.0));
@@ -95,5 +133,5 @@ float4 pixelMain(PixelIn input) : SV_Target
     float  ambient  = 0.15;
     float  light    = ambient + diffuse * (1.0 - ambient);
 
-    return float4(texColor.rgb * light, texColor.a);
+    return float4(color.rgb * light, color.a);
 }
