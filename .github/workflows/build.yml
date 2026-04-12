@@ -18,7 +18,7 @@ jobs:
         build_type: [Debug, Release]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -42,7 +42,7 @@ jobs:
       #   run: ctest --test-dir build/linux --output-on-failure
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: campello_renderer-linux-${{ matrix.build_type }}
           path: build/linux/*.so
@@ -59,7 +59,7 @@ jobs:
         arch: [x64]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -85,7 +85,7 @@ jobs:
       #   run: ctest --test-dir build/windows --output-on-failure -C ${{ matrix.build_type }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: campello_renderer-windows-${{ matrix.arch }}-${{ matrix.build_type }}
           path: build/windows/${{ matrix.build_type }}/*.dll
@@ -101,7 +101,7 @@ jobs:
         build_type: [Debug, Release]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -127,14 +127,14 @@ jobs:
         run: cmake --build build/macos-example --config ${{ matrix.build_type }}
 
       - name: Upload library artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: campello_renderer-macos-${{ matrix.build_type }}
           path: build/macos/*.dylib
           if-no-files-found: ignore
 
       - name: Upload example artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: campello_renderer-macos-example-${{ matrix.build_type }}
           path: build/macos-example/examples/macos/${{ matrix.build_type }}/*.app
@@ -150,7 +150,7 @@ jobs:
         build_type: [Debug, Release]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -167,7 +167,7 @@ jobs:
         run: cmake --build build/ios --config ${{ matrix.build_type }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: campello_renderer-ios-${{ matrix.build_type }}
           path: build/ios/**/*.a
@@ -184,7 +184,7 @@ jobs:
         abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -216,14 +216,14 @@ jobs:
           fi
 
       - name: Upload APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: campello_renderer-android-${{ matrix.abi }}-${{ matrix.build_type }}
           path: examples/android/app/build/outputs/apk/${{ steps.vars.outputs.BUILD_TYPE_LC }}/*.apk
           if-no-files-found: ignore
 
       - name: Upload native libraries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: campello_renderer-android-libs-${{ matrix.abi }}-${{ matrix.build_type }}
           path: |
