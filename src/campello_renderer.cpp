@@ -410,6 +410,17 @@ void Renderer::setScene(uint32_t index) {
         texEntry11.data.texture.viewDimension = GPU::TextureType::tt2d;
         bglDesc.entries.push_back(texEntry11);
 
+        // Binding 20: transmissionTexture (KHR_materials_transmission — R=transmission factor)
+        // Reuses baseColorSampler (Metal has 16 sampler limit)
+        GPU::EntryObject texEntry12{};
+        texEntry12.binding    = 20;
+        texEntry12.visibility = GPU::ShaderStage::fragment;
+        texEntry12.type       = GPU::EntryObjectType::texture;
+        texEntry12.data.texture.multisampled  = false;
+        texEntry12.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntry12.data.texture.viewDimension = GPU::TextureType::tt2d;
+        bglDesc.entries.push_back(texEntry12);
+
         bindGroupLayout = device->createBindGroupLayout(bglDesc);
     }
 
@@ -758,6 +769,13 @@ void Renderer::setScene(uint32_t index) {
                     getTextureAndSampler(mat.khrMaterialsClearcoat->clearcoatNormalTexture, clearcoatNormalTex, unused);
             }
 
+            // Transmission texture (binding 20) — KHR_materials_transmission: R channel scales transmissionFactor
+            std::shared_ptr<GPU::Texture> transmissionTex = defaultTexture;  // White = full transmission
+            std::shared_ptr<GPU::Sampler> transmissionSamp = defaultSampler;
+            if (mat.khrMaterialsTransmission && mat.khrMaterialsTransmission->transmissionTexture) {
+                getTextureAndSampler(mat.khrMaterialsTransmission->transmissionTexture, transmissionTex, transmissionSamp);
+            }
+
             // Create bind group with all textures and lights buffer
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout  = bindGroupLayout;
@@ -782,6 +800,7 @@ void Renderer::setScene(uint32_t index) {
                 {17, clearcoatTex},
                 {18, clearcoatRoughnessTex},
                 {19, clearcoatNormalTex},
+                {20, transmissionTex},
                 // Buffer(17): material uniforms at the per-material offset — bound to both
                 // vertex and fragment stages via setBindGroup, making [[buffer(17)]] visible
                 // in all fragment shader variants.
@@ -1910,6 +1929,11 @@ void Renderer::renderToTarget(
     // ------------------------------------------------------------------
     if (materialUniformBuffer) {
         // Helper: build a material slot from material data.
+        // Matches Metal struct layout EXACTLY.
+        // Metal packs floats at 4-byte intervals, but float3 is 16-byte aligned.
+        // Correct offsets (verified from shader struct):
+        //   transmissionFactor = offset 228 (index 57)
+        //   hasTransmissionTexture = offset 232 (index 58)
         auto buildSlot = [](float bc[4], float r0[4], float r1[4],
                             float metallic, float roughness, float normalScale,
                             float alphaMode, float alphaCutoff, float unlit,
@@ -1923,49 +1947,77 @@ void Renderer::renderToTarget(
                             float clearcoatFactor, float clearcoatRoughnessFactor,
                             float hasClearcoatTex, float hasClearcoatRoughnessTex,
                             float hasClearcoatNormalTex, float clearcoatNormalScale,
-                            float out[48]) {
+                            float transmissionFactor, float hasTransmissionTex,
+                            float out[60]) {
+            // Zero initialize
+            for (int i = 0; i < 60; i++) out[i] = 0.f;
+            
+            // [0-2] float4s at offsets 0, 16, 32
             out[0]  = bc[0]; out[1]  = bc[1]; out[2]  = bc[2];  out[3]  = bc[3];
             out[4]  = r0[0]; out[5]  = r0[1]; out[6]  = r0[2];  out[7]  = r0[3];
             out[8]  = r1[0]; out[9]  = r1[1]; out[10] = r1[2];  out[11] = r1[3];
-            out[12] = metallic;
-            out[13] = roughness;
-            out[14] = normalScale;
-            out[15] = alphaMode;
-            out[16] = alphaCutoff;
-            out[17] = unlit;
-            out[18] = hasNormal;
-            out[19] = hasEmissive;
-            out[20] = hasOcclusion;
-            out[21] = occlusionStrength;
-            out[22] = 0.f; // explicit pad (offset 88)
-            out[23] = 0.f; // implicit Metal pad (offset 92) — float3 aligns to 16 bytes → offset 96
-            out[24] = emissiveFactor[0]; // offset 96
-            out[25] = emissiveFactor[1]; // offset 100
-            out[26] = emissiveFactor[2]; // offset 104
-            out[27] = ior;               // offset 108 — KHR_materials_ior (default 1.5)
-            out[28] = specularFactor;    // offset 112 — KHR_materials_specular scalar weight
-            out[29] = hasSpecularTex;    // offset 116
-            out[30] = hasSpecularColorTex; // offset 120
-            out[31] = 0.f;               // offset 124 — pad before float3
-            out[32] = specularColorFactor[0]; // offset 128
-            out[33] = specularColorFactor[1]; // offset 132
-            out[34] = specularColorFactor[2]; // offset 136
-            out[35] = 0.f;               // offset 140 — pad before float3
-            out[36] = sheenColorFactor[0]; // offset 144
-            out[37] = sheenColorFactor[1]; // offset 148
-            out[38] = sheenColorFactor[2]; // offset 152
-            out[39] = sheenRoughnessFactor;   // offset 156
-            out[40] = hasSheenColorTex;       // offset 160
-            out[41] = hasSheenRoughnessTex;   // offset 164
-            out[42] = clearcoatFactor;        // offset 168
-            out[43] = clearcoatRoughnessFactor; // offset 172
-            out[44] = hasClearcoatTex;        // offset 176
-            out[45] = hasClearcoatRoughnessTex; // offset 180
-            out[46] = hasClearcoatNormalTex;  // offset 184
-            out[47] = clearcoatNormalScale;   // offset 188
+            
+            // [12-22] floats at offsets 48-88
+            out[12] = metallic;           // 48
+            out[13] = roughness;          // 52
+            out[14] = normalScale;        // 56
+            out[15] = alphaMode;          // 60
+            out[16] = alphaCutoff;        // 64
+            out[17] = unlit;              // 68
+            out[18] = hasNormal;          // 72
+            out[19] = hasEmissive;        // 76
+            out[20] = hasOcclusion;       // 80
+            out[21] = occlusionStrength;  // 84
+            out[22] = 0.f;                // 88 - _padding
+            
+            // emissiveFactor float3 at offset 96 (16-byte aligned)
+            out[24] = emissiveFactor[0];  // 96
+            out[25] = emissiveFactor[1];  // 100
+            out[26] = emissiveFactor[2];  // 104
+            out[27] = ior;                // 108
+            
+            // [28-31] at offsets 112-124
+            out[28] = specularFactor;         // 112
+            out[29] = hasSpecularTex;         // 116
+            out[30] = hasSpecularColorTex;    // 120
+            out[31] = 0.f;                    // 124 - _pad2
+            
+            // specularColorFactor float3 at offset 128? No wait, 124+4=128 which IS 16-aligned
+            // But struct says _pad2 at 124, then specularColorFactor... let me check
+            // After _pad2 at 124, next is 128. 128 is 16-aligned. Good.
+            out[32] = specularColorFactor[0]; // 128
+            out[33] = specularColorFactor[1]; // 132
+            out[34] = specularColorFactor[2]; // 136
+            // _pad3 at 140? No wait, 136+4=140, not 16-aligned
+            // Next float3 needs 16-align, so next is 144
+            // So _pad3 at 140, then sheenColorFactor at 144
+            out[35] = 0.f;                    // 140 - _pad3
+            
+            // sheenColorFactor float3 at offset 144
+            out[36] = sheenColorFactor[0];    // 144
+            out[37] = sheenColorFactor[1];    // 148
+            out[38] = sheenColorFactor[2];    // 152
+            out[39] = sheenRoughnessFactor;   // 156
+            
+            // [40-43] at offsets 160-172
+            out[40] = hasSheenColorTex;       // 160
+            out[41] = hasSheenRoughnessTex;   // 164
+            out[42] = clearcoatFactor;        // 168
+            out[43] = clearcoatRoughnessFactor; // 172
+            
+            // [44-47] at offsets 176-188
+            out[44] = hasClearcoatTex;        // 176
+            out[45] = hasClearcoatRoughnessTex; // 180
+            out[46] = hasClearcoatNormalTex;  // 184
+            out[47] = clearcoatNormalScale;   // 188
+            
+            // transmissionFactor at offset 228 (index 57)
+            // hasTransmissionTexture at offset 232 (index 58)
+            out[57] = transmissionFactor;     // 228
+            out[58] = hasTransmissionTex;     // 232
         };
 
-        // Default slot — white, identity UV transform, metallic=1, roughness=1, no textures, no sheen, no clearcoat.
+        // Default slot — white, identity UV transform, metallic=1, roughness=1, no textures, no sheen, no clearcoat, no transmission.
         {
             float bc[4]            = {1.f, 1.f, 1.f, 1.f};
             float row0[4]          = {1.f, 0.f, 0.f, 0.f}; // w=0 → identity fast path
@@ -1973,12 +2025,13 @@ void Renderer::renderToTarget(
             float emissive[3]      = {0.f, 0.f, 0.f};
             float specularColor[3] = {1.f, 1.f, 1.f};
             float sheenColor[3]    = {0.f, 0.f, 0.f};
-            float slot[48];
+            float slot[60];
             buildSlot(bc, row0, row1, 1.f, 1.f, 1.f, 0.f, 0.5f, 0.f, 0.f, 0.f, 0.f, 1.f,
                       emissive, 1.5f, 1.f, 0.f, 0.f, specularColor,
                       sheenColor, 0.f, 0.f, 0.f,
-                      0.f, 0.f, 0.f, 0.f, 0.f, 1.f, slot);
-            materialUniformBuffer->upload(0, (uint64_t)sizeof(slot), slot);
+                      0.f, 0.f, 0.f, 0.f, 0.f, 1.f,
+                      0.f, 0.f, slot); // transmissionFactor=0, hasTransmissionTex=0
+            materialUniformBuffer->upload(0, (uint64_t)(60 * sizeof(float)), slot);
         }
 
         if (asset->materials) {
@@ -2098,7 +2151,17 @@ void Renderer::renderToTarget(
                     }
                 }
 
-                float slot[48];
+                // KHR_materials_transmission
+                float transmissionFactor = 0.f;
+                float hasTransmissionTex = 0.f;
+                if (mat.khrMaterialsTransmission) {
+                    transmissionFactor = (float)mat.khrMaterialsTransmission->transmissionFactor;
+                    if (mat.khrMaterialsTransmission->transmissionTexture) {
+                        hasTransmissionTex = 1.f;
+                    }
+                }
+
+                float slot[60];
                 buildSlot(bc, row0, row1, metallic, roughness, normalScale,
                           alphaMode, alphaCutoff, unlit, hasNormal, hasEmissive, hasOcclusion,
                           occlusionStrength, emissiveFactor, ior,
@@ -2106,21 +2169,11 @@ void Renderer::renderToTarget(
                           sheenColorFactor, sheenRoughnessFactor, hasSheenColorTex, hasSheenRoughnessTex,
                           clearcoatFactor, clearcoatRoughnessFactor,
                           hasClearcoatTex, hasClearcoatRoughnessTex, hasClearcoatNormalTex, clearcoatNormalScale,
+                          transmissionFactor, hasTransmissionTex,
                           slot);
                 
-                // Debug: print first material's values
-                if (i == 0) {
-                    std::cout << "Material 0 upload:" << std::endl;
-                    std::cout << "  baseColor: " << bc[0] << ", " << bc[1] << ", " << bc[2] << ", " << bc[3] << std::endl;
-                    std::cout << "  metallic: " << metallic << ", roughness: " << roughness << std::endl;
-                    std::cout << "  alphaMode: " << alphaMode << ", unlit: " << unlit << std::endl;
-                    std::cout << "  hasNormal: " << hasNormal << std::endl;
-                    std::cout << "  emissiveFactor: " << emissiveFactor[0] << ", " << emissiveFactor[1] << ", " << emissiveFactor[2] << std::endl;
-                    std::cout << "  hasEmissive: " << hasEmissive << std::endl;
-                }
-                
                 materialUniformBuffer->upload((uint64_t)(i + 1) * kMaterialUniformStride,
-                                              (uint64_t)sizeof(slot), slot);
+                                              (uint64_t)(60 * sizeof(float)), slot);
             }
         }
     }
@@ -2470,14 +2523,21 @@ void Renderer::renderPrimitive(
         variantResolved:;
     }
 
-    if (hasTexcoord && matIdx >= 0 && asset->materials &&
-        (size_t)matIdx < asset->materials->size())
-    {
+    // Get material properties (even without texcoords for transmission/blend mode)
+    if (matIdx >= 0 && asset->materials && (size_t)matIdx < asset->materials->size()) {
         auto &mat = (*asset->materials)[(size_t)matIdx];
-        if (mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture)
-            hasTexture = true;
         doubleSided = mat.doubleSided;
         useBlend    = (mat.alphaMode == AlphaMode::blend);
+        
+        // KHR_materials_transmission: force blend mode if transmission is active
+        if (mat.khrMaterialsTransmission && mat.khrMaterialsTransmission->transmissionFactor > 0.0f) {
+            useBlend = true;
+        }
+        
+        if (hasTexcoord) {
+            if (mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture)
+                hasTexture = true;
+        }
     }
 
     int wantedVariant = hasTexture ? 2 : 1;

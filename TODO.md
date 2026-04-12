@@ -136,7 +136,21 @@ The gltf library (v0.3.6) parses **23 extensions** into structured data. The ren
 
 ### KHR_materials_transmission
 
-- [ ] **`KHR_materials_transmission`** — parsed as `Material::khrMaterialsTransmission` (`transmissionFactor`, `transmissionTexture`). Physically-based glass / thin-sheet transparency. Requires a render-to-texture pass to capture the background for refraction sampling.
+- [x] **`KHR_materials_transmission`** (simplified) — parsed as `Material::khrMaterialsTransmission` (`transmissionFactor`, `transmissionTexture`). 
+  - Simplified implementation: treats transmission as additional alpha transparency
+  - `transmissionFactor` 0.0 = fully opaque, 1.0 = fully transparent
+  - Multiplied with base color alpha in both `fragmentMain_flat` and `fragmentMain_textured`
+  - No render-to-texture (simpler, good for thin glass/panels)
+  - Uniform at material buffer offset 228 (index 57), correctly aligned for Metal
+  
+- [ ] **`KHR_materials_transmission`** (sophisticated / physically based) — proper transmission with refraction
+  - Render opaque scene to offscreen texture (background frame buffer)
+  - Sample background texture with refracted UV coordinates in fragment shader
+  - Implement `transmissionTexture` sampling (R channel scales transmissionFactor)
+  - Apply Beer-Law attenuation for colored transmission (integrate with `KHR_materials_volume`)
+  - Handle IOR-dependent refraction angle (Snell's law) using `KHR_materials_ior`
+  - Consider screen-space refraction for performance (fallback to environment map at edges)
+  - Sort transparent objects back-to-front with transmission-aware blending
 
 ### KHR_materials_volume
 

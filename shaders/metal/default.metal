@@ -34,6 +34,8 @@ using namespace metal;
 //   [[texture(17)]] — clearcoatTexture (R linear, reuses baseColorSampler)
 //   [[texture(18)]] — clearcoatRoughnessTexture (G linear, reuses baseColorSampler)
 //   [[texture(19)]] — clearcoatNormalTexture (RGB linear, reuses baseColorSampler)
+//   [[texture(20)]] — transmissionTexture (R linear, scales transmissionFactor)
+//                     reuses baseColorSampler (slot limit reached)
 //
 // Pipeline variants:
 //   fragmentMain_flat     — Lambert + baseColorFactor, no texture sampling
@@ -79,6 +81,8 @@ using namespace metal;
 //   [180..183] hasClearcoatRoughnessTexture — 0=no, 1=has clearcoat roughness texture (G channel)
 //   [184..187] hasClearcoatNormalTexture — 0=no, 1=has clearcoat normal texture
 //   [188..191] clearcoatNormalScale    — clearcoat normal map intensity (default 1.0)
+//   [192..195] transmissionFactor      — KHR_materials_transmission scalar (default 0.0 = opaque)
+//   [196..199] hasTransmissionTexture  — 0=no, 1=has transmission texture (R channel)
 struct MaterialUniforms {
     float4 baseColorFactor;
     float4 uvTransformRow0;
@@ -112,6 +116,8 @@ struct MaterialUniforms {
     float  hasClearcoatRoughnessTexture;
     float  hasClearcoatNormalTexture;
     float  clearcoatNormalScale;
+    float  transmissionFactor;
+    float  hasTransmissionTexture;
 };
 
 struct VertexIn {
@@ -208,6 +214,11 @@ fragment float4 fragmentMain_flat(
     constant MaterialUniforms &mat [[buffer(17)]])
 {
     float4 baseColor = mat.baseColorFactor;
+
+    // KHR_materials_transmission (simplified): additional transparency
+    if (mat.transmissionFactor > 0.0) {
+        baseColor.a *= (1.0 - mat.transmissionFactor);
+    }
 
     if (mat.unlit > 0.5) {
         return baseColor;
@@ -318,12 +329,23 @@ fragment float4 fragmentMain_textured(
     texture2d<float> sheenRoughnessTexture     [[texture(16)]],
     texture2d<float> clearcoatTexture          [[texture(17)]],
     texture2d<float> clearcoatRoughnessTexture [[texture(18)]],
-    texture2d<float> clearcoatNormalTexture    [[texture(19)]])
+    texture2d<float> clearcoatNormalTexture    [[texture(19)]],
+    texture2d<float> transmissionTexture       [[texture(20)]])
 {
     float2 uv = in.texcoord0;
 
     // Sample base color texture.
     float4 baseColor = baseColorTexture.sample(baseColorSampler, uv) * mat.baseColorFactor;
+
+    // KHR_materials_transmission: sample texture R channel to scale transmissionFactor
+    float transmission = mat.transmissionFactor;
+    if (mat.hasTransmissionTexture > 0.5) {
+        float transmissionTex = transmissionTexture.sample(baseColorSampler, uv).r;
+        transmission *= transmissionTex;
+    }
+    if (transmission > 0.0) {
+        baseColor.a *= (1.0 - transmission);
+    }
 
     // Alpha mask.
     if (mat.alphaMode > 0.5 && mat.alphaMode < 1.5 && baseColor.a < mat.alphaCutoff) {

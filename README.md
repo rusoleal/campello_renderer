@@ -1,6 +1,6 @@
 # campello_renderer
 
-**v0.1.0** — Native 3D renderer library (C++20, shared library)
+**v0.1.3** — Native 3D renderer library (C++20, shared library)
 
 [![Build](https://github.com/rusoleal/campello_renderer/actions/workflows/build.yml/badge.svg)](https://github.com/rusoleal/campello_renderer/actions/workflows/build.yml)
 [![Release](https://github.com/rusoleal/campello_renderer/actions/workflows/release.yml/badge.svg)](https://github.com/rusoleal/campello_renderer/actions/workflows/release.yml)
@@ -17,8 +17,8 @@
 
 ## Dependencies
 
-* [systems::leal::gltf](https://github.com/rusoleal/gltf) v0.2.1 — C++ glTF/GLB asset loader
-* [systems::leal::campello_gpu](https://github.com/rusoleal/campello_gpu) v0.6.1 — Low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
+* [systems::leal::gltf](https://github.com/rusoleal/gltf) v0.4.0 — C++ glTF/GLB asset loader
+* [systems::leal::campello_gpu](https://github.com/rusoleal/campello_gpu) v0.8.0 — Low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
 
 ## Building
 

@@ -1,5 +1,72 @@
 # Changelog
 
+## [0.1.3] - 2026-04-12
+
+### Added
+- **Animation system** — Full GLTF animation support with multi-animation playback:
+  - `update(double dt)` — advances all playing animations
+  - `playAnimation(index)` / `pauseAnimation(index)` / `stopAnimation(index)` — per-animation control
+  - `stopAllAnimations()` — stop all animations at once
+  - `setAnimationTime(index, t)` / `getAnimationTime(index)` — per-animation seeking
+  - `setAnimationLoop(index, bool)` / `isAnimationLooping(index)` — per-animation loop control
+  - `isAnimationPlaying(index)` — check individual animation state
+  - `getAnimationCount()` / `getAnimationName(i)` / `getAnimationDuration(i)` — animation introspection
+  - LINEAR interpolation with slerp for rotations, STEP interpolation supported
+  - Last-animation-wins when multiple animations target same node/property
+- **EXT_mesh_gpu_instancing** — GPU instancing for repeated meshes via `EXT_mesh_gpu_instancing`:
+  - Instance transforms (translation, rotation, scale) loaded from accessor data
+  - Per-instance matrices uploaded to GPU, bound at vertex slot 19
+  - `drawIndexed`/`draw` with instance count for efficient rendering
+- **KHR_materials_variants** — Material variant switching:
+  - `setMaterialVariant(index)` / `getMaterialVariantCount()` / `getMaterialVariantName(i)` API
+  - `renderPrimitive()` applies variant material index when active
+- **KHR_materials_ior** — Index of refraction for dielectric materials:
+  - `ior` uploaded to material uniform buffer (offset 108)
+  - Shader computes F0 from IOR: `((ior-1)/(ior+1))²` instead of hardcoded 0.04
+- **KHR_materials_specular** — Specular layer for dielectric materials:
+  - `specularFactor` (scalar) and `specularColorFactor` (vec3) uniforms (offsets 112, 128)
+  - `specularTexture` (A channel) and `specularColorTexture` (RGB, sRGB) bindings
+  - Shader mixes dielectric F0 with metallic F0 based on specular parameters
+- **KHR_materials_clearcoat** — Clearcoat layer rendering:
+  - GGX NDF + Smith-GGX visibility + Schlick Fresnel (F0=0.04)
+  - `clearcoatTexture` (R, binding 17), `clearcoatRoughnessTexture` (G, binding 18), `clearcoatNormalTexture` (binding 19)
+  - Base layer attenuated by `(1 - ccFactor × F_Schlick(0.04, NdotV))`
+- **KHR_materials_sheen** — Sheen lobe for fabric-like materials:
+  - Charlie NDF + Neubelt visibility term
+  - `sheenColorTexture` (RGB sRGB, binding 15) and `sheenRoughnessTexture` (R linear, binding 16)
+  - Uniforms at material buffer offsets 144-167
+- **KHR_materials_transmission** (simplified) — Transmission for transparent materials:
+  - `transmissionFactor` (scalar, offset 228) and `transmissionTexture` (R channel, binding 20)
+  - Simplified implementation: modulates alpha (`alpha *= 1 - transmission`)
+  - Forces blend pipeline when transmission is active
+  - No render-to-texture (thin glass approximation)
+- **KHR_materials_unlit** — Unlit shading model:
+  - `khrMaterialsUnlit` flag in material buffer (offset 68)
+  - Returns `baseColor × baseColorTexture` without lighting when enabled
+- **Emissive + Occlusion textures**:
+  - `emissiveTexture` (RGB, sRGB) with `emissiveFactor` (vec3, offset 96)
+  - `KHR_materials_emissive_strength` scalar multiplier
+  - `occlusionTexture` (R channel) with `occlusionStrength` — multiplies ambient and diffuse
+- **Alpha blend mode** — Full transparency support:
+  - Blend pipelines (`srcAlpha * oneMinusSrcAlpha`) for all variants
+  - Depth write disabled for transparent materials
+  - Back-to-front sort for transparent primitives (squared camera distance)
+- **Double-sided materials** — No culling with `CullMode::none` for double-sided materials
+
+### Changed
+- Upgraded `campello_gpu` dependency from v0.6.0 to v0.8.0
+- Upgraded `gltf` dependency from v0.3.5 to v0.4.0
+  - Breaking: `GLTF::loadGLTF()` now requires callback for external resources
+- Material uniform buffer expanded to 256-byte stride:
+  - New fields: emissiveFactor, ior, specularFactor, specularColorFactor, sheen params, clearcoat params, transmission params
+- Metal shader updated with all new PBR extensions
+
+### Fixed
+- Metal `float3` alignment — All float3 fields now at 16-byte aligned offsets (96, 128, 144, etc.)
+- Transmission struct alignment — `transmissionFactor` now at correct offset 228 (index 57)
+
+---
+
 ## Unreleased
 
 ### Added
