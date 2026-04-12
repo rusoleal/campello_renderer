@@ -12,6 +12,7 @@ using namespace metal;
 //   slot 16  Matrices     float4x4[2] — MVP (clip) and Model (world)
 //   slot 17  MaterialUniforms — per-primitive material constants
 //   slot 18  float3*      — camera world position
+//   slot 19  InstanceMatrix — float4x4 per-instance transform (EXT_mesh_gpu_instancing)
 //
 // Bind group 0 (fragment stage):
 //   [[texture(0)]]  — baseColorTexture (RGBA8)
@@ -147,7 +148,8 @@ struct NodeTransforms {
 vertex VertexOut vertexMain(
     VertexIn                  in   [[stage_in]],
     device const NodeTransforms *nodeTransforms  [[buffer(16)]],
-    constant MaterialUniforms &mat [[buffer(17)]])
+    constant MaterialUniforms &mat [[buffer(17)]],
+    device const float4x4    *instanceMatrices   [[buffer(19)]])
 {
     // Apply KHR_texture_transform when hasUVTransform flag (row0.w) is set.
     float2 transformedUV;
@@ -162,9 +164,16 @@ vertex VertexOut vertexMain(
     float4x4 mvp   = nodeTransforms[0].mvp;
     float4x4 model = nodeTransforms[0].model;
 
-    float4 worldPos4 = model * float4(in.position, 1.0);
+    // EXT_mesh_gpu_instancing: apply per-instance transform if available.
+    // instanceMatrices is a per-instance buffer (stepMode=instance).
+    float4x4 instM = instanceMatrices[0];
+    float4 localPos = instM * float4(in.position, 1.0);
+    float3 localNormal = (instM * float4(in.normal, 0.0)).xyz;
+    float3 localTangent = (instM * float4(in.tangent.xyz, 0.0)).xyz;
 
-    float3 N = normalize((model * float4(in.normal, 0.0)).xyz);
+    float4 worldPos4 = model * localPos;
+
+    float3 N = normalize((model * float4(localNormal, 0.0)).xyz);
 
     float3 T;
     if (length(in.tangent.xyz) < 0.001) {
@@ -174,14 +183,14 @@ vertex VertexOut vertexMain(
             T = normalize(cross(float3(1,0,0), N));
         }
     } else {
-        T = normalize((model * float4(in.tangent.xyz, 0.0)).xyz);
+        T = normalize((model * float4(localTangent, 0.0)).xyz);
         T = normalize(T - dot(T, N) * N);
     }
 
     float3 B = cross(N, T);
 
     VertexOut out;
-    out.clipPosition   = mvp * float4(in.position, 1.0);
+    out.clipPosition   = mvp * localPos;
     out.worldPos       = worldPos4.xyz;
     out.worldNormal    = N;
     out.worldTangent   = T;

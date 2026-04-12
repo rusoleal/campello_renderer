@@ -64,7 +64,18 @@
 
 ## Animation
 
-- [ ] **Implement `update(double dt)`** — currently a no-op `(void)dt`. Evaluate GLTF animation channels (TRS keyframe interpolation: LINEAR, STEP, CUBICSPLINE) and apply to node transforms before `render()`.
+- [x] **Implement `update(double dt)`** — GLTF animation channels fully implemented with multi-animation support:
+  - Multiple animations can play simultaneously on different node sets
+  - `playAnimation(index)` / `pauseAnimation(index)` / `stopAnimation(index)` for per-animation playback control
+  - `stopAllAnimations()` to stop all animations at once
+  - `setAnimationTime(index, t)` / `getAnimationTime(index)` for per-animation seeking
+  - `setAnimationLoop(index, bool)` / `isAnimationLooping(index)` for per-animation loop control
+  - `isAnimationPlaying(index)` to check individual animation state
+  - `getAnimationCount()` / `getAnimationName(i)` / `getAnimationDuration(i)` for introspection
+  - Keyframe sampling with LINEAR interpolation (translation, rotation via slerp, scale)
+  - STEP interpolation supported
+  - Animated TRS merged from all playing animations before `render()` computes world matrices
+  - Last-animation-wins when multiple animations target the same node/property
 - [ ] **Skeletal meshes** — joint matrix palette (skin / inverse bind matrices).
 
 ---
@@ -145,7 +156,12 @@ The gltf library (v0.3.6) parses **23 extensions** into structured data. The ren
 
 ### EXT_mesh_gpu_instancing
 
-- [ ] **`EXT_mesh_gpu_instancing`** — parsed into `Node::extMeshGpuInstancing` (`attributes` map: `TRANSLATION`, `ROTATION`, `SCALE` → accessor IDs). Enables efficient GPU instancing for large repeated meshes. Requires reading the instance accessor data and submitting multi-instance draw calls with per-instance transform buffers.
+- [x] **`EXT_mesh_gpu_instancing`** — parsed into `Node::extMeshGpuInstancing` (`attributes` map: `TRANSLATION`, `ROTATION`, `SCALE` → accessor IDs). Enables efficient GPU instancing for large repeated meshes. 
+  - Instance data loaded in `setScene()`: reads accessors for translation, rotation, scale
+  - Per-instance transform matrices uploaded to GPU buffer (`nodeInstanceData`)
+  - Vertex buffer slot 19 added for per-instance matrices (stepMode=instance)
+  - Metal shader updated to apply instance transform before node transform
+  - `renderPrimitive()` uses `drawIndexed(..., instanceCount)` / `draw(..., instanceCount)`
 
 ### KHR_materials_variants
 

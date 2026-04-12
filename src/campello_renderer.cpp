@@ -60,8 +60,15 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         gpuSamplers.clear();
         materialBindGroups.clear();
         dracoPrimitiveBuffers.clear();
+        nodeInstanceData.clear();
+        animationStates.clear();
+        animatedNodes.clear();
         return;
     }
+
+    // New asset loaded — reset animation state.
+    animationStates.clear();
+    animatedNodes.clear();
 
     size_t imageCount = asset->images ? asset->images->size() : 0;
     size_t bufferCount = asset->buffers ? asset->buffers->size() : 0;
@@ -526,6 +533,19 @@ void Renderer::setScene(uint32_t index) {
         if (defaultClearcoatNormalTexture) defaultClearcoatNormalTexture->upload(0, 4, flatNormal);
     }
 
+    // Default instance matrix: identity matrix for non-instanced rendering.
+    // Column-major float4x4 (64 bytes) — bound to slot 19 when EXT_mesh_gpu_instancing is not used.
+    if (!defaultInstanceMatrixBuffer) {
+        float identity[16] = {
+            1, 0, 0, 0,  // column 0
+            0, 1, 0, 0,  // column 1
+            0, 0, 1, 0,  // column 2
+            0, 0, 0, 1   // column 3
+        };
+        defaultInstanceMatrixBuffer = device->createBuffer(
+            64, GPU::BufferUsage::vertex, reinterpret_cast<uint8_t*>(identity));
+    }
+
     // Lights uniform buffer (KHR_lights_punctual) - created once, updated each frame
     if (!lightsUniformBuffer) {
         lightsUniformBuffer = device->createBuffer(272, GPU::BufferUsage::uniform);
@@ -787,6 +807,129 @@ void Renderer::setScene(uint32_t index) {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Load EXT_mesh_gpu_instancing data.
+    //
+    // For each node with extMeshGpuInstancing, read the TRANSLATION, ROTATION,
+    // and SCALE accessors and build per-instance transform matrices.
+    // The matrices are uploaded to a GPU buffer (column-major float4x4).
+    // ------------------------------------------------------------------
+    nodeInstanceData.clear();
+    if (asset->nodes) {
+        for (uint64_t nodeIdx = 0; nodeIdx < asset->nodes->size(); ++nodeIdx) {
+            auto &node = (*asset->nodes)[nodeIdx];
+            if (!node.extMeshGpuInstancing) continue;
+
+            // Get accessor indices for translation, rotation, scale
+            int64_t transIdx = -1, rotIdx = -1, scaleIdx = -1;
+            auto &attrs = node.extMeshGpuInstancing->attributes;
+            auto it = attrs.find("TRANSLATION");
+            if (it != attrs.end()) transIdx = (int64_t)it->second;
+            it = attrs.find("ROTATION");
+            if (it != attrs.end()) rotIdx = (int64_t)it->second;
+            it = attrs.find("SCALE");
+            if (it != attrs.end()) scaleIdx = (int64_t)it->second;
+
+            // Determine instance count from the first available accessor
+            uint32_t instanceCount = 0;
+            if (transIdx >= 0 && asset->accessors) instanceCount = (uint32_t)(*asset->accessors)[(size_t)transIdx].count;
+            else if (rotIdx >= 0 && asset->accessors) instanceCount = (uint32_t)(*asset->accessors)[(size_t)rotIdx].count;
+            else if (scaleIdx >= 0 && asset->accessors) instanceCount = (uint32_t)(*asset->accessors)[(size_t)scaleIdx].count;
+
+            if (instanceCount == 0) continue;
+
+            // Read accessor data
+            namespace VM = systems::leal::vector_math;
+            std::vector<VM::Vector3<float>> translations(instanceCount, VM::Vector3<float>(0, 0, 0));
+            std::vector<VM::Quaternion<float>> rotations(instanceCount, VM::Quaternion<float>(0, 0, 0, 1));
+            std::vector<VM::Vector3<float>> scales(instanceCount, VM::Vector3<float>(1, 1, 1));
+
+            auto readFloatData = [&](int64_t accIdx, std::vector<float> &outData) {
+                if (accIdx < 0 || !asset->accessors) return;
+                auto &acc = (*asset->accessors)[(size_t)accIdx];
+                if (acc.bufferView < 0 || !asset->bufferViews) return;
+                auto &bv = (*asset->bufferViews)[(size_t)acc.bufferView];
+                if (bv.buffer < 0 || !asset->buffers) return;
+                auto &buf = (*asset->buffers)[(size_t)bv.buffer];
+
+                size_t numComponents = 0;
+                switch (acc.type) {
+                    case systems::leal::gltf::AccessorType::acScalar: numComponents = 1; break;
+                    case systems::leal::gltf::AccessorType::acVec2:   numComponents = 2; break;
+                    case systems::leal::gltf::AccessorType::acVec3:   numComponents = 3; break;
+                    case systems::leal::gltf::AccessorType::acVec4:   numComponents = 4; break;
+                    case systems::leal::gltf::AccessorType::acMat2:   numComponents = 4; break;
+                    case systems::leal::gltf::AccessorType::acMat3:   numComponents = 9; break;
+                    case systems::leal::gltf::AccessorType::acMat4:   numComponents = 16; break;
+                }
+
+                outData.resize(acc.count * numComponents);
+                const uint8_t *src = buf.data.data() + bv.byteOffset + acc.byteOffset;
+                // Handle component type
+                switch (acc.componentType) {
+                    case systems::leal::gltf::ComponentType::ctFloat:
+                        memcpy(outData.data(), src, acc.count * numComponents * sizeof(float));
+                        break;
+                    default:
+                        // Other component types not yet supported for instancing
+                        break;
+                }
+            };
+
+            std::vector<float> transData, rotData, scaleData;
+            readFloatData(transIdx, transData);
+            readFloatData(rotIdx, rotData);
+            readFloatData(scaleIdx, scaleData);
+
+            for (uint32_t i = 0; i < instanceCount; ++i) {
+                if (transIdx >= 0 && !transData.empty()) {
+                    translations[i] = VM::Vector3<float>(
+                        transData[i * 3 + 0],
+                        transData[i * 3 + 1],
+                        transData[i * 3 + 2]);
+                }
+                if (rotIdx >= 0 && !rotData.empty()) {
+                    rotations[i] = VM::Quaternion<float>(
+                        rotData[i * 4 + 0],
+                        rotData[i * 4 + 1],
+                        rotData[i * 4 + 2],
+                        rotData[i * 4 + 3]);
+                }
+                if (scaleIdx >= 0 && !scaleData.empty()) {
+                    scales[i] = VM::Vector3<float>(
+                        scaleData[i * 3 + 0],
+                        scaleData[i * 3 + 1],
+                        scaleData[i * 3 + 2]);
+                }
+            }
+
+            // Build instance matrices (column-major for Metal)
+            std::vector<float> instanceMatrices(instanceCount * 16);
+            for (uint32_t i = 0; i < instanceCount; ++i) {
+                VM::Matrix4<float> m = VM::Matrix4<float>::compose(translations[i], rotations[i], scales[i]);
+                // Transpose to column-major for Metal
+                for (int row = 0; row < 4; ++row) {
+                    for (int col = 0; col < 4; ++col) {
+                        instanceMatrices[i * 16 + col * 4 + row] = m.data[row * 4 + col];
+                    }
+                }
+            }
+
+            // Upload to GPU buffer
+            using BU = systems::leal::campello_gpu::BufferUsage;
+            auto matrixBuffer = device->createBuffer(
+                instanceMatrices.size() * sizeof(float),
+                BU::vertex,
+                reinterpret_cast<uint8_t*>(instanceMatrices.data()));
+
+            if (matrixBuffer) {
+                nodeInstanceData[nodeIdx] = {matrixBuffer, instanceCount};
+            }
+        }
+    }
+
+    // Reset animation state when switching scenes — ensures clean slate.
+    stopAllAnimations();
 }
 
 // ---------------------------------------------------------------------------
@@ -838,6 +981,23 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     base.vertex.buffers.push_back(makeLayout(
         GPU::ComponentType::ctFloat, GPU::AccessorType::acVec4,
         16.0, GPU::StepMode::vertex, VERTEX_SLOT_TANGENT));
+
+    // Slot 19 — Instance matrix (float4x4), per-instance for EXT_mesh_gpu_instancing.
+    // Split into 4 vec4 attributes at locations 24-27.
+    {
+        GPU::VertexLayout instLayout{};
+        instLayout.arrayStride = 64; // sizeof(float4x4)
+        instLayout.stepMode    = GPU::StepMode::instance;
+        for (uint32_t col = 0; col < 4; col++) {
+            GPU::VertexAttribute attr{};
+            attr.componentType  = GPU::ComponentType::ctFloat;
+            attr.accessorType   = GPU::AccessorType::acVec4;
+            attr.offset         = col * 16; // 4 floats * 4 bytes per column
+            attr.shaderLocation = VERTEX_SLOT_INSTANCE_MATRIX + col; // locations 24, 25, 26, 27
+            instLayout.attributes.push_back(attr);
+        }
+        base.vertex.buffers.push_back(instLayout);
+    }
 
     GPU::DepthStencilDescriptor ds{};
     ds.format              = GPU::PixelFormat::depth32float;
@@ -1370,6 +1530,10 @@ void Renderer::computeNodeTransform(
 {
     if (!asset->nodes || nodeIndex >= asset->nodes->size()) return;
     auto &node  = (*asset->nodes)[nodeIndex];
+
+    // Apply animation if active — modifies node TRS before computing matrix.
+    applyAnimatedTRS(nodeIndex);
+
     auto local = nodeLocalMatrix(node);
     auto  world = parentWorld * local;
 
@@ -2050,8 +2214,182 @@ void Renderer::renderToTarget(
 }
 
 void Renderer::update(double dt) {
-    // Reserved for animation updates.
-    (void)dt;
+    if (!asset || !asset->animations) return;
+    if (animationStates.empty()) return;
+
+    // Clear previous animated values — will be rebuilt from all playing animations.
+    animatedNodes.clear();
+
+    // Process each animation that has a state.
+    for (auto &pair : animationStates) {
+        int32_t animIndex = pair.first;
+        AnimationState &state = pair.second;
+
+        if (animIndex < 0 || (size_t)animIndex >= asset->animations->size()) continue;
+        if (!state.playing) continue;
+
+        // Advance time.
+        state.time += dt;
+
+        // Handle looping or clamping.
+        if (state.time > state.duration) {
+            if (state.loop) {
+                state.time = fmod(state.time, state.duration);
+            } else {
+                state.time = state.duration;
+                state.playing = false;
+            }
+        }
+
+        // Sample this animation at its current time.
+        sampleAnimation(animIndex, (float)state.time);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Animation sampling
+// ---------------------------------------------------------------------------
+
+void Renderer::sampleAnimation(int32_t animIndex, float time) {
+    if (!asset || !asset->animations) return;
+    if (animIndex < 0 || (size_t)animIndex >= asset->animations->size()) return;
+
+    auto &animation = (*asset->animations)[(size_t)animIndex];
+
+    // Process each channel.
+    for (auto &channel : animation.channels) {
+        if (channel.target.node < 0) continue;
+        if (!asset->nodes || (size_t)channel.target.node >= asset->nodes->size()) continue;
+        if (channel.sampler >= animation.samplers.size()) continue;
+
+        auto &sampler = animation.samplers[channel.sampler];
+        if (!asset->accessors) continue;
+        if (sampler.input >= asset->accessors->size()) continue;
+        if (sampler.output >= asset->accessors->size()) continue;
+
+        auto &inputAcc = (*asset->accessors)[sampler.input];
+        auto &outputAcc = (*asset->accessors)[sampler.output];
+        if (inputAcc.bufferView < 0 || outputAcc.bufferView < 0) continue;
+        if (!asset->bufferViews) continue;
+        if ((size_t)inputAcc.bufferView >= asset->bufferViews->size()) continue;
+        if ((size_t)outputAcc.bufferView >= asset->bufferViews->size()) continue;
+
+        auto &inputBV = (*asset->bufferViews)[(size_t)inputAcc.bufferView];
+        auto &outputBV = (*asset->bufferViews)[(size_t)outputAcc.bufferView];
+        if (!asset->buffers) continue;
+        if ((size_t)inputBV.buffer >= asset->buffers->size()) continue;
+        if ((size_t)outputBV.buffer >= asset->buffers->size()) continue;
+
+        auto &inputBuf = (*asset->buffers)[(size_t)inputBV.buffer];
+        auto &outputBuf = (*asset->buffers)[(size_t)outputBV.buffer];
+
+        // Get keyframe times (input).
+        const float *times = reinterpret_cast<const float*>(
+            inputBuf.data.data() + inputBV.byteOffset + inputAcc.byteOffset);
+        uint32_t keyframeCount = (uint32_t)inputAcc.count;
+        if (keyframeCount == 0) continue;
+
+        // Get keyframe values (output).
+        const uint8_t *values = outputBuf.data.data() + outputBV.byteOffset + outputAcc.byteOffset;
+
+        // Find keyframe interval.
+        uint32_t kf0 = 0, kf1 = 0;
+        float t = 0.0f;
+
+        if (time <= times[0]) {
+            kf0 = kf1 = 0;
+            t = 0.0f;
+        } else if (time >= times[keyframeCount - 1]) {
+            kf0 = kf1 = keyframeCount - 1;
+            t = 0.0f;
+        } else {
+            for (uint32_t i = 0; i < keyframeCount - 1; ++i) {
+                if (time >= times[i] && time < times[i + 1]) {
+                    kf0 = i;
+                    kf1 = i + 1;
+                    float span = times[kf1] - times[kf0];
+                    t = (span > 0.0f) ? (time - times[kf0]) / span : 0.0f;
+                    break;
+                }
+            }
+        }
+
+        // Apply interpolation based on type and path.
+        namespace VM = systems::leal::vector_math;
+        uint64_t nodeIdx = (uint64_t)channel.target.node;
+
+        if (channel.target.path == "translation") {
+            auto &trs = animatedNodes[nodeIdx];
+            trs.hasTranslation = true;
+
+            const float *v0 = reinterpret_cast<const float*>(values) + kf0 * 3;
+            const float *v1 = reinterpret_cast<const float*>(values) + kf1 * 3;
+
+            if (sampler.interpolation == systems::leal::gltf::AnimationInterpolation::aiStep) {
+                trs.translation = VM::Vector3<double>(v0[0], v0[1], v0[2]);
+            } else {
+                // Linear interpolation.
+                double x = v0[0] + (v1[0] - v0[0]) * t;
+                double y = v0[1] + (v1[1] - v0[1]) * t;
+                double z = v0[2] + (v1[2] - v0[2]) * t;
+                trs.translation = VM::Vector3<double>(x, y, z);
+            }
+        } else if (channel.target.path == "rotation") {
+            auto &trs = animatedNodes[nodeIdx];
+            trs.hasRotation = true;
+
+            const float *v0 = reinterpret_cast<const float*>(values) + kf0 * 4;
+            const float *v1 = reinterpret_cast<const float*>(values) + kf1 * 4;
+
+            VM::Quaternion<double> q0(v0[0], v0[1], v0[2], v0[3]);
+            VM::Quaternion<double> q1(v1[0], v1[1], v1[2], v1[3]);
+
+            if (sampler.interpolation == systems::leal::gltf::AnimationInterpolation::aiStep) {
+                trs.rotation = q0;
+            } else {
+                // Spherical linear interpolation for quaternions.
+                trs.rotation = VM::Quaternion<double>::slerp(q0, q1, (double)t);
+            }
+        } else if (channel.target.path == "scale") {
+            auto &trs = animatedNodes[nodeIdx];
+            trs.hasScale = true;
+
+            const float *v0 = reinterpret_cast<const float*>(values) + kf0 * 3;
+            const float *v1 = reinterpret_cast<const float*>(values) + kf1 * 3;
+
+            if (sampler.interpolation == systems::leal::gltf::AnimationInterpolation::aiStep) {
+                trs.scale = VM::Vector3<double>(v0[0], v0[1], v0[2]);
+            } else {
+                // Linear interpolation.
+                double x = v0[0] + (v1[0] - v0[0]) * t;
+                double y = v0[1] + (v1[1] - v0[1]) * t;
+                double z = v0[2] + (v1[2] - v0[2]) * t;
+                trs.scale = VM::Vector3<double>(x, y, z);
+            }
+        }
+        // TODO: "weights" for morph targets (not implemented).
+    }
+}
+
+// Apply animated TRS values to node transforms before computing world matrices.
+void Renderer::applyAnimatedTRS(uint64_t nodeIndex) {
+    if (!asset || !asset->nodes || nodeIndex >= asset->nodes->size()) return;
+
+    auto it = animatedNodes.find(nodeIndex);
+    if (it == animatedNodes.end()) return;
+
+    auto &node = (*asset->nodes)[nodeIndex];
+    auto &trs = it->second;
+
+    if (trs.hasTranslation) {
+        node.translation = trs.translation;
+    }
+    if (trs.hasRotation) {
+        node.rotation = trs.rotation;
+    }
+    if (trs.hasScale) {
+        node.scale = trs.scale;
+    }
 }
 
 void Renderer::setDebugMode(bool enabled) {
@@ -2207,6 +2545,17 @@ void Renderer::renderPrimitive(
         }
     }
 
+    // --- 5a. Bind instance matrix buffer for EXT_mesh_gpu_instancing ---
+    uint32_t instanceCount = 1;
+    auto instIt = nodeInstanceData.find(nodeIndex);
+    if (instIt != nodeInstanceData.end() && instIt->second.matrixBuffer) {
+        rpe->setVertexBuffer(VERTEX_SLOT_INSTANCE_MATRIX, instIt->second.matrixBuffer, 0);
+        instanceCount = instIt->second.instanceCount;
+    } else if (defaultInstanceMatrixBuffer) {
+        // Bind identity matrix for non-instanced objects
+        rpe->setVertexBuffer(VERTEX_SLOT_INSTANCE_MATRIX, defaultInstanceMatrixBuffer, 0);
+    }
+
     // --- 6. Check for Draco-compressed buffers ---
     auto dracoIt = dracoPrimitiveBuffers.find(&primitive);
     bool hasDracoGPUBuffer = (dracoIt != dracoPrimitiveBuffers.end() && 
@@ -2281,11 +2630,12 @@ void Renderer::renderPrimitive(
     if (!positionBound) return;
 
     // --- 8. Draw indexed or non-indexed ---
+    // EXT_mesh_gpu_instancing: use instanceCount if the node has instance data.
     if (hasDracoGPUBuffer && dracoIt->second.indexBuffer) {
         // Use Draco-decompressed index buffer.
         rpe->setIndexBuffer(dracoIt->second.indexBuffer,
                            systems::leal::campello_gpu::IndexFormat::uint32, 0);
-        rpe->drawIndexed(dracoIt->second.indexCount);
+        rpe->drawIndexed(dracoIt->second.indexCount, instanceCount);
     } else if (primitive.indices >= 0) {
         // Use standard GLTF index buffer.
         auto &idxAcc = (*asset->accessors)[(size_t)primitive.indices];
@@ -2299,17 +2649,17 @@ void Renderer::renderPrimitive(
                     ? systems::leal::campello_gpu::IndexFormat::uint16
                     : systems::leal::campello_gpu::IndexFormat::uint32;
                 rpe->setIndexBuffer(idxBuf, fmt, idxOffset);
-                rpe->drawIndexed((uint32_t)idxAcc.count);
+                rpe->drawIndexed((uint32_t)idxAcc.count, instanceCount);
                 return;
             }
         }
-        rpe->draw((uint32_t)idxAcc.count);
+        rpe->draw((uint32_t)idxAcc.count, instanceCount);
     } else {
         // Non-indexed draw - need vertex count from POSITION accessor.
         auto posIt = primitive.attributes.find("POSITION");
         if (posIt != primitive.attributes.end()) {
             auto &posAcc = (*asset->accessors)[posIt->second];
-            rpe->draw((uint32_t)posAcc.count);
+            rpe->draw((uint32_t)posAcc.count, instanceCount);
         }
     }
 }
@@ -2387,6 +2737,123 @@ uint32_t Renderer::getBindGroupCount() const { return (uint32_t)materialBindGrou
 
 std::shared_ptr<systems::leal::campello_gpu::BindGroup>
 Renderer::getDefaultBindGroup() const { return defaultBindGroup; }
+
+// ---------------------------------------------------------------------------
+// Animation control — multi-animation support
+// ---------------------------------------------------------------------------
+
+uint32_t Renderer::getAnimationCount() const {
+    if (!asset || !asset->animations) return 0;
+    return (uint32_t)asset->animations->size();
+}
+
+std::string Renderer::getAnimationName(uint32_t animationIndex) const {
+    if (!asset || !asset->animations) return {};
+    if (animationIndex >= asset->animations->size()) return {};
+    return (*asset->animations)[animationIndex].name;
+}
+
+double Renderer::getAnimationDuration(uint32_t animationIndex) const {
+    if (!asset || !asset->animations || animationIndex >= asset->animations->size()) return 0.0;
+
+    auto &anim = (*asset->animations)[animationIndex];
+    double maxTime = 0.0;
+    for (auto &sampler : anim.samplers) {
+        if (!asset->accessors || sampler.input >= asset->accessors->size()) continue;
+        auto &inputAcc = (*asset->accessors)[sampler.input];
+        if (inputAcc.bufferView < 0 || !asset->bufferViews) continue;
+        auto &inputBV = (*asset->bufferViews)[(size_t)inputAcc.bufferView];
+        if ((size_t)inputBV.buffer >= asset->buffers->size()) continue;
+        auto &inputBuf = (*asset->buffers)[(size_t)inputBV.buffer];
+
+        const float *times = reinterpret_cast<const float*>(
+            inputBuf.data.data() + inputBV.byteOffset + inputAcc.byteOffset);
+        if (inputAcc.count > 0) {
+            maxTime = std::max(maxTime, (double)times[inputAcc.count - 1]);
+        }
+    }
+    return maxTime;
+}
+
+void Renderer::playAnimation(uint32_t animationIndex) {
+    if (!asset || !asset->animations || animationIndex >= asset->animations->size()) return;
+
+    auto &state = animationStates[(int32_t)animationIndex];
+    state.playing = true;
+    // Initialize duration if not set.
+    if (state.duration <= 0.0) {
+        state.duration = getAnimationDuration(animationIndex);
+    }
+}
+
+void Renderer::pauseAnimation(uint32_t animationIndex) {
+    auto it = animationStates.find((int32_t)animationIndex);
+    if (it != animationStates.end()) {
+        it->second.playing = false;
+    }
+}
+
+void Renderer::stopAnimation(uint32_t animationIndex) {
+    auto it = animationStates.find((int32_t)animationIndex);
+    if (it != animationStates.end()) {
+        it->second.playing = false;
+        it->second.time = 0.0;
+    }
+    // Clear animated nodes if no animations are playing.
+    bool anyPlaying = false;
+    for (auto &pair : animationStates) {
+        if (pair.second.playing) {
+            anyPlaying = true;
+            break;
+        }
+    }
+    if (!anyPlaying) {
+        animatedNodes.clear();
+    }
+}
+
+void Renderer::stopAllAnimations() {
+    for (auto &pair : animationStates) {
+        pair.second.playing = false;
+        pair.second.time = 0.0;
+    }
+    animatedNodes.clear();
+}
+
+bool Renderer::isAnimationPlaying(uint32_t animationIndex) const {
+    auto it = animationStates.find((int32_t)animationIndex);
+    if (it != animationStates.end()) {
+        return it->second.playing;
+    }
+    return false;
+}
+
+void Renderer::setAnimationLoop(uint32_t animationIndex, bool loop) {
+    if (!asset || !asset->animations || animationIndex >= asset->animations->size()) return;
+    animationStates[(int32_t)animationIndex].loop = loop;
+}
+
+bool Renderer::isAnimationLooping(uint32_t animationIndex) const {
+    auto it = animationStates.find((int32_t)animationIndex);
+    if (it != animationStates.end()) {
+        return it->second.loop;
+    }
+    return true; // Default to looping.
+}
+
+void Renderer::setAnimationTime(uint32_t animationIndex, double time) {
+    if (!asset || !asset->animations || animationIndex >= asset->animations->size()) return;
+    auto &state = animationStates[(int32_t)animationIndex];
+    state.time = std::max(0.0, std::min(time, state.duration));
+}
+
+double Renderer::getAnimationTime(uint32_t animationIndex) const {
+    auto it = animationStates.find((int32_t)animationIndex);
+    if (it != animationStates.end()) {
+        return it->second.time;
+    }
+    return 0.0;
+}
 
 // ---------------------------------------------------------------------------
 // Draco decompressed buffer upload

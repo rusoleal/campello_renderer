@@ -141,6 +141,22 @@ namespace rend = systems::leal::campello_renderer;
 
     _renderer->setAsset(asset);
     _camera.fitBounds(_renderer->getBoundsRadius());
+
+    // Debug: Print animation info.
+    uint32_t animCount = _renderer->getAnimationCount();
+    NSLog(@"Animations found: %u", animCount);
+    for (uint32_t i = 0; i < animCount; ++i) {
+        NSLog(@"  Animation %u: %s (duration: %.2fs)", 
+              i, 
+              _renderer->getAnimationName(i).c_str(),
+              _renderer->getAnimationDuration(i));
+    }
+
+    // Auto-play first animation if available.
+    if (animCount > 0) {
+        _renderer->playAnimation(0);
+        NSLog(@"Auto-playing animation: %s", _renderer->getAnimationName(0).c_str());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +171,9 @@ namespace rend = systems::leal::campello_renderer;
     
     // Ensure drawable texture is valid before rendering
     if (drawable.texture.pixelFormat == MTLPixelFormatInvalid) return;
+
+    // Update animations (call with 1/60s delta time for 60fps).
+    _renderer->update(1.0 / 60.0);
 
     // Pass the orbit camera matrices to the renderer each frame.
     CGSize sz = view.drawableSize;

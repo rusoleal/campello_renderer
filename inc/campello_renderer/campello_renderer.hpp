@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <unordered_map>
 #include <vector>
 #include <gltf/gltf.hpp>
 #include <campello_gpu/device.hpp>
@@ -18,14 +19,15 @@ namespace systems::leal::campello_renderer {
     public:
         // Vertex buffer slot convention — must match the pipeline's vertex descriptor
         // and the shader bindings.
-        static constexpr uint32_t VERTEX_SLOT_POSITION  = 0;  // float3 POSITION
-        static constexpr uint32_t VERTEX_SLOT_NORMAL    = 1;  // float3 NORMAL
-        static constexpr uint32_t VERTEX_SLOT_TEXCOORD0 = 2;  // float2 TEXCOORD_0
-        static constexpr uint32_t VERTEX_SLOT_TANGENT   = 3;  // float4 TANGENT
-        static constexpr uint32_t VERTEX_SLOT_MVP       = 16; // float4x4, row-major MVP matrix (per-instance)
-        static constexpr uint32_t VERTEX_SLOT_MATERIAL  = 17; // MaterialUniforms (112 bytes, 256 stride)
-        static constexpr uint32_t VERTEX_SLOT_CAMERA    = 18; // CameraPosition (float3 world space)
-        static constexpr uint32_t VERTEX_SLOT_LIGHTS    = 15; // LightsUniforms - use slot 15 to avoid conflict
+        static constexpr uint32_t VERTEX_SLOT_POSITION   = 0;  // float3 POSITION
+        static constexpr uint32_t VERTEX_SLOT_NORMAL     = 1;  // float3 NORMAL
+        static constexpr uint32_t VERTEX_SLOT_TEXCOORD0  = 2;  // float2 TEXCOORD_0
+        static constexpr uint32_t VERTEX_SLOT_TANGENT    = 3;  // float4 TANGENT
+        static constexpr uint32_t VERTEX_SLOT_MVP        = 16; // float4x4, row-major MVP matrix (per-node)
+        static constexpr uint32_t VERTEX_SLOT_MATERIAL   = 17; // MaterialUniforms (112 bytes, 256 stride)
+        static constexpr uint32_t VERTEX_SLOT_CAMERA     = 18; // CameraPosition (float3 world space)
+        static constexpr uint32_t VERTEX_SLOT_LIGHTS     = 15; // LightsUniforms - use slot 15 to avoid conflict
+        static constexpr uint32_t VERTEX_SLOT_INSTANCE_MATRIX = 19; // float4x4 per-instance transform (EXT_mesh_gpu_instancing)
                                                                //   [0..15]  baseColorFactor
                                                                //   [16..31] uvTransformRow0 (.w = hasTransform)
                                                                //   [32..47] uvTransformRow1
@@ -74,6 +76,11 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultClearcoatTexture;         // (1,1,1,1) linear - white R = factor passes through (default factor=0)
         std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultClearcoatRoughnessTexture; // (1,1,1,1) linear - white G = factor passes through
         std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultClearcoatNormalTexture;   // (0.5,0.5,1,1) linear - flat normal
+        
+        // Default identity matrix for non-instanced rendering (EXT_mesh_gpu_instancing).
+        // Always bound to slot 19; instanced objects override with their own buffer.
+        std::shared_ptr<systems::leal::campello_gpu::Buffer>           defaultInstanceMatrixBuffer;
+        
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout>  bindGroupLayout;
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        defaultBindGroup;
 
@@ -99,6 +106,15 @@ namespace systems::leal::campello_renderer {
         // and a fallback zero-UV buffer for primitives without TEXCOORD_0.
         std::shared_ptr<systems::leal::campello_gpu::Buffer> materialUniformBuffer;
         std::shared_ptr<systems::leal::campello_gpu::Buffer> fallbackUVBuffer;
+
+        // EXT_mesh_gpu_instancing: per-node instance data.
+        // Each node with the extension gets a GPU buffer containing per-instance
+        // transform matrices (float4x4 per instance, column-major).
+        struct InstanceData {
+            std::shared_ptr<systems::leal::campello_gpu::Buffer> matrixBuffer;
+            uint32_t instanceCount = 0;
+        };
+        std::unordered_map<uint64_t, InstanceData> nodeInstanceData;
 
         uint32_t renderWidth  = 0;
         uint32_t renderHeight = 0;
@@ -148,6 +164,31 @@ namespace systems::leal::campello_renderer {
 
         // Active KHR_materials_variants index. -1 = use each primitive's default material.
         int32_t activeVariant = -1;
+
+        // Per-animation state for multi-animation support.
+        struct AnimationState {
+            double time = 0.0;           // Current animation time in seconds
+            bool playing = false;        // true = playing, false = paused
+            bool loop = true;            // true = loop, false = stop at end
+            double duration = 0.0;       // Duration from keyframe data
+        };
+        std::unordered_map<int32_t, AnimationState> animationStates;
+
+        // Animated node transforms — merged from all playing animations.
+        // Maps node index to animated TRS values.
+        struct AnimatedTRS {
+            bool hasTranslation = false;
+            bool hasRotation = false;
+            bool hasScale = false;
+            systems::leal::vector_math::Vector3<double> translation;
+            systems::leal::vector_math::Quaternion<double> rotation;
+            systems::leal::vector_math::Vector3<double> scale;
+        };
+        std::unordered_map<uint64_t, AnimatedTRS> animatedNodes;
+
+        // Animation sampling helpers.
+        void sampleAnimation(int32_t animIndex, float time);
+        void applyAnimatedTRS(uint64_t nodeIndex);
 
         static systems::leal::vector_math::Matrix4<double> nodeLocalMatrix(
             const systems::leal::gltf::Node &node);
@@ -231,6 +272,27 @@ namespace systems::leal::campello_renderer {
         void setMaterialVariant(int32_t variantIndex);
         uint32_t getMaterialVariantCount() const;
         std::string getMaterialVariantName(uint32_t variantIndex) const;
+
+        // Animation control — multi-animation support.
+        // Multiple animations can play simultaneously on different node sets.
+        uint32_t getAnimationCount() const;
+        std::string getAnimationName(uint32_t animationIndex) const;
+        double getAnimationDuration(uint32_t animationIndex) const;
+
+        // Per-animation playback control.
+        void playAnimation(uint32_t animationIndex);            // Start/resume specific animation
+        void pauseAnimation(uint32_t animationIndex);           // Pause specific animation
+        void stopAnimation(uint32_t animationIndex);            // Stop and reset specific animation to time 0
+        void stopAllAnimations();                               // Stop all animations
+
+        // Per-animation state queries.
+        bool isAnimationPlaying(uint32_t animationIndex) const; // Get playback state
+        void setAnimationLoop(uint32_t animationIndex, bool loop);  // Set loop mode
+        bool isAnimationLooping(uint32_t animationIndex) const;   // Get loop mode
+
+        // Per-animation time control.
+        void setAnimationTime(uint32_t animationIndex, double time);  // Seek to specific time
+        double getAnimationTime(uint32_t animationIndex) const;       // Get current time
 
         // Accessors for uploaded GPU resources.
         std::shared_ptr<systems::leal::campello_gpu::Buffer>  getGpuBuffer(uint32_t index) const;
