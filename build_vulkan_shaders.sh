@@ -72,7 +72,7 @@ def spv_to_hex_lines(path):
     lines = []
     for i in range(0, len(data), 12):
         chunk = data[i:i+12]
-        lines.append("    " + ", ".join(f"0x{b:02x}" for b in chunk))
+        lines.append("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",")
     return "\n".join(lines), len(data)
 
 vert_path, frag_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]

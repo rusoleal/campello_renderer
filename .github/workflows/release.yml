@@ -44,7 +44,7 @@ jobs:
           cd package && tar -czf campello_renderer-linux.tar.gz campello_renderer-linux
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: linux-package
           path: package/campello_renderer-linux.tar.gz
@@ -77,7 +77,7 @@ jobs:
           Compress-Archive -Path "package/campello_renderer-windows" -DestinationPath "package/campello_renderer-windows.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: windows-package
           path: package/campello_renderer-windows.zip
@@ -105,7 +105,7 @@ jobs:
           cd package && tar -czf campello_renderer-macos.tar.gz campello_renderer-macos
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: macos-package
           path: package/campello_renderer-macos.tar.gz
@@ -139,7 +139,7 @@ jobs:
           cd package && tar -czf campello_renderer-ios.tar.gz campello_renderer-ios
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ios-package
           path: package/campello_renderer-ios.tar.gz
@@ -179,7 +179,7 @@ jobs:
           find examples/android/app/build/intermediates/merged_native_libs/release/out/lib/${{ matrix.abi }} -name "*.so" -exec cp {} package/campello_renderer-android/${{ matrix.abi }}/ \; 2>/dev/null || true
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: android-package-${{ matrix.abi }}
           path: package/campello_renderer-android/${{ matrix.abi }}/
@@ -207,7 +207,7 @@ jobs:
           cd package && tar -czf campello_renderer-android.tar.gz campello_renderer-android
 
       - name: Upload combined artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: android-package
           path: package/campello_renderer-android.tar.gz
