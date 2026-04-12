@@ -45,6 +45,19 @@ target_link_libraries(${PROJECT_NAME}
     ${PLATFORM_LIBS}
 )
 
+# On iOS, ensure all shared-library dependencies advertise @rpath install names
+# so they can be embedded in an app bundle at @executable_path/Frameworks.
+if(IOS)
+    foreach(_dep campello_gpu gltf campello_image ${PROJECT_NAME})
+        if(TARGET ${_dep})
+            set_target_properties(${_dep} PROPERTIES
+                INSTALL_NAME_DIR "@rpath"
+                BUILD_WITH_INSTALL_NAME_DIR TRUE
+            )
+        endif()
+    endforeach()
+endif()
+
 target_include_directories(${PROJECT_NAME} PUBLIC
                            "${PROJECT_BINARY_DIR}"
                            )
@@ -53,6 +66,13 @@ if(APPLE AND NOT IOS)
     option(CAMPELLO_RENDERER_BUILD_MACOS_EXAMPLE "Build macOS example" OFF)
     if(CAMPELLO_RENDERER_BUILD_MACOS_EXAMPLE)
         add_subdirectory(examples/macos)
+    endif()
+endif()
+
+if(IOS)
+    option(CAMPELLO_RENDERER_BUILD_IOS_EXAMPLE "Build iOS example" OFF)
+    if(CAMPELLO_RENDERER_BUILD_IOS_EXAMPLE)
+        add_subdirectory(examples/ios)
     endif()
 endif()
 

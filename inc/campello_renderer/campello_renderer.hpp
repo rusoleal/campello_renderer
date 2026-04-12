@@ -23,8 +23,9 @@ namespace systems::leal::campello_renderer {
         static constexpr uint32_t VERTEX_SLOT_TEXCOORD0 = 2;  // float2 TEXCOORD_0
         static constexpr uint32_t VERTEX_SLOT_TANGENT   = 3;  // float4 TANGENT
         static constexpr uint32_t VERTEX_SLOT_MVP       = 16; // float4x4, row-major MVP matrix (per-instance)
-        static constexpr uint32_t VERTEX_SLOT_MATERIAL  = 17; // MaterialUniforms (80 bytes, 256 stride)
+        static constexpr uint32_t VERTEX_SLOT_MATERIAL  = 17; // MaterialUniforms (112 bytes, 256 stride)
         static constexpr uint32_t VERTEX_SLOT_CAMERA    = 18; // CameraPosition (float3 world space)
+        static constexpr uint32_t VERTEX_SLOT_LIGHTS    = 15; // LightsUniforms - use slot 15 to avoid conflict
                                                                //   [0..15]  baseColorFactor
                                                                //   [16..31] uvTransformRow0 (.w = hasTransform)
                                                                //   [32..47] uvTransformRow1
@@ -66,6 +67,13 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultNormalTexture;            // (0.5,0.5,1,1) - flat normal
         std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultEmissiveTexture;          // (0,0,0,1) - black (no emission)
         std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultOcclusionTexture;         // (1,1,1,1) - white (no occlusion)
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultSpecularTexture;          // (1,1,1,1) - white alpha = full specularFactor passthrough
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultSpecularColorTexture;     // (1,1,1,1) sRGB - white = no specular color tint
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultSheenColorTexture;        // (0,0,0,1) sRGB - black = no sheen (default sheenColor=[0,0,0])
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultSheenRoughnessTexture;    // (1,1,1,1) linear - white R = factor passes through unchanged
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultClearcoatTexture;         // (1,1,1,1) linear - white R = factor passes through (default factor=0)
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultClearcoatRoughnessTexture; // (1,1,1,1) linear - white G = factor passes through
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          defaultClearcoatNormalTexture;   // (0.5,0.5,1,1) linear - flat normal
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout>  bindGroupLayout;
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        defaultBindGroup;
 
@@ -77,6 +85,12 @@ namespace systems::leal::campello_renderer {
         // Double-sided pipeline variants (no back-face culling).
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlatDoubleSided;
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTexturedDoubleSided;
+        
+        // Alpha-blend pipeline variants (transparent materials).
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlatBlend;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTexturedBlend;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlatBlendDoubleSided;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTexturedBlendDoubleSided;
 
         // Debug rendering mode.
         bool debugModeEnabled = false;
@@ -101,6 +115,10 @@ namespace systems::leal::campello_renderer {
         // Camera position buffer — uploaded each frame for specular lighting.
         // Contains float3 cameraPositionWorld.
         std::shared_ptr<systems::leal::campello_gpu::Buffer> cameraPositionBuffer;
+        
+        // Lights uniform buffer — uploaded each frame with active punctual lights from KHR_lights_punctual.
+        // Supports up to 4 lights (directional, point, or spot). Bound via bind group at binding 10.
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> lightsUniformBuffer;
 
         // Camera override — set by setCameraMatrices(), cleared by clearCameraOverride().
         bool hasCameraOverride = false;
@@ -117,6 +135,19 @@ namespace systems::leal::campello_renderer {
         // to avoid redundant setPipeline() calls.
         // 0 = none, 1 = flat, 2 = textured, 3 = debug, 4 = flat double-sided, 5 = textured double-sided
         int currentPipelineVariant = 0;
+
+        // Camera world position extracted each frame — used to depth-sort transparent draws.
+        float cameraWorldPos[3] = {0.0f, 0.0f, 3.0f};
+
+        // Transparent (BLEND) draws collected during opaque traversal, sorted and drawn after.
+        struct TransparentDraw {
+            const systems::leal::gltf::Primitive *primitive;
+            uint64_t nodeIndex;
+        };
+        std::vector<TransparentDraw> transparentQueue;
+
+        // Active KHR_materials_variants index. -1 = use each primitive's default material.
+        int32_t activeVariant = -1;
 
         static systems::leal::vector_math::Matrix4<double> nodeLocalMatrix(
             const systems::leal::gltf::Node &node);
@@ -193,6 +224,13 @@ namespace systems::leal::campello_renderer {
         // to verify geometry loading and camera setup.
         void setDebugMode(bool enabled);
         bool isDebugModeEnabled() const;
+
+        // KHR_materials_variants — switch the active named material variant.
+        // variantIndex selects an entry from asset->khrMaterialsVariants.
+        // Pass -1 to restore each primitive's default material (the asset default).
+        void setMaterialVariant(int32_t variantIndex);
+        uint32_t getMaterialVariantCount() const;
+        std::string getMaterialVariantName(uint32_t variantIndex) const;
 
         // Accessors for uploaded GPU resources.
         std::shared_ptr<systems::leal::campello_gpu::Buffer>  getGpuBuffer(uint32_t index) const;

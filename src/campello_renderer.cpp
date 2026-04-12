@@ -15,7 +15,9 @@
 #include <campello_gpu/descriptors/bind_group_layout_descriptor.hpp>
 #include <campello_gpu/descriptors/bind_group_descriptor.hpp>
 #include <campello_gpu/bind_group.hpp>
+#include <algorithm>
 #include <cmath>
+#include <unordered_set>
 
 #if defined(__APPLE__)
 #include "shaders/metal_default.h"
@@ -48,6 +50,7 @@ Renderer::Renderer(std::shared_ptr<systems::leal::campello_gpu::Device> device) 
 
 void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
     this->asset = asset;
+    activeVariant = -1;
     if (asset == nullptr) {
         images.clear();
         nodeTransforms.clear();
@@ -92,6 +95,10 @@ void Renderer::setScene(uint32_t index) {
 
     sceneIndex = index;
 
+    // Force rebuild of defaultBindGroup each setScene() so it references the
+    // fresh materialUniformBuffer and cameraPositionBuffer for this asset.
+    defaultBindGroup = nullptr;
+
     // Upload GLTF binary buffers referenced by this scene.
     for (int b = 0; b < (int)info->buffers.size(); b++) {
         if (info->buffers[b] && gpuBuffers[b] == nullptr) {
@@ -112,13 +119,62 @@ void Renderer::setScene(uint32_t index) {
     // Upload any Draco-decompressed buffers to GPU.
     uploadDracoBuffers(info);
 
+    // Scan ALL materials in the asset to determine which image indices carry
+    // colour data (baseColor, emissive) and therefore need sRGB sampling.
+    // Linear data textures (metallicRoughness, normal, occlusion) must stay
+    // rgba8unorm so the GPU does not gamma-decode them.
+    // This scan covers all materials (not just the active scene) because
+    // gpuTextures persists across setScene() calls.
+    std::unordered_set<int64_t> srgbImageIndices;
+    if (asset->textures && asset->materials) {
+        auto imageIndexForTex = [&](int64_t texIdx) -> int64_t {
+            if (texIdx < 0 || (size_t)texIdx >= asset->textures->size()) return -1;
+            auto &gt = (*asset->textures)[(size_t)texIdx];
+            return (gt.ext_texture_webp >= 0) ? gt.ext_texture_webp : gt.source;
+        };
+        for (auto &mat : *asset->materials) {
+            if (mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture)
+                srgbImageIndices.insert(imageIndexForTex(mat.pbrMetallicRoughness->baseColorTexture->index));
+            if (mat.emissiveTexture)
+                srgbImageIndices.insert(imageIndexForTex(mat.emissiveTexture->index));
+            // KHR_materials_specular: specularColorTexture is sRGB-encoded
+            if (mat.khrMaterialsSpecular && mat.khrMaterialsSpecular->specularColorTexture)
+                srgbImageIndices.insert(imageIndexForTex(mat.khrMaterialsSpecular->specularColorTexture->index));
+            // KHR_materials_sheen: sheenColorTexture is sRGB-encoded; roughness texture is linear
+            if (mat.khrMaterialsSheen && mat.khrMaterialsSheen->sheenColorTexture)
+                srgbImageIndices.insert(imageIndexForTex(mat.khrMaterialsSheen->sheenColorTexture->index));
+        }
+        srgbImageIndices.erase(-1); // remove sentinel from any unresolved lookups
+    }
+
+    namespace GPU = systems::leal::campello_gpu;
+
     // Decode and upload images referenced by this scene.
     for (int a = 0; a < (int)info->images.size(); a++) {
         if (info->images[a]) {
             if (gpuTextures[a] == nullptr) {
                 auto &image = (*asset->images)[a];
+                // Colour images (baseColor, emissive) are sRGB-encoded — the GPU
+                // linearises them automatically on sample.  Data images (normal,
+                // metallicRoughness, occlusion) must remain linear.
+                auto fmt = srgbImageIndices.count(a)
+                    ? GPU::PixelFormat::rgba8unorm_srgb
+                    : GPU::PixelFormat::rgba8unorm;
+
                 if (image.data.size() > 0) {
-                    // TODO: handle data:uri images
+                    // Data:uri images are already decoded by the gltf library.
+                    auto img = systems::leal::campello_image::Image::fromMemory(
+                        image.data.data(), image.data.size());
+                    if (img != nullptr) {
+                        auto texture = device->createTexture(
+                            GPU::TextureType::tt2d, fmt,
+                            img->getWidth(), img->getHeight(), 1, 1, 1,
+                            GPU::TextureUsage::textureBinding);
+                        if (texture != nullptr) {
+                            texture->upload(0, img->getDataSize(), const_cast<uint8_t*>(img->getData()));
+                            gpuTextures[a] = texture;
+                        }
+                    }
                 } else if (image.bufferView != -1) {
                     auto &bufferView = (*asset->bufferViews)[image.bufferView];
                     auto &buffer     = (*asset->buffers)[bufferView.buffer];
@@ -127,10 +183,9 @@ void Renderer::setScene(uint32_t index) {
                         auto img = systems::leal::campello_image::Image::fromMemory(src, bufferView.byteLength);
                         if (img != nullptr) {
                             auto texture = device->createTexture(
-                                systems::leal::campello_gpu::TextureType::tt2d,
-                                systems::leal::campello_gpu::PixelFormat::rgba8unorm,
+                                GPU::TextureType::tt2d, fmt,
                                 img->getWidth(), img->getHeight(), 1, 1, 1,
-                                systems::leal::campello_gpu::TextureUsage::textureBinding);
+                                GPU::TextureUsage::textureBinding);
                             if (texture != nullptr) {
                                 texture->upload(0, img->getDataSize(), const_cast<uint8_t*>(img->getData()));
                                 gpuTextures[a] = texture;
@@ -157,8 +212,6 @@ void Renderer::setScene(uint32_t index) {
     // ------------------------------------------------------------------
     // Lazy-initialize shared texture resources (once per device lifetime).
     // ------------------------------------------------------------------
-    namespace GPU = systems::leal::campello_gpu;
-
     if (!bindGroupLayout) {
         GPU::BindGroupLayoutDescriptor bglDesc{};
 
@@ -252,6 +305,104 @@ void Renderer::setScene(uint32_t index) {
         sampEntry4.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
         bglDesc.entries.push_back(sampEntry4);
 
+        // Binding 10: lightsUniformBuffer (KHR_lights_punctual)
+        GPU::EntryObject lightsEntry{};
+        lightsEntry.binding    = 10;
+        lightsEntry.visibility = GPU::ShaderStage::fragment;
+        lightsEntry.type       = GPU::EntryObjectType::buffer;
+        lightsEntry.data.buffer.hasDinamicOffaset = false;
+        lightsEntry.data.buffer.minBindingSize    = 272; // 16-byte header + 4 lights * 64 bytes
+        lightsEntry.data.buffer.type              = GPU::EntryObjectBufferType::uniform;
+        bglDesc.entries.push_back(lightsEntry);
+
+        // Binding 11: specularTexture (KHR_materials_specular — A channel = specular factor)
+        GPU::EntryObject texEntry5{};
+        texEntry5.binding    = 11;
+        texEntry5.visibility = GPU::ShaderStage::fragment;
+        texEntry5.type       = GPU::EntryObjectType::texture;
+        texEntry5.data.texture.multisampled  = false;
+        texEntry5.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntry5.data.texture.viewDimension = GPU::TextureType::tt2d;
+        bglDesc.entries.push_back(texEntry5);
+
+        // Binding 12: specularSampler
+        GPU::EntryObject sampEntry5{};
+        sampEntry5.binding    = 12;
+        sampEntry5.visibility = GPU::ShaderStage::fragment;
+        sampEntry5.type       = GPU::EntryObjectType::sampler;
+        sampEntry5.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+        bglDesc.entries.push_back(sampEntry5);
+
+        // Binding 13: specularColorTexture (KHR_materials_specular — RGB = F0 color tint, sRGB)
+        GPU::EntryObject texEntry6{};
+        texEntry6.binding    = 13;
+        texEntry6.visibility = GPU::ShaderStage::fragment;
+        texEntry6.type       = GPU::EntryObjectType::texture;
+        texEntry6.data.texture.multisampled  = false;
+        texEntry6.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntry6.data.texture.viewDimension = GPU::TextureType::tt2d;
+        bglDesc.entries.push_back(texEntry6);
+
+        // Binding 14: specularColorSampler
+        GPU::EntryObject sampEntry6{};
+        sampEntry6.binding    = 14;
+        sampEntry6.visibility = GPU::ShaderStage::fragment;
+        sampEntry6.type       = GPU::EntryObjectType::sampler;
+        sampEntry6.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+        bglDesc.entries.push_back(sampEntry6);
+
+        // Binding 15: sheenColorTexture (KHR_materials_sheen — RGB sRGB = sheen color)
+        // Note: sampler reused from baseColorSampler (binding 1) in the shader — Metal only
+        // allows 16 sampler slots (0–15) and all are already claimed.
+        GPU::EntryObject texEntry7{};
+        texEntry7.binding    = 15;
+        texEntry7.visibility = GPU::ShaderStage::fragment;
+        texEntry7.type       = GPU::EntryObjectType::texture;
+        texEntry7.data.texture.multisampled  = false;
+        texEntry7.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntry7.data.texture.viewDimension = GPU::TextureType::tt2d;
+        bglDesc.entries.push_back(texEntry7);
+
+        // Binding 16: sheenRoughnessTexture (KHR_materials_sheen — R = roughness factor)
+        GPU::EntryObject texEntry8{};
+        texEntry8.binding    = 16;
+        texEntry8.visibility = GPU::ShaderStage::fragment;
+        texEntry8.type       = GPU::EntryObjectType::texture;
+        texEntry8.data.texture.multisampled  = false;
+        texEntry8.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntry8.data.texture.viewDimension = GPU::TextureType::tt2d;
+        bglDesc.entries.push_back(texEntry8);
+
+        // Binding 17: clearcoatTexture (KHR_materials_clearcoat — R = intensity)
+        GPU::EntryObject texEntry9{};
+        texEntry9.binding    = 17;
+        texEntry9.visibility = GPU::ShaderStage::fragment;
+        texEntry9.type       = GPU::EntryObjectType::texture;
+        texEntry9.data.texture.multisampled  = false;
+        texEntry9.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntry9.data.texture.viewDimension = GPU::TextureType::tt2d;
+        bglDesc.entries.push_back(texEntry9);
+
+        // Binding 18: clearcoatRoughnessTexture (KHR_materials_clearcoat — G = roughness)
+        GPU::EntryObject texEntry10{};
+        texEntry10.binding    = 18;
+        texEntry10.visibility = GPU::ShaderStage::fragment;
+        texEntry10.type       = GPU::EntryObjectType::texture;
+        texEntry10.data.texture.multisampled  = false;
+        texEntry10.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntry10.data.texture.viewDimension = GPU::TextureType::tt2d;
+        bglDesc.entries.push_back(texEntry10);
+
+        // Binding 19: clearcoatNormalTexture (KHR_materials_clearcoat — tangent-space normal)
+        GPU::EntryObject texEntry11{};
+        texEntry11.binding    = 19;
+        texEntry11.visibility = GPU::ShaderStage::fragment;
+        texEntry11.type       = GPU::EntryObjectType::texture;
+        texEntry11.data.texture.multisampled  = false;
+        texEntry11.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntry11.data.texture.viewDimension = GPU::TextureType::tt2d;
+        bglDesc.entries.push_back(texEntry11);
+
         bindGroupLayout = device->createBindGroupLayout(bglDesc);
     }
 
@@ -271,7 +422,7 @@ void Renderer::setScene(uint32_t index) {
     if (!defaultTexture) {
         uint8_t white[4] = {255, 255, 255, 255};
         defaultTexture = device->createTexture(
-            GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
+            GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm_srgb,
             1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
         if (defaultTexture) defaultTexture->upload(0, 4, white);
     }
@@ -298,7 +449,7 @@ void Renderer::setScene(uint32_t index) {
     if (!defaultEmissiveTexture) {
         uint8_t black[4] = {0, 0, 0, 255}; // RGB=(0,0,0), A=1.0
         defaultEmissiveTexture = device->createTexture(
-            GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
+            GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm_srgb,
             1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
         if (defaultEmissiveTexture) defaultEmissiveTexture->upload(0, 4, black);
     }
@@ -312,22 +463,129 @@ void Renderer::setScene(uint32_t index) {
         if (defaultOcclusionTexture) defaultOcclusionTexture->upload(0, 4, white);
     }
 
+    // Default specular texture: white (1,1,1,1) — A=1.0 passes specularFactor through unchanged
+    if (!defaultSpecularTexture) {
+        uint8_t white[4] = {255, 255, 255, 255};
+        defaultSpecularTexture = device->createTexture(
+            GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
+            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+        if (defaultSpecularTexture) defaultSpecularTexture->upload(0, 4, white);
+    }
+
+    // Default specular color texture: white sRGB (1,1,1,1) — no F0 color tint
+    if (!defaultSpecularColorTexture) {
+        uint8_t white[4] = {255, 255, 255, 255};
+        defaultSpecularColorTexture = device->createTexture(
+            GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm_srgb,
+            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+        if (defaultSpecularColorTexture) defaultSpecularColorTexture->upload(0, 4, white);
+    }
+
+    // Default sheen color texture: black sRGB (0,0,0,1) — sheenColor=[0,0,0] means no sheen by default
+    if (!defaultSheenColorTexture) {
+        uint8_t black[4] = {0, 0, 0, 255};
+        defaultSheenColorTexture = device->createTexture(
+            GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm_srgb,
+            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+        if (defaultSheenColorTexture) defaultSheenColorTexture->upload(0, 4, black);
+    }
+
+    // Default sheen roughness texture: white linear (1,1,1,1) — R=1.0 passes sheenRoughnessFactor through
+    if (!defaultSheenRoughnessTexture) {
+        uint8_t white[4] = {255, 255, 255, 255};
+        defaultSheenRoughnessTexture = device->createTexture(
+            GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
+            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+        if (defaultSheenRoughnessTexture) defaultSheenRoughnessTexture->upload(0, 4, white);
+    }
+
+    // Default clearcoat intensity texture: white linear — R=1.0 passes clearcoatFactor through (default factor=0)
+    if (!defaultClearcoatTexture) {
+        uint8_t white[4] = {255, 255, 255, 255};
+        defaultClearcoatTexture = device->createTexture(
+            GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
+            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+        if (defaultClearcoatTexture) defaultClearcoatTexture->upload(0, 4, white);
+    }
+
+    // Default clearcoat roughness texture: white linear — G=1.0 passes clearcoatRoughnessFactor through
+    if (!defaultClearcoatRoughnessTexture) {
+        uint8_t white[4] = {255, 255, 255, 255};
+        defaultClearcoatRoughnessTexture = device->createTexture(
+            GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
+            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+        if (defaultClearcoatRoughnessTexture) defaultClearcoatRoughnessTexture->upload(0, 4, white);
+    }
+
+    // Default clearcoat normal texture: flat normal (128,128,255,255) — identity tangent-space normal
+    if (!defaultClearcoatNormalTexture) {
+        uint8_t flatNormal[4] = {128, 128, 255, 255};
+        defaultClearcoatNormalTexture = device->createTexture(
+            GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
+            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+        if (defaultClearcoatNormalTexture) defaultClearcoatNormalTexture->upload(0, 4, flatNormal);
+    }
+
+    // Lights uniform buffer (KHR_lights_punctual) - created once, updated each frame
+    if (!lightsUniformBuffer) {
+        lightsUniformBuffer = device->createBuffer(272, GPU::BufferUsage::uniform);
+        // Initialize to zero (no lights)
+        uint8_t zeros[272] = {0};
+        lightsUniformBuffer->upload(0, 272, zeros);
+    }
+
+    // Camera position buffer — created once, uploaded each frame.
+    // 16 bytes for float4 alignment (float3 cameraPos + 1 pad).
+    if (!cameraPositionBuffer) {
+        cameraPositionBuffer = device->createBuffer(16, GPU::BufferUsage::vertex);
+        float defaultCam[4] = {0.f, 0.f, 3.f, 0.f};
+        cameraPositionBuffer->upload(0, 16, defaultCam);
+    }
+
+    // Material uniform buffer — recreated each setScene() (size depends on material count).
+    // Slot 0 = default; slots 1..N = per-material.
+    {
+        size_t matCount = asset->materials ? asset->materials->size() : 0;
+        uint64_t bufSize = (uint64_t)(matCount + 1) * kMaterialUniformStride;
+        materialUniformBuffer = device->createBuffer(bufSize, GPU::BufferUsage::vertex);
+    }
+
     if (!defaultBindGroup && bindGroupLayout && defaultTexture && defaultSampler &&
         defaultMetallicRoughnessTexture && defaultNormalTexture &&
-        defaultEmissiveTexture && defaultOcclusionTexture) {
+        defaultEmissiveTexture && defaultOcclusionTexture &&
+        defaultSpecularTexture && defaultSpecularColorTexture &&
+        defaultSheenColorTexture && defaultSheenRoughnessTexture &&
+        defaultClearcoatTexture && defaultClearcoatRoughnessTexture &&
+        defaultClearcoatNormalTexture && lightsUniformBuffer &&
+        materialUniformBuffer && cameraPositionBuffer) {
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout  = bindGroupLayout;
         bgDesc.entries = {
-            {0, defaultTexture},
-            {1, defaultSampler},
-            {2, defaultMetallicRoughnessTexture},
-            {3, defaultSampler},
-            {4, defaultNormalTexture},
-            {5, defaultSampler},
-            {6, defaultEmissiveTexture},
-            {7, defaultSampler},
-            {8, defaultOcclusionTexture},
-            {9, defaultSampler}
+            {0,  defaultTexture},
+            {1,  defaultSampler},
+            {2,  defaultMetallicRoughnessTexture},
+            {3,  defaultSampler},
+            {4,  defaultNormalTexture},
+            {5,  defaultSampler},
+            {6,  defaultEmissiveTexture},
+            {7,  defaultSampler},
+            {8,  defaultOcclusionTexture},
+            {9,  defaultSampler},
+            {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+            {11, defaultSpecularTexture},
+            {12, defaultSampler},
+            {13, defaultSpecularColorTexture},
+            {14, defaultSampler},
+            {15, defaultSheenColorTexture},
+            {16, defaultSheenRoughnessTexture},
+            {17, defaultClearcoatTexture},
+            {18, defaultClearcoatRoughnessTexture},
+            {19, defaultClearcoatNormalTexture},
+            // Buffer(17): material uniforms — bound to both vertex and fragment stages via setBindGroup.
+            // This makes constant MaterialUniforms &mat [[buffer(17)]] visible to fragment shaders.
+            {17, GPU::BufferBinding{materialUniformBuffer, 0, kMaterialUniformStride}},
+            // Buffer(18): camera world position — read by fragmentMain_textured [[buffer(18)]].
+            {18, GPU::BufferBinding{cameraPositionBuffer, 0, 16}},
         };
         defaultBindGroup = device->createBindGroup(bgDesc);
     }
@@ -425,20 +683,93 @@ void Renderer::setScene(uint32_t index) {
                 getTextureAndSampler(mat.occlusionTexture, occlusionTex, occlusionSamp);
             }
 
-            // Create bind group with all textures
+            // Specular texture (binding 11, 12) — KHR_materials_specular: A channel
+            std::shared_ptr<GPU::Texture> specularTex = defaultSpecularTexture;
+            std::shared_ptr<GPU::Sampler> specularSamp = defaultSampler;
+            if (mat.khrMaterialsSpecular && mat.khrMaterialsSpecular->specularTexture) {
+                getTextureAndSampler(mat.khrMaterialsSpecular->specularTexture, specularTex, specularSamp);
+            }
+
+            // Specular color texture (binding 13, 14) — KHR_materials_specular: RGB F0 color tint
+            std::shared_ptr<GPU::Texture> specularColorTex = defaultSpecularColorTexture;
+            std::shared_ptr<GPU::Sampler> specularColorSamp = defaultSampler;
+            if (mat.khrMaterialsSpecular && mat.khrMaterialsSpecular->specularColorTexture) {
+                getTextureAndSampler(mat.khrMaterialsSpecular->specularColorTexture, specularColorTex, specularColorSamp);
+            }
+
+            // Sheen color texture (binding 15) — KHR_materials_sheen: RGB sRGB sheen color
+            // Note: no dedicated sampler; shader reuses baseColorSampler (Metal sampler slot limit).
+            std::shared_ptr<GPU::Texture> sheenColorTex = defaultSheenColorTexture;
+            {
+                std::shared_ptr<GPU::Sampler> unused = defaultSampler;
+                if (mat.khrMaterialsSheen && mat.khrMaterialsSheen->sheenColorTexture)
+                    getTextureAndSampler(mat.khrMaterialsSheen->sheenColorTexture, sheenColorTex, unused);
+            }
+
+            // Sheen roughness texture (binding 16) — KHR_materials_sheen: R channel = roughness
+            std::shared_ptr<GPU::Texture> sheenRoughnessTex = defaultSheenRoughnessTexture;
+            {
+                std::shared_ptr<GPU::Sampler> unused = defaultSampler;
+                if (mat.khrMaterialsSheen && mat.khrMaterialsSheen->sheenRoughnessTexture)
+                    getTextureAndSampler(mat.khrMaterialsSheen->sheenRoughnessTexture, sheenRoughnessTex, unused);
+            }
+
+            // Clearcoat intensity texture (binding 17) — KHR_materials_clearcoat: R channel
+            std::shared_ptr<GPU::Texture> clearcoatTex = defaultClearcoatTexture;
+            {
+                std::shared_ptr<GPU::Sampler> unused = defaultSampler;
+                if (mat.khrMaterialsClearcoat && mat.khrMaterialsClearcoat->clearcoatTexture)
+                    getTextureAndSampler(mat.khrMaterialsClearcoat->clearcoatTexture, clearcoatTex, unused);
+            }
+
+            // Clearcoat roughness texture (binding 18) — KHR_materials_clearcoat: G channel
+            std::shared_ptr<GPU::Texture> clearcoatRoughnessTex = defaultClearcoatRoughnessTexture;
+            {
+                std::shared_ptr<GPU::Sampler> unused = defaultSampler;
+                if (mat.khrMaterialsClearcoat && mat.khrMaterialsClearcoat->clearcoatRoughnessTexture)
+                    getTextureAndSampler(mat.khrMaterialsClearcoat->clearcoatRoughnessTexture, clearcoatRoughnessTex, unused);
+            }
+
+            // Clearcoat normal texture (binding 19) — KHR_materials_clearcoat: tangent-space normal
+            std::shared_ptr<GPU::Texture> clearcoatNormalTex = defaultClearcoatNormalTexture;
+            {
+                std::shared_ptr<GPU::Sampler> unused = defaultSampler;
+                if (mat.khrMaterialsClearcoat && mat.khrMaterialsClearcoat->clearcoatNormalTexture)
+                    getTextureAndSampler(mat.khrMaterialsClearcoat->clearcoatNormalTexture, clearcoatNormalTex, unused);
+            }
+
+            // Create bind group with all textures and lights buffer
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout  = bindGroupLayout;
             bgDesc.entries = {
-                {0, baseColorTex},
-                {1, baseColorSamp},
-                {2, mrTex},
-                {3, mrSamp},
-                {4, normalTex},
-                {5, normalSamp},
-                {6, emissiveTex},
-                {7, emissiveSamp},
-                {8, occlusionTex},
-                {9, occlusionSamp}
+                {0,  baseColorTex},
+                {1,  baseColorSamp},
+                {2,  mrTex},
+                {3,  mrSamp},
+                {4,  normalTex},
+                {5,  normalSamp},
+                {6,  emissiveTex},
+                {7,  emissiveSamp},
+                {8,  occlusionTex},
+                {9,  occlusionSamp},
+                {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+                {11, specularTex},
+                {12, specularSamp},
+                {13, specularColorTex},
+                {14, specularColorSamp},
+                {15, sheenColorTex},
+                {16, sheenRoughnessTex},
+                {17, clearcoatTex},
+                {18, clearcoatRoughnessTex},
+                {19, clearcoatNormalTex},
+                // Buffer(17): material uniforms at the per-material offset — bound to both
+                // vertex and fragment stages via setBindGroup, making [[buffer(17)]] visible
+                // in all fragment shader variants.
+                {17, GPU::BufferBinding{materialUniformBuffer,
+                                        (uint64_t)(m + 1) * kMaterialUniformStride,
+                                        kMaterialUniformStride}},
+                // Buffer(18): camera world position for specular lighting in fragment shader.
+                {18, GPU::BufferBinding{cameraPositionBuffer, 0, 16}},
             };
             materialBindGroups[m] = device->createBindGroup(bgDesc);
         }
@@ -456,15 +787,6 @@ void Renderer::setScene(uint32_t index) {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Create material uniform buffer: slot 0 = default [1,1,1,1],
-    // slots 1..N = per-material uniforms (kMaterialUniformStride bytes each).
-    // ------------------------------------------------------------------
-    {
-        size_t matCount = asset->materials ? asset->materials->size() : 0;
-        uint64_t bufSize = (uint64_t)(matCount + 1) * kMaterialUniformStride;
-        materialUniformBuffer = device->createBuffer(bufSize, GPU::BufferUsage::vertex);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +911,67 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         frag.targets.push_back(cs);
         d.fragment = frag;
         pipelineTexturedDoubleSided = device->createRenderPipeline(d);
+    }
+
+    // --- Alpha-blend variants (transparency) ---
+    // Standard alpha blending: src * srcAlpha + dst * (1 - srcAlpha)
+    // Depth write disabled for transparent materials to avoid artifacts
+    GPU::BlendState alphaBlend{};
+    alphaBlend.color = { GPU::BlendFactor::srcAlpha, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
+    alphaBlend.alpha = { GPU::BlendFactor::one, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
+    
+    GPU::DepthStencilDescriptor blendDs = ds;
+    blendDs.depthWriteEnabled = false;  // Don't write depth for transparent objects
+    
+    {
+        GPU::RenderPipelineDescriptor d = base;
+        d.depthStencil = blendDs;
+        GPU::ColorState blendCs = cs;
+        blendCs.blend = alphaBlend;
+        GPU::FragmentDescriptor frag{};
+        frag.module     = shaderModule;
+        frag.entryPoint = "fragmentMain_flat";
+        frag.targets.push_back(blendCs);
+        d.fragment = frag;
+        pipelineFlatBlend = device->createRenderPipeline(d);
+    }
+    {
+        GPU::RenderPipelineDescriptor d = base;
+        d.depthStencil = blendDs;
+        GPU::ColorState blendCs = cs;
+        blendCs.blend = alphaBlend;
+        GPU::FragmentDescriptor frag{};
+        frag.module     = shaderModule;
+        frag.entryPoint = "fragmentMain_textured";
+        frag.targets.push_back(blendCs);
+        d.fragment = frag;
+        pipelineTexturedBlend = device->createRenderPipeline(d);
+    }
+    {
+        GPU::RenderPipelineDescriptor d = base;
+        d.cullMode = GPU::CullMode::none;
+        d.depthStencil = blendDs;
+        GPU::ColorState blendCs = cs;
+        blendCs.blend = alphaBlend;
+        GPU::FragmentDescriptor frag{};
+        frag.module     = shaderModule;
+        frag.entryPoint = "fragmentMain_flat";
+        frag.targets.push_back(blendCs);
+        d.fragment = frag;
+        pipelineFlatBlendDoubleSided = device->createRenderPipeline(d);
+    }
+    {
+        GPU::RenderPipelineDescriptor d = base;
+        d.cullMode = GPU::CullMode::none;
+        d.depthStencil = blendDs;
+        GPU::ColorState blendCs = cs;
+        blendCs.blend = alphaBlend;
+        GPU::FragmentDescriptor frag{};
+        frag.module     = shaderModule;
+        frag.entryPoint = "fragmentMain_textured";
+        frag.targets.push_back(blendCs);
+        d.fragment = frag;
+        pipelineTexturedBlendDoubleSided = device->createRenderPipeline(d);
     }
 
 #elif defined(ANDROID)
@@ -743,6 +1126,12 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     // Double-sided variants (TODO: proper pipeline creation when Vulkan backend is fixed)
     pipelineFlatDoubleSided     = pipelineFlat;
     pipelineTexturedDoubleSided = pipelineTextured;
+    
+    // Alpha-blend variants (TODO: proper blend state when Vulkan backend supports it)
+    pipelineFlatBlend             = pipelineFlat;
+    pipelineTexturedBlend         = pipelineTextured;
+    pipelineFlatBlendDoubleSided  = pipelineFlat;
+    pipelineTexturedBlendDoubleSided = pipelineTextured;
 
 #elif defined(_WIN32)
     using namespace systems::leal::campello_renderer::shaders;
@@ -884,6 +1273,12 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     // Double-sided variants (TODO: proper pipeline creation when DXIL shaders are ready)
     pipelineFlatDoubleSided     = pipelineFlat;
     pipelineTexturedDoubleSided = pipelineTextured;
+    
+    // Alpha-blend variants (TODO: proper blend state when DXIL shaders are ready)
+    pipelineFlatBlend             = pipelineFlat;
+    pipelineTexturedBlend         = pipelineTextured;
+    pipelineFlatBlendDoubleSided  = pipelineFlat;
+    pipelineTexturedBlendDoubleSided = pipelineTextured;
 
 #else
     (void)colorFormat;
@@ -1055,7 +1450,9 @@ void Renderer::renderToTarget(
     std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView)
 {
     if (!asset || (!pipelineFlat && !pipelineTextured && !pipelineDebug &&
-                   !pipelineFlatDoubleSided && !pipelineTexturedDoubleSided)) return;
+                   !pipelineFlatDoubleSided && !pipelineTexturedDoubleSided &&
+                   !pipelineFlatBlend && !pipelineTexturedBlend &&
+                   !pipelineFlatBlendDoubleSided && !pipelineTexturedBlendDoubleSided)) return;
     if (!asset->scenes || sceneIndex >= asset->scenes->size()) return;
     if (!colorView) return;
 
@@ -1124,10 +1521,6 @@ void Renderer::renderToTarget(
     // We extract eye = -R^T * view[:3, 3]
     // ------------------------------------------------------------------
     {
-        if (!cameraPositionBuffer) {
-            cameraPositionBuffer = device->createBuffer(16, GPU::BufferUsage::vertex); // 16 bytes for float4 alignment
-        }
-        
         if (cameraPositionBuffer) {
             // Extract camera position from view matrix.
             // view matrix stores: [R | t] where t = -R * eye
@@ -1152,15 +1545,180 @@ void Renderer::renderToTarget(
             camPos[0] = -(float)(R[0][0] * t[0] + R[1][0] * t[1] + R[2][0] * t[2]);
             camPos[1] = -(float)(R[0][1] * t[0] + R[1][1] * t[1] + R[2][1] * t[2]);
             camPos[2] = -(float)(R[0][2] * t[0] + R[1][2] * t[1] + R[2][2] * t[2]);
-            
+
+            cameraWorldPos[0] = camPos[0];
+            cameraWorldPos[1] = camPos[1];
+            cameraWorldPos[2] = camPos[2];
+
             cameraPositionBuffer->upload(0, 16, camPos);
         }
     }
 
     // ------------------------------------------------------------------
-    // 3. Upload material uniforms (PBR params + UV transform + alpha + emissive + occlusion per slot).
+    // 3. Upload KHR_lights_punctual lights to uniform buffer (binding 10).
     //
-    // Each slot is kMaterialUniformStride (256) bytes, but we use 104 bytes of data:
+    // Uniform buffer layout (256 bytes):
+    //   [0]:      uint32_t lightCount
+    //   [4-15]:   padding (12 bytes)
+    //   [16-79]:  Light 0 (64 bytes: position, color, direction, spot angles)
+    //   [80-143]: Light 1
+    //   [144-207]: Light 2
+    //   [208-271]: Light 3
+    // ------------------------------------------------------------------
+    {
+        if (lightsUniformBuffer) {
+            struct LightData {
+                float position[4];    // xyz + type (0=dir, 1=point, 2=spot)
+                float color[4];       // rgb + intensity
+                float direction[4];   // xyz + range
+                float spotAngles[4];  // inner/outer cone angles + padding
+            };
+            
+            struct LightsUniform {
+                uint32_t count;
+                float padding[3];
+                LightData lights[4];
+            };
+            
+            LightsUniform lightsData = {};
+            lightsData.count = 0;
+            
+            if (asset && asset->khrLightsPunctual && !asset->khrLightsPunctual->empty()) {
+                // Count and collect lights from scene nodes
+                int lightCount = 0;
+                
+                auto countLights = [&](auto&& self, uint64_t nodeIndex, 
+                                       const VM::Matrix4<double>& parentWorld) -> void {
+                    if (!asset->nodes || nodeIndex >= asset->nodes->size()) return;
+                    auto &node = (*asset->nodes)[nodeIndex];
+                    VM::Matrix4<double> world = parentWorld * nodeLocalMatrix(node);
+                    
+                    if (node.light >= 0 && node.light < (int64_t)asset->khrLightsPunctual->size()) {
+                        if (lightCount < 4) {
+                            auto &light = (*asset->khrLightsPunctual)[(size_t)node.light];
+                            LightData &ld = lightsData.lights[lightCount];
+                            
+                            // Type: 0=directional, 1=point, 2=spot
+                            float typeVal = 0.0f;
+                            if (light.type == systems::leal::gltf::KHRLightPunctualType::point) typeVal = 1.0f;
+                            else if (light.type == systems::leal::gltf::KHRLightPunctualType::spot) typeVal = 2.0f;
+                            
+                            // Position (point/spot) or direction (directional)
+                            if (light.type == systems::leal::gltf::KHRLightPunctualType::directional) {
+                                // Z-axis (column 2) in row-major VM::Matrix4: data[row*4+2]
+                                double dirX = world.data[2];
+                                double dirY = world.data[6];
+                                double dirZ = world.data[10];
+                                double len = std::sqrt(dirX*dirX + dirY*dirY + dirZ*dirZ);
+                                if (len > 0.0001) {
+                                    ld.position[0] = (float)(-dirX / len);
+                                    ld.position[1] = (float)(-dirY / len);
+                                    ld.position[2] = (float)(-dirZ / len);
+                                } else {
+                                    ld.position[0] = 0.0f; ld.position[1] = 0.0f; ld.position[2] = -1.0f;
+                                }
+                            } else {
+                                ld.position[0] = (float)world.data[3];
+                                ld.position[1] = (float)world.data[7];
+                                ld.position[2] = (float)world.data[11];
+                            }
+                            ld.position[3] = typeVal;
+                            
+                            // Color and intensity
+                            ld.color[0] = (float)light.color.x();
+                            ld.color[1] = (float)light.color.y();
+                            ld.color[2] = (float)light.color.z();
+                            ld.color[3] = (float)light.intensity;
+                            
+                            // Spot direction and range
+                            if (light.type == systems::leal::gltf::KHRLightPunctualType::spot) {
+                                // Z-axis (column 2) in row-major VM::Matrix4: data[row*4+2]
+                                double dirX = world.data[2];
+                                double dirY = world.data[6];
+                                double dirZ = world.data[10];
+                                double len = std::sqrt(dirX*dirX + dirY*dirY + dirZ*dirZ);
+                                if (len > 0.0001) {
+                                    ld.direction[0] = (float)(-dirX / len);
+                                    ld.direction[1] = (float)(-dirY / len);
+                                    ld.direction[2] = (float)(-dirZ / len);
+                                } else {
+                                    ld.direction[0] = 0.0f; ld.direction[1] = 0.0f; ld.direction[2] = -1.0f;
+                                }
+                            } else {
+                                ld.direction[0] = 0.0f;
+                                ld.direction[1] = 0.0f;
+                                ld.direction[2] = 0.0f;
+                            }
+                            ld.direction[3] = (float)light.range;
+                            
+                            // Spot cone angles
+                            if (light.type == systems::leal::gltf::KHRLightPunctualType::spot) {
+                                ld.spotAngles[0] = (float)light.innerConeAngle;
+                                ld.spotAngles[1] = (float)light.outerConeAngle;
+                            }
+                            
+                            lightCount++;
+                        }
+                    }
+                    
+                    for (auto childIdx : node.children) {
+                        self(self, childIdx, world);
+                    }
+                };
+                
+                auto &scene = (*asset->scenes)[sceneIndex];
+                if (scene.nodes) {
+                    for (auto rootIdx : *scene.nodes) {
+                        countLights(countLights, rootIdx, M4::identity());
+                    }
+                }
+                lightsData.count = (uint32_t)lightCount;
+            }
+
+            // If the asset has no lights, synthesize a default directional light
+            // so the shader always iterates at least one light with no special cases.
+            if (lightsData.count == 0) {
+                lightsData.count = 1;
+                LightData &ld = lightsData.lights[0];
+                // Direction: normalize(0.5, 1.0, 0.5) — front-top-right
+                constexpr float dx = 0.5f, dy = 1.0f, dz = 0.5f;
+                constexpr float len = 1.2247448f; // sqrt(0.25 + 1.0 + 0.25)
+                ld.position[0] = dx / len;
+                ld.position[1] = dy / len;
+                ld.position[2] = dz / len;
+                ld.position[3] = 0.0f;  // type = directional
+                ld.color[0] = 1.0f; ld.color[1] = 1.0f; ld.color[2] = 1.0f;
+                ld.color[3] = 5.0f;  // intensity = 5 lux (compensates for Reinhard tone mapping)
+                ld.direction[0] = ld.direction[1] = ld.direction[2] = 0.0f;
+                ld.direction[3] = 0.0f;  // range (unused for directional)
+                ld.spotAngles[0] = ld.spotAngles[1] = ld.spotAngles[2] = ld.spotAngles[3] = 0.0f;
+            }
+
+            lightsUniformBuffer->upload(0, sizeof(LightsUniform), &lightsData);
+            
+            // DEBUG: Print light data
+            if (lightsData.count > 0) {
+                std::cout << "=== LIGHTS UPLOADED: count=" << lightsData.count << " ===" << std::endl;
+                for (uint32_t i = 0; i < lightsData.count; i++) {
+                    std::cout << "  Light " << i << ": pos=" 
+                              << lightsData.lights[i].position[0] << ","
+                              << lightsData.lights[i].position[1] << ","
+                              << lightsData.lights[i].position[2]
+                              << " color="
+                              << lightsData.lights[i].color[0] << ","
+                              << lightsData.lights[i].color[1] << ","
+                              << lightsData.lights[i].color[2]
+                              << " intensity=" << lightsData.lights[i].color[3]
+                              << std::endl;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 4. Upload material uniforms (PBR params + UV transform + alpha + emissive + occlusion per slot).
+    //
+    // Each slot is kMaterialUniformStride (256) bytes. Used layout (140 bytes):
     //   [0..15]   float4 baseColorFactor
     //   [16..31]  float4 uvTransformRow0  (KHR_texture_transform row 0: [a, b, tx, hasTransform])
     //   [32..47]  float4 uvTransformRow1  (KHR_texture_transform row 1: [c, d, ty, 0])
@@ -1174,22 +1732,34 @@ void Renderer::renderToTarget(
     //   [76..79]  float  hasEmissiveTexture (0=no, 1=yes)
     //   [80..83]  float  hasOcclusionTexture (0=no, 1=yes)
     //   [84..87]  float  occlusionStrength
-    //   [88..91]  float  emissiveFactorR
-    //   [92..95]  float  emissiveFactorG
-    //   [96..99]  float  emissiveFactorB
-    //   [100..103] float padding
+    //   [88..95]  float2 pad (Metal float3 alignment: emissiveFactor lands at offset 96)
+    //   [96..107] float3 emissiveFactor   (16-byte aligned in Metal)
+    //   [108..111] float ior              (KHR_materials_ior, default 1.5)
+    //   [112..115] float specularFactor   (KHR_materials_specular, default 1.0)
+    //   [116..119] float hasSpecularTexture
+    //   [120..123] float hasSpecularColorTexture
+    //   [124..127] float pad2             (Metal float3 alignment: specularColorFactor at offset 128)
+    //   [128..139] float3 specularColorFactor (KHR_materials_specular F0 tint, default [1,1,1])
     //
     // Slot 0 is the default (white, identity UV transform, metallic=1, roughness=1, no textures).
     // Slots 1..N correspond to asset->materials indices 0..N-1.
     // ------------------------------------------------------------------
     if (materialUniformBuffer) {
-        // Helper: build a 104-byte slot from material data.
-        auto buildSlot = [](float bc[4], float r0[4], float r1[4], 
+        // Helper: build a material slot from material data.
+        auto buildSlot = [](float bc[4], float r0[4], float r1[4],
                             float metallic, float roughness, float normalScale,
-                            float alphaMode, float alphaCutoff, float unlit, 
+                            float alphaMode, float alphaCutoff, float unlit,
                             float hasNormal, float hasEmissive, float hasOcclusion,
                             float occlusionStrength, float emissiveFactor[3],
-                            float out[29]) {
+                            float ior,
+                            float specularFactor, float hasSpecularTex, float hasSpecularColorTex,
+                            float specularColorFactor[3],
+                            float sheenColorFactor[3], float sheenRoughnessFactor,
+                            float hasSheenColorTex, float hasSheenRoughnessTex,
+                            float clearcoatFactor, float clearcoatRoughnessFactor,
+                            float hasClearcoatTex, float hasClearcoatRoughnessTex,
+                            float hasClearcoatNormalTex, float clearcoatNormalScale,
+                            float out[48]) {
             out[0]  = bc[0]; out[1]  = bc[1]; out[2]  = bc[2];  out[3]  = bc[3];
             out[4]  = r0[0]; out[5]  = r0[1]; out[6]  = r0[2];  out[7]  = r0[3];
             out[8]  = r1[0]; out[9]  = r1[1]; out[10] = r1[2];  out[11] = r1[3];
@@ -1203,23 +1773,47 @@ void Renderer::renderToTarget(
             out[19] = hasEmissive;
             out[20] = hasOcclusion;
             out[21] = occlusionStrength;
-            out[22] = 0.f; // padding (offset 88)
-            out[23] = 0.f; // padding (offset 92) - emissiveFactor starts at offset 96
+            out[22] = 0.f; // explicit pad (offset 88)
+            out[23] = 0.f; // implicit Metal pad (offset 92) — float3 aligns to 16 bytes → offset 96
             out[24] = emissiveFactor[0]; // offset 96
             out[25] = emissiveFactor[1]; // offset 100
             out[26] = emissiveFactor[2]; // offset 104
-            out[27] = 0.f; // padding
-            out[28] = 0.f; // padding
+            out[27] = ior;               // offset 108 — KHR_materials_ior (default 1.5)
+            out[28] = specularFactor;    // offset 112 — KHR_materials_specular scalar weight
+            out[29] = hasSpecularTex;    // offset 116
+            out[30] = hasSpecularColorTex; // offset 120
+            out[31] = 0.f;               // offset 124 — pad before float3
+            out[32] = specularColorFactor[0]; // offset 128
+            out[33] = specularColorFactor[1]; // offset 132
+            out[34] = specularColorFactor[2]; // offset 136
+            out[35] = 0.f;               // offset 140 — pad before float3
+            out[36] = sheenColorFactor[0]; // offset 144
+            out[37] = sheenColorFactor[1]; // offset 148
+            out[38] = sheenColorFactor[2]; // offset 152
+            out[39] = sheenRoughnessFactor;   // offset 156
+            out[40] = hasSheenColorTex;       // offset 160
+            out[41] = hasSheenRoughnessTex;   // offset 164
+            out[42] = clearcoatFactor;        // offset 168
+            out[43] = clearcoatRoughnessFactor; // offset 172
+            out[44] = hasClearcoatTex;        // offset 176
+            out[45] = hasClearcoatRoughnessTex; // offset 180
+            out[46] = hasClearcoatNormalTex;  // offset 184
+            out[47] = clearcoatNormalScale;   // offset 188
         };
 
-        // Default slot — white, identity UV transform, metallic=1, roughness=1, no textures.
+        // Default slot — white, identity UV transform, metallic=1, roughness=1, no textures, no sheen, no clearcoat.
         {
-            float bc[4]    = {1.f, 1.f, 1.f, 1.f};
-            float row0[4]  = {1.f, 0.f, 0.f, 0.f}; // w=0 → identity fast path
-            float row1[4]  = {0.f, 1.f, 0.f, 0.f};
-            float emissive[3] = {0.f, 0.f, 0.f};
-            float slot[29];
-            buildSlot(bc, row0, row1, 1.f, 1.f, 1.f, 0.f, 0.5f, 0.f, 0.f, 0.f, 0.f, 1.f, emissive, slot);
+            float bc[4]            = {1.f, 1.f, 1.f, 1.f};
+            float row0[4]          = {1.f, 0.f, 0.f, 0.f}; // w=0 → identity fast path
+            float row1[4]          = {0.f, 1.f, 0.f, 0.f};
+            float emissive[3]      = {0.f, 0.f, 0.f};
+            float specularColor[3] = {1.f, 1.f, 1.f};
+            float sheenColor[3]    = {0.f, 0.f, 0.f};
+            float slot[48];
+            buildSlot(bc, row0, row1, 1.f, 1.f, 1.f, 0.f, 0.5f, 0.f, 0.f, 0.f, 0.f, 1.f,
+                      emissive, 1.5f, 1.f, 0.f, 0.f, specularColor,
+                      sheenColor, 0.f, 0.f, 0.f,
+                      0.f, 0.f, 0.f, 0.f, 0.f, 1.f, slot);
             materialUniformBuffer->upload(0, (uint64_t)sizeof(slot), slot);
         }
 
@@ -1288,10 +1882,67 @@ void Renderer::renderToTarget(
                 float alphaCutoff = (float)mat.alphaCutoff;
                 float unlit       = mat.khrMaterialsUnlit ? 1.0f : 0.0f;
 
-                float slot[29];
+                // KHR_materials_ior: index of refraction (default 1.5 → F0 = 0.04).
+                float ior = (float)mat.khrMaterialsIor;
+
+                // KHR_materials_specular: specular layer weight and F0 color tint.
+                float specularFactor       = 1.f;
+                float hasSpecularTex       = 0.f;
+                float hasSpecularColorTex  = 0.f;
+                float specularColorFactor[3] = {1.f, 1.f, 1.f};
+                if (mat.khrMaterialsSpecular) {
+                    auto &spec = *mat.khrMaterialsSpecular;
+                    specularFactor          = (float)spec.specularFactor;
+                    specularColorFactor[0]  = (float)spec.specularColorFactor.x();
+                    specularColorFactor[1]  = (float)spec.specularColorFactor.y();
+                    specularColorFactor[2]  = (float)spec.specularColorFactor.z();
+                    if (spec.specularTexture)      hasSpecularTex      = 1.f;
+                    if (spec.specularColorTexture)  hasSpecularColorTex = 1.f;
+                }
+
+                // KHR_materials_sheen: sheen color and roughness.
+                float sheenColorFactor[3]  = {0.f, 0.f, 0.f};
+                float sheenRoughnessFactor = 0.f;
+                float hasSheenColorTex     = 0.f;
+                float hasSheenRoughnessTex = 0.f;
+                if (mat.khrMaterialsSheen) {
+                    auto &sheen = *mat.khrMaterialsSheen;
+                    sheenColorFactor[0]  = (float)sheen.sheenColorFactor.x();
+                    sheenColorFactor[1]  = (float)sheen.sheenColorFactor.y();
+                    sheenColorFactor[2]  = (float)sheen.sheenColorFactor.z();
+                    sheenRoughnessFactor = (float)sheen.sheenRoughnessFactor;
+                    if (sheen.sheenColorTexture)     hasSheenColorTex     = 1.f;
+                    if (sheen.sheenRoughnessTexture) hasSheenRoughnessTex = 1.f;
+                }
+
+                // KHR_materials_clearcoat: layer intensity, roughness, and optional textures.
+                float clearcoatFactor          = 0.f;
+                float clearcoatRoughnessFactor = 0.f;
+                float hasClearcoatTex          = 0.f;
+                float hasClearcoatRoughnessTex = 0.f;
+                float hasClearcoatNormalTex    = 0.f;
+                float clearcoatNormalScale     = 1.f;
+                if (mat.khrMaterialsClearcoat) {
+                    auto &cc = *mat.khrMaterialsClearcoat;
+                    clearcoatFactor          = (float)cc.clearcoatFactor;
+                    clearcoatRoughnessFactor = (float)cc.clearcoatRoughnessFactor;
+                    if (cc.clearcoatTexture)          hasClearcoatTex          = 1.f;
+                    if (cc.clearcoatRoughnessTexture) hasClearcoatRoughnessTex = 1.f;
+                    if (cc.clearcoatNormalTexture) {
+                        hasClearcoatNormalTex = 1.f;
+                        clearcoatNormalScale  = (float)cc.clearcoatNormalTexture->scale;
+                    }
+                }
+
+                float slot[48];
                 buildSlot(bc, row0, row1, metallic, roughness, normalScale,
                           alphaMode, alphaCutoff, unlit, hasNormal, hasEmissive, hasOcclusion,
-                          occlusionStrength, emissiveFactor, slot);
+                          occlusionStrength, emissiveFactor, ior,
+                          specularFactor, hasSpecularTex, hasSpecularColorTex, specularColorFactor,
+                          sheenColorFactor, sheenRoughnessFactor, hasSheenColorTex, hasSheenRoughnessTex,
+                          clearcoatFactor, clearcoatRoughnessFactor,
+                          hasClearcoatTex, hasClearcoatRoughnessTex, hasClearcoatNormalTex, clearcoatNormalScale,
+                          slot);
                 
                 // Debug: print first material's values
                 if (i == 0) {
@@ -1365,9 +2016,32 @@ void Renderer::renderToTarget(
         rpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
     }
 
+    transparentQueue.clear();
+
     if (scene.nodes) {
         for (auto nodeIndex : *scene.nodes) {
             renderNode(rpe, nodeIndex);
+        }
+    }
+
+    // Sort transparent draws back-to-front and draw them after all opaque geometry.
+    // nodeTransforms stores the model matrix column-major at [nodeIndex*32 + 16..31];
+    // the world translation is at column 3: offsets 28 (X), 29 (Y), 30 (Z).
+    if (!transparentQueue.empty()) {
+        std::sort(transparentQueue.begin(), transparentQueue.end(),
+            [&](const TransparentDraw &a, const TransparentDraw &b) {
+                auto squaredDist = [&](uint64_t ni) -> float {
+                    size_t base = ni * 32;
+                    if (base + 31 >= nodeTransforms.size()) return 0.0f;
+                    float dx = nodeTransforms[base + 28] - cameraWorldPos[0];
+                    float dy = nodeTransforms[base + 29] - cameraWorldPos[1];
+                    float dz = nodeTransforms[base + 30] - cameraWorldPos[2];
+                    return dx*dx + dy*dy + dz*dz;
+                };
+                return squaredDist(a.nodeIndex) > squaredDist(b.nodeIndex); // farther first
+            });
+        for (auto &draw : transparentQueue) {
+            renderPrimitive(rpe, *draw.primitive, draw.nodeIndex);
         }
     }
 
@@ -1402,7 +2076,28 @@ void Renderer::renderNode(
     if (node.mesh >= 0) {
         auto &mesh = (*asset->meshes)[(size_t)node.mesh];
         for (auto &primitive : mesh.primitives) {
-            renderPrimitive(rpe, primitive, nodeIndex);
+            // Defer BLEND primitives to the back-to-front transparent pass.
+            // Debug mode skips alpha logic entirely — draw immediately.
+            bool isBlend = false;
+            if (!debugModeEnabled) {
+                int64_t matIdx = primitive.material;
+                if (activeVariant >= 0 && !primitive.khrMaterialsVariantsMappings.empty()) {
+                    for (auto &mapping : primitive.khrMaterialsVariantsMappings) {
+                        for (auto v : mapping.variants) {
+                            if ((int64_t)v == activeVariant) { matIdx = mapping.material; goto blendCheck; }
+                        }
+                    }
+                }
+                blendCheck:
+                if (matIdx >= 0 && asset->materials && (size_t)matIdx < asset->materials->size()) {
+                    isBlend = ((*asset->materials)[(size_t)matIdx].alphaMode == gltf::AlphaMode::blend);
+                }
+            }
+            if (isBlend) {
+                transparentQueue.push_back({&primitive, nodeIndex});
+            } else {
+                renderPrimitive(rpe, primitive, nodeIndex);
+            }
         }
     }
     for (auto childIndex : node.children) {
@@ -1415,11 +2110,27 @@ void Renderer::renderPrimitive(
     const systems::leal::gltf::Primitive &primitive,
     uint64_t nodeIndex)
 {
-    // --- 1. Determine pipeline variant (flat vs textured) and cull mode ---
+    using namespace systems::leal::gltf;
+    
+    // --- 1. Determine pipeline variant (flat vs textured), cull mode, and alpha mode ---
     bool hasTexcoord = primitive.attributes.count("TEXCOORD_0") > 0;
     bool hasTexture  = false;
     bool doubleSided = false;
+    bool useBlend    = false;  // true for BLEND alpha mode
     int64_t matIdx   = primitive.material;
+
+    // KHR_materials_variants: override matIdx when a variant is active.
+    if (activeVariant >= 0 && !primitive.khrMaterialsVariantsMappings.empty()) {
+        for (auto &mapping : primitive.khrMaterialsVariantsMappings) {
+            for (auto v : mapping.variants) {
+                if ((int64_t)v == activeVariant) {
+                    matIdx = mapping.material;
+                    goto variantResolved;
+                }
+            }
+        }
+        variantResolved:;
+    }
 
     if (hasTexcoord && matIdx >= 0 && asset->materials &&
         (size_t)matIdx < asset->materials->size())
@@ -1428,6 +2139,7 @@ void Renderer::renderPrimitive(
         if (mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture)
             hasTexture = true;
         doubleSided = mat.doubleSided;
+        useBlend    = (mat.alphaMode == AlphaMode::blend);
     }
 
     int wantedVariant = hasTexture ? 2 : 1;
@@ -1438,6 +2150,17 @@ void Renderer::renderPrimitive(
     if (doubleSided) {
         pipeline = hasTexture ? pipelineTexturedDoubleSided : pipelineFlatDoubleSided;
         wantedVariant = hasTexture ? 5 : 4;
+    }
+    
+    // Alpha-blend materials use blend pipelines (depth write disabled for transparency).
+    if (useBlend) {
+        if (doubleSided) {
+            pipeline = hasTexture ? pipelineTexturedBlendDoubleSided : pipelineFlatBlendDoubleSided;
+            wantedVariant = hasTexture ? 9 : 8;
+        } else {
+            pipeline = hasTexture ? pipelineTexturedBlend : pipelineFlatBlend;
+            wantedVariant = hasTexture ? 7 : 6;
+        }
     }
 
     // Debug mode overrides pipeline selection.
@@ -1452,9 +2175,12 @@ void Renderer::renderPrimitive(
     }
 
     // --- 2. Bind material bind group at index 0 ---
-    // Contains baseColor, metallicRoughness, and normal textures.
-    // Skip texture binding in debug mode (debug shader doesn't use textures).
-    if (!debugModeEnabled) {
+    // The bind group contains textures (fragment stage), samplers (fragment stage),
+    // lightsUniformBuffer (fragment [[buffer(10)]]),
+    // materialUniformBuffer at the per-material offset (both vertex [[buffer(17)]] and
+    // fragment [[buffer(17)]]), and cameraPositionBuffer (fragment [[buffer(18)]]).
+    // Always bound — even in debug mode, unused bindings are harmless on Metal.
+    {
         std::shared_ptr<systems::leal::campello_gpu::BindGroup> bg = defaultBindGroup;
 
         if (matIdx >= 0 && (size_t)matIdx < materialBindGroups.size() && materialBindGroups[matIdx]) {
@@ -1463,27 +2189,7 @@ void Renderer::renderPrimitive(
 
         if (bg) rpe->setBindGroup(0, bg);
     }
-
-    // --- 3. Bind material uniforms at slot 17 ---
-    if (materialUniformBuffer) {
-        uint64_t matOffset = (matIdx >= 0) ? (uint64_t)(matIdx + 1) * kMaterialUniformStride : 0;
-        
-        // Debug: print which material slot is being bound
-        static int bindCount = 0;
-        if (bindCount < 5) {
-            std::cout << "Binding material slot: matIdx=" << matIdx 
-                      << " offset=" << matOffset << " stride=" << kMaterialUniformStride << std::endl;
-            bindCount++;
-        }
-        
-        rpe->setVertexBuffer(VERTEX_SLOT_MATERIAL, materialUniformBuffer, matOffset);
-    }
-
-    // --- 4. Bind camera position at slot 18 ---
-    if (cameraPositionBuffer) {
-        rpe->setVertexBuffer(VERTEX_SLOT_CAMERA, cameraPositionBuffer, 0);
-    }
-
+    
     // --- 5. Bind transform matrices for this node ---
     // Buffer contains: MVP (64 bytes) + Model (64 bytes) = 128 bytes per node.
     if (transformBuffer) {
@@ -1651,6 +2357,25 @@ Renderer::getGpuTexture(uint32_t index) const {
 
 uint32_t Renderer::getGpuBufferCount()  const { return (uint32_t)gpuBuffers.size(); }
 uint32_t Renderer::getGpuTextureCount() const { return (uint32_t)gpuTextures.size(); }
+
+// ---------------------------------------------------------------------------
+// KHR_materials_variants
+// ---------------------------------------------------------------------------
+
+void Renderer::setMaterialVariant(int32_t variantIndex) {
+    activeVariant = variantIndex;
+}
+
+uint32_t Renderer::getMaterialVariantCount() const {
+    if (!asset || !asset->khrMaterialsVariants) return 0;
+    return (uint32_t)asset->khrMaterialsVariants->size();
+}
+
+std::string Renderer::getMaterialVariantName(uint32_t variantIndex) const {
+    if (!asset || !asset->khrMaterialsVariants) return {};
+    if (variantIndex >= asset->khrMaterialsVariants->size()) return {};
+    return (*asset->khrMaterialsVariants)[variantIndex].name;
+}
 
 std::shared_ptr<systems::leal::campello_gpu::BindGroup>
 Renderer::getBindGroup(uint32_t index) const {

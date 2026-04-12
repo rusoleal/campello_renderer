@@ -18,8 +18,7 @@
 
 ## Immediate (pre-commit)
 
-- [ ] **Fix `actions/checkout@v6` in CI** — `.github/workflows/build.yml` uses `@v6` (does not exist). Must be `@v4`. All 5 jobs affected. Fix before committing the pending dependency bumps.
-- [ ] **Commit pending changes** — `campello_gpu` v0.6.1→v0.7.0, `gltf` v0.3.5→v0.3.6, `LICENSE` — after fixing the checkout version.
+- [x] **Commit pending changes** — `campello_gpu` v0.6.1→v0.7.0, `gltf` v0.3.5→v0.3.6, `LICENSE` — PBR textures (metallicRoughness, normal, emissive, occlusion) implemented.
 
 ---
 
@@ -32,7 +31,7 @@
 
 ## Asset Loading
 
-- [ ] **`data:uri` image support** — `setScene()` has a `TODO: handle data:uri images` comment and skips images where `image.data` is non-empty (base64 data URIs). Implement base64 decode + `campello_image` decode path.
+- [x] **`data:uri` image support** — The gltf library already decodes data:uri images automatically. The renderer now uses `image.data` directly with `campello_image::Image::fromMemory()`.
 - [ ] **External image URIs** — `.gltf` files referencing external image files (not buffer views) are not loaded.
 - [ ] **Non-standard buffer view strides** — interleaved vertex data (`byteStride > 0` in buffer views) is not handled; `byteOffset` is applied but stride is ignored.
 
@@ -88,7 +87,7 @@ The gltf library (v0.3.6) parses **23 extensions** into structured data. The ren
 - [x] **`occlusionTexture`** — parsed as `Material::occlusionTexture` (`OcclusionTextureInfo` with `strength` field). Multiply lighting by R channel of the occlusion texture. Implemented in fragment shader with `occlusionStrength` uniform.
 - [x] **`emissiveFactor` + `emissiveTexture`** — parsed as `Material::emissiveFactor` (Vector3) and `emissiveTexture` (TextureInfo). Add emissive contribution after lighting. `KHR_materials_emissive_strength` scalar multiplier is already parsed as `Material::khrMaterialsEmissiveStrength`. Fixed Metal `float3` alignment (16-byte aligned, starts at offset 96).
 - [x] **Alpha modes: MASK** — `Material::alphaMode` (OPAQUE/MASK/BLEND) and `alphaCutoff`. MASK: `discard` in fragment shader when alpha < cutoff.
-- [ ] **Alpha modes: BLEND** — requires sorted transparent draw pass with alpha blending enabled in the pipeline color state.
+- [x] **Alpha modes: BLEND (macOS/Metal)** — alpha blending enabled in pipeline color state with `srcAlpha * oneMinusSrcAlpha`. Blend pipelines created for all variants (flat/textured × single/double-sided). Depth write disabled for transparent materials. Android/Windows: blend pipeline variants alias to opaque (TODO per-platform). Back-to-front sort: transparent primitives collected during opaque traversal, sorted by squared camera distance (descending), drawn after all opaque geometry.
 - [x] **Double-sided materials** — `Material::doubleSided`. Pipeline variants with `CullMode::none` for double-sided materials.
 
 ### KHR_materials_unlit
@@ -101,26 +100,28 @@ The gltf library (v0.3.6) parses **23 extensions** into structured data. The ren
 
 ### KHR_lights_punctual
 
-- [ ] **`KHR_lights_punctual`** — parsed into `GLTF::khrLightsPunctual` (vector of `KHRLightPunctual`). Each light has `type` (directional/point/spot), `color`, `intensity`, `range`, and spot cone angles. Node references via `Node::light` index. Currently no lighting model beyond a hardcoded view direction. Implementation needs:
-  - Pass active lights to the shader (uniform buffer or push constants)
-  - Implement point/directional/spot attenuation
-  - Respect light world transform from the node's world matrix
+- [x] **`KHR_lights_punctual`** — parsed into `GLTF::khrLightsPunctual` (vector of `KHRLightPunctual`). Each light has `type` (directional/point/spot), `color`, `intensity`, `range`, and spot cone angles. Node references via `Node::light` index.
+  - Lights collected by traversing scene graph, finding nodes with `node.light >= 0`
+  - Light transforms computed from node world matrices (directional: -Z axis, point/spot: position)
+  - Up to 4 lights supported, uploaded to vertex buffer slot 15 (`VERTEX_SLOT_LIGHTS`)
+  - Shader iterates lights, computes inverse-square attenuation (point/spot), spot cone factor (spot), Reinhard tone mapping at output
+  - C++ injects a default directional light (5 lux) when no lights exist in the scene (no hardcoded shader fallback)
 
 ### KHR_materials_ior
 
-- [ ] **`KHR_materials_ior`** — parsed as `Material::khrMaterialsIor` (scalar, default 1.5). Affects Fresnel reflectance. Replace hardcoded F0 in specular calculations with `((ior - 1) / (ior + 1))^2`.
+- [x] **`KHR_materials_ior`** — uploaded to material uniform buffer slot 27 (byte 108). Fragment shader replaces hardcoded `F0 = 0.04` with `((ior-1)/(ior+1))²`. Default IOR 1.5 produces F0=0.04, so no regression on assets without the extension.
 
 ### KHR_materials_specular
 
-- [ ] **`KHR_materials_specular`** — parsed as `Material::khrMaterialsSpecular` (`specularFactor`, `specularTexture`, `specularColorFactor` vec3, `specularColorTexture`). Modulates the specular reflection layer on top of PBR metallic-roughness.
+- [x] **`KHR_materials_specular`** — `specularFactor` (scalar) and `specularColorFactor` (vec3) uploaded to `materialUniformBuffer` (offsets 112, 128). `specularTexture` (A channel) and `specularColorTexture` (RGB, sRGB) bound at slots 11–14. Fragment shader computes `F0_dielectric = min(IOR_f0 × specularColor, 1) × specular` before mixing with metallic F0. Default values (factor=1, color=[1,1,1]) are backward-compatible with KHR_materials_ior behaviour.
 
 ### KHR_materials_clearcoat
 
-- [ ] **`KHR_materials_clearcoat`** — parsed as `Material::khrMaterialsClearcoat` (`clearcoatFactor`, `clearcoatTexture`, `clearcoatRoughnessFactor`, `clearcoatRoughnessTexture`, `clearcoatNormalTexture`). Adds a thin, clear coating layer over the base material. Requires an additional BRDF lobe in shaders.
+- [x] **`KHR_materials_clearcoat`** — GGX NDF + Smith-GGX visibility + Schlick Fresnel (fixed F0=0.04, IOR 1.5). Three textures: clearcoatTexture (R, binding 17), clearcoatRoughnessTexture (G, binding 18), clearcoatNormalTexture (binding 19). All reuse baseColorSampler. Clearcoat normal decoded with TBN and `clearcoatNormalScale`. Base layer attenuated by `(1 - ccFactor × F_Schlick(0.04, NdotV))`. Uniforms at material buffer offsets 168–191.
 
 ### KHR_materials_sheen
 
-- [ ] **`KHR_materials_sheen`** — parsed as `Material::khrMaterialsSheen` (`sheenColorFactor` vec3, `sheenColorTexture`, `sheenRoughnessFactor`, `sheenRoughnessTexture`). Models cloth/fabric micro-fibre retroreflection.
+- [x] **`KHR_materials_sheen`** — Charlie NDF + Neubelt visibility term. `sheenColorFactor` × `sheenColorTexture` (RGB sRGB, binding 15) tints the sheen lobe; `sheenRoughnessFactor` × `sheenRoughnessTexture` (R linear, binding 16) controls lobe width. Uniforms packed at material buffer offsets 144–167. Both sheen textures reuse `baseColorSampler` (Metal sampler slot limit of 16 is reached).
 
 ### KHR_materials_transmission
 
@@ -148,7 +149,7 @@ The gltf library (v0.3.6) parses **23 extensions** into structured data. The ren
 
 ### KHR_materials_variants
 
-- [ ] **`KHR_materials_variants`** — parsed into `GLTF::khrMaterialsVariants` (name list) and `Primitive::khrMaterialsVariantsMappings` (material index per variant). Add a `setMaterialVariant(uint32_t variantIndex)` API that swaps material indices before rendering.
+- [x] **`KHR_materials_variants`** — `setMaterialVariant(int32_t)` API implemented. `getMaterialVariantCount()` / `getMaterialVariantName()` accessors added. `renderPrimitive()` overrides `matIdx` from `khrMaterialsVariantsMappings` when a variant is active. Pass -1 to restore asset defaults. `activeVariant` reset on `setAsset()`.
 
 ### KHR_texture_basisu (KTX2)
 
@@ -179,7 +180,7 @@ The gltf library (v0.3.6) parses **23 extensions** into structured data. The ren
 - [x] Occlusion texture — R channel sampled, multiplied with ambient and diffuse lighting
 - [x] Emissive factor + texture — RGB texture sampled, multiplied by `emissiveFactor`, added after lighting
 - [x] Alpha modes: MASK (cutout) — implemented
-- [ ] Alpha modes: BLEND (transparency) — requires sorted transparent draw pass
+- [x] Alpha modes: BLEND (macOS/Metal) — pipelines ready; Android/Windows alias to opaque; back-to-front sort not yet implemented
 - [x] Double-sided materials (toggle `CullMode::none`)
 
 ---
