@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.5.0 FATAL_ERROR)
 
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 
+# Skip if gltf target is already defined (e.g., by parent project)
+if(TARGET gltf)
+    message(STATUS "gltf target already exists, skipping FetchContent")
+    return()
+endif()
+
 include(FetchContent)
 
 FetchContent_Declare(

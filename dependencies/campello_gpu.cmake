@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.5.0 FATAL_ERROR)
 
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 
+# Skip if campello_gpu target is already defined (e.g., by parent project)
+if(TARGET campello_gpu)
+    message(STATUS "campello_gpu target already exists, skipping FetchContent")
+    return()
+endif()
+
 include(FetchContent)
 
 FetchContent_Declare(

@@ -67,7 +67,7 @@
 
 ---
 
-## Unreleased
+## [0.1.4] - 2026-04-12
 
 ### Added
 - **PBR metallic-roughness rendering** — Full metallic-roughness workflow with:
@@ -94,6 +94,9 @@
 - **Bind group layout expanded** — Now supports 6 bindings (3 textures + 3 samplers)
 - **Material uniform buffer expanded** — New layout includes metallicFactor, roughnessFactor, normalScale, hasNormalTexture flag
 - Updated Metal shaders with new PBR lighting model
+
+### Fixed
+- Dependency cmake files (`campello_gpu.cmake`, `campello_image.cmake`, `gltf.cmake`) now guard against re-fetching targets already defined by a parent project — prevents CMake target redefinition errors when `campello_renderer` is consumed as a sub-project
 
 ## [0.1.2] - 2026-04-06
 
