@@ -13,7 +13,7 @@ include(FetchContent)
 FetchContent_Declare(
         extern_campello_image
         GIT_REPOSITORY https://github.com/rusoleal/campello_image
-        GIT_TAG        v0.3.1
+        GIT_TAG        v0.4.0
 )
 
 if(NOT extern_campello_image_POPULATED)

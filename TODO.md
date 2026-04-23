@@ -1,6 +1,6 @@
 # campello_renderer TODO
 
-## Current State (v0.1.2)
+## Current State (v0.2.0)
 
 ### What works
 - `setAsset(shared_ptr<GLTF>)` — loads asset, allocates GPU buffer/texture/sampler/bind-group slot arrays
@@ -18,7 +18,15 @@
 
 ## Immediate (pre-commit)
 
-- [x] **Commit pending changes** — `campello_gpu` v0.6.1→v0.7.0, `gltf` v0.3.5→v0.3.6, `LICENSE` — PBR textures (metallicRoughness, normal, emissive, occlusion) implemented.
+- [x] **Commit pending changes** — `campello_gpu` v0.9.0, `gltf` v0.4.1, `LICENSE` — PBR textures (metallicRoughness, normal, emissive, occlusion) implemented.
+- [x] **Triple-buffer frame-in-flight ring** — 3 `FrameResources` with fences; prevents CPU/GPU desync.
+- [x] **Build directory split** — separate `build/macos/debug` and `build/macos/release` to prevent mixed objects.
+- [x] **Local `campello_gpu` override** — `dependencies/campello_gpu.cmake` points to `/Users/rubenleal/Projects/campello_gpu` for rapid iteration.
+- [x] **Metal validation fixes** — removed `instLayout` from vertex descriptor (fixed missing binding 3/4 crash); added `fallbackTangentBuffer`; fixed vertex stage material buffer binding at slot 17.
+- [x] **Depth/stencil format mismatch fix** — patched `campello_gpu` Metal backend to skip stencil attachment when depth format is `depth32float` (no stencil component).
+- [x] **Redundant buffer binding deduplication** — `setVertexBufferIfChanged()` tracks last-bound `(buffer, offset)` per slot to avoid Metal debug-layer asserts.
+- [x] **Frustum culling** — AABB-vs-frustum plane tests skip whole node subtrees outside the camera view. Fixed row-major matrix plane extraction bug.
+- [x] **View mode hotkeys** — 17 debug visualization modes: normal, worldNormal, baseColor, metallic, roughness, occlusion, emissive, alpha, uv0, specularFactor, specularColor, sheenColor, sheenRoughness, clearcoat, clearcoatRoughness, clearcoatNormal, transmission.
 
 ---
 
@@ -33,7 +41,7 @@
 
 - [x] **`data:uri` image support** — The gltf library already decodes data:uri images automatically. The renderer now uses `image.data` directly with `campello_image::Image::fromMemory()`.
 - [ ] **External image URIs** — `.gltf` files referencing external image files (not buffer views) are not loaded.
-- [ ] **Non-standard buffer view strides** — interleaved vertex data (`byteStride > 0` in buffer views) is not handled; `byteOffset` is applied but stride is ignored.
+- [x] **Non-standard buffer view strides** — interleaved vertex data (`byteStride > 0` in buffer views) is now deinterleaved into contiguous GPU buffers per accessor at load time. The renderer scans all mesh primitives in `setScene()`, detects accessors in buffer views with `byteStride > 0`, and extracts each attribute into its own tightly-packed GPU buffer. `renderPrimitive()` prefers the deinterleaved buffer when binding standard GLTF attributes.
 
 ---
 
@@ -76,13 +84,39 @@
   - STEP interpolation supported
   - Animated TRS merged from all playing animations before `render()` computes world matrices
   - Last-animation-wins when multiple animations target the same node/property
-- [ ] **Skeletal meshes** — joint matrix palette (skin / inverse bind matrices).
+- [x] **Skeletal meshes** — joint matrix palette implemented. `setScene()` reads `inverseBindMatrices` and caches per-skin joint data. Each frame, `computeSkinningTransforms()` computes `jointMatrix = inverse(skinNodeWorld) * jointWorld * inverseBindMatrix` per glTF spec and uploads to a triple-buffered GPU palette. `renderPrimitive()` binds `JOINTS_0` (slot 4), `WEIGHTS_0` (slot 5), and joint matrix buffer (slot 20). Metal shader blends up to 4 joint matrices in vertexMain before instance/node transforms. Fallback zero buffers and identity joint matrix handle non-skinned primitives cleanly. Pipeline vertex descriptors dynamically match detected `JOINTS_0` (`UNSIGNED_BYTE`/`UNSIGNED_SHORT`) and `WEIGHTS_0` (`FLOAT`/`UNSIGNED_BYTE` normalized/`UNSIGNED_SHORT` normalized) component types.
+
+---
+
+## Rendering Performance (large scenes)
+
+### Priority 1 — prerequisites for visibility culling
+
+- [x] **Add per-primitive bounds** — local AABB data is now cached per primitive from `POSITION` accessor min/max when available, with a CPU fallback scan for float position buffers.
+- [x] **Cache per-node world bounds** — node-local bounds are derived from mesh primitives in `setScene()`, then world bounds are refreshed during transform updates and merged up the hierarchy each frame.
+- [x] **Build a visible draw list before the render pass** — scene traversal now gathers opaque / transparent draw items before the render pass instead of drawing recursively during traversal.
+
+### Priority 2 — primary large-scene optimization
+
+- [x] **Implement camera frustum culling** — the renderer now extracts the six frustum planes from the active view-projection matrix and skips whole node subtrees whose cached world bounds are outside the frustum before issuing draw calls.
+- [x] **Reduce transform buffer uploads** — `uploadVisibleNodeTransforms()` now finds the highest visible node index and uploads only `[0, (maxIndex+1) * 128]` bytes instead of the entire buffer.
+- [x] **Cull `EXT_mesh_gpu_instancing` instances** — `updateVisibleInstances()` now tests each instance's world-space translation against the frustum planes. Visible instances are compacted into `visibleMatrices` and only the surviving count is uploaded/drawn.
+
+### Priority 3 — draw-call and state-change reduction
+
+- [ ] **Add mesh / material batching and state sorting** — once visibility is known, sort opaque draws by pipeline / material / vertex buffers to reduce `setPipeline`, `setBindGroup`, and vertex/index buffer rebinding overhead in large scenes.
+- [x] **Guard debug logging in hot paths** — `std::cout` diagnostics removed from `computeNodeTransform()` and `renderPrimitive()` hot paths.
+
+### Priority 4 — longer-term scalability
+
+- [ ] **Add renderer performance counters** — expose CPU traversal time, culling reject counts, visible primitive counts, draw-call counts, and GPU frame time so optimizations can be verified against representative large-scene assets.
+- [ ] **Add distance-based LOD hooks** — define per-mesh LOD selection and optional far-distance impostor / low-poly fallback support so large environments do not submit full-resolution geometry at every distance.
 
 ---
 
 ## GLTF Extension Rendering Support
 
-The gltf library (v0.3.6) parses **23 extensions** into structured data. The renderer currently uses a small subset. Below is what remains to implement, grouped by complexity.
+The gltf library (v0.4.1) parses **23 extensions** into structured data. The renderer currently uses a small subset. Below is what remains to implement, grouped by complexity.
 
 ### Currently rendered
 - [x] Core PBR `baseColorFactor` — uploaded to `materialUniformBuffer` (slot 17) per material
@@ -197,7 +231,7 @@ The gltf library (v0.3.6) parses **23 extensions** into structured data. The ren
 
 ### KHR_mesh_quantization
 
-- [ ] **`KHR_mesh_quantization`** — recognized by the gltf library but no struct is generated. Quantized vertex attributes use normalized integer component types (BYTE, SHORT) instead of FLOAT. The renderer's `createDefaultPipelines()` vertex layouts currently hard-code `ctFloat`. Add per-accessor component type detection and map to the correct `GPU::ComponentType` when binding vertex buffers.
+- [ ] **`KHR_mesh_quantization`** — pipeline variants and `normalized` flag support are implemented, but the test asset (`BoxQuantized.glb`) revealed geometry/normal issues. Needs revisiting to verify end-to-end correctness with proper Khronos sample assets. Deferred until higher-priority extensions are complete.
 
 ---
 
@@ -217,7 +251,7 @@ The gltf library (v0.3.6) parses **23 extensions** into structured data. The ren
 
 ## Dependencies
 
-- [ ] **Wire up `webp.cmake`** — `dependencies/webp.cmake` (libwebp v1.5.0) is defined but not included in `CMakeLists.txt`. `campello_image` + GLTF `ext_texture_webp` already support WebP image indices; linking libwebp would enable actual decode.
+- [x] **`webp.cmake` removed** — `campello_image` already fetches and links its own `libwebp` internally (v1.6.0); the unused root-level `dependencies/webp.cmake` has been deleted.
 
 ---
 
@@ -233,6 +267,7 @@ The gltf library (v0.3.6) parses **23 extensions** into structured data. The ren
 ## Examples
 
 ### macOS (`examples/macos/`)
+- [x] **Lighting controls menu** — `Lighting` menu with toggles for punctual lights (Cmd+Shift+L) and default light (Cmd+Option+L), plus `Background` submenu with Dark/Gray/Light presets (1/2/3). Scene presentation API: `setClearColor()`, `setPunctualLightsEnabled()`, `setDefaultLightEnabled()`.
 - [ ] Drag-and-drop `.gltf` / `.glb` file loading
 - [ ] Node hierarchy / scene picker UI
 - [ ] Load `.gltf` text format (not just `.glb`)

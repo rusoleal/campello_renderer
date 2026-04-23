@@ -59,8 +59,21 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         boundsRadius          = 1.0f;
         gpuSamplers.clear();
         materialBindGroups.clear();
+        flatMaterialBindGroups.clear();
+        defaultFlatBindGroup = nullptr;
+        quantizedPipelines.clear();
         dracoPrimitiveBuffers.clear();
+        deinterleavedBuffers.clear();
         nodeInstanceData.clear();
+        primitiveBounds.clear();
+        nodeMeshLocalBounds.clear();
+        nodeLocalBounds.clear();
+        nodeWorldBounds.clear();
+        nodeWorldMatrices.clear();
+        visibleNodeMask.clear();
+        opaqueQueue.clear();
+        transparentQueue.clear();
+        hasFrustumPlanes = false;
         animationStates.clear();
         animatedNodes.clear();
         return;
@@ -126,6 +139,78 @@ void Renderer::setScene(uint32_t index) {
     // Upload any Draco-decompressed buffers to GPU.
     uploadDracoBuffers(info);
 
+    // Deinterleave vertex attributes from buffer views with byteStride > 0.
+    // The pipeline vertex layouts assume tightly packed data (stride = attribute
+    // size). Interleaved data shares a buffer view with a common stride, so we
+    // extract each accessor into its own contiguous GPU buffer.
+    deinterleavedBuffers.clear();
+    if (asset->meshes && asset->accessors && asset->bufferViews) {
+        auto getComponentSize = [](systems::leal::gltf::ComponentType ct) -> size_t {
+            using CT = systems::leal::gltf::ComponentType;
+            switch (ct) {
+                case CT::ctByte: return 1;
+                case CT::ctUnsignedByte: return 1;
+                case CT::ctShort: return 2;
+                case CT::ctUnsignedShort: return 2;
+                case CT::ctUnsignedInt: return 4;
+                case CT::ctFloat: return 4;
+            }
+            return 1;
+        };
+        auto getTypeCount = [](systems::leal::gltf::AccessorType at) -> size_t {
+            using AT = systems::leal::gltf::AccessorType;
+            switch (at) {
+                case AT::acScalar: return 1;
+                case AT::acVec2:   return 2;
+                case AT::acVec3:   return 3;
+                case AT::acVec4:   return 4;
+                case AT::acMat2:   return 4;
+                case AT::acMat3:   return 9;
+                case AT::acMat4:   return 16;
+            }
+            return 1;
+        };
+
+        for (auto &mesh : *asset->meshes) {
+            for (auto &primitive : mesh.primitives) {
+                for (auto &[semantic, accIdx] : primitive.attributes) {
+                    if (accIdx < 0 || (size_t)accIdx >= asset->accessors->size()) continue;
+                    auto &acc = (*asset->accessors)[(size_t)accIdx];
+                    if (acc.bufferView < 0 || (size_t)acc.bufferView >= asset->bufferViews->size()) continue;
+                    auto &bv = (*asset->bufferViews)[(size_t)acc.bufferView];
+                    if (bv.byteStride <= 0) continue;
+                    if (deinterleavedBuffers.count(accIdx)) continue;
+
+                    size_t compSize = getComponentSize(acc.componentType);
+                    size_t typeCount = getTypeCount(acc.type);
+                    size_t elementSize = compSize * typeCount;
+                    size_t totalSize = elementSize * acc.count;
+                    if (totalSize == 0) continue;
+
+                    auto &buf = (*asset->buffers)[bv.buffer];
+                    if (buf.data.empty()) continue;
+
+                    size_t paddedElementSize = (elementSize + 3) & ~size_t(3); // round up to 4
+                    std::vector<uint8_t> deinterleaved(paddedElementSize * acc.count, 0);
+                    const uint8_t *src = buf.data.data() + bv.byteOffset + acc.byteOffset;
+                    for (size_t i = 0; i < acc.count; ++i) {
+                        std::memcpy(deinterleaved.data() + i * paddedElementSize,
+                                    src + i * bv.byteStride,
+                                    elementSize);
+                    }
+
+                    using BU = systems::leal::campello_gpu::BufferUsage;
+                    auto gpuBuf = device->createBuffer(
+                        totalSize, BU::vertex,
+                        deinterleaved.data());
+                    if (gpuBuf) {
+                        deinterleavedBuffers[accIdx] = gpuBuf;
+                    }
+                }
+            }
+        }
+    }
+
     // Scan ALL materials in the asset to determine which image indices carry
     // colour data (baseColor, emissive) and therefore need sRGB sampling.
     // Linear data textures (metallicRoughness, normal, occlusion) must stay
@@ -156,29 +241,39 @@ void Renderer::setScene(uint32_t index) {
 
     namespace GPU = systems::leal::campello_gpu;
 
+    // Helper: map campello_image format to campello_gpu pixel format.
+    auto imageFormatToPixelFormat = [](systems::leal::campello_image::ImageFormat imgFmt,
+                                        bool srgb) -> GPU::PixelFormat {
+        switch (imgFmt) {
+            case systems::leal::campello_image::ImageFormat::rgba8:
+                return srgb ? GPU::PixelFormat::rgba8unorm_srgb : GPU::PixelFormat::rgba8unorm;
+            case systems::leal::campello_image::ImageFormat::rgba16f:
+                return GPU::PixelFormat::rgba16float;
+            case systems::leal::campello_image::ImageFormat::rgba32f:
+                return GPU::PixelFormat::rgba32float;
+        }
+        return GPU::PixelFormat::rgba8unorm;
+    };
+
     // Decode and upload images referenced by this scene.
     for (int a = 0; a < (int)info->images.size(); a++) {
         if (info->images[a]) {
             if (gpuTextures[a] == nullptr) {
                 auto &image = (*asset->images)[a];
-                // Colour images (baseColor, emissive) are sRGB-encoded — the GPU
-                // linearises them automatically on sample.  Data images (normal,
-                // metallicRoughness, occlusion) must remain linear.
-                auto fmt = srgbImageIndices.count(a)
-                    ? GPU::PixelFormat::rgba8unorm_srgb
-                    : GPU::PixelFormat::rgba8unorm;
+                bool wantsSrgb = srgbImageIndices.count(a) > 0;
 
                 if (image.data.size() > 0) {
                     // Data:uri images are already decoded by the gltf library.
                     auto img = systems::leal::campello_image::Image::fromMemory(
                         image.data.data(), image.data.size());
                     if (img != nullptr) {
+                        auto fmt = imageFormatToPixelFormat(img->getFormat(), wantsSrgb);
                         auto texture = device->createTexture(
                             GPU::TextureType::tt2d, fmt,
                             img->getWidth(), img->getHeight(), 1, 1, 1,
                             GPU::TextureUsage::textureBinding);
                         if (texture != nullptr) {
-                            texture->upload(0, img->getDataSize(), const_cast<uint8_t*>(img->getData()));
+                            texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
                             gpuTextures[a] = texture;
                         }
                     }
@@ -189,12 +284,13 @@ void Renderer::setScene(uint32_t index) {
                         const uint8_t *src = buffer.data.data() + bufferView.byteOffset;
                         auto img = systems::leal::campello_image::Image::fromMemory(src, bufferView.byteLength);
                         if (img != nullptr) {
+                            auto fmt = imageFormatToPixelFormat(img->getFormat(), wantsSrgb);
                             auto texture = device->createTexture(
                                 GPU::TextureType::tt2d, fmt,
                                 img->getWidth(), img->getHeight(), 1, 1, 1,
                                 GPU::TextureUsage::textureBinding);
                             if (texture != nullptr) {
-                                texture->upload(0, img->getDataSize(), const_cast<uint8_t*>(img->getData()));
+                                texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
                                 gpuTextures[a] = texture;
                             }
                         }
@@ -210,10 +306,17 @@ void Renderer::setScene(uint32_t index) {
     // Layout per node: 16 floats MVP, 16 floats Model = 32 floats = 128 bytes.
     if (asset->nodes && !asset->nodes->empty()) {
         size_t nodeCount = asset->nodes->size();
-        std::cout << "Scene has " << nodeCount << " nodes" << std::endl;
         nodeTransforms.assign(nodeCount * 32, 0.0f); // 32 floats per node
+        nodeMeshLocalBounds.assign(nodeCount, Bounds{});
+        nodeLocalBounds.assign(nodeCount, Bounds{});
+        nodeWorldBounds.assign(nodeCount, Bounds{});
+        nodeWorldMatrices.assign(nodeCount, systems::leal::vector_math::Matrix4<double>::identity());
+        visibleNodeMask.assign(nodeCount, 0);
         using BU = systems::leal::campello_gpu::BufferUsage;
-        transformBuffer = device->createBuffer(nodeCount * 128, BU::vertex); // 128 bytes per node
+        for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
+            frameResources[f].transformBuffer = device->createBuffer(nodeCount * 128, BU::vertex);
+        }
+        transformBuffer = frameResources[0].transformBuffer;
     }
 
     // ------------------------------------------------------------------
@@ -421,6 +524,16 @@ void Renderer::setScene(uint32_t index) {
         texEntry12.data.texture.viewDimension = GPU::TextureType::tt2d;
         bglDesc.entries.push_back(texEntry12);
 
+        // Binding 21: environmentMap (cube texture for IBL / skybox)
+        GPU::EntryObject texEntryEnv{};
+        texEntryEnv.binding    = 21;
+        texEntryEnv.visibility = GPU::ShaderStage::fragment;
+        texEntryEnv.type       = GPU::EntryObjectType::texture;
+        texEntryEnv.data.texture.multisampled  = false;
+        texEntryEnv.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntryEnv.data.texture.viewDimension = GPU::TextureType::ttCube;
+        bglDesc.entries.push_back(texEntryEnv);
+
         bindGroupLayout = device->createBindGroupLayout(bglDesc);
     }
 
@@ -544,6 +657,29 @@ void Renderer::setScene(uint32_t index) {
         if (defaultClearcoatNormalTexture) defaultClearcoatNormalTexture->upload(0, 4, flatNormal);
     }
 
+    // Default environment map: 1x1x6 dark gray cube — used when no environment is set.
+    if (!environmentMap) {
+        uint8_t darkGray[4] = {26, 26, 26, 255}; // ~0.1 linear
+        auto defaultEnvTex = device->createTexture(
+            GPU::TextureType::ttCube, GPU::PixelFormat::rgba8unorm,
+            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+        if (defaultEnvTex) {
+            uint8_t faces[24];
+            for (int f = 0; f < 6; ++f) memcpy(faces + f * 4, darkGray, 4);
+            defaultEnvTex->upload(0, 24, faces);
+            environmentMap = defaultEnvTex;
+        }
+    }
+    if (!environmentSampler) {
+        GPU::SamplerDescriptor esd{};
+        esd.addressModeU = GPU::WrapMode::clampToEdge;
+        esd.addressModeV = GPU::WrapMode::clampToEdge;
+        esd.addressModeW = GPU::WrapMode::clampToEdge;
+        esd.magFilter    = GPU::FilterMode::fmLinear;
+        esd.minFilter    = GPU::FilterMode::fmLinear;
+        environmentSampler = device->createSampler(esd);
+    }
+
     // Default instance matrix: identity matrix for non-instanced rendering.
     // Column-major float4x4 (64 bytes) — bound to slot 19 when EXT_mesh_gpu_instancing is not used.
     if (!defaultInstanceMatrixBuffer) {
@@ -557,24 +693,27 @@ void Renderer::setScene(uint32_t index) {
             64, GPU::BufferUsage::vertex, reinterpret_cast<uint8_t*>(identity));
     }
 
-    // Lights uniform buffer (KHR_lights_punctual) - created once, updated each frame
-    if (!lightsUniformBuffer) {
-        lightsUniformBuffer = device->createBuffer(272, GPU::BufferUsage::uniform);
-        // Initialize to zero (no lights)
-        uint8_t zeros[272] = {0};
-        lightsUniformBuffer->upload(0, 272, zeros);
+    // Frame-in-flight buffers: lights, camera, and fences.
+    for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
+        if (!frameResources[f].lightsUniformBuffer) {
+            frameResources[f].lightsUniformBuffer = device->createBuffer(272, GPU::BufferUsage::uniform);
+            uint8_t zeros[272] = {0};
+            frameResources[f].lightsUniformBuffer->upload(0, 272, zeros);
+        }
+        if (!frameResources[f].cameraPositionBuffer) {
+            frameResources[f].cameraPositionBuffer = device->createBuffer(16, GPU::BufferUsage::vertex);
+            float defaultCam[4] = {0.f, 0.f, 3.f, 0.f};
+            frameResources[f].cameraPositionBuffer->upload(0, 16, defaultCam);
+        }
+        if (!frameResources[f].fence) {
+            frameResources[f].fence = device->createFence();
+        }
     }
-
-    // Camera position buffer — created once, uploaded each frame.
-    // 16 bytes for float4 alignment (float3 cameraPos + 1 pad).
-    if (!cameraPositionBuffer) {
-        cameraPositionBuffer = device->createBuffer(16, GPU::BufferUsage::vertex);
-        float defaultCam[4] = {0.f, 0.f, 3.f, 0.f};
-        cameraPositionBuffer->upload(0, 16, defaultCam);
-    }
+    lightsUniformBuffer = frameResources[0].lightsUniformBuffer;
+    cameraPositionBuffer = frameResources[0].cameraPositionBuffer;
 
     // Material uniform buffer — recreated each setScene() (size depends on material count).
-    // Slot 0 = default; slots 1..N = per-material.
+    // Slot 0 = default; slots 1..N = per-material.  Static after upload, so single buffer.
     {
         size_t matCount = asset->materials ? asset->materials->size() : 0;
         uint64_t bufSize = (uint64_t)(matCount + 1) * kMaterialUniformStride;
@@ -587,8 +726,8 @@ void Renderer::setScene(uint32_t index) {
         defaultSpecularTexture && defaultSpecularColorTexture &&
         defaultSheenColorTexture && defaultSheenRoughnessTexture &&
         defaultClearcoatTexture && defaultClearcoatRoughnessTexture &&
-        defaultClearcoatNormalTexture && lightsUniformBuffer &&
-        materialUniformBuffer && cameraPositionBuffer) {
+        defaultClearcoatNormalTexture &&
+        materialUniformBuffer) {
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout  = bindGroupLayout;
         bgDesc.entries = {
@@ -602,7 +741,6 @@ void Renderer::setScene(uint32_t index) {
             {7,  defaultSampler},
             {8,  defaultOcclusionTexture},
             {9,  defaultSampler},
-            {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {11, defaultSpecularTexture},
             {12, defaultSampler},
             {13, defaultSpecularColorTexture},
@@ -612,13 +750,34 @@ void Renderer::setScene(uint32_t index) {
             {17, defaultClearcoatTexture},
             {18, defaultClearcoatRoughnessTexture},
             {19, defaultClearcoatNormalTexture},
-            // Buffer(17): material uniforms — bound to both vertex and fragment stages via setBindGroup.
-            // This makes constant MaterialUniforms &mat [[buffer(17)]] visible to fragment shaders.
+            {21, environmentMap},
+            // Buffer(17): material uniforms — static after scene load.
             {17, GPU::BufferBinding{materialUniformBuffer, 0, kMaterialUniformStride}},
-            // Buffer(18): camera world position — read by fragmentMain_textured [[buffer(18)]].
-            {18, GPU::BufferBinding{cameraPositionBuffer, 0, 16}},
         };
         defaultBindGroup = device->createBindGroup(bgDesc);
+
+        // Flat-variant bind group: only material buffer, no textures/samplers.
+        GPU::BindGroupDescriptor flatBgDesc{};
+        flatBgDesc.layout  = bindGroupLayout;
+        flatBgDesc.entries = {
+            {17, GPU::BufferBinding{materialUniformBuffer, 0, kMaterialUniformStride}},
+        };
+        defaultFlatBindGroup = device->createBindGroup(flatBgDesc);
+    }
+
+    // Per-frame bind groups for lights (10) and camera (18).
+    for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
+        if (!frameBindGroup[f] && bindGroupLayout &&
+            frameResources[f].lightsUniformBuffer &&
+            frameResources[f].cameraPositionBuffer) {
+            GPU::BindGroupDescriptor bgDesc{};
+            bgDesc.layout  = bindGroupLayout;
+            bgDesc.entries = {
+                {10, GPU::BufferBinding{frameResources[f].lightsUniformBuffer, 0, 272}},
+                {18, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, 16}},
+            };
+            frameBindGroup[f] = device->createBindGroup(bgDesc);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -650,8 +809,10 @@ void Renderer::setScene(uint32_t index) {
     // Build one bind group per GLTF material with all material textures.
     // ------------------------------------------------------------------
     materialBindGroups.clear();
+    flatMaterialBindGroups.clear();
     if (asset->materials && bindGroupLayout) {
         materialBindGroups.resize(asset->materials->size());
+        flatMaterialBindGroups.resize(asset->materials->size());
         for (size_t m = 0; m < asset->materials->size(); ++m) {
             auto &mat = (*asset->materials)[m];
 
@@ -776,7 +937,8 @@ void Renderer::setScene(uint32_t index) {
                 getTextureAndSampler(mat.khrMaterialsTransmission->transmissionTexture, transmissionTex, transmissionSamp);
             }
 
-            // Create bind group with all textures and lights buffer
+            // Create bind group with all textures and static material buffer.
+            // Lights (10) and camera (18) are bound separately via frameBindGroup.
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout  = bindGroupLayout;
             bgDesc.entries = {
@@ -790,7 +952,6 @@ void Renderer::setScene(uint32_t index) {
                 {7,  emissiveSamp},
                 {8,  occlusionTex},
                 {9,  occlusionSamp},
-                {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
                 {11, specularTex},
                 {12, specularSamp},
                 {13, specularColorTex},
@@ -801,16 +962,23 @@ void Renderer::setScene(uint32_t index) {
                 {18, clearcoatRoughnessTex},
                 {19, clearcoatNormalTex},
                 {20, transmissionTex},
-                // Buffer(17): material uniforms at the per-material offset — bound to both
-                // vertex and fragment stages via setBindGroup, making [[buffer(17)]] visible
-                // in all fragment shader variants.
+                {21, environmentMap},
+                // Buffer(17): material uniforms at the per-material offset.
                 {17, GPU::BufferBinding{materialUniformBuffer,
                                         (uint64_t)(m + 1) * kMaterialUniformStride,
                                         kMaterialUniformStride}},
-                // Buffer(18): camera world position for specular lighting in fragment shader.
-                {18, GPU::BufferBinding{cameraPositionBuffer, 0, 16}},
             };
             materialBindGroups[m] = device->createBindGroup(bgDesc);
+
+            // Flat-variant bind group: only material buffer, no textures/samplers.
+            GPU::BindGroupDescriptor flatBgDesc{};
+            flatBgDesc.layout  = bindGroupLayout;
+            flatBgDesc.entries = {
+                {17, GPU::BufferBinding{materialUniformBuffer,
+                                        (uint64_t)(m + 1) * kMaterialUniformStride,
+                                        kMaterialUniformStride}},
+            };
+            flatMaterialBindGroups[m] = device->createBindGroup(flatBgDesc);
         }
     }
 
@@ -924,8 +1092,13 @@ void Renderer::setScene(uint32_t index) {
 
             // Build instance matrices (column-major for Metal)
             std::vector<float> instanceMatrices(instanceCount * 16);
+            std::vector<VM::Matrix4<double>> cpuMatrices(instanceCount);
             for (uint32_t i = 0; i < instanceCount; ++i) {
                 VM::Matrix4<float> m = VM::Matrix4<float>::compose(translations[i], rotations[i], scales[i]);
+                cpuMatrices[i] = VM::Matrix4<double>::compose(
+                    VM::Vector3<double>(translations[i].x(), translations[i].y(), translations[i].z()),
+                    VM::Quaternion<double>(rotations[i].x(), rotations[i].y(), rotations[i].z(), rotations[i].w()),
+                    VM::Vector3<double>(scales[i].x(), scales[i].y(), scales[i].z()));
                 // Transpose to column-major for Metal
                 for (int row = 0; row < 4; ++row) {
                     for (int col = 0; col < 4; ++col) {
@@ -942,21 +1115,469 @@ void Renderer::setScene(uint32_t index) {
                 reinterpret_cast<uint8_t*>(instanceMatrices.data()));
 
             if (matrixBuffer) {
-                nodeInstanceData[nodeIdx] = {matrixBuffer, instanceCount};
+                InstanceData data;
+                data.matrixBuffer = matrixBuffer;
+                data.instanceCount = instanceCount;
+                data.cpuMatrices = std::move(cpuMatrices);
+                data.visibleMatrices.resize((size_t)instanceCount * 16);
+                data.visibleCount = instanceCount;
+                nodeInstanceData[nodeIdx] = std::move(data);
             }
+        }
+    }
+
+    primitiveBounds.clear();
+    if (asset->meshes) {
+        for (auto &mesh : *asset->meshes) {
+            for (auto &primitive : mesh.primitives) {
+                primitiveBounds[&primitive] = computePrimitiveBounds(primitive);
+            }
+        }
+    }
+
+    if (asset->nodes) {
+        for (uint64_t nodeIdx = 0; nodeIdx < asset->nodes->size(); ++nodeIdx) {
+            Bounds merged;
+            auto &node = (*asset->nodes)[nodeIdx];
+            if (node.mesh >= 0 && asset->meshes && (size_t)node.mesh < asset->meshes->size()) {
+                auto &mesh = (*asset->meshes)[(size_t)node.mesh];
+                for (auto &primitive : mesh.primitives) {
+                    auto it = primitiveBounds.find(&primitive);
+                    if (it != primitiveBounds.end()) {
+                        merged = mergeBounds(merged, it->second);
+                    }
+                }
+            }
+            nodeMeshLocalBounds[nodeIdx] = merged;
+            nodeLocalBounds[nodeIdx] = merged;
+        }
+
+        for (auto &[nodeIdx, instanceData] : nodeInstanceData) {
+            if (nodeIdx >= nodeLocalBounds.size()) continue;
+            if (!nodeLocalBounds[nodeIdx].valid || instanceData.cpuMatrices.empty()) continue;
+
+            Bounds instancedBounds;
+            for (auto &instanceMatrix : instanceData.cpuMatrices) {
+                instancedBounds = mergeBounds(
+                    instancedBounds,
+                    transformBounds(nodeLocalBounds[nodeIdx], instanceMatrix));
+            }
+            nodeLocalBounds[nodeIdx] = instancedBounds;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Load skinning data (skeletal meshes).
+    // ------------------------------------------------------------------
+    skinData.clear();
+    nodeSkinIndex.clear();
+    totalJointMatrixBytes = 0;
+    if (asset->nodes) {
+        nodeSkinIndex.assign(asset->nodes->size(), -1);
+        for (uint64_t nodeIdx = 0; nodeIdx < asset->nodes->size(); ++nodeIdx) {
+            auto &node = (*asset->nodes)[nodeIdx];
+            if (node.skin >= 0) {
+                nodeSkinIndex[nodeIdx] = node.skin;
+            }
+        }
+    }
+    if (asset->skins && asset->accessors && asset->bufferViews && asset->buffers) {
+        uint64_t gpuOffset = 0;
+        for (size_t skinIdx = 0; skinIdx < asset->skins->size(); ++skinIdx) {
+            auto &gltfSkin = (*asset->skins)[skinIdx];
+            SkinData sd;
+            sd.jointCount = gltfSkin.joints ? gltfSkin.joints->size() : 0;
+            if (sd.jointCount == 0) {
+                skinData.push_back(std::move(sd));
+                continue;
+            }
+            // Read inverse bind matrices accessor (float4x4 per joint).
+            if (gltfSkin.inverseBindMatrices >= 0 &&
+                (size_t)gltfSkin.inverseBindMatrices < asset->accessors->size()) {
+                auto &ibmAcc = (*asset->accessors)[(size_t)gltfSkin.inverseBindMatrices];
+                if (ibmAcc.bufferView >= 0 && (size_t)ibmAcc.bufferView < asset->bufferViews->size()) {
+                    auto &ibmBV = (*asset->bufferViews)[(size_t)ibmAcc.bufferView];
+                    if (ibmBV.buffer >= 0 && (size_t)ibmBV.buffer < asset->buffers->size()) {
+                        auto &buf = (*asset->buffers)[(size_t)ibmBV.buffer];
+                        const uint8_t *src = buf.data.data() + ibmBV.byteOffset + ibmAcc.byteOffset;
+                        sd.inverseBindMatrices.resize(sd.jointCount * 16);
+                        // GLTF stores matrices as 16 floats (column-major).
+                        // Our Matrix4 uses row-major, so we need to transpose.
+                        const float *fSrc = reinterpret_cast<const float*>(src);
+                        for (uint64_t j = 0; j < sd.jointCount; ++j) {
+                            for (int row = 0; row < 4; ++row) {
+                                for (int col = 0; col < 4; ++col) {
+                                    // src is column-major: src[col*4 + row]
+                                    // Store in row-major for our Matrix4
+                                    float val = fSrc[j * 16 + col * 4 + row];
+                                    sd.inverseBindMatrices[j * 16 + row * 4 + col] = val;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Cache joint node indices.
+            if (gltfSkin.joints) {
+                for (auto jn : *gltfSkin.joints) {
+                    sd.jointNodeIndices.push_back(jn);
+                }
+            }
+            // 256-byte aligned offset into joint matrix buffer.
+            sd.gpuOffset = gpuOffset;
+            uint64_t bytesNeeded = sd.jointCount * 64;
+            uint64_t paddedBytes = ((bytesNeeded + 255) / 256) * 256;
+            gpuOffset += paddedBytes;
+            skinData.push_back(std::move(sd));
+        }
+        totalJointMatrixBytes = gpuOffset;
+    }
+
+    // Fallback buffers for primitives without JOINTS_0 / WEIGHTS_0.
+    if (!fallbackJointBuffer) {
+        constexpr uint64_t kFallbackJointSize = 256 * 1024; // enough zero uint4s
+        std::vector<uint8_t> zeros(kFallbackJointSize, 0);
+        fallbackJointBuffer = device->createBuffer(
+            kFallbackJointSize, GPU::BufferUsage::vertex, zeros.data());
+    }
+    if (!fallbackWeightBuffer) {
+        constexpr uint64_t kFallbackWeightSize = 256 * 1024; // enough zero float4s
+        std::vector<uint8_t> zeros(kFallbackWeightSize, 0);
+        fallbackWeightBuffer = device->createBuffer(
+            kFallbackWeightSize, GPU::BufferUsage::vertex, zeros.data());
+    }
+    // Default identity joint matrix for non-skinned draws.
+    if (!defaultJointMatrixBuffer) {
+        float identity[16] = {
+            1, 0, 0, 0,  // column 0
+            0, 1, 0, 0,  // column 1
+            0, 0, 1, 0,  // column 2
+            0, 0, 0, 1   // column 3
+        };
+        defaultJointMatrixBuffer = device->createBuffer(
+            64, GPU::BufferUsage::vertex, reinterpret_cast<uint8_t*>(identity));
+    }
+
+    // Per-frame joint matrix buffers.
+    if (totalJointMatrixBytes > 0) {
+        jointMatrixData.resize(totalJointMatrixBytes / sizeof(float));
+        for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
+            frameResources[f].jointMatrixBuffer = device->createBuffer(
+                totalJointMatrixBytes, GPU::BufferUsage::vertex);
+        }
+    }
+
+    // Detect actual JOINTS_0 / WEIGHTS_0 component types and recreate pipelines if needed.
+    {
+        GPU::ComponentType detectedJointsType = jointsComponentType;
+        GPU::ComponentType detectedWeightsType = weightsComponentType;
+        bool detectedWeightsNorm = weightsNormalized;
+        bool foundJoints = false, foundWeights = false;
+        if (asset->meshes && asset->accessors) {
+            for (auto &mesh : *asset->meshes) {
+                for (auto &primitive : mesh.primitives) {
+                    if (!foundJoints) {
+                        auto jit = primitive.attributes.find("JOINTS_0");
+                        if (jit != primitive.attributes.end() && jit->second >= 0 &&
+                            (size_t)jit->second < asset->accessors->size()) {
+                            detectedJointsType = static_cast<GPU::ComponentType>(
+                                static_cast<int>((*asset->accessors)[(size_t)jit->second].componentType));
+                            foundJoints = true;
+                        }
+                    }
+                    if (!foundWeights) {
+                        auto wit = primitive.attributes.find("WEIGHTS_0");
+                        if (wit != primitive.attributes.end() && wit->second >= 0 &&
+                            (size_t)wit->second < asset->accessors->size()) {
+                            auto &acc = (*asset->accessors)[(size_t)wit->second];
+                            detectedWeightsType = static_cast<GPU::ComponentType>(
+                                static_cast<int>(acc.componentType));
+                            detectedWeightsNorm = acc.normalized;
+                            foundWeights = true;
+                        }
+                    }
+                    if (foundJoints && foundWeights) break;
+                }
+                if (foundJoints && foundWeights) break;
+            }
+        }
+        if (detectedJointsType != jointsComponentType ||
+            detectedWeightsType != weightsComponentType ||
+            detectedWeightsNorm != weightsNormalized) {
+            jointsComponentType = detectedJointsType;
+            weightsComponentType = detectedWeightsType;
+            weightsNormalized = detectedWeightsNorm;
+            // Recreate default pipelines with the correct vertex descriptor.
+            if (cachedColorFormat != GPU::PixelFormat::invalid) {
+                createDefaultPipelines(cachedColorFormat);
+            }
+            // Clear quantized pipelines so they get recreated with the new types.
+            quantizedPipelines.clear();
         }
     }
 
     // Reset animation state when switching scenes — ensures clean slate.
     stopAllAnimations();
+
+    // Create quantized pipeline variants if this asset uses KHR_mesh_quantization.
+    createQuantizedPipelinesIfNeeded();
 }
 
 // ---------------------------------------------------------------------------
 // Pipeline / resize
 // ---------------------------------------------------------------------------
 
+void Renderer::createQuantizedPipelinesIfNeeded() {
+    namespace GPU = systems::leal::campello_gpu;
+
+    if (!quantizedPipelines.empty()) return;
+    if (!asset || !asset->meshes || !asset->accessors) return;
+    if (cachedColorFormat == GPU::PixelFormat::invalid) return;
+
+    // Scan the scene to find the first non-float accessor and determine
+    // which component types are used for each semantic.
+    GPU::ComponentType posType = GPU::ComponentType::ctFloat;
+    GPU::ComponentType normType = GPU::ComponentType::ctFloat;
+    GPU::ComponentType texType = GPU::ComponentType::ctFloat;
+    GPU::ComponentType tanType = GPU::ComponentType::ctFloat;
+    bool hasQuantized = false;
+
+    auto detectType = [&](const std::string &semantic, GPU::ComponentType &outType) {
+        for (auto &mesh : *asset->meshes) {
+            for (auto &primitive : mesh.primitives) {
+                auto it = primitive.attributes.find(semantic);
+                if (it == primitive.attributes.end()) continue;
+                int64_t accIdx = it->second;
+                if (accIdx < 0 || (size_t)accIdx >= asset->accessors->size()) continue;
+                auto &acc = (*asset->accessors)[(size_t)accIdx];
+                if (acc.componentType != systems::leal::gltf::ComponentType::ctFloat) {
+                    outType = static_cast<GPU::ComponentType>(static_cast<int>(acc.componentType));
+                    hasQuantized = true;
+                }
+            }
+        }
+    };
+
+    detectType("POSITION", posType);
+    detectType("NORMAL", normType);
+    detectType("TEXCOORD_0", texType);
+    detectType("TANGENT", tanType);
+
+    if (!hasQuantized) return;
+
+#if defined(__APPLE__)
+    using namespace systems::leal::campello_renderer::shaders;
+    auto shaderModule = device->createShaderModule(kDefaultMetalShader, kDefaultMetalShaderSize);
+    if (!shaderModule) return;
+
+    auto makeLayout = [](GPU::ComponentType ct, GPU::AccessorType at,
+                         double stride, GPU::StepMode sm, uint32_t location,
+                         bool normalized) {
+        GPU::VertexLayout layout{};
+        layout.arrayStride = stride;
+        layout.stepMode    = sm;
+        GPU::VertexAttribute attr{};
+        attr.componentType  = ct;
+        attr.accessorType   = at;
+        attr.offset         = 0;
+        attr.shaderLocation = location;
+        attr.normalized     = normalized;
+        layout.attributes.push_back(attr);
+        return layout;
+    };
+
+    // Strides depend on component size, padded to 4-byte boundary for Metal.
+    auto compSize = [](GPU::ComponentType ct) -> double {
+        switch (ct) {
+            case GPU::ComponentType::ctByte: return 1;
+            case GPU::ComponentType::ctUnsignedByte: return 1;
+            case GPU::ComponentType::ctShort: return 2;
+            case GPU::ComponentType::ctUnsignedShort: return 2;
+            case GPU::ComponentType::ctUnsignedInt: return 4;
+            case GPU::ComponentType::ctFloat: return 4;
+        }
+        return 4;
+    };
+    auto paddedStride = [&](double raw) -> double {
+        uint32_t u = static_cast<uint32_t>(raw);
+        return static_cast<double>((u + 3) & ~uint32_t(3));
+    };
+
+    // Only integer types are normalized for KHR_mesh_quantization.
+    bool posNorm = (posType != GPU::ComponentType::ctFloat && posType != GPU::ComponentType::ctUnsignedInt);
+    bool normNorm = (normType != GPU::ComponentType::ctFloat && normType != GPU::ComponentType::ctUnsignedInt);
+    bool texNorm = (texType != GPU::ComponentType::ctFloat && texType != GPU::ComponentType::ctUnsignedInt);
+    bool tanNorm = (tanType != GPU::ComponentType::ctFloat && tanType != GPU::ComponentType::ctUnsignedInt);
+
+    GPU::RenderPipelineDescriptor base{};
+    base.vertex.module     = shaderModule;
+    base.vertex.entryPoint = "vertexMain";
+    base.vertex.buffers.push_back(makeLayout(
+        posType, GPU::AccessorType::acVec3,
+        paddedStride(3.0 * compSize(posType)), GPU::StepMode::vertex, VERTEX_SLOT_POSITION, posNorm));
+    base.vertex.buffers.push_back(makeLayout(
+        normType, GPU::AccessorType::acVec3,
+        paddedStride(3.0 * compSize(normType)), GPU::StepMode::vertex, VERTEX_SLOT_NORMAL, normNorm));
+    base.vertex.buffers.push_back(makeLayout(
+        texType, GPU::AccessorType::acVec2,
+        paddedStride(2.0 * compSize(texType)), GPU::StepMode::vertex, VERTEX_SLOT_TEXCOORD0, texNorm));
+    base.vertex.buffers.push_back(makeLayout(
+        tanType, GPU::AccessorType::acVec4,
+        paddedStride(4.0 * compSize(tanType)), GPU::StepMode::vertex, VERTEX_SLOT_TANGENT, tanNorm));
+    // JOINTS_0 / WEIGHTS_0 for skinning — use detected component types.
+    double qJointsStride = (jointsComponentType == GPU::ComponentType::ctUnsignedShort) ? 8.0 : 4.0;
+    base.vertex.buffers.push_back(makeLayout(
+        jointsComponentType, GPU::AccessorType::acVec4,
+        qJointsStride, GPU::StepMode::vertex, VERTEX_SLOT_JOINTS, false));
+    double qWeightsStride = (weightsComponentType == GPU::ComponentType::ctFloat) ? 16.0 :
+                            (weightsComponentType == GPU::ComponentType::ctUnsignedShort) ? 8.0 : 4.0;
+    base.vertex.buffers.push_back(makeLayout(
+        weightsComponentType, GPU::AccessorType::acVec4,
+        qWeightsStride, GPU::StepMode::vertex, VERTEX_SLOT_WEIGHTS, weightsNormalized));
+
+    GPU::DepthStencilDescriptor ds{};
+    ds.format              = GPU::PixelFormat::depth32float;
+    ds.depthWriteEnabled   = true;
+    ds.depthCompare        = GPU::CompareOp::less;
+    ds.depthBias           = 0.0;
+    ds.depthBiasClamp      = 0.0;
+    ds.depthBiasSlopeScale = 0.0;
+    ds.stencilReadMask     = 0xFFFFFFFF;
+    ds.stencilWriteMask    = 0xFFFFFFFF;
+    base.depthStencil      = ds;
+
+    base.topology  = GPU::PrimitiveTopology::triangleList;
+    base.cullMode  = GPU::CullMode::back;
+    base.frontFace = GPU::FrontFace::ccw;
+
+    GPU::ColorState cs{};
+    cs.format    = cachedColorFormat;
+    cs.writeMask = GPU::ColorWrite::all;
+
+    // Helper to create a variant and store it in the map.
+    auto storeVariant = [&](int variant, const GPU::RenderPipelineDescriptor &d) {
+        auto pipe = device->createRenderPipeline(d);
+        if (pipe) quantizedPipelines[variant] = pipe;
+    };
+
+    // Variant 1: flat
+    {
+        GPU::RenderPipelineDescriptor d = base;
+        GPU::FragmentDescriptor frag{};
+        frag.module     = shaderModule;
+        frag.entryPoint = "fragmentMain_flat";
+        frag.targets.push_back(cs);
+        d.fragment = frag;
+        storeVariant(1, d);
+    }
+    // Variant 2: textured
+    {
+        GPU::RenderPipelineDescriptor d = base;
+        GPU::FragmentDescriptor frag{};
+        frag.module     = shaderModule;
+        frag.entryPoint = "fragmentMain_textured";
+        frag.targets.push_back(cs);
+        d.fragment = frag;
+        storeVariant(2, d);
+    }
+    // Variant 3: debug
+    {
+        GPU::RenderPipelineDescriptor d = base;
+        GPU::FragmentDescriptor frag{};
+        frag.module     = shaderModule;
+        frag.entryPoint = "fragmentMain_debug";
+        frag.targets.push_back(cs);
+        d.fragment = frag;
+        storeVariant(3, d);
+    }
+    // Variant 4: flat double-sided
+    {
+        GPU::RenderPipelineDescriptor d = base;
+        d.cullMode = GPU::CullMode::none;
+        GPU::FragmentDescriptor frag{};
+        frag.module     = shaderModule;
+        frag.entryPoint = "fragmentMain_flat";
+        frag.targets.push_back(cs);
+        d.fragment = frag;
+        storeVariant(4, d);
+    }
+    // Variant 5: textured double-sided
+    {
+        GPU::RenderPipelineDescriptor d = base;
+        d.cullMode = GPU::CullMode::none;
+        GPU::FragmentDescriptor frag{};
+        frag.module     = shaderModule;
+        frag.entryPoint = "fragmentMain_textured";
+        frag.targets.push_back(cs);
+        d.fragment = frag;
+        storeVariant(5, d);
+    }
+    // Blend state
+    GPU::BlendState alphaBlend{};
+    alphaBlend.color = { GPU::BlendFactor::srcAlpha, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
+    alphaBlend.alpha = { GPU::BlendFactor::one, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
+    GPU::DepthStencilDescriptor blendDs = ds;
+    blendDs.depthWriteEnabled = false;
+    // Variant 6: flat blend
+    {
+        GPU::RenderPipelineDescriptor d = base;
+        d.depthStencil = blendDs;
+        GPU::ColorState blendCs = cs;
+        blendCs.blend = alphaBlend;
+        GPU::FragmentDescriptor frag{};
+        frag.module     = shaderModule;
+        frag.entryPoint = "fragmentMain_flat";
+        frag.targets.push_back(blendCs);
+        d.fragment = frag;
+        storeVariant(6, d);
+    }
+    // Variant 7: textured blend
+    {
+        GPU::RenderPipelineDescriptor d = base;
+        d.depthStencil = blendDs;
+        GPU::ColorState blendCs = cs;
+        blendCs.blend = alphaBlend;
+        GPU::FragmentDescriptor frag{};
+        frag.module     = shaderModule;
+        frag.entryPoint = "fragmentMain_textured";
+        frag.targets.push_back(blendCs);
+        d.fragment = frag;
+        storeVariant(7, d);
+    }
+    // Variant 8: flat blend double-sided
+    {
+        GPU::RenderPipelineDescriptor d = base;
+        d.cullMode = GPU::CullMode::none;
+        d.depthStencil = blendDs;
+        GPU::ColorState blendCs = cs;
+        blendCs.blend = alphaBlend;
+        GPU::FragmentDescriptor frag{};
+        frag.module     = shaderModule;
+        frag.entryPoint = "fragmentMain_flat";
+        frag.targets.push_back(blendCs);
+        d.fragment = frag;
+        storeVariant(8, d);
+    }
+    // Variant 9: textured blend double-sided
+    {
+        GPU::RenderPipelineDescriptor d = base;
+        d.cullMode = GPU::CullMode::none;
+        d.depthStencil = blendDs;
+        GPU::ColorState blendCs = cs;
+        blendCs.blend = alphaBlend;
+        GPU::FragmentDescriptor frag{};
+        frag.module     = shaderModule;
+        frag.entryPoint = "fragmentMain_textured";
+        frag.targets.push_back(blendCs);
+        d.fragment = frag;
+        storeVariant(9, d);
+    }
+#endif
+}
+
 void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat colorFormat) {
     namespace GPU = systems::leal::campello_gpu;
+    cachedColorFormat = colorFormat;
 
 #if defined(__APPLE__)
     using namespace systems::leal::campello_renderer::shaders;
@@ -972,10 +1593,11 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     base.vertex.module     = shaderModule;
     base.vertex.entryPoint = "vertexMain";
 
-    // Slots 0–3: stage_in attributes. Slots 16/17 are raw [[buffer(N)]] in the
+    // Slots 0–5: stage_in attributes. Slots 16/17 are raw [[buffer(N)]] in the
     // shader and are not part of the vertex descriptor.
     auto makeLayout = [](GPU::ComponentType ct, GPU::AccessorType at,
-                         double stride, GPU::StepMode sm, uint32_t location) {
+                         double stride, GPU::StepMode sm, uint32_t location,
+                         bool normalized = false) {
         GPU::VertexLayout layout{};
         layout.arrayStride = stride;
         layout.stepMode    = sm;
@@ -984,6 +1606,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         attr.accessorType   = at;
         attr.offset         = 0;
         attr.shaderLocation = location;
+        attr.normalized     = normalized;
         layout.attributes.push_back(attr);
         return layout;
     };
@@ -1000,23 +1623,16 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     base.vertex.buffers.push_back(makeLayout(
         GPU::ComponentType::ctFloat, GPU::AccessorType::acVec4,
         16.0, GPU::StepMode::vertex, VERTEX_SLOT_TANGENT));
-
-    // Slot 19 — Instance matrix (float4x4), per-instance for EXT_mesh_gpu_instancing.
-    // Split into 4 vec4 attributes at locations 24-27.
-    {
-        GPU::VertexLayout instLayout{};
-        instLayout.arrayStride = 64; // sizeof(float4x4)
-        instLayout.stepMode    = GPU::StepMode::instance;
-        for (uint32_t col = 0; col < 4; col++) {
-            GPU::VertexAttribute attr{};
-            attr.componentType  = GPU::ComponentType::ctFloat;
-            attr.accessorType   = GPU::AccessorType::acVec4;
-            attr.offset         = col * 16; // 4 floats * 4 bytes per column
-            attr.shaderLocation = VERTEX_SLOT_INSTANCE_MATRIX + col; // locations 24, 25, 26, 27
-            instLayout.attributes.push_back(attr);
-        }
-        base.vertex.buffers.push_back(instLayout);
-    }
+    // JOINTS_0 / WEIGHTS_0 — use detected component types (may be recreated in setScene()).
+    double jointsStride = (jointsComponentType == GPU::ComponentType::ctUnsignedShort) ? 8.0 : 4.0;
+    base.vertex.buffers.push_back(makeLayout(
+        jointsComponentType, GPU::AccessorType::acVec4,
+        jointsStride, GPU::StepMode::vertex, VERTEX_SLOT_JOINTS));
+    double weightsStride = (weightsComponentType == GPU::ComponentType::ctFloat) ? 16.0 :
+                           (weightsComponentType == GPU::ComponentType::ctUnsignedShort) ? 8.0 : 4.0;
+    base.vertex.buffers.push_back(makeLayout(
+        weightsComponentType, GPU::AccessorType::acVec4,
+        weightsStride, GPU::StepMode::vertex, VERTEX_SLOT_WEIGHTS, weightsNormalized));
 
     GPU::DepthStencilDescriptor ds{};
     ds.format              = GPU::PixelFormat::depth32float;
@@ -1151,6 +1767,71 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         frag.targets.push_back(blendCs);
         d.fragment = frag;
         pipelineTexturedBlendDoubleSided = device->createRenderPipeline(d);
+    }
+
+    // --- Skybox pipeline ---
+    {
+        // Skybox bind group layout: cube texture (0), sampler (1), uniform buffer (2).
+        if (!skyboxBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor sbglDesc{};
+            GPU::EntryObject sbTex{};
+            sbTex.binding = 0;
+            sbTex.visibility = GPU::ShaderStage::fragment;
+            sbTex.type = GPU::EntryObjectType::texture;
+            sbTex.data.texture.multisampled = false;
+            sbTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            sbTex.data.texture.viewDimension = GPU::TextureType::ttCube;
+            sbglDesc.entries.push_back(sbTex);
+
+            GPU::EntryObject sbSamp{};
+            sbSamp.binding = 1;
+            sbSamp.visibility = GPU::ShaderStage::fragment;
+            sbSamp.type = GPU::EntryObjectType::sampler;
+            sbSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            sbglDesc.entries.push_back(sbSamp);
+
+            GPU::EntryObject sbBuf{};
+            sbBuf.binding = 2;
+            sbBuf.visibility = GPU::ShaderStage::fragment;
+            sbBuf.type = GPU::EntryObjectType::buffer;
+            sbBuf.data.buffer.hasDinamicOffaset = false;
+            sbBuf.data.buffer.minBindingSize = 96;
+            sbBuf.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+            sbglDesc.entries.push_back(sbBuf);
+
+            skyboxBindGroupLayout = device->createBindGroupLayout(sbglDesc);
+        }
+
+        GPU::RenderPipelineDescriptor skyDesc{};
+        skyDesc.vertex.module = shaderModule;
+        skyDesc.vertex.entryPoint = "skyboxVertex";
+        // No vertex buffers — fullscreen triangle generated from vertex_id.
+
+        GPU::DepthStencilDescriptor skyDs{};
+        skyDs.format = GPU::PixelFormat::depth32float;
+        skyDs.depthWriteEnabled = false;   // Don't write depth
+        skyDs.depthCompare = GPU::CompareOp::lessEqual;
+        skyDs.depthBias = 0.0;
+        skyDs.depthBiasClamp = 0.0;
+        skyDs.depthBiasSlopeScale = 0.0;
+        skyDs.stencilReadMask = 0xFFFFFFFF;
+        skyDs.stencilWriteMask = 0xFFFFFFFF;
+        skyDesc.depthStencil = skyDs;
+
+        skyDesc.topology = GPU::PrimitiveTopology::triangleList;
+        skyDesc.cullMode = GPU::CullMode::none;
+        skyDesc.frontFace = GPU::FrontFace::ccw;
+
+        GPU::FragmentDescriptor skyFrag{};
+        skyFrag.module = shaderModule;
+        skyFrag.entryPoint = "skyboxFragment";
+        GPU::ColorState skyCs{};
+        skyCs.format = colorFormat;
+        skyCs.writeMask = GPU::ColorWrite::all;
+        skyFrag.targets.push_back(skyCs);
+        skyDesc.fragment = skyFrag;
+
+        pipelineSkybox = device->createRenderPipeline(skyDesc);
     }
 
 #elif defined(ANDROID)
@@ -1470,15 +2151,27 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         fallbackUVBuffer = device->createBuffer(
             kFallbackUVSize, GPU::BufferUsage::vertex, zeros.data());
     }
+
+    // Fallback tangent buffer — all zeros, used for primitives without TANGENT.
+    // Zero-length tangents trigger the shader's auto-generated fallback.
+    if (!fallbackTangentBuffer) {
+        constexpr uint64_t kFallbackTangentSize = 256 * 1024; // 16 384 float4 values
+        std::vector<uint8_t> zeros(kFallbackTangentSize, 0);
+        fallbackTangentBuffer = device->createBuffer(
+            kFallbackTangentSize, GPU::BufferUsage::vertex, zeros.data());
+    }
 }
 
 void Renderer::resize(uint32_t width, uint32_t height) {
+    std::cout << "[Renderer::resize] " << renderWidth << "x" << renderHeight
+              << " → " << width << "x" << height << std::endl;
     renderWidth  = width;
     renderHeight = height;
 
     if (width == 0 || height == 0) {
         depthTexture = nullptr;
         depthView    = nullptr;
+        std::cout << "[Renderer::resize] zero size, cleared depth" << std::endl;
         return;
     }
 
@@ -1523,6 +2216,326 @@ Renderer::nodeLocalMatrix(const systems::leal::gltf::Node &node) {
         node.translation, node.rotation, node.scale);
 }
 
+Renderer::Bounds Renderer::mergeBounds(const Bounds &a, const Bounds &b) {
+    if (!a.valid) return b;
+    if (!b.valid) return a;
+
+    Bounds out;
+    out.valid = true;
+    out.min = systems::leal::vector_math::Vector3<double>(
+        std::min(a.min.x(), b.min.x()),
+        std::min(a.min.y(), b.min.y()),
+        std::min(a.min.z(), b.min.z()));
+    out.max = systems::leal::vector_math::Vector3<double>(
+        std::max(a.max.x(), b.max.x()),
+        std::max(a.max.y(), b.max.y()),
+        std::max(a.max.z(), b.max.z()));
+    return out;
+}
+
+Renderer::Bounds Renderer::transformBounds(
+    const Bounds &bounds,
+    const systems::leal::vector_math::Matrix4<double> &world) const
+{
+    if (!bounds.valid) return {};
+
+    auto transformPoint = [&](double x, double y, double z) {
+        return systems::leal::vector_math::Vector3<double>(
+            world.data[0] * x + world.data[1] * y + world.data[2]  * z + world.data[3],
+            world.data[4] * x + world.data[5] * y + world.data[6]  * z + world.data[7],
+            world.data[8] * x + world.data[9] * y + world.data[10] * z + world.data[11]);
+    };
+
+    Bounds out;
+    out.valid = true;
+    bool first = true;
+    for (int ix = 0; ix < 2; ++ix) {
+        for (int iy = 0; iy < 2; ++iy) {
+            for (int iz = 0; iz < 2; ++iz) {
+                auto p = transformPoint(
+                    ix ? bounds.max.x() : bounds.min.x(),
+                    iy ? bounds.max.y() : bounds.min.y(),
+                    iz ? bounds.max.z() : bounds.min.z());
+                if (first) {
+                    out.min = out.max = p;
+                    first = false;
+                } else {
+                    out.min = systems::leal::vector_math::Vector3<double>(
+                        std::min(out.min.x(), p.x()),
+                        std::min(out.min.y(), p.y()),
+                        std::min(out.min.z(), p.z()));
+                    out.max = systems::leal::vector_math::Vector3<double>(
+                        std::max(out.max.x(), p.x()),
+                        std::max(out.max.y(), p.y()),
+                        std::max(out.max.z(), p.z()));
+                }
+            }
+        }
+    }
+    return out;
+}
+
+Renderer::Bounds Renderer::computePrimitiveBounds(
+    const systems::leal::gltf::Primitive &primitive) const
+{
+    Bounds out;
+    if (!asset || !asset->accessors || !asset->bufferViews || !asset->buffers) return out;
+
+    auto posIt = primitive.attributes.find("POSITION");
+    if (posIt == primitive.attributes.end()) return out;
+    if ((size_t)posIt->second >= asset->accessors->size()) return out;
+
+    auto &acc = (*asset->accessors)[posIt->second];
+    if (acc.type != systems::leal::gltf::AccessorType::acVec3) return out;
+
+    if (acc.min && acc.max && acc.min->size() >= 3 && acc.max->size() >= 3) {
+        out.valid = true;
+        out.min = systems::leal::vector_math::Vector3<double>((*acc.min)[0], (*acc.min)[1], (*acc.min)[2]);
+        out.max = systems::leal::vector_math::Vector3<double>((*acc.max)[0], (*acc.max)[1], (*acc.max)[2]);
+        return out;
+    }
+
+    if (acc.componentType != systems::leal::gltf::ComponentType::ctFloat) return out;
+
+    if (acc.bufferView < 0 || (size_t)acc.bufferView >= asset->bufferViews->size()) return out;
+    auto &bv = (*asset->bufferViews)[(size_t)acc.bufferView];
+    if ((size_t)bv.buffer >= asset->buffers->size()) return out;
+    auto &buffer = (*asset->buffers)[(size_t)bv.buffer];
+    if (buffer.data.empty()) return out;
+
+    size_t stride = bv.byteStride > 0 ? (size_t)bv.byteStride : 12;
+    size_t start = (size_t)bv.byteOffset + (size_t)acc.byteOffset;
+    if (start + 12 > buffer.data.size()) return out;
+
+    bool first = true;
+    for (size_t i = 0; i < acc.count; ++i) {
+        size_t offset = start + i * stride;
+        if (offset + 12 > buffer.data.size()) break;
+        const float *v = reinterpret_cast<const float *>(buffer.data.data() + offset);
+        systems::leal::vector_math::Vector3<double> p(v[0], v[1], v[2]);
+        if (first) {
+            out.min = out.max = p;
+            out.valid = true;
+            first = false;
+        } else {
+            out.min = systems::leal::vector_math::Vector3<double>(
+                std::min(out.min.x(), p.x()),
+                std::min(out.min.y(), p.y()),
+                std::min(out.min.z(), p.z()));
+            out.max = systems::leal::vector_math::Vector3<double>(
+                std::max(out.max.x(), p.x()),
+                std::max(out.max.y(), p.y()),
+                std::max(out.max.z(), p.z()));
+        }
+    }
+
+    return out;
+}
+
+int64_t Renderer::resolvePrimitiveMaterial(const systems::leal::gltf::Primitive &primitive) const {
+    int64_t matIdx = primitive.material;
+    if (activeVariant >= 0 && !primitive.khrMaterialsVariantsMappings.empty()) {
+        for (auto &mapping : primitive.khrMaterialsVariantsMappings) {
+            for (auto v : mapping.variants) {
+                if ((int64_t)v == activeVariant) {
+                    return mapping.material;
+                }
+            }
+        }
+    }
+    return matIdx;
+}
+
+bool Renderer::isTransparentMaterial(int64_t materialIndex) const {
+    if (materialIndex < 0 || !asset->materials || (size_t)materialIndex >= asset->materials->size()) {
+        return false;
+    }
+
+    auto &mat = (*asset->materials)[(size_t)materialIndex];
+    if (mat.alphaMode == systems::leal::gltf::AlphaMode::blend) return true;
+    return mat.khrMaterialsTransmission && mat.khrMaterialsTransmission->transmissionFactor > 0.0f;
+}
+
+void Renderer::updateFrustumPlanes() {
+    auto makePlane = [](double a, double b, double c, double d) {
+        Plane plane;
+        plane.normal = systems::leal::vector_math::Vector3<double>(a, b, c);
+        double len = plane.normal.length();
+        if (len > 1e-8) {
+            plane.normal = plane.normal / len;
+            plane.distance = d / len;
+        } else {
+            plane.distance = d;
+        }
+        return plane;
+    };
+
+    const auto &m = vpMatrix.data;
+    // vpMatrix is stored row-major and uses column-vector convention (M * v).
+    // Row i is at m[i*4 + 0..3].  Clip coordinates are dot(row_i, v).
+    // OpenGL/Metal clip space: -w <= x,y,z <= w.
+    frustumPlanes[0] = makePlane(m[0] + m[12],  m[1] + m[13],  m[2] + m[14],  m[3] + m[15]);   // left   (row0 + row3)
+    frustumPlanes[1] = makePlane(m[12] - m[0],  m[13] - m[1],  m[14] - m[2],  m[15] - m[3]);   // right  (row3 - row0)
+    frustumPlanes[2] = makePlane(m[4] + m[12],  m[5] + m[13],  m[6] + m[14],  m[7] + m[15]);   // bottom (row1 + row3)
+    frustumPlanes[3] = makePlane(m[12] - m[4],  m[13] - m[5],  m[14] - m[6],  m[15] - m[7]);   // top    (row3 - row1)
+    frustumPlanes[4] = makePlane(m[8] + m[12],  m[9] + m[13],  m[10] + m[14], m[11] + m[15]);  // near   (row2 + row3)
+    frustumPlanes[5] = makePlane(m[12] - m[8],  m[13] - m[9],  m[14] - m[10], m[15] - m[11]);  // far    (row3 - row2)
+    hasFrustumPlanes = true;
+}
+
+bool Renderer::isBoundsVisible(const Bounds &bounds) const {
+    if (!bounds.valid || !hasFrustumPlanes) return true;
+
+    for (const auto &plane : frustumPlanes) {
+        // p-vertex: the AABB corner most inside along the plane normal
+        double px = (plane.normal.x() >= 0.0) ? bounds.max.x() : bounds.min.x();
+        double py = (plane.normal.y() >= 0.0) ? bounds.max.y() : bounds.min.y();
+        double pz = (plane.normal.z() >= 0.0) ? bounds.max.z() : bounds.min.z();
+
+        double dist = plane.normal.x() * px
+                    + plane.normal.y() * py
+                    + plane.normal.z() * pz
+                    + plane.distance;
+        if (dist < 0.0) {
+            // Even the most-inside corner is behind this plane → cull
+            return false;
+        }
+    }
+    return true;
+}
+
+void Renderer::uploadVisibleNodeTransforms() {
+    if (!transformBuffer || nodeTransforms.empty()) return;
+
+    // Find the highest visible node index to reduce upload size.
+    size_t maxVisibleIndex = 0;
+    for (size_t i = visibleNodeMask.size(); i-- > 0;) {
+        if (visibleNodeMask[i]) {
+            maxVisibleIndex = i;
+            break;
+        }
+    }
+
+    size_t uploadFloats = (maxVisibleIndex + 1) * 32; // 32 floats per node
+    if (uploadFloats > nodeTransforms.size()) uploadFloats = nodeTransforms.size();
+
+    transformBuffer->upload(
+        0,
+        uploadFloats * sizeof(float),
+        reinterpret_cast<uint8_t *>(nodeTransforms.data()));
+}
+
+void Renderer::updateVisibleInstances(uint64_t nodeIndex) {
+    auto instIt = nodeInstanceData.find(nodeIndex);
+    if (instIt == nodeInstanceData.end()) return;
+
+    auto &instanceData = instIt->second;
+    instanceData.visibleCount = 0;
+
+    if (!instanceData.matrixBuffer || instanceData.cpuMatrices.empty()) return;
+
+    size_t writeOffset = 0;
+    for (const auto &instanceMatrix : instanceData.cpuMatrices) {
+        // Quick point-in-frustum test using the instance translation.
+        double px = instanceMatrix.data[3];   // column 3, row 0
+        double py = instanceMatrix.data[7];   // column 3, row 1
+        double pz = instanceMatrix.data[11];  // column 3, row 2
+
+        bool visible = true;
+        if (hasFrustumPlanes) {
+            for (const auto &plane : frustumPlanes) {
+                double dist = plane.normal.x() * px
+                            + plane.normal.y() * py
+                            + plane.normal.z() * pz
+                            + plane.distance;
+                if (dist < 0.0) { visible = false; break; }
+            }
+        }
+
+        if (!visible) continue;
+
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 4; ++col) {
+                instanceData.visibleMatrices[writeOffset + col * 4 + row] =
+                    static_cast<float>(instanceMatrix.data[row * 4 + col]);
+            }
+        }
+        writeOffset += 16;
+        instanceData.visibleCount++;
+    }
+
+    if (instanceData.visibleCount == 0) return;
+
+    instanceData.matrixBuffer->upload(
+        0,
+        static_cast<uint64_t>(instanceData.visibleCount) * 64,
+        reinterpret_cast<uint8_t *>(instanceData.visibleMatrices.data()));
+}
+
+// ---------------------------------------------------------------------------
+// Skeletal mesh skinning
+// ---------------------------------------------------------------------------
+
+void Renderer::computeSkinningTransforms() {
+    if (skinData.empty() || totalJointMatrixBytes == 0) return;
+    if (jointMatrixData.empty()) return;
+
+    namespace VM = systems::leal::vector_math;
+
+    for (size_t skinIdx = 0; skinIdx < skinData.size(); ++skinIdx) {
+        auto &sd = skinData[skinIdx];
+        if (sd.jointCount == 0) continue;
+
+        // Find the world matrix of the skinned mesh node so we can cancel it out.
+        // Per glTF spec: jointMatrix = inverse(skinNodeWorld) * jointWorld * inverseBindMatrix
+        VM::Matrix4<double> skinNodeWorld = VM::Matrix4<double>::identity();
+        for (uint64_t nodeIdx = 0; nodeIdx < nodeSkinIndex.size(); ++nodeIdx) {
+            if (nodeSkinIndex[nodeIdx] == (int64_t)skinIdx && nodeIdx < nodeWorldMatrices.size()) {
+                skinNodeWorld = nodeWorldMatrices[nodeIdx];
+                break;
+            }
+        }
+        VM::Matrix4<double> invSkinNodeWorld = skinNodeWorld.inverted();
+
+        for (uint64_t j = 0; j < sd.jointCount; ++j) {
+            uint64_t jointNodeIdx = sd.jointNodeIndices[j];
+            VM::Matrix4<double> jointWorld = VM::Matrix4<double>::identity();
+            if (jointNodeIdx < nodeWorldMatrices.size()) {
+                jointWorld = nodeWorldMatrices[jointNodeIdx];
+            }
+
+            // Read inverse bind matrix for this joint (stored row-major in sd.inverseBindMatrices).
+            VM::Matrix4<double> ibm;
+            for (int row = 0; row < 4; ++row) {
+                for (int col = 0; col < 4; ++col) {
+                    ibm.data[row * 4 + col] = sd.inverseBindMatrices[j * 16 + row * 4 + col];
+                }
+            }
+
+            // finalMatrix = inv(skinNodeWorld) * jointWorld * inverseBindMatrix
+            VM::Matrix4<double> finalMatrix = invSkinNodeWorld * jointWorld * ibm;
+
+            // Write to jointMatrixData in column-major for Metal (transposed from row-major).
+            size_t baseIdx = (sd.gpuOffset / sizeof(float)) + j * 16;
+            for (int row = 0; row < 4; ++row) {
+                for (int col = 0; col < 4; ++col) {
+                    jointMatrixData[baseIdx + col * 4 + row] = static_cast<float>(finalMatrix.data[row * 4 + col]);
+                }
+            }
+        }
+    }
+}
+
+void Renderer::uploadJointMatrices() {
+    if (skinData.empty() || totalJointMatrixBytes == 0) return;
+    if (jointMatrixData.empty()) return;
+    auto &frame = frameResources[currentFrameIndex];
+    if (!frame.jointMatrixBuffer) return;
+    frame.jointMatrixBuffer->upload(
+        0, totalJointMatrixBytes,
+        reinterpret_cast<uint8_t *>(jointMatrixData.data()));
+}
+
 bool Renderer::findCameraNode(
     uint64_t nodeIndex,
     const systems::leal::vector_math::Matrix4<double> &parentWorld,
@@ -1555,6 +2568,13 @@ void Renderer::computeNodeTransform(
 
     auto local = nodeLocalMatrix(node);
     auto  world = parentWorld * local;
+    if (nodeIndex < nodeWorldMatrices.size()) {
+        nodeWorldMatrices[nodeIndex] = world;
+    }
+    Bounds worldBounds;
+    if (nodeIndex < nodeLocalBounds.size()) {
+        worldBounds = transformBounds(nodeLocalBounds[nodeIndex], world);
+    }
 
     // Buffer layout per node: 32 floats total, stored as two contiguous float4x4 matrices
     // [0..15]  = MVP matrix (clip space) - matrices[0] in shader
@@ -1577,23 +2597,16 @@ void Renderer::computeNodeTransform(
             }
         }
         
-        // Debug: print first matrix values for first node
-        static int matrixDebugCount = 0;
-        if (matrixDebugCount < 3 && nodeIndex == 0) {
-            std::cout << "Node 0 Model matrix translation: " 
-                      << world.data[3] << ", "
-                      << world.data[7] << ", "
-                      << world.data[11] << std::endl;
-            std::cout << "  First few buffer values: "
-                      << nodeTransforms[16] << ", "
-                      << nodeTransforms[17] << ", "
-                      << nodeTransforms[18] << ", "
-                      << nodeTransforms[19] << std::endl;
-            matrixDebugCount++;
-        }
+        // (matrix debug removed)
     }
     for (auto childIndex : node.children) {
         computeNodeTransform(childIndex, world);
+        if (childIndex < nodeWorldBounds.size()) {
+            worldBounds = mergeBounds(worldBounds, nodeWorldBounds[childIndex]);
+        }
+    }
+    if (nodeIndex < nodeWorldBounds.size()) {
+        nodeWorldBounds[nodeIndex] = worldBounds;
     }
 }
 
@@ -1638,6 +2651,21 @@ void Renderer::renderToTarget(
                    !pipelineFlatBlendDoubleSided && !pipelineTexturedBlendDoubleSided)) return;
     if (!asset->scenes || sceneIndex >= asset->scenes->size()) return;
     if (!colorView) return;
+
+    // ------------------------------------------------------------------
+    // Frame-in-flight synchronization.
+    // Wait until the GPU has finished with the frame slot we're about to overwrite.
+    // ------------------------------------------------------------------
+    auto &frame = frameResources[currentFrameIndex];
+    if (frame.fence) {
+        frame.fence->wait();
+    }
+
+    // Update aliases so existing code references the current frame's buffers.
+    transformBuffer       = frame.transformBuffer;
+    cameraPositionBuffer  = frame.cameraPositionBuffer;
+    lightsUniformBuffer   = frame.lightsUniformBuffer;
+    // jointMatrixBuffer is accessed directly via frameResources[currentFrameIndex] during render.
 
     auto encoder = device->createCommandEncoder();
     if (!encoder) return;
@@ -1697,6 +2725,8 @@ void Renderer::renderToTarget(
         vpMatrix = proj * view;
     }
 
+    updateFrustumPlanes();
+
     // ------------------------------------------------------------------
     // 2. Upload camera position for specular lighting.
     //
@@ -1738,6 +2768,34 @@ void Renderer::renderToTarget(
     }
 
     // ------------------------------------------------------------------
+    // 3a. Upload skybox uniforms (invVP + screenSize + cameraPos).
+    // ------------------------------------------------------------------
+    if (pipelineSkybox && environmentMap) {
+        if (!skyboxUniformBuffer[currentFrameIndex]) {
+            skyboxUniformBuffer[currentFrameIndex] = device->createBuffer(96, GPU::BufferUsage::uniform);
+        }
+        if (skyboxUniformBuffer[currentFrameIndex]) {
+            auto invVP = vpMatrix.inverted();
+            float skyboxData[24] = {0}; // 96 bytes
+            // invVP in column-major for Metal (transposed from row-major)
+            for (int row = 0; row < 4; ++row) {
+                for (int col = 0; col < 4; ++col) {
+                    skyboxData[col * 4 + row] = (float)invVP.data[row * 4 + col];
+                }
+            }
+            // screenSize at offset 64 (float2)
+            skyboxData[16] = (float)renderWidth;
+            skyboxData[17] = (float)renderHeight;
+            // cameraPos at offset 80 (float3, 16-byte aligned)
+            skyboxData[20] = cameraWorldPos[0];
+            skyboxData[21] = cameraWorldPos[1];
+            skyboxData[22] = cameraWorldPos[2];
+            skyboxUniformBuffer[currentFrameIndex]->upload(
+                0, 96, reinterpret_cast<uint8_t*>(skyboxData));
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 3. Upload KHR_lights_punctual lights to uniform buffer (binding 10).
     //
     // Uniform buffer layout (256 bytes):
@@ -1766,7 +2824,7 @@ void Renderer::renderToTarget(
             LightsUniform lightsData = {};
             lightsData.count = 0;
             
-            if (asset && asset->khrLightsPunctual && !asset->khrLightsPunctual->empty()) {
+            if (punctualLightsEnabled && asset && asset->khrLightsPunctual && !asset->khrLightsPunctual->empty()) {
                 // Count and collect lights from scene nodes
                 int lightCount = 0;
                 
@@ -1858,9 +2916,8 @@ void Renderer::renderToTarget(
                 lightsData.count = (uint32_t)lightCount;
             }
 
-            // If the asset has no lights, synthesize a default directional light
-            // so the shader always iterates at least one light with no special cases.
-            if (lightsData.count == 0) {
+            // If the asset has no lights, optionally synthesize a default directional light.
+            if (lightsData.count == 0 && defaultLightEnabled) {
                 lightsData.count = 1;
                 LightData &ld = lightsData.lights[0];
                 // Direction: normalize(0.5, 1.0, 0.5) — front-top-right
@@ -1878,23 +2935,7 @@ void Renderer::renderToTarget(
             }
 
             lightsUniformBuffer->upload(0, sizeof(LightsUniform), &lightsData);
-            
-            // DEBUG: Print light data
-            if (lightsData.count > 0) {
-                std::cout << "=== LIGHTS UPLOADED: count=" << lightsData.count << " ===" << std::endl;
-                for (uint32_t i = 0; i < lightsData.count; i++) {
-                    std::cout << "  Light " << i << ": pos=" 
-                              << lightsData.lights[i].position[0] << ","
-                              << lightsData.lights[i].position[1] << ","
-                              << lightsData.lights[i].position[2]
-                              << " color="
-                              << lightsData.lights[i].color[0] << ","
-                              << lightsData.lights[i].color[1] << ","
-                              << lightsData.lights[i].color[2]
-                              << " intensity=" << lightsData.lights[i].color[3]
-                              << std::endl;
-                }
-            }
+            // (lights debug removed)
         }
     }
 
@@ -1934,6 +2975,7 @@ void Renderer::renderToTarget(
         // Correct offsets (verified from shader struct):
         //   transmissionFactor = offset 228 (index 57)
         //   hasTransmissionTexture = offset 232 (index 58)
+        //   viewMode = offset 236 (index 59)
         auto buildSlot = [](float bc[4], float r0[4], float r1[4],
                             float metallic, float roughness, float normalScale,
                             float alphaMode, float alphaCutoff, float unlit,
@@ -1948,9 +2990,11 @@ void Renderer::renderToTarget(
                             float hasClearcoatTex, float hasClearcoatRoughnessTex,
                             float hasClearcoatNormalTex, float clearcoatNormalScale,
                             float transmissionFactor, float hasTransmissionTex,
-                            float out[60]) {
+                            float viewModeValue,
+                            float environmentIntensityValue, float iblEnabledValue,
+                            float out[64]) {
             // Zero initialize
-            for (int i = 0; i < 60; i++) out[i] = 0.f;
+            for (int i = 0; i < 64; i++) out[i] = 0.f;
             
             // [0-2] float4s at offsets 0, 16, 32
             out[0]  = bc[0]; out[1]  = bc[1]; out[2]  = bc[2];  out[3]  = bc[3];
@@ -2015,6 +3059,9 @@ void Renderer::renderToTarget(
             // hasTransmissionTexture at offset 232 (index 58)
             out[57] = transmissionFactor;     // 228
             out[58] = hasTransmissionTex;     // 232
+            out[59] = viewModeValue;          // 236
+            out[60] = environmentIntensityValue; // 240
+            out[61] = iblEnabledValue;           // 244
         };
 
         // Default slot — white, identity UV transform, metallic=1, roughness=1, no textures, no sheen, no clearcoat, no transmission.
@@ -2025,13 +3072,14 @@ void Renderer::renderToTarget(
             float emissive[3]      = {0.f, 0.f, 0.f};
             float specularColor[3] = {1.f, 1.f, 1.f};
             float sheenColor[3]    = {0.f, 0.f, 0.f};
-            float slot[60];
+            float slot[64];
             buildSlot(bc, row0, row1, 1.f, 1.f, 1.f, 0.f, 0.5f, 0.f, 0.f, 0.f, 0.f, 1.f,
                       emissive, 1.5f, 1.f, 0.f, 0.f, specularColor,
                       sheenColor, 0.f, 0.f, 0.f,
                       0.f, 0.f, 0.f, 0.f, 0.f, 1.f,
-                      0.f, 0.f, slot); // transmissionFactor=0, hasTransmissionTex=0
-            materialUniformBuffer->upload(0, (uint64_t)(60 * sizeof(float)), slot);
+                      0.f, 0.f, (float)viewMode,
+                      environmentIntensity, iblEnabled ? 1.f : 0.f, slot);
+            materialUniformBuffer->upload(0, (uint64_t)(64 * sizeof(float)), slot);
         }
 
         if (asset->materials) {
@@ -2161,7 +3209,7 @@ void Renderer::renderToTarget(
                     }
                 }
 
-                float slot[60];
+                float slot[64];
                 buildSlot(bc, row0, row1, metallic, roughness, normalScale,
                           alphaMode, alphaCutoff, unlit, hasNormal, hasEmissive, hasOcclusion,
                           occlusionStrength, emissiveFactor, ior,
@@ -2169,11 +3217,11 @@ void Renderer::renderToTarget(
                           sheenColorFactor, sheenRoughnessFactor, hasSheenColorTex, hasSheenRoughnessTex,
                           clearcoatFactor, clearcoatRoughnessFactor,
                           hasClearcoatTex, hasClearcoatRoughnessTex, hasClearcoatNormalTex, clearcoatNormalScale,
-                          transmissionFactor, hasTransmissionTex,
-                          slot);
+                          transmissionFactor, hasTransmissionTex, (float)viewMode,
+                          environmentIntensity, iblEnabled ? 1.f : 0.f, slot);
                 
                 materialUniformBuffer->upload((uint64_t)(i + 1) * kMaterialUniformStride,
-                                              (uint64_t)(60 * sizeof(float)), slot);
+                                              (uint64_t)(64 * sizeof(float)), slot);
             }
         }
     }
@@ -2187,21 +3235,30 @@ void Renderer::renderToTarget(
             computeNodeTransform(rootIdx, M4::identity());
         }
     }
-    if (transformBuffer && !nodeTransforms.empty()) {
-        transformBuffer->upload(
-            0, nodeTransforms.size() * sizeof(float), nodeTransforms.data());
+    opaqueQueue.clear();
+    transparentQueue.clear();
+    std::fill(visibleNodeMask.begin(), visibleNodeMask.end(), 0);
+    if (scene.nodes) {
+        for (auto nodeIndex : *scene.nodes) {
+            gatherVisibleDraws(nodeIndex);
+        }
     }
+
+    // Compute joint matrices for skeletal meshes after all node world matrices are ready.
+    computeSkinningTransforms();
+    uploadJointMatrices();
+
+    uploadVisibleNodeTransforms();
 
     // ------------------------------------------------------------------
     // 4. Record render pass and draw calls.
     // ------------------------------------------------------------------
     GPU::ColorAttachment ca{};
     ca.view          = colorView;
-    // Match the MTKView clear color (dark blue-gray) to avoid blinking
-    ca.clearValue[0] = 0.08f;
-    ca.clearValue[1] = 0.08f;
-    ca.clearValue[2] = 0.10f;
-    ca.clearValue[3] = 1.0f;
+    ca.clearValue[0] = clearColor[0];
+    ca.clearValue[1] = clearColor[1];
+    ca.clearValue[2] = clearColor[2];
+    ca.clearValue[3] = clearColor[3];
     ca.loadOp        = GPU::LoadOp::clear;
     ca.storeOp       = GPU::StoreOp::store;
     ca.depthSlice    = 0;
@@ -2227,18 +3284,41 @@ void Renderer::renderToTarget(
     if (!rpe) return;
 
     currentPipelineVariant = 0; // reset — renderPrimitive() will set it per draw
+    lastBoundVertexBuffers.fill({}); // reset vertex buffer binding state
 
     if (renderWidth > 0 && renderHeight > 0) {
         rpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
         rpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
     }
+    // (render debug removed)
 
-    transparentQueue.clear();
-
-    if (scene.nodes) {
-        for (auto nodeIndex : *scene.nodes) {
-            renderNode(rpe, nodeIndex);
+    // ------------------------------------------------------------------
+    // Render skybox first (before opaque geometry).
+    // ------------------------------------------------------------------
+    if (skyboxEnabled && pipelineSkybox && environmentMap && skyboxUniformBuffer[currentFrameIndex]) {
+        // Create/update skybox bind group for the current frame.
+        if (!skyboxBindGroup[currentFrameIndex] && skyboxBindGroupLayout) {
+            GPU::BindGroupDescriptor sbDesc{};
+            sbDesc.layout = skyboxBindGroupLayout;
+            sbDesc.entries = {
+                {0, environmentMap},
+                {1, environmentSampler},
+                {2, GPU::BufferBinding{skyboxUniformBuffer[currentFrameIndex], 0, 96}},
+            };
+            skyboxBindGroup[currentFrameIndex] = device->createBindGroup(sbDesc);
         }
+        if (skyboxBindGroup[currentFrameIndex]) {
+            rpe->setPipeline(pipelineSkybox);
+            rpe->setBindGroup(0, skyboxBindGroup[currentFrameIndex]);
+            // Reset pipeline tracking so renderPrimitive() will rebind its pipeline.
+            currentPipelineVariant = 0;
+            lastBoundVertexBuffers.fill({});
+            rpe->draw(3);
+        }
+    }
+
+    for (auto &draw : opaqueQueue) {
+        renderPrimitive(rpe, *draw.primitive, draw.nodeIndex);
     }
 
     // Sort transparent draws back-to-front and draw them after all opaque geometry.
@@ -2246,7 +3326,7 @@ void Renderer::renderToTarget(
     // the world translation is at column 3: offsets 28 (X), 29 (Y), 30 (Z).
     if (!transparentQueue.empty()) {
         std::sort(transparentQueue.begin(), transparentQueue.end(),
-            [&](const TransparentDraw &a, const TransparentDraw &b) {
+            [&](const DrawItem &a, const DrawItem &b) {
                 auto squaredDist = [&](uint64_t ni) -> float {
                     size_t base = ni * 32;
                     if (base + 31 >= nodeTransforms.size()) return 0.0f;
@@ -2263,7 +3343,8 @@ void Renderer::renderToTarget(
     }
 
     rpe->end();
-    device->submit(encoder->finish());
+    device->submit(encoder->finish(), frame.fence);
+    currentFrameIndex = (currentFrameIndex + 1) % kMaxFramesInFlight;
 }
 
 void Renderer::update(double dt) {
@@ -2445,55 +3526,73 @@ void Renderer::applyAnimatedTRS(uint64_t nodeIndex) {
     }
 }
 
+void Renderer::setViewMode(ViewMode mode) {
+    viewMode = mode;
+}
+
+ViewMode Renderer::getViewMode() const {
+    return viewMode;
+}
+
 void Renderer::setDebugMode(bool enabled) {
-    debugModeEnabled = enabled;
+    viewMode = enabled ? ViewMode::worldNormal : ViewMode::normal;
 }
 
 bool Renderer::isDebugModeEnabled() const {
-    return debugModeEnabled;
+    return viewMode == ViewMode::worldNormal;
 }
 
 // ---------------------------------------------------------------------------
 // Scene-graph traversal
 // ---------------------------------------------------------------------------
 
-void Renderer::renderNode(
-    const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
-    uint64_t nodeIndex)
+void Renderer::gatherVisibleDraws(uint64_t nodeIndex)
 {
     if (!asset->nodes || nodeIndex >= asset->nodes->size()) return;
+
+    // Frustum cull: skip this entire subtree if the node's world bounds are outside.
+    if (nodeIndex < nodeWorldBounds.size() && !isBoundsVisible(nodeWorldBounds[nodeIndex])) {
+        return;
+    }
+
+    if (nodeIndex < visibleNodeMask.size()) {
+        visibleNodeMask[nodeIndex] = 1;
+    }
     auto &node = (*asset->nodes)[nodeIndex];
 
     if (node.mesh >= 0) {
+        updateVisibleInstances(nodeIndex);
         auto &mesh = (*asset->meshes)[(size_t)node.mesh];
         for (auto &primitive : mesh.primitives) {
-            // Defer BLEND primitives to the back-to-front transparent pass.
-            // Debug mode skips alpha logic entirely — draw immediately.
-            bool isBlend = false;
-            if (!debugModeEnabled) {
-                int64_t matIdx = primitive.material;
-                if (activeVariant >= 0 && !primitive.khrMaterialsVariantsMappings.empty()) {
-                    for (auto &mapping : primitive.khrMaterialsVariantsMappings) {
-                        for (auto v : mapping.variants) {
-                            if ((int64_t)v == activeVariant) { matIdx = mapping.material; goto blendCheck; }
-                        }
-                    }
-                }
-                blendCheck:
-                if (matIdx >= 0 && asset->materials && (size_t)matIdx < asset->materials->size()) {
-                    isBlend = ((*asset->materials)[(size_t)matIdx].alphaMode == gltf::AlphaMode::blend);
-                }
-            }
-            if (isBlend) {
-                transparentQueue.push_back({&primitive, nodeIndex});
+            DrawItem draw;
+            draw.primitive = &primitive;
+            draw.nodeIndex = nodeIndex;
+            draw.materialIndex = resolvePrimitiveMaterial(primitive);
+            draw.transparent = (viewMode == ViewMode::normal) && isTransparentMaterial(draw.materialIndex);
+            if (draw.transparent) {
+                transparentQueue.push_back(draw);
             } else {
-                renderPrimitive(rpe, primitive, nodeIndex);
+                opaqueQueue.push_back(draw);
             }
         }
     }
     for (auto childIndex : node.children) {
-        renderNode(rpe, childIndex);
+        gatherVisibleDraws(childIndex);
     }
+}
+
+void Renderer::setVertexBufferIfChanged(
+    const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+    uint32_t slot,
+    const std::shared_ptr<systems::leal::campello_gpu::Buffer> &buffer,
+    uint64_t offset)
+{
+    if (slot >= lastBoundVertexBuffers.size()) return;
+    auto &last = lastBoundVertexBuffers[slot];
+    if (last.buffer == buffer.get() && last.offset == offset) return;
+    rpe->setVertexBuffer(slot, buffer, offset);
+    last.buffer = buffer.get();
+    last.offset = offset;
 }
 
 void Renderer::renderPrimitive(
@@ -2508,20 +3607,23 @@ void Renderer::renderPrimitive(
     bool hasTexture  = false;
     bool doubleSided = false;
     bool useBlend    = false;  // true for BLEND alpha mode
-    int64_t matIdx   = primitive.material;
-
-    // KHR_materials_variants: override matIdx when a variant is active.
-    if (activeVariant >= 0 && !primitive.khrMaterialsVariantsMappings.empty()) {
-        for (auto &mapping : primitive.khrMaterialsVariantsMappings) {
-            for (auto v : mapping.variants) {
-                if ((int64_t)v == activeVariant) {
-                    matIdx = mapping.material;
-                    goto variantResolved;
-                }
-            }
-        }
-        variantResolved:;
-    }
+    int64_t matIdx   = resolvePrimitiveMaterial(primitive);
+    bool needsTexturedView =
+        viewMode == ViewMode::baseColor ||
+        viewMode == ViewMode::metallic ||
+        viewMode == ViewMode::roughness ||
+        viewMode == ViewMode::occlusion ||
+        viewMode == ViewMode::emissive ||
+        viewMode == ViewMode::alpha ||
+        viewMode == ViewMode::uv0 ||
+        viewMode == ViewMode::specularFactor ||
+        viewMode == ViewMode::specularColor ||
+        viewMode == ViewMode::sheenColor ||
+        viewMode == ViewMode::sheenRoughness ||
+        viewMode == ViewMode::clearcoat ||
+        viewMode == ViewMode::clearcoatRoughness ||
+        viewMode == ViewMode::clearcoatNormal ||
+        viewMode == ViewMode::transmission;
 
     // Get material properties (even without texcoords for transmission/blend mode)
     if (matIdx >= 0 && asset->materials && (size_t)matIdx < asset->materials->size()) {
@@ -2533,10 +3635,22 @@ void Renderer::renderPrimitive(
         if (mat.khrMaterialsTransmission && mat.khrMaterialsTransmission->transmissionFactor > 0.0f) {
             useBlend = true;
         }
-        
+
         if (hasTexcoord) {
-            if (mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture)
+            if ((mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture) ||
+                mat.normalTexture ||
+                mat.occlusionTexture ||
+                mat.emissiveTexture ||
+                (mat.khrMaterialsSpecular &&
+                 (mat.khrMaterialsSpecular->specularTexture || mat.khrMaterialsSpecular->specularColorTexture)) ||
+                mat.khrMaterialsSheen ||
+                mat.khrMaterialsClearcoat ||
+                mat.khrMaterialsTransmission ||
+                needsTexturedView) {
                 hasTexture = true;
+            }
+        } else if (needsTexturedView) {
+            hasTexture = true;
         }
     }
 
@@ -2562,9 +3676,29 @@ void Renderer::renderPrimitive(
     }
 
     // Debug mode overrides pipeline selection.
-    if (debugModeEnabled) {
+    if (viewMode == ViewMode::worldNormal) {
         wantedVariant = 3;
         pipeline      = pipelineDebug;
+    }
+
+    // KHR_mesh_quantization: if this primitive uses non-float accessors,
+    // switch to the quantized pipeline variant for the current wantedVariant.
+    if (asset->accessors && !quantizedPipelines.empty()) {
+        bool usesQuantized = false;
+        for (auto &[semantic, accIdx] : primitive.attributes) {
+            if (accIdx < 0 || (size_t)accIdx >= asset->accessors->size()) continue;
+            auto &acc = (*asset->accessors)[(size_t)accIdx];
+            if (acc.componentType != systems::leal::gltf::ComponentType::ctFloat) {
+                usesQuantized = true;
+                break;
+            }
+        }
+        if (usesQuantized) {
+            auto it = quantizedPipelines.find(wantedVariant);
+            if (it != quantizedPipelines.end() && it->second) {
+                pipeline = it->second;
+            }
+        }
     }
 
     if (pipeline && wantedVariant != currentPipelineVariant) {
@@ -2572,19 +3706,30 @@ void Renderer::renderPrimitive(
         currentPipelineVariant = wantedVariant;
     }
 
-    // --- 2. Bind material bind group at index 0 ---
-    // The bind group contains textures (fragment stage), samplers (fragment stage),
-    // lightsUniformBuffer (fragment [[buffer(10)]]),
-    // materialUniformBuffer at the per-material offset (both vertex [[buffer(17)]] and
-    // fragment [[buffer(17)]]), and cameraPositionBuffer (fragment [[buffer(18)]]).
-    // Always bound — even in debug mode, unused bindings are harmless on Metal.
-    {
+    // --- 2. Bind bind groups ---
+    // Index 0: textures + samplers.
+    // Index 1: frame-varying buffers — lights (10) and camera position (18).
+    // Only bind what the active shader variant actually references to avoid
+    // Metal debug-layer "unused binding" assertions.
+    bool needsTextures = (wantedVariant == 2 || wantedVariant == 5 ||
+                          wantedVariant == 7 || wantedVariant == 9);
+    if (needsTextures) {
         std::shared_ptr<systems::leal::campello_gpu::BindGroup> bg = defaultBindGroup;
-
         if (matIdx >= 0 && (size_t)matIdx < materialBindGroups.size() && materialBindGroups[matIdx]) {
             bg = materialBindGroups[matIdx];
         }
-
+        if (bg) rpe->setBindGroup(0, bg);
+        if (frameBindGroup[currentFrameIndex]) {
+            rpe->setBindGroup(1, frameBindGroup[currentFrameIndex]);
+        }
+    } else {
+        // Flat/debug variants: bind only the material buffer (no textures/samplers)
+        // so the fragment shader can read mat.baseColorFactor without triggering
+        // Metal debug-layer unused-binding asserts.
+        std::shared_ptr<systems::leal::campello_gpu::BindGroup> bg = defaultFlatBindGroup;
+        if (matIdx >= 0 && (size_t)matIdx < flatMaterialBindGroups.size() && flatMaterialBindGroups[matIdx]) {
+            bg = flatMaterialBindGroups[matIdx];
+        }
         if (bg) rpe->setBindGroup(0, bg);
     }
     
@@ -2593,15 +3738,17 @@ void Renderer::renderPrimitive(
     if (transformBuffer) {
         uint64_t offset = nodeIndex * 128; // 32 floats * 4 bytes
         if (offset + 128 <= transformBuffer->getLength()) {
-            // Debug: print first few binding operations
-            static int matrixBindCount = 0;
-            if (matrixBindCount < 5) {
-                std::cout << "Binding matrices for node " << nodeIndex 
-                          << " at offset " << offset 
-                          << " buffer size " << transformBuffer->getLength() << std::endl;
-                matrixBindCount++;
-            }
-            rpe->setVertexBuffer(VERTEX_SLOT_MVP, transformBuffer, offset);
+            // (bind debug removed)
+            setVertexBufferIfChanged(rpe, VERTEX_SLOT_MVP, transformBuffer, offset);
+        }
+    }
+
+    // Bind material uniforms to vertex stage (shader reads [[buffer(17)]]).
+    // matIndex = -1 → slot 0 (default); matIndex >= 0 → slot matIndex+1.
+    if (materialUniformBuffer) {
+        uint64_t matOffset = (uint64_t)(matIdx + 1) * kMaterialUniformStride;
+        if (matOffset + kMaterialUniformStride <= materialUniformBuffer->getLength()) {
+            setVertexBufferIfChanged(rpe, VERTEX_SLOT_MATERIAL, materialUniformBuffer, matOffset);
         }
     }
 
@@ -2609,11 +3756,25 @@ void Renderer::renderPrimitive(
     uint32_t instanceCount = 1;
     auto instIt = nodeInstanceData.find(nodeIndex);
     if (instIt != nodeInstanceData.end() && instIt->second.matrixBuffer) {
-        rpe->setVertexBuffer(VERTEX_SLOT_INSTANCE_MATRIX, instIt->second.matrixBuffer, 0);
-        instanceCount = instIt->second.instanceCount;
+        if (instIt->second.visibleCount == 0) return;
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_INSTANCE_MATRIX, instIt->second.matrixBuffer, 0);
+        instanceCount = instIt->second.visibleCount;
     } else if (defaultInstanceMatrixBuffer) {
         // Bind identity matrix for non-instanced objects
-        rpe->setVertexBuffer(VERTEX_SLOT_INSTANCE_MATRIX, defaultInstanceMatrixBuffer, 0);
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_INSTANCE_MATRIX, defaultInstanceMatrixBuffer, 0);
+    }
+
+    // --- 5b. Bind joint matrix palette for skeletal meshes ---
+    int64_t skinIdx = (nodeIndex < nodeSkinIndex.size()) ? nodeSkinIndex[nodeIndex] : -1;
+    if (skinIdx >= 0 && (size_t)skinIdx < skinData.size() &&
+        frameResources[currentFrameIndex].jointMatrixBuffer) {
+        auto &sd = skinData[(size_t)skinIdx];
+        setVertexBufferIfChanged(
+            rpe, VERTEX_SLOT_JOINT_MATRICES,
+            frameResources[currentFrameIndex].jointMatrixBuffer, sd.gpuOffset);
+    } else if (defaultJointMatrixBuffer) {
+        setVertexBufferIfChanged(
+            rpe, VERTEX_SLOT_JOINT_MATRICES, defaultJointMatrixBuffer, 0);
     }
 
     // --- 6. Check for Draco-compressed buffers ---
@@ -2631,7 +3792,7 @@ void Renderer::renderPrimitive(
         auto bindDracoAttribute = [&](const std::string &semantic, uint32_t slot) -> bool {
             auto it = dracoBufs.attributeBuffers.find(semantic);
             if (it != dracoBufs.attributeBuffers.end() && it->second) {
-                rpe->setVertexBuffer(slot, it->second, 0);
+                setVertexBufferIfChanged(rpe, slot, it->second, 0);
                 return true;
             }
             return false;
@@ -2639,12 +3800,28 @@ void Renderer::renderPrimitive(
 
         positionBound = bindDracoAttribute("POSITION", VERTEX_SLOT_POSITION);
         bindDracoAttribute("NORMAL",   VERTEX_SLOT_NORMAL);
-        bindDracoAttribute("TANGENT",  VERTEX_SLOT_TANGENT);
+        if (!bindDracoAttribute("TANGENT", VERTEX_SLOT_TANGENT)) {
+            if (fallbackTangentBuffer) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_TANGENT, fallbackTangentBuffer, 0);
+            }
+        }
 
         // TEXCOORD_0: bind real data or fallback zero buffer
         if (!bindDracoAttribute("TEXCOORD_0", VERTEX_SLOT_TEXCOORD0)) {
             if (fallbackUVBuffer) {
-                rpe->setVertexBuffer(VERTEX_SLOT_TEXCOORD0, fallbackUVBuffer, 0);
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD0, fallbackUVBuffer, 0);
+            }
+        }
+
+        // JOINTS_0 / WEIGHTS_0 for skeletal meshes
+        if (!bindDracoAttribute("JOINTS_0", VERTEX_SLOT_JOINTS)) {
+            if (fallbackJointBuffer) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_JOINTS, fallbackJointBuffer, 0);
+            }
+        }
+        if (!bindDracoAttribute("WEIGHTS_0", VERTEX_SLOT_WEIGHTS)) {
+            if (fallbackWeightBuffer) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_WEIGHTS, fallbackWeightBuffer, 0);
             }
         }
     } else {
@@ -2652,12 +3829,22 @@ void Renderer::renderPrimitive(
         auto bindAttribute = [&](const std::string &semantic, uint32_t slot) -> bool {
             auto it = primitive.attributes.find(semantic);
             if (it == primitive.attributes.end()) return false;
-            auto &acc = (*asset->accessors)[it->second];
+            int64_t accIdx = it->second;
+            auto &acc = (*asset->accessors)[accIdx];
             if (acc.bufferView < 0) return false;
             auto &bv  = (*asset->bufferViews)[(size_t)acc.bufferView];
+
+            // Prefer deinterleaved buffer if this accessor came from an interleaved
+            // buffer view (byteStride > 0).
+            auto deinterIt = deinterleavedBuffers.find(accIdx);
+            if (deinterIt != deinterleavedBuffers.end() && deinterIt->second) {
+                setVertexBufferIfChanged(rpe, slot, deinterIt->second, 0);
+                return true;
+            }
+
             auto  buf = gpuBuffers[bv.buffer];
             if (buf) {
-                rpe->setVertexBuffer(slot, buf, bv.byteOffset + acc.byteOffset);
+                setVertexBufferIfChanged(rpe, slot, buf, bv.byteOffset + acc.byteOffset);
                 return true;
             }
             return false;
@@ -2666,22 +3853,26 @@ void Renderer::renderPrimitive(
         positionBound = bindAttribute("POSITION", VERTEX_SLOT_POSITION);
         bool normalBound = bindAttribute("NORMAL",   VERTEX_SLOT_NORMAL);
         bool tangentBound = bindAttribute("TANGENT",  VERTEX_SLOT_TANGENT);
-        
-        // Debug: check if attributes were bound
-        static int attrDebugCount = 0;
-        if (attrDebugCount < 10) {
-            std::cout << "Attributes bound: POS=" << positionBound 
-                      << " NORM=" << normalBound 
-                      << " TAN=" << tangentBound << std::endl;
-            std::cout << "  Primitive has NORMAL attr: " 
-                      << (primitive.attributes.count("NORMAL") > 0 ? "YES" : "NO") << std::endl;
-            attrDebugCount++;
+        if (!tangentBound && fallbackTangentBuffer) {
+            setVertexBufferIfChanged(rpe, VERTEX_SLOT_TANGENT, fallbackTangentBuffer, 0);
         }
 
         // TEXCOORD_0: bind real data or fallback zero buffer
         if (!bindAttribute("TEXCOORD_0", VERTEX_SLOT_TEXCOORD0)) {
             if (fallbackUVBuffer) {
-                rpe->setVertexBuffer(VERTEX_SLOT_TEXCOORD0, fallbackUVBuffer, 0);
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD0, fallbackUVBuffer, 0);
+            }
+        }
+
+        // JOINTS_0 / WEIGHTS_0 for skeletal meshes
+        if (!bindAttribute("JOINTS_0", VERTEX_SLOT_JOINTS)) {
+            if (fallbackJointBuffer) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_JOINTS, fallbackJointBuffer, 0);
+            }
+        }
+        if (!bindAttribute("WEIGHTS_0", VERTEX_SLOT_WEIGHTS)) {
+            if (fallbackWeightBuffer) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_WEIGHTS, fallbackWeightBuffer, 0);
             }
         }
     }
@@ -2747,6 +3938,139 @@ void Renderer::clearCameraOverride() {
 
 float Renderer::getBoundsRadius() const {
     return boundsRadius;
+}
+
+// ---------------------------------------------------------------------------
+// Scene presentation controls
+// ---------------------------------------------------------------------------
+
+void Renderer::setClearColor(float r, float g, float b, float a) {
+    clearColor[0] = r;
+    clearColor[1] = g;
+    clearColor[2] = b;
+    clearColor[3] = a;
+}
+
+void Renderer::getClearColor(float *outR, float *outG, float *outB, float *outA) const {
+    if (outR) *outR = clearColor[0];
+    if (outG) *outG = clearColor[1];
+    if (outB) *outB = clearColor[2];
+    if (outA) *outA = clearColor[3];
+}
+
+void Renderer::setPunctualLightsEnabled(bool enabled) {
+    punctualLightsEnabled = enabled;
+}
+
+bool Renderer::isPunctualLightsEnabled() const {
+    return punctualLightsEnabled;
+}
+
+void Renderer::setDefaultLightEnabled(bool enabled) {
+    defaultLightEnabled = enabled;
+}
+
+bool Renderer::isDefaultLightEnabled() const {
+    return defaultLightEnabled;
+}
+
+// ---------------------------------------------------------------------------
+// Environment map / IBL controls
+// ---------------------------------------------------------------------------
+
+void Renderer::setEnvironmentMap(std::shared_ptr<systems::leal::campello_gpu::Texture> cubemap) {
+    environmentMap = cubemap;
+    for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
+        skyboxBindGroup[f] = nullptr; // Force recreation with new texture
+    }
+}
+
+std::shared_ptr<systems::leal::campello_gpu::Texture>
+Renderer::loadEnvironmentMap(
+    const std::string &px, const std::string &nx,
+    const std::string &py, const std::string &ny,
+    const std::string &pz, const std::string &nz)
+{
+    namespace GPU = systems::leal::campello_gpu;
+    namespace Img = systems::leal::campello_image;
+
+    std::vector<std::shared_ptr<Img::Image>> faces;
+    faces.push_back(Img::Image::fromFile(px.c_str()));
+    faces.push_back(Img::Image::fromFile(nx.c_str()));
+    faces.push_back(Img::Image::fromFile(py.c_str()));
+    faces.push_back(Img::Image::fromFile(ny.c_str()));
+    faces.push_back(Img::Image::fromFile(pz.c_str()));
+    faces.push_back(Img::Image::fromFile(nz.c_str()));
+
+    for (auto &f : faces) {
+        if (!f) return nullptr;
+    }
+
+    uint32_t w = faces[0]->getWidth();
+    uint32_t h = faces[0]->getHeight();
+    for (auto &f : faces) {
+        if (f->getWidth() != w || f->getHeight() != h) return nullptr;
+    }
+
+    GPU::PixelFormat fmt = GPU::PixelFormat::rgba8unorm;
+    switch (faces[0]->getFormat()) {
+        case Img::ImageFormat::rgba8:   fmt = GPU::PixelFormat::rgba8unorm; break;
+        case Img::ImageFormat::rgba16f: fmt = GPU::PixelFormat::rgba16float; break;
+        case Img::ImageFormat::rgba32f: fmt = GPU::PixelFormat::rgba32float; break;
+    }
+
+    auto tex = device->createTexture(
+        GPU::TextureType::ttCube, fmt,
+        w, h, 1, 1, 1,
+        (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
+                            uint32_t(GPU::TextureUsage::copyDst)));
+    if (!tex) return nullptr;
+
+    size_t bytesPerFace = faces[0]->getDataSize();
+    size_t totalBytes = bytesPerFace * 6;
+    auto staging = device->createBuffer(totalBytes, GPU::BufferUsage::copySrc);
+    if (!staging) return nullptr;
+
+    for (int i = 0; i < 6; ++i) {
+        staging->upload(i * bytesPerFace, bytesPerFace, const_cast<void*>(faces[i]->getData()));
+    }
+
+    uint64_t bytesPerRow = (h > 0) ? (bytesPerFace / h) : bytesPerFace;
+    auto encoder = device->createCommandEncoder();
+    if (encoder) {
+        for (int i = 0; i < 6; ++i) {
+            encoder->copyBufferToTexture(staging, i * bytesPerFace, bytesPerRow, tex, 0, i);
+        }
+        auto fence = device->createFence();
+        device->submit(encoder->finish(), fence);
+        if (fence) fence->wait();
+    }
+
+    return tex;
+}
+
+void Renderer::setSkyboxEnabled(bool enabled) {
+    skyboxEnabled = enabled;
+}
+
+void Renderer::setIBLEnabled(bool enabled) {
+    iblEnabled = enabled;
+}
+
+void Renderer::setEnvironmentIntensity(float intensity) {
+    environmentIntensity = intensity;
+}
+
+bool Renderer::isSkyboxEnabled() const {
+    return skyboxEnabled;
+}
+
+bool Renderer::isIBLEnabled() const {
+    return iblEnabled;
+}
+
+float Renderer::getEnvironmentIntensity() const {
+    return environmentIntensity;
 }
 
 // ---------------------------------------------------------------------------

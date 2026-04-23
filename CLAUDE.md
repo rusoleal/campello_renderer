@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`campello_renderer` (v0.1.2) is a C++20 shared library that provides a 3D rendering layer on top of custom dependencies:
-- **campello_gpu** (v0.7.0) — low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
-- **gltf** (v0.3.6) — GLTF/GLB asset loader
-- **campello_image** (v0.3.1) — image decoding (PNG, JPEG, WebP via buffer views)
+`campello_renderer` (v0.2.0) is a C++20 shared library that provides a 3D rendering layer on top of custom dependencies:
+- **campello_gpu** (v0.11.0) — low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
+- **gltf** (v0.4.1) — GLTF/GLB asset loader
+- **campello_image** (v0.4.0) — image decoding (PNG, JPEG, WebP, HDR, OpenEXR)
 
 The library is consumed as a CMake dependency and targets Android, macOS, iOS, Windows, and Linux. macOS is the primary development/test platform.
 
@@ -16,14 +16,18 @@ The library is consumed as a CMake dependency and targets Android, macOS, iOS, W
 Dependencies are fetched automatically via `FetchContent` from GitHub (see `dependencies/`). The main build entry points:
 
 ```bash
-# macOS (tests enabled)
-cmake -S . -B build/macos -DCAMPELLO_RENDERER_BUILD_TEST=ON
-cmake --build build/macos
-ctest --test-dir build/macos
+# macOS (tests enabled) — Debug
+cmake -S . -B build/macos/debug -DCAMPELLO_RENDERER_BUILD_TEST=ON -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/macos/debug
+ctest --test-dir build/macos/debug
 
-# macOS example app
-cmake -S . -B build/macos-example -DCAMPELLO_RENDERER_BUILD_MACOS_EXAMPLE=ON
-cmake --build build/macos-example
+# macOS example app — Debug or Release
+./build_macos_example.sh Debug    # → build/macos/debug
+./build_macos_example.sh Release  # → build/macos/release
+
+# Then run with or without Metal API Validation:
+./run_macos_example_debug.sh      # MTL_DEBUG_LAYER=1
+./run_macos_example_release.sh    # no validation
 
 # Android (primary runtime target)
 cd examples/android
@@ -106,7 +110,6 @@ Two variants are created by `createDefaultPipelines()`:
 - `src/shaders/vulkan_default.h` — embedded Vulkan SPIR-V
 - `src/shaders/directx_default.h` — DirectX DXIL (currently empty stubs)
 - `dependencies/campello_gpu.cmake` / `gltf.cmake` / `campello_image.cmake` — FetchContent declarations
-- `dependencies/webp.cmake` — libwebp FetchContent (prepared but not included in the build yet)
 
 ### Examples
 
@@ -121,7 +124,7 @@ Tests cover: version string, construction, `setAsset`/`getAsset`, `setScene`, `s
 
 ## Versioning
 
-Version is defined in `CMakeLists.txt` (`project(campello_renderer VERSION 0.1.2)`) and propagated to `campello_renderer_config.h` via `configure_file`.
+Version is defined in `CMakeLists.txt` (`project(campello_renderer VERSION 0.2.0)`) and propagated to `campello_renderer_config.h` via `configure_file`.
 
 **When upgrading the package version, update the version string in ALL of these locations:**
 1. `CMakeLists.txt` — `project(campello_renderer VERSION x.x.x)`
@@ -132,7 +135,7 @@ Version is defined in `CMakeLists.txt` (`project(campello_renderer VERSION 0.1.2
 ```
 Expected equality of these values:
   systems::leal::campello_renderer::getVersion()
-    Which is: "0.1.2"
+    Which is: "0.2.0"
   "0.1.1"
 ```
 Always verify tests pass after version bumps.

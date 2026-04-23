@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.2.0] - 2026-04-22
+
+### Added
+- **Skybox rendering** — Fullscreen-triangle skybox that samples an environment cubemap:
+  - `pipelineSkybox` with depth-write disabled, rendered before opaque geometry
+  - Inverse VP matrix unprojects screen pixels to world-space ray directions
+  - `setSkyboxEnabled(bool)` / `isSkyboxEnabled()` API
+- **Image-Based Lighting (IBL)** — Environment cubemap sampled in PBR fragment shader:
+  - Diffuse: sample cubemap along normal direction, modulated by `baseColor × (1 − metallic)`
+  - Specular: sample cubemap along reflection vector with Fresnel approximation
+  - `setIBLEnabled(bool)` / `isIBLEnabled()` API
+  - `setEnvironmentIntensity(float)` / `getEnvironmentIntensity()` API
+  - `setEnvironmentMap(cubemap)` to bind a custom environment cubemap
+  - `loadEnvironmentMap(px, nx, py, ny, pz, nz)` — load 6 face images into a `ttCube` texture
+  - New `ViewMode::environment` (`i` key) visualizes IBL contribution
+- **campello_gpu v0.11.0** — Adds `ttCube` / `ttCubeArray` texture support (required for skybox + IBL)
+
+### Changed
+- Upgraded `campello_image` dependency from v0.3.1 to v0.4.0
+  - **BREAKING**: `Image::getData()` now returns `const void*` (was `const uint8_t*`)
+  - All image upload calls updated to cast via `const_cast<void*>(img->getData())`
+  - HDR formats (Radiance `.hdr`, OpenEXR `.exr`) now decode to `rgba32float`
+  - Texture creation in `setScene()` now selects `PixelFormat` based on `Image::getFormat()`:
+    - `rgba8` → `rgba8unorm` / `rgba8unorm_srgb`
+    - `rgba16f` → `rgba16float`
+    - `rgba32f` → `rgba32float`
+- `MaterialUniforms` expanded with `environmentIntensity` and `iblEnabled` fields
+- Metal shader `fragmentMain_textured` updated with IBL sampling
+- New skybox vertex/fragment shaders added to `default.metal`
+
+---
+
 ## [0.1.3] - 2026-04-12
 
 ### Added

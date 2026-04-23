@@ -8,13 +8,25 @@ if(TARGET campello_gpu)
     return()
 endif()
 
-include(FetchContent)
+# Use local campello_gpu for rapid iteration, otherwise fetch from GitHub.
+set(CAMPELLO_GPU_LOCAL_PATH "/Users/rubenleal/Projects/campello_gpu")
 
-FetchContent_Declare(
-        extern_campello_gpu
-        GIT_REPOSITORY https://github.com/rusoleal/campello_gpu
-        GIT_TAG        v0.8.0
-)
+if(EXISTS "${CAMPELLO_GPU_LOCAL_PATH}/CMakeLists.txt")
+    message(STATUS "Using local campello_gpu: ${CAMPELLO_GPU_LOCAL_PATH}")
+    include(FetchContent)
+    FetchContent_Declare(
+            extern_campello_gpu
+            SOURCE_DIR ${CAMPELLO_GPU_LOCAL_PATH}
+    )
+else()
+    message(STATUS "Fetching campello_gpu v0.11.0 from GitHub")
+    include(FetchContent)
+    FetchContent_Declare(
+            extern_campello_gpu
+            GIT_REPOSITORY https://github.com/rusoleal/campello_gpu
+            GIT_TAG        v0.11.0
+    )
+endif()
 
 if(NOT extern_campello_gpu_POPULATED)
     FetchContent_GetProperties(extern_campello_gpu)

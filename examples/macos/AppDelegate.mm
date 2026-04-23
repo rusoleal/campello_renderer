@@ -62,11 +62,61 @@
     [menuBar addItem:viewItem];
     NSMenu *viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
     viewItem.submenu = viewMenu;
-    NSMenuItem *debugItem = [[NSMenuItem alloc] initWithTitle:@"Debug Mode"
+    NSMenuItem *debugItem = [[NSMenuItem alloc] initWithTitle:@"World Normal View"
                                                        action:@selector(toggleDebugMode:)
                                                 keyEquivalent:@"d"];
     debugItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
     [viewMenu addItem:debugItem];
+
+    // Lighting menu
+    NSMenuItem *lightingItem = [[NSMenuItem alloc] init];
+    [menuBar addItem:lightingItem];
+    NSMenu *lightingMenu = [[NSMenu alloc] initWithTitle:@"Lighting"];
+    lightingItem.submenu = lightingMenu;
+
+    NSMenuItem *punctualItem = [[NSMenuItem alloc] initWithTitle:@"Punctual Lights"
+                                                          action:@selector(togglePunctualLights:)
+                                                   keyEquivalent:@"l"];
+    punctualItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    punctualItem.state = NSControlStateValueOn;
+    [lightingMenu addItem:punctualItem];
+
+    NSMenuItem *defaultItem = [[NSMenuItem alloc] initWithTitle:@"Default Light"
+                                                         action:@selector(toggleDefaultLight:)
+                                                  keyEquivalent:@"l"];
+    defaultItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption;
+    defaultItem.state = NSControlStateValueOn;
+    [lightingMenu addItem:defaultItem];
+
+    NSMenuItem *skyboxItem = [[NSMenuItem alloc] initWithTitle:@"Skybox"
+                                                        action:@selector(toggleSkybox:)
+                                                 keyEquivalent:@"b"];
+    skyboxItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    skyboxItem.state = NSControlStateValueOff;
+    [lightingMenu addItem:skyboxItem];
+
+    NSMenuItem *iblItem = [[NSMenuItem alloc] initWithTitle:@"Image-Based Lighting"
+                                                     action:@selector(toggleIBL:)
+                                              keyEquivalent:@"i"];
+    iblItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    iblItem.state = NSControlStateValueOff;
+    [lightingMenu addItem:iblItem];
+
+    [lightingMenu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *bgItem = [[NSMenuItem alloc] init];
+    [lightingMenu addItem:bgItem];
+    NSMenu *bgMenu = [[NSMenu alloc] initWithTitle:@"Background"];
+    bgItem.submenu = bgMenu;
+    [bgMenu addItemWithTitle:@"Dark"
+                      action:@selector(setBackgroundDark:)
+               keyEquivalent:@"1"];
+    [bgMenu addItemWithTitle:@"Gray"
+                      action:@selector(setBackgroundGray:)
+               keyEquivalent:@"2"];
+    [bgMenu addItemWithTitle:@"Light"
+                      action:@selector(setBackgroundLight:)
+               keyEquivalent:@"3"];
 
     [NSApp setMainMenu:menuBar];
 }

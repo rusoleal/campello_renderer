@@ -83,6 +83,7 @@ using namespace metal;
 //   [188..191] clearcoatNormalScale    — clearcoat normal map intensity (default 1.0)
 //   [192..195] transmissionFactor      — KHR_materials_transmission scalar (default 0.0 = opaque)
 //   [196..199] hasTransmissionTexture  — 0=no, 1=has transmission texture (R channel)
+//   [200..203] viewMode                — renderer inspection mode enum
 struct MaterialUniforms {
     float4 baseColorFactor;
     float4 uvTransformRow0;
@@ -118,13 +119,37 @@ struct MaterialUniforms {
     float  clearcoatNormalScale;
     float  transmissionFactor;
     float  hasTransmissionTexture;
+    float  viewMode;
+    float  environmentIntensity;
+    float  iblEnabled;
 };
+
+constant float VIEW_MODE_NORMAL       = 0.0;
+constant float VIEW_MODE_WORLD_NORMAL = 1.0;
+constant float VIEW_MODE_BASE_COLOR   = 2.0;
+constant float VIEW_MODE_METALLIC     = 3.0;
+constant float VIEW_MODE_ROUGHNESS    = 4.0;
+constant float VIEW_MODE_OCCLUSION    = 5.0;
+constant float VIEW_MODE_EMISSIVE     = 6.0;
+constant float VIEW_MODE_ALPHA        = 7.0;
+constant float VIEW_MODE_UV0          = 8.0;
+constant float VIEW_MODE_SPECULAR_FACTOR     = 9.0;
+constant float VIEW_MODE_SPECULAR_COLOR      = 10.0;
+constant float VIEW_MODE_SHEEN_COLOR         = 11.0;
+constant float VIEW_MODE_SHEEN_ROUGHNESS     = 12.0;
+constant float VIEW_MODE_CLEARCOAT           = 13.0;
+constant float VIEW_MODE_CLEARCOAT_ROUGHNESS = 14.0;
+constant float VIEW_MODE_CLEARCOAT_NORMAL    = 15.0;
+constant float VIEW_MODE_TRANSMISSION        = 16.0;
+constant float VIEW_MODE_ENVIRONMENT         = 17.0;
 
 struct VertexIn {
     float3 position  [[attribute(0)]];
     float3 normal    [[attribute(1)]];
     float2 texcoord0 [[attribute(2)]];
     float4 tangent   [[attribute(3)]];
+    uint4  joints    [[attribute(4)]];
+    float4 weights   [[attribute(5)]];
 };
 
 // VertexOut carries only geometric interpolants — 5 user attribute slots,
@@ -155,7 +180,8 @@ vertex VertexOut vertexMain(
     VertexIn                  in   [[stage_in]],
     device const NodeTransforms *nodeTransforms  [[buffer(16)]],
     constant MaterialUniforms &mat [[buffer(17)]],
-    device const float4x4    *instanceMatrices   [[buffer(19)]])
+    device const float4x4    *instanceMatrices   [[buffer(19)]],
+    device const float4x4    *jointMatrices      [[buffer(20)]])
 {
     // Apply KHR_texture_transform when hasUVTransform flag (row0.w) is set.
     float2 transformedUV;
@@ -167,15 +193,36 @@ vertex VertexOut vertexMain(
         transformedUV = in.texcoord0;
     }
 
+    // Skeletal mesh skinning: blend up to 4 joint matrices.
+    float4 skinnedPos = float4(in.position, 1.0);
+    float3 skinnedNormal = in.normal;
+    float3 skinnedTangent = in.tangent.xyz;
+    float weightSum = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
+    if (weightSum > 0.001 && jointMatrices != nullptr) {
+        skinnedPos = float4(0.0);
+        skinnedNormal = float3(0.0);
+        skinnedTangent = float3(0.0);
+        for (int i = 0; i < 4; i++) {
+            float w = in.weights[i];
+            if (w > 0.0) {
+                uint j = in.joints[i];
+                float4x4 jm = jointMatrices[j];
+                skinnedPos    += w * (jm * float4(in.position, 1.0));
+                skinnedNormal += w * (jm * float4(in.normal, 0.0)).xyz;
+                skinnedTangent += w * (jm * float4(in.tangent.xyz, 0.0)).xyz;
+            }
+        }
+    }
+
     float4x4 mvp   = nodeTransforms[0].mvp;
     float4x4 model = nodeTransforms[0].model;
 
     // EXT_mesh_gpu_instancing: apply per-instance transform if available.
     // instanceMatrices is a per-instance buffer (stepMode=instance).
     float4x4 instM = instanceMatrices[0];
-    float4 localPos = instM * float4(in.position, 1.0);
-    float3 localNormal = (instM * float4(in.normal, 0.0)).xyz;
-    float3 localTangent = (instM * float4(in.tangent.xyz, 0.0)).xyz;
+    float4 localPos = instM * skinnedPos;
+    float3 localNormal = (instM * float4(skinnedNormal, 0.0)).xyz;
+    float3 localTangent = (instM * float4(skinnedTangent, 0.0)).xyz;
 
     float4 worldPos4 = model * localPos;
 
@@ -218,6 +265,57 @@ fragment float4 fragmentMain_flat(
     // KHR_materials_transmission (simplified): additional transparency
     if (mat.transmissionFactor > 0.0) {
         baseColor.a *= (1.0 - mat.transmissionFactor);
+    }
+
+    if (mat.viewMode > VIEW_MODE_NORMAL + 0.5) {
+        if (mat.viewMode < VIEW_MODE_WORLD_NORMAL + 0.5) {
+            float3 N = normalize(in.worldNormal);
+            return float4(N * 0.5 + 0.5, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_BASE_COLOR + 0.5) {
+            return float4(baseColor.rgb, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_METALLIC + 0.5) {
+            return float4(mat.metallicFactor, mat.metallicFactor, mat.metallicFactor, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_ROUGHNESS + 0.5) {
+            return float4(mat.roughnessFactor, mat.roughnessFactor, mat.roughnessFactor, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_OCCLUSION + 0.5) {
+            return float4(1.0, 1.0, 1.0, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_EMISSIVE + 0.5) {
+            return float4(mat.emissiveFactor, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_ALPHA + 0.5) {
+            return float4(baseColor.a, baseColor.a, baseColor.a, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_UV0 + 0.5) {
+            return float4(fract(in.texcoord0), 0.0, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_SPECULAR_FACTOR + 0.5) {
+            return float4(1.0, 1.0, 1.0, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_SPECULAR_COLOR + 0.5) {
+            return float4(1.0, 1.0, 1.0, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_SHEEN_COLOR + 0.5) {
+            return float4(0.0, 0.0, 0.0, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_SHEEN_ROUGHNESS + 0.5) {
+            return float4(0.0, 0.0, 0.0, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_CLEARCOAT + 0.5) {
+            return float4(0.0, 0.0, 0.0, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_CLEARCOAT_ROUGHNESS + 0.5) {
+            return float4(0.0, 0.0, 0.0, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_CLEARCOAT_NORMAL + 0.5) {
+            float3 N = normalize(in.worldNormal);
+            return float4(N * 0.5 + 0.5, 1.0);
+        }
+        return float4(0.0, 0.0, 0.0, 1.0);
     }
 
     if (mat.unlit > 0.5) {
@@ -330,7 +428,8 @@ fragment float4 fragmentMain_textured(
     texture2d<float> clearcoatTexture          [[texture(17)]],
     texture2d<float> clearcoatRoughnessTexture [[texture(18)]],
     texture2d<float> clearcoatNormalTexture    [[texture(19)]],
-    texture2d<float> transmissionTexture       [[texture(20)]])
+    texture2d<float> transmissionTexture       [[texture(20)]],
+    texturecube<float> environmentMap          [[texture(21)]])
 {
     float2 uv = in.texcoord0;
 
@@ -345,6 +444,16 @@ fragment float4 fragmentMain_textured(
     }
     if (transmission > 0.0) {
         baseColor.a *= (1.0 - transmission);
+    }
+
+    if (mat.viewMode > VIEW_MODE_NORMAL + 0.5) {
+        if (mat.viewMode < VIEW_MODE_BASE_COLOR + 0.5) {
+            float3 N = normalize(in.worldNormal);
+            return float4(N * 0.5 + 0.5, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_METALLIC + 0.5) {
+            return float4(baseColor.rgb, 1.0);
+        }
     }
 
     // Alpha mask.
@@ -388,6 +497,43 @@ fragment float4 fragmentMain_textured(
         emissive *= emissiveTexture.sample(emissiveSampler, uv).rgb;
     }
 
+    float specularFactor = mat.specularFactor;
+    if (mat.hasSpecularTexture > 0.5) {
+        specularFactor *= specularTexture.sample(specularSampler, uv).a;
+    }
+
+    float3 specularColor = mat.specularColorFactor;
+    if (mat.hasSpecularColorTexture > 0.5) {
+        specularColor *= specularColorTexture.sample(specularColorSampler, uv).rgb;
+    }
+
+    if (mat.viewMode > VIEW_MODE_NORMAL + 0.5) {
+        if (mat.viewMode < VIEW_MODE_ROUGHNESS + 0.5) {
+            return float4(metallic, metallic, metallic, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_OCCLUSION + 0.5) {
+            return float4(roughness, roughness, roughness, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_EMISSIVE + 0.5) {
+            return float4(occlusion, occlusion, occlusion, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_ALPHA + 0.5) {
+            return float4(emissive, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_UV0 + 0.5) {
+            return float4(baseColor.a, baseColor.a, baseColor.a, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_SPECULAR_FACTOR + 0.5) {
+            return float4(fract(uv), 0.0, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_SPECULAR_COLOR + 0.5) {
+            return float4(specularFactor, specularFactor, specularFactor, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_SHEEN_COLOR + 0.5) {
+            return float4(specularColor, 1.0);
+        }
+    }
+
     // KHR_materials_sheen: sample sheen color and roughness.
     // Reuse baseColorSampler — Metal allows only 16 sampler slots (0–15).
     float3 sheenColor = mat.sheenColorFactor;
@@ -425,6 +571,48 @@ fragment float4 fragmentMain_textured(
     float3 viewDir = normalize(camPos - in.worldPos);
     float  NdotV   = max(dot(N, viewDir), 0.0001f);
     float  ccNdotV = max(dot(ccN, viewDir), 0.0001f);
+
+    // IBL (image-based lighting) from environment cubemap.
+    float3 iblDiffuse  = float3(0.0);
+    float3 iblSpecular = float3(0.0);
+    if (mat.iblEnabled > 0.5) {
+        // Diffuse: sample irradiance using normal direction.
+        float3 envDiffuse = environmentMap.sample(baseColorSampler, N).rgb;
+        iblDiffuse = baseColor.rgb * (1.0 - metallic) * envDiffuse * mat.environmentIntensity * 0.3;
+
+        // Specular: sample using reflection direction.
+        float3 R = reflect(-viewDir, N);
+        float3 envSpecular = environmentMap.sample(baseColorSampler, R).rgb;
+        // Simple Fresnel approximation for IBL specular.
+        float f0_scalar = (mat.ior - 1.0) / (mat.ior + 1.0);
+        f0_scalar *= f0_scalar;
+        float3 F0 = mix(float3(f0_scalar) * mat.specularColorFactor, baseColor.rgb, metallic);
+        float fresnel = pow(1.0 - NdotV, 5.0);
+        float3 F = F0 + (float3(1.0) - F0) * fresnel;
+        iblSpecular = envSpecular * F * metallic * mat.environmentIntensity;
+    }
+
+    if (mat.viewMode > VIEW_MODE_NORMAL + 0.5) {
+        if (mat.viewMode < VIEW_MODE_SHEEN_ROUGHNESS + 0.5) {
+            return float4(sheenColor, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_CLEARCOAT + 0.5) {
+            return float4(sheenRoughness, sheenRoughness, sheenRoughness, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_CLEARCOAT_ROUGHNESS + 0.5) {
+            return float4(ccFactor, ccFactor, ccFactor, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_CLEARCOAT_NORMAL + 0.5) {
+            return float4(ccRoughness, ccRoughness, ccRoughness, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_TRANSMISSION + 0.5) {
+            return float4(ccN * 0.5 + 0.5, 1.0);
+        }
+        if (mat.viewMode < VIEW_MODE_ENVIRONMENT + 0.5) {
+            return float4(iblDiffuse + iblSpecular, 1.0);
+        }
+        return float4(transmission, transmission, transmission, 1.0);
+    }
 
     // Accumulate per-light contributions.
     float3 totalDiffuse   = float3(0.0);
@@ -511,11 +699,50 @@ fragment float4 fragmentMain_textured(
     float3 diffuse      = totalDiffuse * occlusion;
 
     float ccAmbientAtten = 1.0f - ccFactor * F_Schlick_scalar(0.04f, ccNdotV);
-    float3 finalColor = (ambientColor + diffuse + totalSpecular + totalSheen) * ccAmbientAtten
+    float3 finalColor = (ambientColor + diffuse + totalSpecular + totalSheen + iblDiffuse + iblSpecular) * ccAmbientAtten
                         + totalClearcoat + emissive;
 
     // Reinhard tone mapping.
     finalColor = finalColor / (float3(1.0) + finalColor);
 
     return float4(finalColor, baseColor.a);
+}
+
+// ---------------------------------------------------------------------------
+// Skybox shader — fullscreen triangle that samples an environment cubemap.
+// ---------------------------------------------------------------------------
+struct SkyboxOut {
+    float4 position [[position]];
+};
+
+vertex SkyboxOut skyboxVertex(uint vertexID [[vertex_id]]) {
+    float2 pos;
+    if (vertexID == 0) pos = float2(-1, -1);
+    else if (vertexID == 1) pos = float2(3, -1);
+    else pos = float2(-1, 3);
+    SkyboxOut out;
+    out.position = float4(pos, 1.0, 1.0);
+    return out;
+}
+
+struct SkyboxUniforms {
+    float4x4 invVP;
+    float2 screenSize;
+    float2 _pad;
+    float3 cameraPos;
+    float _pad2;
+};
+
+fragment float4 skyboxFragment(SkyboxOut in [[stage_in]],
+                               constant SkyboxUniforms &u [[buffer(2)]],
+                               texturecube<float> envMap [[texture(0)]],
+                               sampler envSampler [[sampler(1)]])
+{
+    float2 ndc = float2(
+        (in.position.x / u.screenSize.x) * 2.0 - 1.0,
+        (1.0 - in.position.y / u.screenSize.y) * 2.0 - 1.0
+    );
+    float4 worldFar = u.invVP * float4(ndc, 1.0, 1.0);
+    float3 worldDir = normalize(worldFar.xyz / worldFar.w - u.cameraPos);
+    return envMap.sample(envSampler, worldDir);
 }
