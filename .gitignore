@@ -2,6 +2,7 @@
 /build
 /build_test
 /build_version_check
+/build_verify
 examples/android/.idea/misc.xml
 
 # Intermediate shader compiler artifacts (kept out of git; sources are the

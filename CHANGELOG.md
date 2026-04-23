@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.1] - 2026-04-23
+
+### Fixed
+- **Linux CI build failure** — `campello_gpu` v0.11.0's `CMakeLists.txt` called `target_include_directories(... PUBLIC ...)` on an `INTERFACE` library when Vulkan SDK was missing. Fixed upstream in `campello_gpu` v0.11.1; dependency bumped accordingly.
+
 ## [0.2.0] - 2026-04-22
 
 ### Added

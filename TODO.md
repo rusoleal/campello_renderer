@@ -1,6 +1,6 @@
 # campello_renderer TODO
 
-## Current State (v0.2.0)
+## Current State (v0.2.1)
 
 ### What works
 - `setAsset(shared_ptr<GLTF>)` — loads asset, allocates GPU buffer/texture/sampler/bind-group slot arrays
