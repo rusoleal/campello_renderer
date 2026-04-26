@@ -26,6 +26,62 @@ namespace gpu  = systems::leal::campello_gpu;
 namespace gltf = systems::leal::gltf;
 namespace rend = systems::leal::campello_renderer;
 
+// ---------------------------------------------------------------------------
+// Transparent drag-drop overlay view
+// ---------------------------------------------------------------------------
+@interface DragDropView : NSView
+@property (nonatomic, assign) ViewController *viewController;
+@end
+
+@implementation DragDropView
+
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        [self registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
+    }
+    return self;
+}
+
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    if (self.window) {
+        [self registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
+    }
+}
+
+- (BOOL)isModelFileURL:(NSURL *)url {
+    NSString *ext = url.pathExtension.lowercaseString;
+    return [ext isEqualToString:@"glb"] || [ext isEqualToString:@"gltf"];
+}
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    NSPasteboard *pb = sender.draggingPasteboard;
+    NSArray<NSURL *> *urls = [pb readObjectsForClasses:@[[NSURL class]]
+                                               options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    for (NSURL *url in urls) {
+        if ([self isModelFileURL:url]) {
+            return NSDragOperationCopy;
+        }
+    }
+    return NSDragOperationNone;
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    NSPasteboard *pb = sender.draggingPasteboard;
+    NSArray<NSURL *> *urls = [pb readObjectsForClasses:@[[NSURL class]]
+                                               options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    for (NSURL *url in urls) {
+        if ([self isModelFileURL:url]) {
+            [self.viewController loadURL:url];
+            return YES;
+        }
+    }
+    return NO;
+}
+
+@end
+
 static NSString *ViewModeName(rend::ViewMode mode) {
     switch (mode) {
         case rend::ViewMode::normal: return @"normal";
@@ -46,6 +102,9 @@ static NSString *ViewModeName(rend::ViewMode mode) {
         case rend::ViewMode::clearcoatNormal: return @"clearcoatNormal";
         case rend::ViewMode::transmission: return @"transmission";
         case rend::ViewMode::environment: return @"environment";
+        case rend::ViewMode::iridescence: return @"iridescence";
+        case rend::ViewMode::anisotropy: return @"anisotropy";
+        case rend::ViewMode::dispersion: return @"dispersion";
     }
 }
 
@@ -71,6 +130,9 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
         case 'y': outMode = rend::ViewMode::clearcoatNormal; return true;
         case 'u': outMode = rend::ViewMode::transmission; return true;
         case 'i': outMode = rend::ViewMode::environment; return true;
+        case 'o': outMode = rend::ViewMode::iridescence; return true;
+        case 'p': outMode = rend::ViewMode::anisotropy; return true;
+        case 'z': outMode = rend::ViewMode::dispersion; return true;
         default: return false;
     }
 }
@@ -106,15 +168,26 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
         return;
     }
 
-    _metalView = [[MTKView alloc] initWithFrame:NSMakeRect(0, 0, 1280, 720)
+    // Container view: self.view holds both MTKView and the drag-drop overlay as siblings.
+    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 1280, 720)];
+    container.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.view = container;
+
+    _metalView = [[MTKView alloc] initWithFrame:container.bounds
                                          device:mtlDevice];
+    _metalView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     _metalView.colorPixelFormat        = MTLPixelFormatBGRA8Unorm;
     _metalView.depthStencilPixelFormat = MTLPixelFormatInvalid; // renderer owns depth
     _metalView.clearColor              = MTLClearColorMake(0.08, 0.08, 0.10, 1.0);
     _metalView.delegate                = self;
     _metalView.preferredFramesPerSecond = 60;
+    [container addSubview:_metalView];
 
-    self.view = _metalView;
+    // Transparent overlay view for drag-and-drop.
+    DragDropView *dragView = [[DragDropView alloc] initWithFrame:container.bounds];
+    dragView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    dragView.viewController = self;
+    [container addSubview:dragView];
 }
 
 - (void)viewDidLoad {
@@ -450,6 +523,100 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
         NSMenuItem *item = (NSMenuItem *)sender;
         item.state = _renderer->isIBLEnabled() ? NSControlStateValueOn : NSControlStateValueOff;
     }
+}
+
+- (IBAction)loadEnvironmentMap:(id)sender {
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.allowsOtherFileTypes = YES;
+    panel.title = @"Load Environment Map";
+    panel.allowedFileTypes = @[@"hdr", @"exr", @"png", @"jpg", @"jpeg", @"webp"];
+
+    [panel beginSheetModalForWindow:self.view.window
+                  completionHandler:^(NSModalResponse result) {
+        if (result != NSModalResponseOK) return;
+        NSURL *url = panel.URL;
+        if (!url) return;
+
+        NSString *path = url.path;
+        std::string cppPath = std::string([path UTF8String]);
+
+        dispatch_sync(_renderQueue, ^{
+            auto tex = _renderer->loadEquirectangularEnvironmentMap(cppPath, 0);
+            if (tex) {
+                _renderer->setEnvironmentMap(tex);
+                _renderer->setSkyboxEnabled(true);
+                _renderer->setIBLEnabled(true);
+                NSLog(@"Environment map loaded: %@", path.lastPathComponent);
+            } else {
+                NSLog(@"Failed to load environment map: %@", path);
+            }
+        });
+    }];
+}
+
+- (IBAction)setBackgroundSolid:(id)sender {
+    if (!_renderer || !_renderQueue) return;
+    dispatch_sync(_renderQueue, ^{
+        _renderer->setSkyboxEnabled(false);
+        _renderer->setIBLEnabled(false);
+        _renderer->setClearColor(0.08f, 0.08f, 0.10f, 1.0f);
+    });
+    NSLog(@"Background: Solid Color (Dark)");
+}
+
+- (IBAction)setBackgroundSkybox:(id)sender {
+    if (!_renderer || !_renderQueue) return;
+    dispatch_sync(_renderQueue, ^{
+        _renderer->setSkyboxEnabled(true);
+        _renderer->setIBLEnabled(false);
+    });
+    NSLog(@"Background: Skybox");
+}
+
+- (IBAction)setBackgroundSkyboxIBL:(id)sender {
+    if (!_renderer || !_renderQueue) return;
+    dispatch_sync(_renderQueue, ^{
+        _renderer->setSkyboxEnabled(true);
+        _renderer->setIBLEnabled(true);
+    });
+    NSLog(@"Background: Skybox + IBL");
+}
+
+- (IBAction)toggleFXAA:(id)sender {
+    if (!_renderer || !_renderQueue) return;
+    dispatch_sync(_renderQueue, ^{
+        bool enabled = !_renderer->isFxaaEnabled();
+        _renderer->setFxaaEnabled(enabled);
+        NSLog(@"FXAA: %@", enabled ? @"ON" : @"OFF");
+    });
+    if ([sender isKindOfClass:[NSMenuItem class]]) {
+        NSMenuItem *item = (NSMenuItem *)sender;
+        item.state = _renderer->isFxaaEnabled() ? NSControlStateValueOn : NSControlStateValueOff;
+    }
+}
+
+- (IBAction)setSsaaOff:(id)sender {
+    if (!_renderer || !_renderQueue) return;
+    dispatch_sync(_renderQueue, ^{
+        _renderer->setSsaaScale(1.0f);
+        NSLog(@"SSAA: OFF");
+    });
+}
+
+- (IBAction)setSsaa15x:(id)sender {
+    if (!_renderer || !_renderQueue) return;
+    dispatch_sync(_renderQueue, ^{
+        _renderer->setSsaaScale(1.5f);
+        NSLog(@"SSAA: 1.5×");
+    });
+}
+
+- (IBAction)setSsaa20x:(id)sender {
+    if (!_renderer || !_renderQueue) return;
+    dispatch_sync(_renderQueue, ^{
+        _renderer->setSsaaScale(2.0f);
+        NSLog(@"SSAA: 2.0×");
+    });
 }
 
 - (BOOL)acceptsFirstResponder { return YES; }

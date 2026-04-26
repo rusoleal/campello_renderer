@@ -34,6 +34,15 @@ echo "Compiled: default.vert → default_vert.spv"
 "$GLSLC" "$SHADER_DIR/default.frag" -o "$SHADER_DIR/default_frag.spv"
 echo "Compiled: default.frag → default_frag.spv"
 
+"$GLSLC" "$SHADER_DIR/fxaa.vert" -o "$SHADER_DIR/fxaa_vert.spv"
+echo "Compiled: fxaa.vert → fxaa_vert.spv"
+
+"$GLSLC" "$SHADER_DIR/fxaa.frag" -o "$SHADER_DIR/fxaa_frag.spv"
+echo "Compiled: fxaa.frag → fxaa_frag.spv"
+
+"$GLSLC" "$SHADER_DIR/downsample.frag" -o "$SHADER_DIR/downsample_frag.spv"
+echo "Compiled: downsample.frag → downsample_frag.spv"
+
 # ---------------------------------------------------------------------------
 # Helper: convert a .spv binary into a C hex byte array (12 bytes per line).
 # ---------------------------------------------------------------------------
@@ -64,7 +73,7 @@ spv_to_c_array() {
 # ---------------------------------------------------------------------------
 # Generate the header using Python (available on all host platforms).
 # ---------------------------------------------------------------------------
-python3 - "$SHADER_DIR/default_vert.spv" "$SHADER_DIR/default_frag.spv" "$OUT_HEADER" <<'PYEOF'
+python3 - "$SHADER_DIR/default_vert.spv" "$SHADER_DIR/default_frag.spv" "$SHADER_DIR/fxaa_vert.spv" "$SHADER_DIR/fxaa_frag.spv" "$SHADER_DIR/downsample_frag.spv" "$OUT_HEADER" <<'PYEOF'
 import sys, os
 
 def spv_to_hex_lines(path):
@@ -75,10 +84,13 @@ def spv_to_hex_lines(path):
         lines.append("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",")
     return "\n".join(lines), len(data)
 
-vert_path, frag_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+vert_path, frag_path, fxaa_vert_path, fxaa_frag_path, downsample_frag_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
 
 vert_hex, vert_size = spv_to_hex_lines(vert_path)
 frag_hex, frag_size = spv_to_hex_lines(frag_path)
+fxaa_vert_hex, fxaa_vert_size = spv_to_hex_lines(fxaa_vert_path)
+fxaa_frag_hex, fxaa_frag_size = spv_to_hex_lines(fxaa_frag_path)
+downsample_frag_hex, downsample_frag_size = spv_to_hex_lines(downsample_frag_path)
 
 header = f"""#pragma once
 
@@ -101,6 +113,21 @@ static const unsigned char kDefaultVulkanFragShader[] = {{
 }};
 static const unsigned int kDefaultVulkanFragShaderSize = {frag_size};
 
+static const unsigned char kDefaultVulkanFxaaVertShader[] = {{
+{fxaa_vert_hex}
+}};
+static const unsigned int kDefaultVulkanFxaaVertShaderSize = {fxaa_vert_size};
+
+static const unsigned char kDefaultVulkanFxaaFragShader[] = {{
+{fxaa_frag_hex}
+}};
+static const unsigned int kDefaultVulkanFxaaFragShaderSize = {fxaa_frag_size};
+
+static const unsigned char kDefaultVulkanDownsampleFragShader[] = {{
+{downsample_frag_hex}
+}};
+static const unsigned int kDefaultVulkanDownsampleFragShaderSize = {downsample_frag_size};
+
 }} // namespace systems::leal::campello_renderer::shaders
 """
 
@@ -108,4 +135,7 @@ open(out_path, "w").write(header)
 print(f"Written: {out_path}")
 print(f"  vert: {vert_size} bytes")
 print(f"  frag: {frag_size} bytes")
+print(f"  fxaa_vert: {fxaa_vert_size} bytes")
+print(f"  fxaa_frag: {fxaa_frag_size} bytes")
+print(f"  downsample_frag: {downsample_frag_size} bytes")
 PYEOF

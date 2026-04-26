@@ -27,7 +27,7 @@ Each module is designed to work standalone, but integrates seamlessly into the e
 ## Dependencies
 
 * [systems::leal::gltf](https://github.com/rusoleal/gltf) v0.4.1 — C++ glTF/GLB asset loader
-* [systems::leal::campello_gpu](https://github.com/rusoleal/campello_gpu) v0.11.0 — Low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
+* [systems::leal::campello_gpu](https://github.com/rusoleal/campello_gpu) v0.12.0 — Low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
 * [systems::leal::campello_image](https://github.com/rusoleal/campello_image) v0.4.0 — Image decoding (PNG, JPEG, WebP, HDR, OpenEXR)
 
 ## Building

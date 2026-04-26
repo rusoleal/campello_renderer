@@ -135,3 +135,98 @@ float4 pixelMain(PixelIn input) : SV_Target
 
     return float4(color.rgb * light, color.a);
 }
+
+// ---------------------------------------------------------------------------
+// FXAA post-process shader (HLSL shader model 6.0)
+// Based on FXAA 3.11 by Timothy Lottes (simplified).
+// ---------------------------------------------------------------------------
+
+struct FxaaOut {
+    float4 position : SV_Position;
+};
+
+FxaaOut fxaaVertex(uint vertexID : SV_VertexID)
+{
+    FxaaOut output;
+    float2 pos;
+    if (vertexID == 0) pos = float2(-1.0, -1.0);
+    else if (vertexID == 1) pos = float2(3.0, -1.0);
+    else pos = float2(-1.0, 3.0);
+    output.position = float4(pos, 1.0, 1.0);
+    return output;
+}
+
+cbuffer FxaaUniforms : register(b0)
+{
+    float2 rcpFrame;
+    float2 _pad;
+};
+
+Texture2D<float4> sceneTexture : register(t0);
+SamplerState      sceneSampler : register(s0);
+
+static float fxaaLuma(float3 rgb)
+{
+    return dot(rgb, float3(0.299, 0.587, 0.114));
+}
+
+float4 fxaaPixel(FxaaOut input) : SV_Target
+{
+    float2 pos = input.position.xy;
+    float2 uv = pos * rcpFrame;
+
+    float3 rgbNW = sceneTexture.Sample(sceneSampler, uv + float2(-rcpFrame.x, -rcpFrame.y)).rgb;
+    float3 rgbNE = sceneTexture.Sample(sceneSampler, uv + float2( rcpFrame.x, -rcpFrame.y)).rgb;
+    float3 rgbSW = sceneTexture.Sample(sceneSampler, uv + float2(-rcpFrame.x,  rcpFrame.y)).rgb;
+    float3 rgbSE = sceneTexture.Sample(sceneSampler, uv + float2( rcpFrame.x,  rcpFrame.y)).rgb;
+    float3 rgbM  = sceneTexture.Sample(sceneSampler, uv).rgb;
+
+    float lumaNW = fxaaLuma(rgbNW);
+    float lumaNE = fxaaLuma(rgbNE);
+    float lumaSW = fxaaLuma(rgbSW);
+    float lumaSE = fxaaLuma(rgbSE);
+    float lumaM  = fxaaLuma(rgbM);
+
+    float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+    float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+
+    if (lumaMax - lumaMin < max(0.0833, lumaMax * 0.166))
+        return float4(rgbM, 1.0);
+
+    float2 dir;
+    dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
+    dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
+
+    float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * 0.25 * 0.125, 1.0/128.0);
+    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+    dir = clamp(dir * rcpDirMin, float2(-8.0, -8.0), float2(8.0, 8.0)) * rcpFrame;
+
+    float3 rgbA = 0.5 * (
+        sceneTexture.Sample(sceneSampler, uv + dir * (1.0/3.0 - 0.5)).rgb +
+        sceneTexture.Sample(sceneSampler, uv + dir * (2.0/3.0 - 0.5)).rgb);
+
+    float3 rgbB = rgbA * 0.5 + 0.25 * (
+        sceneTexture.Sample(sceneSampler, uv + dir * -0.5).rgb +
+        sceneTexture.Sample(sceneSampler, uv + dir *  0.5).rgb);
+
+    float lumaB = fxaaLuma(rgbB);
+    if (lumaB < lumaMin || lumaB > lumaMax)
+        return float4(rgbA, 1.0);
+    return float4(rgbB, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Downsample post-process shader (HLSL shader model 6.0)
+// Reuses fxaaVertex for the fullscreen triangle.
+// ---------------------------------------------------------------------------
+
+Texture2D<float4> downsampleSceneTexture : register(t0);
+SamplerState      downsampleSceneSampler : register(s0);
+
+float4 downsamplePixel(FxaaOut input) : SV_Target
+{
+    float width, height;
+    downsampleSceneTexture.GetDimensions(width, height);
+    float2 uv = input.position.xy / float2(width, height);
+    return downsampleSceneTexture.Sample(downsampleSceneSampler, uv);
+}

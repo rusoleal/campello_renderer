@@ -36,6 +36,8 @@ using namespace metal;
 //   [[texture(19)]] — clearcoatNormalTexture (RGB linear, reuses baseColorSampler)
 //   [[texture(20)]] — transmissionTexture (R linear, scales transmissionFactor)
 //                     reuses baseColorSampler (slot limit reached)
+//   [[texture(22)]] — sceneColorTexture (screen-space refraction source)
+//   [[sampler(23)]]  — sceneColorSampler (clamp-to-edge)
 //
 // Pipeline variants:
 //   fragmentMain_flat     — Lambert + baseColorFactor, no texture sampling
@@ -83,7 +85,22 @@ using namespace metal;
 //   [188..191] clearcoatNormalScale    — clearcoat normal map intensity (default 1.0)
 //   [192..195] transmissionFactor      — KHR_materials_transmission scalar (default 0.0 = opaque)
 //   [196..199] hasTransmissionTexture  — 0=no, 1=has transmission texture (R channel)
-//   [200..203] viewMode                — renderer inspection mode enum
+//   [200..203] thicknessFactor         — KHR_materials_volume thickness (default 0.0)
+//   [204..207] attenuationDistance     — KHR_materials_volume mean free path (default +inf)
+//   [208..223] attenuationColor        — KHR_materials_volume absorption tint (float3, default [1,1,1])
+//   [224..227] viewMode                — renderer inspection mode enum
+//   [228..231] environmentIntensity    — IBL/environment multiplier
+//   [232..235] iblEnabled              — 0=no IBL, 1=IBL active
+//   [236..239] iridescenceFactor       — KHR_materials_iridescence scalar
+//   [240..243] iridescenceIor          — thin-film IOR
+//   [244..247] iridescenceThicknessMin — thin-film thickness minimum (nm)
+//   [248..251] iridescenceThicknessMax — thin-film thickness maximum (nm)
+//   [252..255] hasIridescenceTexture   — 0=no, 1=has iridescence texture
+//   [256..259] hasIridescenceThicknessTexture — 0=no, 1=has thickness texture
+//   [260..263] anisotropyStrength      — KHR_materials_anisotropy strength
+//   [264..267] anisotropicRotation     — rotation angle (radians)
+//   [268..271] hasAnisotropicTexture   — 0=no, 1=has anisotropy texture
+//   [272..275] dispersion              — KHR_materials_dispersion scalar (default 0.0)
 struct MaterialUniforms {
     float4 baseColorFactor;
     float4 uvTransformRow0;
@@ -99,15 +116,15 @@ struct MaterialUniforms {
     float  hasOcclusionTexture;
     float  occlusionStrength;
     float  _padding;
-    float3 emissiveFactor;
+    float4 emissiveFactor;        // xyz = emissive RGB, w unused
     float  ior;
     float  specularFactor;
     float  hasSpecularTexture;
     float  hasSpecularColorTexture;
     float  _pad2;
-    float3 specularColorFactor;
+    float4 specularColorFactor;   // xyz = specular color, w unused
     float  _pad3;
-    float3 sheenColorFactor;
+    float4 sheenColorFactor;      // xyz = sheen color, w unused
     float  sheenRoughnessFactor;
     float  hasSheenColorTexture;
     float  hasSheenRoughnessTexture;
@@ -119,9 +136,32 @@ struct MaterialUniforms {
     float  clearcoatNormalScale;
     float  transmissionFactor;
     float  hasTransmissionTexture;
+    float  thicknessFactor;
+    float  attenuationDistance;
+    float  hasThicknessTexture;
+    float  _padVol;
+    float4 attenuationColor;      // xyz = attenuation color, w unused
     float  viewMode;
     float  environmentIntensity;
     float  iblEnabled;
+    float  iridescenceFactor;
+    float  iridescenceIor;
+    float  iridescenceThicknessMin;
+    float  iridescenceThicknessMax;
+    float  hasIridescenceTexture;
+    float  hasIridescenceThicknessTexture;
+    float  anisotropyStrength;
+    float  anisotropyRotation;
+    float  hasAnisotropicTexture;
+    float  dispersion;            // KHR_materials_dispersion (default 0.0)
+};
+
+struct CameraUniforms {
+    float4   cameraPos;
+    float4x4 viewMatrix;
+    float4x4 projMatrix;
+    float2   screenSize;
+    float2   _pad;
 };
 
 constant float VIEW_MODE_NORMAL       = 0.0;
@@ -142,6 +182,9 @@ constant float VIEW_MODE_CLEARCOAT_ROUGHNESS = 14.0;
 constant float VIEW_MODE_CLEARCOAT_NORMAL    = 15.0;
 constant float VIEW_MODE_TRANSMISSION        = 16.0;
 constant float VIEW_MODE_ENVIRONMENT         = 17.0;
+constant float VIEW_MODE_IRIDESCENCE         = 18.0;
+constant float VIEW_MODE_ANISOTROPY          = 19.0;
+constant float VIEW_MODE_DISPERSION          = 20.0;
 
 struct VertexIn {
     float3 position  [[attribute(0)]];
@@ -268,52 +311,67 @@ fragment float4 fragmentMain_flat(
     }
 
     if (mat.viewMode > VIEW_MODE_NORMAL + 0.5) {
-        if (mat.viewMode < VIEW_MODE_WORLD_NORMAL + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_WORLD_NORMAL) < 0.5) {
             float3 N = normalize(in.worldNormal);
             return float4(N * 0.5 + 0.5, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_BASE_COLOR + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_BASE_COLOR) < 0.5) {
             return float4(baseColor.rgb, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_METALLIC + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_METALLIC) < 0.5) {
             return float4(mat.metallicFactor, mat.metallicFactor, mat.metallicFactor, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_ROUGHNESS + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_ROUGHNESS) < 0.5) {
             return float4(mat.roughnessFactor, mat.roughnessFactor, mat.roughnessFactor, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_OCCLUSION + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_OCCLUSION) < 0.5) {
             return float4(1.0, 1.0, 1.0, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_EMISSIVE + 0.5) {
-            return float4(mat.emissiveFactor, 1.0);
+        if (abs(mat.viewMode - VIEW_MODE_EMISSIVE) < 0.5) {
+            return float4(mat.emissiveFactor.xyz, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_ALPHA + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_ALPHA) < 0.5) {
             return float4(baseColor.a, baseColor.a, baseColor.a, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_UV0 + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_UV0) < 0.5) {
             return float4(fract(in.texcoord0), 0.0, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_SPECULAR_FACTOR + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_SPECULAR_FACTOR) < 0.5) {
             return float4(1.0, 1.0, 1.0, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_SPECULAR_COLOR + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_SPECULAR_COLOR) < 0.5) {
             return float4(1.0, 1.0, 1.0, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_SHEEN_COLOR + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_SHEEN_COLOR) < 0.5) {
             return float4(0.0, 0.0, 0.0, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_SHEEN_ROUGHNESS + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_SHEEN_ROUGHNESS) < 0.5) {
             return float4(0.0, 0.0, 0.0, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_CLEARCOAT + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_CLEARCOAT) < 0.5) {
             return float4(0.0, 0.0, 0.0, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_CLEARCOAT_ROUGHNESS + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_CLEARCOAT_ROUGHNESS) < 0.5) {
             return float4(0.0, 0.0, 0.0, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_CLEARCOAT_NORMAL + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_CLEARCOAT_NORMAL) < 0.5) {
             float3 N = normalize(in.worldNormal);
             return float4(N * 0.5 + 0.5, 1.0);
+        }
+        if (abs(mat.viewMode - VIEW_MODE_TRANSMISSION) < 0.5) {
+            return float4(baseColor.a, baseColor.a, baseColor.a, 1.0);
+        }
+        if (abs(mat.viewMode - VIEW_MODE_ENVIRONMENT) < 0.5) {
+            return float4(0.0, 0.0, 0.0, 1.0);
+        }
+        if (abs(mat.viewMode - VIEW_MODE_IRIDESCENCE) < 0.5) {
+            return float4(0.0, 0.0, 0.0, 1.0);
+        }
+        if (abs(mat.viewMode - VIEW_MODE_ANISOTROPY) < 0.5) {
+            return float4(mat.anisotropyStrength, mat.anisotropyStrength, mat.anisotropyStrength, 1.0);
+        }
+        if (abs(mat.viewMode - VIEW_MODE_DISPERSION) < 0.5) {
+            return float4(mat.dispersion, mat.dispersion, mat.dispersion, 1.0);
         }
         return float4(0.0, 0.0, 0.0, 1.0);
     }
@@ -391,6 +449,45 @@ float F_Schlick_scalar(float F0, float cosTheta) {
 }
 
 // ---------------------------------------------------------------------------
+// Thin-film iridescence — KHR_materials_iridescence
+// Simplified analytical model: interference of reflected light from a thin
+// film. Returns an RGB Fresnel-like factor that modulates the base specular F0.
+// ---------------------------------------------------------------------------
+float3 ThinFilmIridescence(float cosTheta, float thickness, float ior) {
+    // Wavelengths for RGB in nanometers
+    const float3 wavelengths = float3(650.0, 530.0, 470.0);
+
+    // Refracted angle via Snell's law
+    float sinTheta2 = 1.0 - cosTheta * cosTheta;
+    float cosTheta2 = sqrt(max(1.0 - sinTheta2 / (ior * ior), 0.0));
+
+    // Optical path difference
+    float opticalPath = 2.0 * ior * thickness * cosTheta2;
+
+    // Phase for each wavelength
+    float3 phase = 6.28318530718 * opticalPath / wavelengths;
+
+    // Fresnel reflection at air-film interface
+    float R = pow((1.0 - ior) / (1.0 + ior), 2.0);
+
+    // First-order interference
+    float3 interference = 0.5 + 0.5 * cos(phase);
+
+    // Combine with base Fresnel
+    return saturate(interference * (1.0 - R) + R);
+}
+
+// ---------------------------------------------------------------------------
+// Anisotropic GGX NDF — KHR_materials_anisotropy
+// ---------------------------------------------------------------------------
+float D_GGX_Anisotropic(float NdotH, float HdotT, float HdotB, float ax, float ay) {
+    float X = HdotT / ax;
+    float Y = HdotB / ay;
+    float tmp = X * X + Y * Y + NdotH * NdotH;
+    return 1.0 / (M_PI_F * ax * ay * tmp * tmp);
+}
+
+// ---------------------------------------------------------------------------
 // Charlie sheen NDF and Neubelt visibility — KHR_materials_sheen
 // ---------------------------------------------------------------------------
 float D_Charlie(float roughness, float NdotH) {
@@ -407,7 +504,7 @@ float V_Neubelt(float NdotV, float NdotL) {
 fragment float4 fragmentMain_textured(
     VertexOut        in                        [[stage_in]],
     constant MaterialUniforms &mat             [[buffer(17)]],
-    device const float3      *cameraPos        [[buffer(18)]],
+    constant CameraUniforms  &camera           [[buffer(18)]],
     texture2d<float> baseColorTexture          [[texture(0)]],
     sampler          baseColorSampler          [[sampler(1)]],
     texture2d<float> metallicRoughnessTexture  [[texture(2)]],
@@ -429,7 +526,12 @@ fragment float4 fragmentMain_textured(
     texture2d<float> clearcoatRoughnessTexture [[texture(18)]],
     texture2d<float> clearcoatNormalTexture    [[texture(19)]],
     texture2d<float> transmissionTexture       [[texture(20)]],
-    texturecube<float> environmentMap          [[texture(21)]])
+    texturecube<float> environmentMap          [[texture(21)]],
+    texture2d<float> sceneColorTexture         [[texture(22)]],
+    texture2d<float> thicknessTexture          [[texture(23)]],
+    texture2d<float> iridescenceTexture        [[texture(24)]],
+    texture2d<float> iridescenceThicknessTexture [[texture(25)]],
+    texture2d<float> anisotropicTexture          [[texture(26)]])
 {
     float2 uv = in.texcoord0;
 
@@ -442,16 +544,13 @@ fragment float4 fragmentMain_textured(
         float transmissionTex = transmissionTexture.sample(baseColorSampler, uv).r;
         transmission *= transmissionTex;
     }
-    if (transmission > 0.0) {
-        baseColor.a *= (1.0 - transmission);
-    }
 
     if (mat.viewMode > VIEW_MODE_NORMAL + 0.5) {
-        if (mat.viewMode < VIEW_MODE_BASE_COLOR + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_WORLD_NORMAL) < 0.5) {
             float3 N = normalize(in.worldNormal);
             return float4(N * 0.5 + 0.5, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_METALLIC + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_BASE_COLOR) < 0.5) {
             return float4(baseColor.rgb, 1.0);
         }
     }
@@ -471,13 +570,13 @@ fragment float4 fragmentMain_textured(
     float metallic  = mrSample.b * mat.metallicFactor;
     float roughness = clamp(mrSample.g * mat.roughnessFactor, 0.04, 1.0);
 
-    // Normal mapping.
+    // Tangent frame (needed for normal mapping and anisotropy).
+    float3 T = normalize(in.worldTangent);
+    float3 B = normalize(in.worldBitangent);
     float3 N;
     if (mat.hasNormalTexture > 0.5) {
         float3 ns = normalTexture.sample(normalSampler, uv).rgb * 2.0 - 1.0;
         ns.xy *= mat.normalScale;
-        float3 T    = normalize(in.worldTangent);
-        float3 B    = normalize(in.worldBitangent);
         float3 Nbase = normalize(in.worldNormal);
         N = normalize(float3x3(T, B, Nbase) * normalize(ns));
     } else {
@@ -492,7 +591,7 @@ fragment float4 fragmentMain_textured(
     }
 
     // Emissive.
-    float3 emissive = mat.emissiveFactor;
+    float3 emissive = mat.emissiveFactor.xyz;
     if (mat.hasEmissiveTexture > 0.5) {
         emissive *= emissiveTexture.sample(emissiveSampler, uv).rgb;
     }
@@ -502,41 +601,63 @@ fragment float4 fragmentMain_textured(
         specularFactor *= specularTexture.sample(specularSampler, uv).a;
     }
 
-    float3 specularColor = mat.specularColorFactor;
+    float3 specularColor = mat.specularColorFactor.xyz;
     if (mat.hasSpecularColorTexture > 0.5) {
         specularColor *= specularColorTexture.sample(specularColorSampler, uv).rgb;
     }
 
+    // Anisotropy.
+    float anisoStrength = mat.anisotropyStrength;
+    float anisoRotation = mat.anisotropyRotation;
+    if (mat.hasAnisotropicTexture > 0.5) {
+        float2 anisoTex = anisotropicTexture.sample(baseColorSampler, uv).rg;
+        anisoStrength *= anisoTex.r;
+        anisoRotation += anisoTex.g * 2.0 * M_PI_F;
+    }
+
+    // KHR_materials_iridescence: sample factor and thickness.
+    float iridescenceFactor = mat.iridescenceFactor;
+    if (mat.hasIridescenceTexture > 0.5) {
+        iridescenceFactor *= iridescenceTexture.sample(baseColorSampler, uv).r;
+    }
+    float iridescenceThickness = mat.iridescenceThicknessMin;
+    if (mat.hasIridescenceThicknessTexture > 0.5) {
+        iridescenceThickness += (mat.iridescenceThicknessMax - mat.iridescenceThicknessMin)
+                              * iridescenceThicknessTexture.sample(baseColorSampler, uv).g;
+    } else {
+        iridescenceThickness = (mat.iridescenceThicknessMin + mat.iridescenceThicknessMax) * 0.5;
+    }
+
     if (mat.viewMode > VIEW_MODE_NORMAL + 0.5) {
-        if (mat.viewMode < VIEW_MODE_ROUGHNESS + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_METALLIC) < 0.5) {
             return float4(metallic, metallic, metallic, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_OCCLUSION + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_ROUGHNESS) < 0.5) {
             return float4(roughness, roughness, roughness, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_EMISSIVE + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_OCCLUSION) < 0.5) {
             return float4(occlusion, occlusion, occlusion, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_ALPHA + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_EMISSIVE) < 0.5) {
             return float4(emissive, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_UV0 + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_ALPHA) < 0.5) {
             return float4(baseColor.a, baseColor.a, baseColor.a, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_SPECULAR_FACTOR + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_UV0) < 0.5) {
             return float4(fract(uv), 0.0, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_SPECULAR_COLOR + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_SPECULAR_FACTOR) < 0.5) {
             return float4(specularFactor, specularFactor, specularFactor, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_SHEEN_COLOR + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_SPECULAR_COLOR) < 0.5) {
             return float4(specularColor, 1.0);
         }
     }
 
     // KHR_materials_sheen: sample sheen color and roughness.
     // Reuse baseColorSampler — Metal allows only 16 sampler slots (0–15).
-    float3 sheenColor = mat.sheenColorFactor;
+    float3 sheenColor = mat.sheenColorFactor.xyz;
     if (mat.hasSheenColorTexture > 0.5) {
         sheenColor *= sheenColorTexture.sample(baseColorSampler, uv).rgb;
     }
@@ -567,14 +688,21 @@ fragment float4 fragmentMain_textured(
     }
 
     // View direction.
-    float3 camPos  = *cameraPos;
+    float3 camPos  = camera.cameraPos.xyz;
     float3 viewDir = normalize(camPos - in.worldPos);
+
+    // Double-sided rendering: flip normals for back-facing fragments so
+    // lighting and refraction treat them as front-facing.
+    if (dot(N, viewDir) < 0.0) N = -N;
+    if (dot(ccN, viewDir) < 0.0) ccN = -ccN;
+
     float  NdotV   = max(dot(N, viewDir), 0.0001f);
     float  ccNdotV = max(dot(ccN, viewDir), 0.0001f);
 
     // IBL (image-based lighting) from environment cubemap.
     float3 iblDiffuse  = float3(0.0);
     float3 iblSpecular = float3(0.0);
+    float3 iblClearcoat = float3(0.0);
     if (mat.iblEnabled > 0.5) {
         // Diffuse: sample irradiance using normal direction.
         float3 envDiffuse = environmentMap.sample(baseColorSampler, N).rgb;
@@ -586,32 +714,146 @@ fragment float4 fragmentMain_textured(
         // Simple Fresnel approximation for IBL specular.
         float f0_scalar = (mat.ior - 1.0) / (mat.ior + 1.0);
         f0_scalar *= f0_scalar;
-        float3 F0 = mix(float3(f0_scalar) * mat.specularColorFactor, baseColor.rgb, metallic);
+        float3 F0 = mix(float3(f0_scalar) * mat.specularColorFactor.xyz, baseColor.rgb, metallic);
+        // Apply thin-film iridescence to IBL Fresnel.
+        if (iridescenceFactor > 0.0) {
+            float3 iridF0 = ThinFilmIridescence(NdotV, iridescenceThickness, mat.iridescenceIor);
+            F0 = mix(F0, iridF0, iridescenceFactor);
+        }
         float fresnel = pow(1.0 - NdotV, 5.0);
         float3 F = F0 + (float3(1.0) - F0) * fresnel;
-        iblSpecular = envSpecular * F * metallic * mat.environmentIntensity;
+        iblSpecular = envSpecular * F * mat.environmentIntensity;
+
+        // IBL clearcoat: sample environment with clearcoat normal and Fresnel.
+        if (ccFactor > 0.0) {
+            float3 ccR = reflect(-viewDir, ccN);
+            float3 envCC = environmentMap.sample(baseColorSampler, ccR).rgb;
+            float ccFresnel = F_Schlick_scalar(0.04f, ccNdotV);
+            iblClearcoat = envCC * ccFresnel * ccFactor * mat.environmentIntensity;
+        }
+    }
+
+    // KHR_materials_transmission — environment-based refraction.
+    // Sample the environment cubemap in the refracted direction and apply
+    // KHR_materials_volume attenuation (Beer-Lambert law).
+    float3 transmitted = float3(0.0);
+    float transmittance = 0.0;
+    if (transmission > 0.0 && metallic < 0.99) {
+        float eta = 1.0 / mat.ior;
+        float3 T = refract(-viewDir, N, eta);
+        if (all(T == 0.0)) T = -viewDir; // total internal reflection fallback
+
+        // Sample thickness texture if present (modulates thicknessFactor).
+        float thickness = mat.thicknessFactor;
+        if (mat.hasThicknessTexture > 0.5) {
+            thickness *= thicknessTexture.sample(baseColorSampler, uv).r;
+        }
+
+        // Determine the UV at which to sample the opaque scene.
+        // For thin materials (no KHR_materials_volume) the spec says to ignore
+        // macroscopic refraction and sample straight through at the fragment's
+        // screen position. For volume materials we use the refracted ray.
+        // KHR_materials_dispersion: when thickness > 0 and dispersion > 0,
+        // compute a different refracted UV per RGB channel.
+        float2 sampleUV[3];
+        bool uvValid[3];
+        sampleUV[0] = sampleUV[1] = sampleUV[2] = float2(0.0);
+        uvValid[0] = uvValid[1] = uvValid[2] = true;
+        if (thickness > 0.0) {
+            // Volume material: project refracted ray through thickness.
+            float3 viewPos = (camera.viewMatrix * float4(in.worldPos, 1.0)).xyz;
+            float3 viewNormal = normalize((camera.viewMatrix * float4(N, 0.0)).xyz);
+            float3 viewIncident = normalize(viewPos);
+            if (mat.dispersion > 0.0) {
+                float dispersionScale = mat.dispersion * 0.02;
+                float3 iorRGB = float3(mat.ior + dispersionScale, mat.ior, max(mat.ior - dispersionScale, 1.001));
+                for (int ch = 0; ch < 3; ch++) {
+                    float etaCh = 1.0 / iorRGB[ch];
+                    float3 viewRefractCh = refract(viewIncident, viewNormal, etaCh);
+                    if (all(viewRefractCh == 0.0)) viewRefractCh = viewIncident;
+                    float3 backPosCh = viewPos + viewRefractCh * thickness;
+                    float4 backClipCh = camera.projMatrix * float4(backPosCh, 1.0);
+                    sampleUV[ch] = backClipCh.xy / backClipCh.w * 0.5 + 0.5;
+                    sampleUV[ch].y = 1.0 - sampleUV[ch].y;
+                    uvValid[ch] = all(sampleUV[ch] >= 0.0) && all(sampleUV[ch] <= 1.0);
+                }
+            } else {
+                float3 viewRefract = refract(viewIncident, viewNormal, eta);
+                if (all(viewRefract == 0.0)) viewRefract = viewIncident;
+                float3 backPos = viewPos + viewRefract * thickness;
+                float4 backClip = camera.projMatrix * float4(backPos, 1.0);
+                sampleUV[0] = sampleUV[1] = sampleUV[2] = backClip.xy / backClip.w * 0.5 + 0.5;
+                sampleUV[0].y = 1.0 - sampleUV[0].y;
+                uvValid[0] = uvValid[1] = uvValid[2] = all(sampleUV[0] >= 0.0) && all(sampleUV[0] <= 1.0);
+            }
+        } else {
+            // Thin material: sample at the fragment's own screen position.
+            // in.clipPosition is in viewport pixel coords (origin top-left).
+            sampleUV[0] = sampleUV[1] = sampleUV[2] = in.clipPosition.xy / camera.screenSize;
+        }
+
+        constexpr sampler scSampler(coord::normalized, filter::linear, address::clamp_to_edge);
+        // Official glTF-Sample-Viewer LOD formula:
+        // lod = log2(textureWidth) * perceptualRoughness * clamp(ior * 2.0 - 2.0, 0.0, 1.0)
+        float iorScale = clamp(mat.ior * 2.0 - 2.0, 0.0, 1.0);
+        float lod = log2(camera.screenSize.x) * roughness * iorScale;
+
+        // Sample background per-channel (dispersion splits R/G/B refracted UVs).
+        for (int ch = 0; ch < 3; ch++) {
+            if (uvValid[ch]) {
+                transmitted[ch] = sceneColorTexture.sample(scSampler, sampleUV[ch], level(lod))[ch];
+            } else {
+                transmitted[ch] = environmentMap.sample(baseColorSampler, T)[ch];
+            }
+        }
+
+        // KHR_materials_volume attenuation.
+        if (thickness > 0.0 && mat.attenuationDistance > 0.0 && !isinf(mat.attenuationDistance)) {
+            float3 attn = (float3(1.0) - mat.attenuationColor.xyz) / mat.attenuationDistance;
+            transmitted *= exp(-thickness * attn);
+        }
+
+        transmitted *= baseColor.rgb;
+
+        float f0 = (mat.ior - 1.0) / (mat.ior + 1.0);
+        f0 *= f0;
+        float fresnel = f0 + (1.0 - f0) * pow(1.0 - NdotV, 5.0);
+        transmittance = transmission * (1.0 - fresnel) * (1.0 - metallic);
     }
 
     if (mat.viewMode > VIEW_MODE_NORMAL + 0.5) {
-        if (mat.viewMode < VIEW_MODE_SHEEN_ROUGHNESS + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_SHEEN_COLOR) < 0.5) {
             return float4(sheenColor, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_CLEARCOAT + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_SHEEN_ROUGHNESS) < 0.5) {
             return float4(sheenRoughness, sheenRoughness, sheenRoughness, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_CLEARCOAT_ROUGHNESS + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_CLEARCOAT) < 0.5) {
             return float4(ccFactor, ccFactor, ccFactor, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_CLEARCOAT_NORMAL + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_CLEARCOAT_ROUGHNESS) < 0.5) {
             return float4(ccRoughness, ccRoughness, ccRoughness, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_TRANSMISSION + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_CLEARCOAT_NORMAL) < 0.5) {
             return float4(ccN * 0.5 + 0.5, 1.0);
         }
-        if (mat.viewMode < VIEW_MODE_ENVIRONMENT + 0.5) {
+        if (abs(mat.viewMode - VIEW_MODE_TRANSMISSION) < 0.5) {
+            return float4(transmission, transmission, transmission, 1.0);
+        }
+        if (abs(mat.viewMode - VIEW_MODE_ENVIRONMENT) < 0.5) {
             return float4(iblDiffuse + iblSpecular, 1.0);
         }
-        return float4(transmission, transmission, transmission, 1.0);
+        if (abs(mat.viewMode - VIEW_MODE_IRIDESCENCE) < 0.5) {
+            float3 iridF0 = ThinFilmIridescence(NdotV, iridescenceThickness, mat.iridescenceIor);
+            return float4(iridF0 * iridescenceFactor, 1.0);
+        }
+        if (abs(mat.viewMode - VIEW_MODE_ANISOTROPY) < 0.5) {
+            return float4(anisoStrength, anisoStrength, anisoStrength, 1.0);
+        }
+        if (abs(mat.viewMode - VIEW_MODE_DISPERSION) < 0.5) {
+            return float4(mat.dispersion, mat.dispersion, mat.dispersion, 1.0);
+        }
+        return float4(0.0, 0.0, 0.0, 1.0);
     }
 
     // Accumulate per-light contributions.
@@ -662,7 +904,6 @@ fragment float4 fragmentMain_textured(
 
         float3 halfDir = normalize(lightDir + viewDir);
         float  NdotH   = max(dot(N, halfDir), 0.0);
-        float  specPower = max(1.0 / (roughness * roughness) - 1.0, 4.0);
 
         // KHR_materials_specular F0.
         float f0_scalar = (mat.ior - 1.0) / (mat.ior + 1.0);
@@ -672,13 +913,36 @@ fragment float4 fragmentMain_textured(
         if (mat.hasSpecularTexture > 0.5)
             spec *= specularTexture.sample(specularSampler, uv).a;
 
-        float3 specColor = mat.specularColorFactor;
+        float3 specColor = mat.specularColorFactor.xyz;
         if (mat.hasSpecularColorTexture > 0.5)
             specColor *= specularColorTexture.sample(specularColorSampler, uv).rgb;
 
         float3 F0_dielectric = min(float3(f0_scalar) * specColor, float3(1.0)) * spec;
         float3 F0 = mix(F0_dielectric, baseColor.rgb, metallic);
-        totalSpecular += F0 * pow(NdotH, specPower) * metallic * lightColor;
+        // Apply thin-film iridescence to direct-light specular F0.
+        if (iridescenceFactor > 0.0) {
+            float3 iridF0 = ThinFilmIridescence(NdotV, iridescenceThickness, mat.iridescenceIor);
+            F0 = mix(F0, iridF0, iridescenceFactor);
+        }
+
+        // GGX microfacet BRDF (isotropic or anisotropic).
+        float D, V;
+        if (anisoStrength > 0.001) {
+            float aspect = sqrt(1.0 - 0.9 * anisoStrength);
+            float alphaX = max(0.001, roughness * roughness / aspect);
+            float alphaY = max(0.001, roughness * roughness * aspect);
+            float cosR = cos(anisoRotation);
+            float sinR = sin(anisoRotation);
+            float3 anisoT = cosR * T + sinR * B;
+            float3 anisoB = -sinR * T + cosR * B;
+            float HdotT = dot(halfDir, anisoT);
+            float HdotB = dot(halfDir, anisoB);
+            D = D_GGX_Anisotropic(NdotH, HdotT, HdotB, alphaX, alphaY);
+        } else {
+            D = D_GGX(roughness, NdotH);
+        }
+        V = V_SmithGGX(NdotL, NdotV, roughness);
+        totalSpecular += F0 * D * V * NdotL * lightColor;
 
         // KHR_materials_sheen.
         float sheenD = D_Charlie(sheenRoughness, NdotH);
@@ -698,9 +962,16 @@ fragment float4 fragmentMain_textured(
     float3 ambientColor = baseColor.rgb * 0.25 * occlusion;
     float3 diffuse      = totalDiffuse * occlusion;
 
+    // Scale diffuse/ambient terms by (1 - transmittance); specular/clearcoat remain.
+    float diffuseScale = 1.0 - transmittance;
+    ambientColor *= diffuseScale;
+    diffuse      *= diffuseScale;
+    iblDiffuse   *= diffuseScale;
+
     float ccAmbientAtten = 1.0f - ccFactor * F_Schlick_scalar(0.04f, ccNdotV);
     float3 finalColor = (ambientColor + diffuse + totalSpecular + totalSheen + iblDiffuse + iblSpecular) * ccAmbientAtten
-                        + totalClearcoat + emissive;
+                        + totalClearcoat + iblClearcoat + emissive
+                        + transmitted * transmittance;
 
     // Reinhard tone mapping.
     finalColor = finalColor / (float3(1.0) + finalColor);
@@ -727,10 +998,9 @@ vertex SkyboxOut skyboxVertex(uint vertexID [[vertex_id]]) {
 
 struct SkyboxUniforms {
     float4x4 invVP;
-    float2 screenSize;
-    float2 _pad;
-    float3 cameraPos;
-    float _pad2;
+    float2   screenSize;
+    float2   _pad;
+    float4   cameraPos;  // w ignored — float3 would pad to 16 bytes anyway
 };
 
 fragment float4 skyboxFragment(SkyboxOut in [[stage_in]],
@@ -743,6 +1013,100 @@ fragment float4 skyboxFragment(SkyboxOut in [[stage_in]],
         (1.0 - in.position.y / u.screenSize.y) * 2.0 - 1.0
     );
     float4 worldFar = u.invVP * float4(ndc, 1.0, 1.0);
-    float3 worldDir = normalize(worldFar.xyz / worldFar.w - u.cameraPos);
+    float3 worldDir = normalize(worldFar.xyz / worldFar.w - u.cameraPos.xyz);
     return envMap.sample(envSampler, worldDir);
+}
+
+// ---------------------------------------------------------------------------
+// FXAA shader — fullscreen post-process anti-aliasing.
+// Based on FXAA 3.11 by Timothy Lottes (simplified).
+// ---------------------------------------------------------------------------
+struct FxaaOut {
+    float4 position [[position]];
+};
+
+vertex FxaaOut fxaaVertex(uint vertexID [[vertex_id]]) {
+    float2 pos;
+    if (vertexID == 0) pos = float2(-1, -1);
+    else if (vertexID == 1) pos = float2(3, -1);
+    else pos = float2(-1, 3);
+    return FxaaOut{float4(pos, 1.0, 1.0)};
+}
+
+struct FxaaUniforms {
+    float2 rcpFrame;
+    float2 _pad;
+};
+
+static float fxaaLuma(float3 rgb) {
+    return dot(rgb, float3(0.299, 0.587, 0.114));
+}
+
+fragment float4 fxaaFragment(FxaaOut in [[stage_in]],
+                             constant FxaaUniforms &u [[buffer(2)]],
+                             texture2d<float> sceneTex [[texture(0)]],
+                             sampler sceneSampler [[sampler(1)]])
+{
+    float2 pos = in.position.xy;
+    float2 rcpFrame = u.rcpFrame;
+
+    // Sample center and 4 direct neighbours.
+    float3 rgbNW = sceneTex.sample(sceneSampler, pos, int2(-1, -1)).rgb;
+    float3 rgbNE = sceneTex.sample(sceneSampler, pos, int2( 1, -1)).rgb;
+    float3 rgbSW = sceneTex.sample(sceneSampler, pos, int2(-1,  1)).rgb;
+    float3 rgbSE = sceneTex.sample(sceneSampler, pos, int2( 1,  1)).rgb;
+    float3 rgbM  = sceneTex.sample(sceneSampler, pos, int2( 0,  0)).rgb;
+
+    float lumaNW = fxaaLuma(rgbNW);
+    float lumaNE = fxaaLuma(rgbNE);
+    float lumaSW = fxaaLuma(rgbSW);
+    float lumaSE = fxaaLuma(rgbSE);
+    float lumaM  = fxaaLuma(rgbM);
+
+    float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+    float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+
+    // Early exit if contrast is too low.
+    if (lumaMax - lumaMin < max(0.0833, lumaMax * 0.166)) {
+        return float4(rgbM, 1.0);
+    }
+
+    // Compute edge direction.
+    float2 dir;
+    dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
+    dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
+
+    float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * 0.25 * 0.125, 1.0/128.0);
+    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+    dir = clamp(dir * rcpDirMin, float2(-8.0), float2(8.0)) * rcpFrame;
+
+    // Two taps along the edge.
+    float3 rgbA = 0.5 * (
+        sceneTex.sample(sceneSampler, pos + dir * (1.0/3.0 - 0.5)).rgb +
+        sceneTex.sample(sceneSampler, pos + dir * (2.0/3.0 - 0.5)).rgb);
+
+    // Four taps along the edge.
+    float3 rgbB = rgbA * 0.5 + 0.25 * (
+        sceneTex.sample(sceneSampler, pos + dir * -0.5).rgb +
+        sceneTex.sample(sceneSampler, pos + dir *  0.5).rgb);
+
+    float lumaB = fxaaLuma(rgbB);
+
+    // Choose the result that stays within the local luma range.
+    if (lumaB < lumaMin || lumaB > lumaMax) {
+        return float4(rgbA, 1.0);
+    }
+    return float4(rgbB, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Downsample shader — bilinear downsample from scaled scene texture to screen.
+// Reuses fxaaVertex for the fullscreen triangle.
+// ---------------------------------------------------------------------------
+fragment float4 downsampleFragment(FxaaOut in [[stage_in]],
+                                   texture2d<float> sceneTex [[texture(0)]],
+                                   sampler sceneSampler [[sampler(1)]])
+{
+    float2 uv = in.position.xy / float2(sceneTex.get_width(), sceneTex.get_height());
+    return sceneTex.sample(sceneSampler, uv);
 }

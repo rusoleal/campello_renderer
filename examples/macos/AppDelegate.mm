@@ -99,8 +99,53 @@
                                                      action:@selector(toggleIBL:)
                                               keyEquivalent:@"i"];
     iblItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
-    iblItem.state = NSControlStateValueOff;
+    iblItem.state = NSControlStateValueOn;
     [lightingMenu addItem:iblItem];
+
+    [lightingMenu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *envItem = [[NSMenuItem alloc] initWithTitle:@"Load Environment Map…"
+                                                     action:@selector(loadEnvironmentMap:)
+                                              keyEquivalent:@"e"];
+    envItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    [lightingMenu addItem:envItem];
+
+    NSMenuItem *bgModeItem = [[NSMenuItem alloc] init];
+    [lightingMenu addItem:bgModeItem];
+    NSMenu *bgModeMenu = [[NSMenu alloc] initWithTitle:@"Background Mode"];
+    bgModeItem.submenu = bgModeMenu;
+    [bgModeMenu addItemWithTitle:@"Solid Color"
+                          action:@selector(setBackgroundSolid:)
+                   keyEquivalent:@""];
+    [bgModeMenu addItemWithTitle:@"Skybox"
+                          action:@selector(setBackgroundSkybox:)
+                   keyEquivalent:@""];
+    [bgModeMenu addItemWithTitle:@"Skybox + IBL"
+                          action:@selector(setBackgroundSkyboxIBL:)
+                   keyEquivalent:@""];
+
+    [lightingMenu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *fxaaItem = [[NSMenuItem alloc] initWithTitle:@"FXAA"
+                                                      action:@selector(toggleFXAA:)
+                                               keyEquivalent:@"a"];
+    fxaaItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    fxaaItem.state = NSControlStateValueOff;
+    [lightingMenu addItem:fxaaItem];
+
+    NSMenuItem *ssaaItem = [[NSMenuItem alloc] init];
+    [lightingMenu addItem:ssaaItem];
+    NSMenu *ssaaMenu = [[NSMenu alloc] initWithTitle:@"SSAA"];
+    ssaaItem.submenu = ssaaMenu;
+    [ssaaMenu addItemWithTitle:@"Off"
+                        action:@selector(setSsaaOff:)
+                 keyEquivalent:@""];
+    [ssaaMenu addItemWithTitle:@"1.5×"
+                        action:@selector(setSsaa15x:)
+                 keyEquivalent:@""];
+    [ssaaMenu addItemWithTitle:@"2.0×"
+                        action:@selector(setSsaa20x:)
+                 keyEquivalent:@""];
 
     [lightingMenu addItem:[NSMenuItem separatorItem]];
 

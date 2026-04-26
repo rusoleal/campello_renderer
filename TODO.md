@@ -1,6 +1,6 @@
 # campello_renderer TODO
 
-## Current State (v0.2.1)
+## Current State (v0.5.0)
 
 ### What works
 - `setAsset(shared_ptr<GLTF>)` — loads asset, allocates GPU buffer/texture/sampler/bind-group slot arrays
@@ -40,7 +40,7 @@
 ## Asset Loading
 
 - [x] **`data:uri` image support** — The gltf library already decodes data:uri images automatically. The renderer now uses `image.data` directly with `campello_image::Image::fromMemory()`.
-- [ ] **External image URIs** — `.gltf` files referencing external image files (not buffer views) are not loaded.
+- [x] **External image URIs** — `.gltf` files referencing external image files are loaded via `Renderer::imageBasePath` / `setAssetBasePath()`. Both `setAsset()` and `uploadMaterial()` resolve external image paths relative to the base path.
 - [x] **Non-standard buffer view strides** — interleaved vertex data (`byteStride > 0` in buffer views) is now deinterleaved into contiguous GPU buffers per accessor at load time. The renderer scans all mesh primitives in `setScene()`, detects accessors in buffer views with `byteStride > 0`, and extracts each attribute into its own tightly-packed GPU buffer. `renderPrimitive()` prefers the deinterleaved buffer when binding standard GLTF attributes.
 
 ---
@@ -62,8 +62,8 @@
 - [ ] **Add `dxc` compile step to CMake** — guard with `if(WIN32)`.
 
 ### Apple (macOS / iOS)
-- [ ] **iOS SDK compile** — current `.metallib` is compiled for macOS. Add `iphoneos` and `iphonesimulator` SDK variants.
-- [ ] **Add Metal compile step to CMake** — automate `metal` → `metallib` compilation for Apple targets.
+- [x] **iOS SDK compile** — `build_metal_shaders.sh` compiles for macOS, iOS simulator, and iOS device SDKs.
+- [x] **Add Metal compile step to CMake** — `metal_shaders` custom target + `add_dependencies(campello_renderer metal_shaders)` auto-rebuilds embedded `.metallib` header when `default.metal` changes.
 
 ### Longer term
 - [ ] **Single shader source** — evaluate HLSL → MSL + SPIR-V via DXC + SPIRV-Cross to eliminate per-platform divergence.
@@ -104,12 +104,12 @@
 
 ### Priority 3 — draw-call and state-change reduction
 
-- [ ] **Add mesh / material batching and state sorting** — once visibility is known, sort opaque draws by pipeline / material / vertex buffers to reduce `setPipeline`, `setBindGroup`, and vertex/index buffer rebinding overhead in large scenes.
+- [x] **Add mesh / material batching and state sorting** — opaque draws sorted by `(pipelineVariant << 48) | (materialPtr << 16) | meshPtr`. Both legacy `renderToTarget()` and ECS `render(const RenderScene&)` paths sort before submission.
 - [x] **Guard debug logging in hot paths** — `std::cout` diagnostics removed from `computeNodeTransform()` and `renderPrimitive()` hot paths.
 
 ### Priority 4 — longer-term scalability
 
-- [ ] **Add renderer performance counters** — expose CPU traversal time, culling reject counts, visible primitive counts, draw-call counts, and GPU frame time so optimizations can be verified against representative large-scene assets.
+- [x] **Add renderer performance counters** — `RenderStats` exposes `opaqueDrawCount`, `transparentDrawCount`, `totalDrawCount`, `culledNodeCount`, `visibleNodeCount`, `cpuFrameTimeMs`. Populated in both legacy and ECS render paths.
 - [ ] **Add distance-based LOD hooks** — define per-mesh LOD selection and optional far-distance impostor / low-poly fallback support so large environments do not submit full-resolution geometry at every distance.
 
 ---
@@ -177,26 +177,19 @@ The gltf library (v0.4.1) parses **23 extensions** into structured data. The ren
   - No render-to-texture (simpler, good for thin glass/panels)
   - Uniform at material buffer offset 228 (index 57), correctly aligned for Metal
   
-- [ ] **`KHR_materials_transmission`** (sophisticated / physically based) — proper transmission with refraction
-  - Render opaque scene to offscreen texture (background frame buffer)
-  - Sample background texture with refracted UV coordinates in fragment shader
-  - Implement `transmissionTexture` sampling (R channel scales transmissionFactor)
-  - Apply Beer-Law attenuation for colored transmission (integrate with `KHR_materials_volume`)
-  - Handle IOR-dependent refraction angle (Snell's law) using `KHR_materials_ior`
-  - Consider screen-space refraction for performance (fallback to environment map at edges)
-  - Sort transparent objects back-to-front with transmission-aware blending
+- [x] **`KHR_materials_transmission`** (sophisticated / physically based) — screen-space refraction implemented. Opaque scene rendered to offscreen `opaqueSceneTexture` (binding 22) with mipmap generation. Transparent pass samples background with refracted UVs using IOR. `transmissionTexture` (binding 20) scales factor. Beer-Lambert attenuation integrated with `KHR_materials_volume`.
 
 ### KHR_materials_volume
 
-- [ ] **`KHR_materials_volume`** — parsed as `Material::khrMaterialsVolume` (`thicknessFactor`, `thicknessTexture`, `attenuationDistance`, `attenuationColor`). Beer-Law absorption for transmissive volumes (e.g., colored glass). Depends on `KHR_materials_transmission`.
+- [x] **`KHR_materials_volume`** — `thicknessTexture` sampled at binding 23. Beer-Lambert attenuation `exp(-thickness * attn)` applied in fragment shader. Uniforms: `thicknessFactor`, `hasThicknessTex`, `attenuationDistance`, `attenuationColor`.
 
 ### KHR_materials_iridescence
 
-- [ ] **`KHR_materials_iridescence`** — parsed as `Material::khrMaterialsIridescence` (`iridescenceFactor`, `iridescenceTexture`, `iridescenceIor`, `iridescenceThicknessMinimum/Maximum` nm, `iridescenceThicknessTexture`). Thin-film interference (soap bubble / oil slick effect). Complex shader math; low priority.
+- [x] **`KHR_materials_iridescence`** — `iridescenceTexture` (binding 24) and `iridescenceThicknessTexture` (binding 25). `ThinFilmIridescence()` helper in Metal shader computes optical path difference for RGB wavelengths. Modulates `F0` in direct and IBL specular paths. Uniforms expanded to 78 floats.
 
 ### KHR_materials_anisotropy
 
-- [ ] **`KHR_materials_anisotropy`** — parsed as `Material::khrMaterialsAnisotropy` (`anisotropyStrength`, `anisotropyRotation`, `anisotropyTexture`). Directional specular highlights (brushed metal). Requires tangent-space anisotropic BRDF.
+- [x] **`KHR_materials_anisotropy`** — parsed as `Material::khrMaterialsAnisotropy` (`anisotropyStrength`, `anisotropyRotation`, `anisotropyTexture`). Directional specular highlights (brushed metal). Tangent-space anisotropic GGX BRDF implemented in Metal shader with `aspect = sqrt(1.0 - 0.9 * strength)`. Anisotropy texture (binding 26) samples R=strength and G=rotation (0–1 maps to 0–2π). View mode and macOS example hotkey (`p`) added.
 
 ### KHR_materials_dispersion
 
@@ -222,12 +215,12 @@ The gltf library (v0.4.1) parses **23 extensions** into structured data. The ren
 ### Compression (call before rendering)
 
 - [x] **`KHR_draco_mesh_compression`** — `GLTF::loadGLB()` already calls `decompressDraco()` internally, so the renderer should NOT call it again in `setScene()`. Fixed double-decompression bug.
-- [ ] **`KHR_draco_mesh_compression`** for .gltf files — For .gltf files with external .bin buffers, the renderer needs to load the external buffer and then call `decompressDraco()`.
+- [x] **`KHR_draco_mesh_compression`** for .gltf files — `import_gltf()` now uses the callback-based `GLTF::loadGLTF(text, callback)` overload for `.gltf` files. The callback loads external `.bin` buffers (and images) relative to the file's base directory. `decompressDraco()` and `decompressMeshopt()` are called automatically by the gltf library after all external buffers arrive.
 - [x] **`EXT_meshopt_compression` / `KHR_meshopt_compression`** — `GLTF::decompressMeshopt()` called in `setScene()`, decoded buffer view data used automatically since it's stored in the standard buffer view structure.
 
 ### KHR_animation_pointer
 
-- [ ] **`KHR_animation_pointer`** — parsed into `AnimationChannelTarget::khrAnimationPointer` (RFC 6901 JSON pointer string). Extends animation to drive arbitrary material and extension properties (e.g., `emissiveFactor`, `transmission`). Depends on `update()` animation being implemented first.
+- [x] **`KHR_animation_pointer`** — `GltfAnimator::sampleAnimation()` handles `target.path == "pointer"` channels. Node pointers (`/nodes/{N}/translation|rotation|scale`) route to the existing `AnimatedTRS` system. Material pointers (`/materials/{N}/...`) and light pointers (`/extensions/KHR_lights_punctual/lights/{N}/...`) are stored in `animatedPointers` and resolved by `applyAnimatedPointers()`, which mutates the glTF asset and returns modified material indices. Legacy `Renderer::update()` re-uploads affected material slots automatically. ECS path has `material_animation_sync_system()` for the same purpose.
 
 ### KHR_mesh_quantization
 
@@ -268,9 +261,9 @@ The gltf library (v0.4.1) parses **23 extensions** into structured data. The ren
 
 ### macOS (`examples/macos/`)
 - [x] **Lighting controls menu** — `Lighting` menu with toggles for punctual lights (Cmd+Shift+L) and default light (Cmd+Option+L), plus `Background` submenu with Dark/Gray/Light presets (1/2/3). Scene presentation API: `setClearColor()`, `setPunctualLightsEnabled()`, `setDefaultLightEnabled()`.
-- [ ] Drag-and-drop `.gltf` / `.glb` file loading
+- [x] **Drag-and-drop `.gltf` / `.glb` file loading**
 - [ ] Node hierarchy / scene picker UI
-- [ ] Load `.gltf` text format (not just `.glb`)
+- [x] **Load `.gltf` text format** — macOS example uses `GLTF::loadGLTF()` with a URI resolver callback for external buffers/images. Both `.glb` and `.gltf` are supported.
 
 ### Android (`examples/android/`)
 - [ ] Verify render with campello_gpu v0.7.0 + gltf v0.3.6 after dependency bumps

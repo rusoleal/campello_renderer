@@ -12,4 +12,12 @@
 - (IBAction)setBackgroundLight:(id)sender;
 - (IBAction)toggleSkybox:(id)sender;
 - (IBAction)toggleIBL:(id)sender;
+- (IBAction)loadEnvironmentMap:(id)sender;
+- (IBAction)setBackgroundSolid:(id)sender;
+- (IBAction)setBackgroundSkybox:(id)sender;
+- (IBAction)setBackgroundSkyboxIBL:(id)sender;
+- (IBAction)toggleFXAA:(id)sender;
+- (IBAction)setSsaaOff:(id)sender;
+- (IBAction)setSsaa15x:(id)sender;
+- (IBAction)setSsaa20x:(id)sender;
 @end

@@ -16,6 +16,7 @@
 #include <campello_gpu/descriptors/bind_group_descriptor.hpp>
 #include <campello_gpu/bind_group.hpp>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <unordered_set>
 
@@ -33,8 +34,331 @@ using namespace systems::leal::campello_renderer;
 
 // Byte size of one material slot in materialUniformBuffer.
 // Layout: float4 baseColorFactor (16 B) + float4 uvTransformRow0 (16 B) + float4 uvTransformRow1 (16 B).
-// Must be >= 256 for Metal vertex buffer offset alignment (setVertexBuffer offset must be 256-byte aligned).
-static constexpr uint64_t kMaterialUniformStride = 256;
+// Must be a multiple of 256 for Metal vertex buffer offset alignment.
+static constexpr uint64_t kMaterialUniformStride = 512;
+
+// Low-level material uniform slot layout (81 floats = 324 bytes).
+// Must match the Metal shader struct exactly.
+static void buildSlotRaw(float bc[4], float r0[4], float r1[4],
+                         float metallic, float roughness, float normalScale,
+                         float alphaMode, float alphaCutoff, float unlit,
+                         float hasNormal, float hasEmissive, float hasOcclusion,
+                         float occlusionStrength, float emissiveFactor[3],
+                         float ior,
+                         float specularFactor, float hasSpecularTex, float hasSpecularColorTex,
+                         float specularColorFactor[3],
+                         float sheenColorFactor[3], float sheenRoughnessFactor,
+                         float hasSheenColorTex, float hasSheenRoughnessTex,
+                         float clearcoatFactor, float clearcoatRoughnessFactor,
+                         float hasClearcoatTex, float hasClearcoatRoughnessTex,
+                         float hasClearcoatNormalTex, float clearcoatNormalScale,
+                         float transmissionFactor, float hasTransmissionTex,
+                         float thicknessFactor, float hasThicknessTex, float attenuationDistance,
+                         float attenuationColor[3],
+                         float iridescenceFactor, float iridescenceIor,
+                         float iridescenceThicknessMin, float iridescenceThicknessMax,
+                         float hasIridescenceTex, float hasIridescenceThicknessTex,
+                         float anisotropyStrength, float anisotropyRotation,
+                         float hasAnisotropicTex,
+                         float dispersion,
+                         float viewModeValue,
+                         float environmentIntensityValue, float iblEnabledValue,
+                         float out[82]) {
+    // Zero initialize
+    for (int i = 0; i < 82; i++) out[i] = 0.f;
+    
+    // [0-11] float4s at offsets 0, 16, 32
+    out[0]  = bc[0]; out[1]  = bc[1]; out[2]  = bc[2];  out[3]  = bc[3];
+    out[4]  = r0[0]; out[5]  = r0[1]; out[6]  = r0[2];  out[7]  = r0[3];
+    out[8]  = r1[0]; out[9]  = r1[1]; out[10] = r1[2];  out[11] = r1[3];
+    
+    // [12-22] floats at offsets 48-88
+    out[12] = metallic;           // 48
+    out[13] = roughness;          // 52
+    out[14] = normalScale;        // 56
+    out[15] = alphaMode;          // 60
+    out[16] = alphaCutoff;        // 64
+    out[17] = unlit;              // 68
+    out[18] = hasNormal;          // 72
+    out[19] = hasEmissive;        // 76
+    out[20] = hasOcclusion;       // 80
+    out[21] = occlusionStrength;  // 84
+    out[22] = 0.f;                // 88 - _padding
+    out[23] = 0.f;                // 92 - implicit pad to 16-byte align
+    
+    // emissiveFactor float4 at offset 96
+    out[24] = emissiveFactor[0];  // 96
+    out[25] = emissiveFactor[1];  // 100
+    out[26] = emissiveFactor[2];  // 104
+    out[27] = 0.f;                // 108 - emissiveFactor w (unused)
+    
+    out[28] = ior;                // 112
+    out[29] = specularFactor;     // 116
+    out[30] = hasSpecularTex;     // 120
+    out[31] = hasSpecularColorTex;// 124
+    
+    out[32] = 0.f;                // 128 - _pad2
+    out[33] = 0.f;                // 132 - implicit pad
+    out[34] = 0.f;                // 136 - implicit pad
+    out[35] = 0.f;                // 140 - implicit pad
+    
+    // specularColorFactor float4 at offset 144
+    out[36] = specularColorFactor[0]; // 144
+    out[37] = specularColorFactor[1]; // 148
+    out[38] = specularColorFactor[2]; // 152
+    out[39] = 0.f;                    // 156 - w (unused)
+    
+    out[40] = 0.f;                // 160 - _pad3
+    out[41] = 0.f;                // 164 - implicit pad
+    out[42] = 0.f;                // 168 - implicit pad
+    out[43] = 0.f;                // 172 - implicit pad
+    
+    // sheenColorFactor float4 at offset 176
+    out[44] = sheenColorFactor[0]; // 176
+    out[45] = sheenColorFactor[1]; // 180
+    out[46] = sheenColorFactor[2]; // 184
+    out[47] = 0.f;                 // 188 - w (unused)
+    
+    out[48] = sheenRoughnessFactor;   // 192
+    out[49] = hasSheenColorTex;       // 196
+    out[50] = hasSheenRoughnessTex;   // 200
+    out[51] = clearcoatFactor;        // 204
+    out[52] = clearcoatRoughnessFactor; // 208
+    out[53] = hasClearcoatTex;        // 212
+    out[54] = hasClearcoatRoughnessTex; // 216
+    out[55] = hasClearcoatNormalTex;    // 220
+    out[56] = clearcoatNormalScale;     // 224
+    
+    out[57] = transmissionFactor;     // 228
+    out[58] = hasTransmissionTex;     // 232
+    out[59] = thicknessFactor;        // 236
+    out[60] = attenuationDistance;    // 240
+    
+    out[61] = hasThicknessTex;        // 244
+    out[62] = 0.f;                    // 248 - _padVol
+    
+    out[63] = 0.f;                    // 252 - implicit pad to 16-byte align
+    
+    // attenuationColor float4 at offset 256
+    out[64] = attenuationColor[0];    // 256
+    out[65] = attenuationColor[1];    // 260
+    out[66] = attenuationColor[2];    // 264
+    out[67] = 0.f;                    // 268 - w (unused)
+    
+    out[68] = viewModeValue;          // 272
+    out[69] = environmentIntensityValue; // 276
+    out[70] = iblEnabledValue;           // 280
+    out[71] = 0.f;                       // 284 - pad to 288
+    out[72] = iridescenceFactor;         // 288
+    out[73] = iridescenceIor;            // 292
+    out[74] = iridescenceThicknessMin;   // 296
+    out[75] = iridescenceThicknessMax;   // 300
+    out[76] = hasIridescenceTex;         // 304
+    out[77] = hasIridescenceThicknessTex;// 308
+    out[78] = anisotropyStrength;        // 312
+    out[79] = anisotropyRotation;        // 316
+    out[80] = hasAnisotropicTex;         // 320
+    out[81] = dispersion;                // 324
+}
+
+// Read a gltf::Material and fill a 81-float uniform slot.
+static void buildMaterialSlotFromGltf(const systems::leal::gltf::Material& mat,
+                                      float viewModeValue,
+                                      float environmentIntensityValue,
+                                      float iblEnabledValue,
+                                      float out[82]) {
+    // Base color factor.
+    float bc[4] = {1.f, 1.f, 1.f, 1.f};
+    float metallic = 1.f;
+    float roughness = 1.f;
+    if (mat.pbrMetallicRoughness) {
+        bc[0] = (float)mat.pbrMetallicRoughness->baseColorFactor.x();
+        bc[1] = (float)mat.pbrMetallicRoughness->baseColorFactor.y();
+        bc[2] = (float)mat.pbrMetallicRoughness->baseColorFactor.z();
+        bc[3] = (float)mat.pbrMetallicRoughness->baseColorFactor.w();
+        metallic = (float)mat.pbrMetallicRoughness->metallicFactor;
+        roughness = (float)mat.pbrMetallicRoughness->roughnessFactor;
+    }
+
+    // KHR_texture_transform for baseColorTexture.
+    float row0[4] = {1.f, 0.f, 0.f, 0.f}; // w=0 → identity fast path
+    float row1[4] = {0.f, 1.f, 0.f, 0.f};
+    if (mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture) {
+        auto &xfPtr = mat.pbrMetallicRoughness->baseColorTexture->khrTextureTransform;
+        if (xfPtr) {
+            float c  = (float)std::cos(xfPtr->rotation);
+            float s  = (float)std::sin(xfPtr->rotation);
+            float sx = (float)xfPtr->scale.x();
+            float sy = (float)xfPtr->scale.y();
+            float ox = (float)xfPtr->offset.x();
+            float oy = (float)xfPtr->offset.y();
+            row0[0] = sx * c;  row0[1] = -sy * s;  row0[2] = ox;  row0[3] = 1.f;
+            row1[0] = sx * s;  row1[1] =  sy * c;  row1[2] = oy;
+        }
+    }
+
+    // Normal scale from normalTexture info.
+    float normalScale = 1.f;
+    float hasNormal = 0.f;
+    if (mat.normalTexture) {
+        normalScale = (float)mat.normalTexture->scale;
+        hasNormal = 1.f;
+    }
+
+    // Emissive factor and texture.
+    float emissiveFactor[3] = {0.f, 0.f, 0.f};
+    float hasEmissive = 0.f;
+    if (mat.emissiveTexture) {
+        hasEmissive = 1.f;
+    }
+    emissiveFactor[0] = (float)mat.emissiveFactor.x();
+    emissiveFactor[1] = (float)mat.emissiveFactor.y();
+    emissiveFactor[2] = (float)mat.emissiveFactor.z();
+
+    // Occlusion texture and strength.
+    float hasOcclusion = 0.f;
+    float occlusionStrength = 1.f;
+    if (mat.occlusionTexture) {
+        hasOcclusion = 1.f;
+        occlusionStrength = (float)mat.occlusionTexture->strength;
+    }
+
+    // Alpha mode and flags.
+    float alphaMode   = (float)mat.alphaMode;
+    float alphaCutoff = (float)mat.alphaCutoff;
+    float unlit       = mat.khrMaterialsUnlit ? 1.0f : 0.0f;
+
+    // KHR_materials_ior: index of refraction (default 1.5 → F0 = 0.04).
+    float ior = (float)mat.khrMaterialsIor;
+
+    // KHR_materials_specular: specular layer weight and F0 color tint.
+    float specularFactor       = 1.f;
+    float hasSpecularTex       = 0.f;
+    float hasSpecularColorTex  = 0.f;
+    float specularColorFactor[3] = {1.f, 1.f, 1.f};
+    if (mat.khrMaterialsSpecular) {
+        auto &spec = *mat.khrMaterialsSpecular;
+        specularFactor          = (float)spec.specularFactor;
+        specularColorFactor[0]  = (float)spec.specularColorFactor.x();
+        specularColorFactor[1]  = (float)spec.specularColorFactor.y();
+        specularColorFactor[2]  = (float)spec.specularColorFactor.z();
+        if (spec.specularTexture)      hasSpecularTex      = 1.f;
+        if (spec.specularColorTexture)  hasSpecularColorTex = 1.f;
+    }
+
+    // KHR_materials_sheen: sheen color and roughness.
+    float sheenColorFactor[3]  = {0.f, 0.f, 0.f};
+    float sheenRoughnessFactor = 0.f;
+    float hasSheenColorTex     = 0.f;
+    float hasSheenRoughnessTex = 0.f;
+    if (mat.khrMaterialsSheen) {
+        auto &sheen = *mat.khrMaterialsSheen;
+        sheenColorFactor[0]  = (float)sheen.sheenColorFactor.x();
+        sheenColorFactor[1]  = (float)sheen.sheenColorFactor.y();
+        sheenColorFactor[2]  = (float)sheen.sheenColorFactor.z();
+        sheenRoughnessFactor = (float)sheen.sheenRoughnessFactor;
+        if (sheen.sheenColorTexture)     hasSheenColorTex     = 1.f;
+        if (sheen.sheenRoughnessTexture) hasSheenRoughnessTex = 1.f;
+    }
+
+    // KHR_materials_clearcoat: layer intensity, roughness, and optional textures.
+    float clearcoatFactor          = 0.f;
+    float clearcoatRoughnessFactor = 0.f;
+    float hasClearcoatTex          = 0.f;
+    float hasClearcoatRoughnessTex = 0.f;
+    float hasClearcoatNormalTex    = 0.f;
+    float clearcoatNormalScale     = 1.f;
+    if (mat.khrMaterialsClearcoat) {
+        auto &cc = *mat.khrMaterialsClearcoat;
+        clearcoatFactor          = (float)cc.clearcoatFactor;
+        clearcoatRoughnessFactor = (float)cc.clearcoatRoughnessFactor;
+        if (cc.clearcoatTexture)          hasClearcoatTex          = 1.f;
+        if (cc.clearcoatRoughnessTexture) hasClearcoatRoughnessTex = 1.f;
+        if (cc.clearcoatNormalTexture) {
+            hasClearcoatNormalTex = 1.f;
+            clearcoatNormalScale  = (float)cc.clearcoatNormalTexture->scale;
+        }
+    }
+
+    // KHR_materials_transmission
+    float transmissionFactor = 0.f;
+    float hasTransmissionTex = 0.f;
+    if (mat.khrMaterialsTransmission) {
+        transmissionFactor = (float)mat.khrMaterialsTransmission->transmissionFactor;
+        if (mat.khrMaterialsTransmission->transmissionTexture) {
+            hasTransmissionTex = 1.f;
+        }
+    }
+
+    // KHR_materials_volume
+    float thicknessFactor = 0.f;
+    float hasThicknessTex = 0.f;
+    float attenuationDistance = 0.f;
+    float attenuationColor[3] = {1.f, 1.f, 1.f};
+    if (mat.khrMaterialsVolume) {
+        thicknessFactor = (float)mat.khrMaterialsVolume->thicknessFactor;
+        if (mat.khrMaterialsVolume->thicknessTexture) {
+            hasThicknessTex = 1.f;
+        }
+        attenuationDistance = (float)mat.khrMaterialsVolume->attenuationDistance;
+        attenuationColor[0] = (float)mat.khrMaterialsVolume->attenuationColor.data[0];
+        attenuationColor[1] = (float)mat.khrMaterialsVolume->attenuationColor.data[1];
+        attenuationColor[2] = (float)mat.khrMaterialsVolume->attenuationColor.data[2];
+    }
+
+    // KHR_materials_iridescence
+    float iridescenceFactor = 0.f;
+    float iridescenceIor = 1.3f;
+    float iridescenceThicknessMin = 100.f;
+    float iridescenceThicknessMax = 400.f;
+    float hasIridescenceTex = 0.f;
+    float hasIridescenceThicknessTex = 0.f;
+    if (mat.khrMaterialsIridescence) {
+        iridescenceFactor = (float)mat.khrMaterialsIridescence->iridescenceFactor;
+        iridescenceIor = (float)mat.khrMaterialsIridescence->iridescenceIor;
+        iridescenceThicknessMin = (float)mat.khrMaterialsIridescence->iridescenceThicknessMinimum;
+        iridescenceThicknessMax = (float)mat.khrMaterialsIridescence->iridescenceThicknessMaximum;
+        if (mat.khrMaterialsIridescence->iridescenceTexture) {
+            hasIridescenceTex = 1.f;
+        }
+        if (mat.khrMaterialsIridescence->iridescenceThicknessTexture) {
+            hasIridescenceThicknessTex = 1.f;
+        }
+    }
+
+    // KHR_materials_anisotropy
+    float anisotropyStrength = 0.f;
+    float anisotropyRotation = 0.f;
+    float hasAnisotropicTex = 0.f;
+    if (mat.khrMaterialsAnisotropy) {
+        anisotropyStrength = (float)mat.khrMaterialsAnisotropy->anisotropyStrength;
+        anisotropyRotation = (float)mat.khrMaterialsAnisotropy->anisotropyRotation;
+        if (mat.khrMaterialsAnisotropy->anisotropyTexture) {
+            hasAnisotropicTex = 1.f;
+        }
+    }
+
+    // KHR_materials_dispersion
+    float dispersion = (float)mat.khrMaterialsDispersion;
+
+    buildSlotRaw(bc, row0, row1, metallic, roughness, normalScale,
+                 alphaMode, alphaCutoff, unlit, hasNormal, hasEmissive, hasOcclusion,
+                 occlusionStrength, emissiveFactor, ior,
+                 specularFactor, hasSpecularTex, hasSpecularColorTex, specularColorFactor,
+                 sheenColorFactor, sheenRoughnessFactor, hasSheenColorTex, hasSheenRoughnessTex,
+                 clearcoatFactor, clearcoatRoughnessFactor,
+                 hasClearcoatTex, hasClearcoatRoughnessTex, hasClearcoatNormalTex, clearcoatNormalScale,
+                 transmissionFactor, hasTransmissionTex,
+                 thicknessFactor, hasThicknessTex, attenuationDistance, attenuationColor,
+                 iridescenceFactor, iridescenceIor,
+                 iridescenceThicknessMin, iridescenceThicknessMax,
+                 hasIridescenceTex, hasIridescenceThicknessTex,
+                 anisotropyStrength, anisotropyRotation, hasAnisotropicTex,
+                 dispersion,
+                 viewModeValue,
+                 environmentIntensityValue, iblEnabledValue,
+                 out);
+}
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -42,6 +366,7 @@ static constexpr uint64_t kMaterialUniformStride = 256;
 
 Renderer::Renderer(std::shared_ptr<systems::leal::campello_gpu::Device> device) {
     this->device = device;
+    animator = std::make_unique<GltfAnimator>();
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +389,10 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         quantizedPipelines.clear();
         dracoPrimitiveBuffers.clear();
         deinterleavedBuffers.clear();
+        meshPool.clear();
+        materialPool.clear();
+        meshCache.clear();
+        materialCache.clear();
         nodeInstanceData.clear();
         primitiveBounds.clear();
         nodeMeshLocalBounds.clear();
@@ -74,14 +403,12 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         opaqueQueue.clear();
         transparentQueue.clear();
         hasFrustumPlanes = false;
-        animationStates.clear();
-        animatedNodes.clear();
+        if (animator) animator->setAsset(nullptr);
         return;
     }
 
     // New asset loaded — reset animation state.
-    animationStates.clear();
-    animatedNodes.clear();
+    if (animator) animator->setAsset(asset);
 
     size_t imageCount = asset->images ? asset->images->size() : 0;
     size_t bufferCount = asset->buffers ? asset->buffers->size() : 0;
@@ -100,6 +427,18 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
 
 std::shared_ptr<systems::leal::gltf::GLTF> Renderer::getAsset() {
     return asset;
+}
+
+void Renderer::setAssetBasePath(const std::string& path) {
+    assetBasePath = path;
+    // Ensure trailing slash for simple concatenation.
+    if (!assetBasePath.empty() && assetBasePath.back() != '/' && assetBasePath.back() != '\\') {
+        assetBasePath += '/';
+    }
+}
+
+std::string Renderer::getAssetBasePath() const {
+    return assetBasePath;
 }
 
 void Renderer::setCamera(uint32_t index) {
@@ -293,6 +632,24 @@ void Renderer::setScene(uint32_t index) {
                                 texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
                                 gpuTextures[a] = texture;
                             }
+                        }
+                    }
+                } else if (!image.uri.empty()) {
+                    // External image file referenced by URI.
+                    std::string imagePath = image.uri;
+                    if (!assetBasePath.empty() && imagePath.find(":") == std::string::npos && imagePath.front() != '/') {
+                        imagePath = assetBasePath + imagePath;
+                    }
+                    auto img = systems::leal::campello_image::Image::fromFile(imagePath.c_str());
+                    if (img != nullptr) {
+                        auto fmt = imageFormatToPixelFormat(img->getFormat(), wantsSrgb);
+                        auto texture = device->createTexture(
+                            GPU::TextureType::tt2d, fmt,
+                            img->getWidth(), img->getHeight(), 1, 1, 1,
+                            GPU::TextureUsage::textureBinding);
+                        if (texture != nullptr) {
+                            texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
+                            gpuTextures[a] = texture;
                         }
                     }
                 }
@@ -534,6 +891,56 @@ void Renderer::setScene(uint32_t index) {
         texEntryEnv.data.texture.viewDimension = GPU::TextureType::ttCube;
         bglDesc.entries.push_back(texEntryEnv);
 
+        // Binding 22: sceneColorTexture (screen-space refraction source)
+        GPU::EntryObject texEntrySc{};
+        texEntrySc.binding    = 22;
+        texEntrySc.visibility = GPU::ShaderStage::fragment;
+        texEntrySc.type       = GPU::EntryObjectType::texture;
+        texEntrySc.data.texture.multisampled  = false;
+        texEntrySc.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntrySc.data.texture.viewDimension = GPU::TextureType::tt2d;
+        bglDesc.entries.push_back(texEntrySc);
+
+        // Binding 23: thicknessTexture (KHR_materials_volume — R = thickness factor)
+        GPU::EntryObject texEntryTh{};
+        texEntryTh.binding    = 23;
+        texEntryTh.visibility = GPU::ShaderStage::fragment;
+        texEntryTh.type       = GPU::EntryObjectType::texture;
+        texEntryTh.data.texture.multisampled  = false;
+        texEntryTh.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntryTh.data.texture.viewDimension = GPU::TextureType::tt2d;
+        bglDesc.entries.push_back(texEntryTh);
+
+        // Binding 24: iridescenceTexture (KHR_materials_iridescence — R = iridescence factor)
+        GPU::EntryObject texEntryIrid{};
+        texEntryIrid.binding    = 24;
+        texEntryIrid.visibility = GPU::ShaderStage::fragment;
+        texEntryIrid.type       = GPU::EntryObjectType::texture;
+        texEntryIrid.data.texture.multisampled  = false;
+        texEntryIrid.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntryIrid.data.texture.viewDimension = GPU::TextureType::tt2d;
+        bglDesc.entries.push_back(texEntryIrid);
+
+        // Binding 25: iridescenceThicknessTexture (KHR_materials_iridescence — G = thickness)
+        GPU::EntryObject texEntryIridTh{};
+        texEntryIridTh.binding    = 25;
+        texEntryIridTh.visibility = GPU::ShaderStage::fragment;
+        texEntryIridTh.type       = GPU::EntryObjectType::texture;
+        texEntryIridTh.data.texture.multisampled  = false;
+        texEntryIridTh.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntryIridTh.data.texture.viewDimension = GPU::TextureType::tt2d;
+        bglDesc.entries.push_back(texEntryIridTh);
+
+        // Binding 26: anisotropicTexture (KHR_materials_anisotropy — R = strength, G = rotation)
+        GPU::EntryObject texEntryAniso{};
+        texEntryAniso.binding    = 26;
+        texEntryAniso.visibility = GPU::ShaderStage::fragment;
+        texEntryAniso.type       = GPU::EntryObjectType::texture;
+        texEntryAniso.data.texture.multisampled  = false;
+        texEntryAniso.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        texEntryAniso.data.texture.viewDimension = GPU::TextureType::tt2d;
+        bglDesc.entries.push_back(texEntryAniso);
+
         bindGroupLayout = device->createBindGroupLayout(bglDesc);
     }
 
@@ -548,6 +955,22 @@ void Renderer::setScene(uint32_t index) {
         sd.lodMaxClamp   = 1000.0;
         sd.maxAnisotropy = 1.0;
         defaultSampler = device->createSampler(sd);
+    }
+
+
+
+    // FXAA clamp-to-edge sampler — created lazily, shared across all platforms.
+    if (!fxaaSampler) {
+        GPU::SamplerDescriptor sd{};
+        sd.magFilter = GPU::FilterMode::fmLinear;
+        sd.minFilter = GPU::FilterMode::fmLinear;
+        sd.addressModeU = GPU::WrapMode::clampToEdge;
+        sd.addressModeV = GPU::WrapMode::clampToEdge;
+        sd.addressModeW = GPU::WrapMode::clampToEdge;
+        sd.lodMinClamp = 0.0;
+        sd.lodMaxClamp = 1000.0;
+        sd.maxAnisotropy = 1.0;
+        fxaaSampler = device->createSampler(sd);
     }
 
     if (!defaultTexture) {
@@ -657,16 +1080,31 @@ void Renderer::setScene(uint32_t index) {
         if (defaultClearcoatNormalTexture) defaultClearcoatNormalTexture->upload(0, 4, flatNormal);
     }
 
-    // Default environment map: 1x1x6 dark gray cube — used when no environment is set.
+    // Default environment map: 1x1x6 medium-bright gray cube — used when no environment is set.
+    // Brighter than physical black so transmission materials look reasonable out of the box.
     if (!environmentMap) {
-        uint8_t darkGray[4] = {26, 26, 26, 255}; // ~0.1 linear
+        uint8_t darkGray[4] = {140, 150, 160, 255}; // ~0.55 linear, slightly blue-ish (sky-like)
         auto defaultEnvTex = device->createTexture(
             GPU::TextureType::ttCube, GPU::PixelFormat::rgba8unorm,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
+                                uint32_t(GPU::TextureUsage::copyDst)));
         if (defaultEnvTex) {
             uint8_t faces[24];
             for (int f = 0; f < 6; ++f) memcpy(faces + f * 4, darkGray, 4);
-            defaultEnvTex->upload(0, 24, faces);
+            auto staging = device->createBuffer(24, GPU::BufferUsage::copySrc);
+            if (staging) {
+                staging->upload(0, 24, faces);
+                auto encoder = device->createCommandEncoder();
+                if (encoder) {
+                    for (int i = 0; i < 6; ++i) {
+                        encoder->copyBufferToTexture(staging, i * 4, 4, defaultEnvTex, 0, i);
+                    }
+                    auto fence = device->createFence();
+                    device->submit(encoder->finish(), fence);
+                    if (fence) fence->wait();
+                }
+            }
             environmentMap = defaultEnvTex;
         }
     }
@@ -701,9 +1139,10 @@ void Renderer::setScene(uint32_t index) {
             frameResources[f].lightsUniformBuffer->upload(0, 272, zeros);
         }
         if (!frameResources[f].cameraPositionBuffer) {
-            frameResources[f].cameraPositionBuffer = device->createBuffer(16, GPU::BufferUsage::vertex);
-            float defaultCam[4] = {0.f, 0.f, 3.f, 0.f};
-            frameResources[f].cameraPositionBuffer->upload(0, 16, defaultCam);
+            frameResources[f].cameraPositionBuffer = device->createBuffer(160, GPU::BufferUsage::uniform);
+            float defaultCam[40] = {0.f};
+            defaultCam[2] = 3.f;
+            frameResources[f].cameraPositionBuffer->upload(0, 160, defaultCam);
         }
         if (!frameResources[f].fence) {
             frameResources[f].fence = device->createFence();
@@ -765,7 +1204,8 @@ void Renderer::setScene(uint32_t index) {
         defaultFlatBindGroup = device->createBindGroup(flatBgDesc);
     }
 
-    // Per-frame bind groups for lights (10) and camera (18).
+    // Per-frame bind groups for lights (10), camera matrices (18),
+    // and screen-space refraction source (22).
     for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
         if (!frameBindGroup[f] && bindGroupLayout &&
             frameResources[f].lightsUniformBuffer &&
@@ -774,7 +1214,8 @@ void Renderer::setScene(uint32_t index) {
             bgDesc.layout  = bindGroupLayout;
             bgDesc.entries = {
                 {10, GPU::BufferBinding{frameResources[f].lightsUniformBuffer, 0, 272}},
-                {18, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, 16}},
+                {18, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, 160}},
+                {22, defaultTexture},
             };
             frameBindGroup[f] = device->createBindGroup(bgDesc);
         }
@@ -937,6 +1378,34 @@ void Renderer::setScene(uint32_t index) {
                 getTextureAndSampler(mat.khrMaterialsTransmission->transmissionTexture, transmissionTex, transmissionSamp);
             }
 
+            // Thickness texture (binding 23) — KHR_materials_volume: R channel scales thicknessFactor
+            std::shared_ptr<GPU::Texture> thicknessTex = defaultTexture;  // White = full thickness
+            std::shared_ptr<GPU::Sampler> thicknessSamp = defaultSampler;
+            if (mat.khrMaterialsVolume && mat.khrMaterialsVolume->thicknessTexture) {
+                getTextureAndSampler(mat.khrMaterialsVolume->thicknessTexture, thicknessTex, thicknessSamp);
+            }
+
+            // Iridescence texture (binding 24) — KHR_materials_iridescence: R channel = factor
+            std::shared_ptr<GPU::Texture> iridescenceTex = defaultTexture;
+            std::shared_ptr<GPU::Sampler> iridescenceSamp = defaultSampler;
+            if (mat.khrMaterialsIridescence && mat.khrMaterialsIridescence->iridescenceTexture) {
+                getTextureAndSampler(mat.khrMaterialsIridescence->iridescenceTexture, iridescenceTex, iridescenceSamp);
+            }
+
+            // Iridescence thickness texture (binding 25) — KHR_materials_iridescence: G channel = thickness
+            std::shared_ptr<GPU::Texture> iridescenceThicknessTex = defaultTexture;
+            std::shared_ptr<GPU::Sampler> iridescenceThicknessSamp = defaultSampler;
+            if (mat.khrMaterialsIridescence && mat.khrMaterialsIridescence->iridescenceThicknessTexture) {
+                getTextureAndSampler(mat.khrMaterialsIridescence->iridescenceThicknessTexture, iridescenceThicknessTex, iridescenceThicknessSamp);
+            }
+
+            // Anisotropic texture (binding 26) — KHR_materials_anisotropy: R = strength, G = rotation
+            std::shared_ptr<GPU::Texture> anisotropicTex = defaultTexture;
+            std::shared_ptr<GPU::Sampler> anisotropicSamp = defaultSampler;
+            if (mat.khrMaterialsAnisotropy && mat.khrMaterialsAnisotropy->anisotropyTexture) {
+                getTextureAndSampler(mat.khrMaterialsAnisotropy->anisotropyTexture, anisotropicTex, anisotropicSamp);
+            }
+
             // Create bind group with all textures and static material buffer.
             // Lights (10) and camera (18) are bound separately via frameBindGroup.
             GPU::BindGroupDescriptor bgDesc{};
@@ -963,6 +1432,10 @@ void Renderer::setScene(uint32_t index) {
                 {19, clearcoatNormalTex},
                 {20, transmissionTex},
                 {21, environmentMap},
+                {23, thicknessTex},
+                {24, iridescenceTex},
+                {25, iridescenceThicknessTex},
+                {26, anisotropicTex},
                 // Buffer(17): material uniforms at the per-material offset.
                 {17, GPU::BufferBinding{materialUniformBuffer,
                                         (uint64_t)(m + 1) * kMaterialUniformStride,
@@ -1321,6 +1794,20 @@ void Renderer::setScene(uint32_t index) {
 
     // Create quantized pipeline variants if this asset uses KHR_mesh_quantization.
     createQuantizedPipelinesIfNeeded();
+
+    // Populate engine-native caches for the new RenderScene API.
+    if (asset->materials) {
+        for (size_t i = 0; i < asset->materials->size(); ++i) {
+            uploadMaterial((*asset->materials)[i], *asset);
+        }
+    }
+    if (asset->meshes) {
+        for (auto &mesh : *asset->meshes) {
+            for (auto &primitive : mesh.primitives) {
+                uploadMesh(primitive, *asset);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1834,6 +2321,103 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         pipelineSkybox = device->createRenderPipeline(skyDesc);
     }
 
+    // --- FXAA post-process pipeline ---
+    {
+        if (!fxaaBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor fglDesc{};
+            GPU::EntryObject fTex{};
+            fTex.binding = 0;
+            fTex.visibility = GPU::ShaderStage::fragment;
+            fTex.type = GPU::EntryObjectType::texture;
+            fTex.data.texture.multisampled = false;
+            fTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            fTex.data.texture.viewDimension = GPU::TextureType::tt2d;
+            fglDesc.entries.push_back(fTex);
+
+            GPU::EntryObject fSamp{};
+            fSamp.binding = 1;
+            fSamp.visibility = GPU::ShaderStage::fragment;
+            fSamp.type = GPU::EntryObjectType::sampler;
+            fSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            fglDesc.entries.push_back(fSamp);
+
+            GPU::EntryObject fBuf{};
+            fBuf.binding = 2;
+            fBuf.visibility = GPU::ShaderStage::fragment;
+            fBuf.type = GPU::EntryObjectType::buffer;
+            fBuf.data.buffer.hasDinamicOffaset = false;
+            fBuf.data.buffer.minBindingSize = 16;
+            fBuf.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+            fglDesc.entries.push_back(fBuf);
+
+            fxaaBindGroupLayout = device->createBindGroupLayout(fglDesc);
+        }
+
+        GPU::RenderPipelineDescriptor fxaaDesc{};
+        fxaaDesc.vertex.module = shaderModule;
+        fxaaDesc.vertex.entryPoint = "fxaaVertex";
+        // No vertex buffers — fullscreen triangle from vertex_id.
+
+        // No depth/stencil for post-process pass.
+        fxaaDesc.topology = GPU::PrimitiveTopology::triangleList;
+        fxaaDesc.cullMode = GPU::CullMode::none;
+        fxaaDesc.frontFace = GPU::FrontFace::ccw;
+
+        GPU::FragmentDescriptor fxaaFrag{};
+        fxaaFrag.module = shaderModule;
+        fxaaFrag.entryPoint = "fxaaFragment";
+        GPU::ColorState fxaaCs{};
+        fxaaCs.format = colorFormat;
+        fxaaCs.writeMask = GPU::ColorWrite::all;
+        fxaaFrag.targets.push_back(fxaaCs);
+        fxaaDesc.fragment = fxaaFrag;
+
+        pipelineFxaa = device->createRenderPipeline(fxaaDesc);
+    }
+
+    // --- Downsample pipeline (Metal) ---
+    {
+        if (!downsampleBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor dglDesc{};
+            GPU::EntryObject dTex{};
+            dTex.binding = 0;
+            dTex.visibility = GPU::ShaderStage::fragment;
+            dTex.type = GPU::EntryObjectType::texture;
+            dTex.data.texture.multisampled = false;
+            dTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            dTex.data.texture.viewDimension = GPU::TextureType::tt2d;
+            dglDesc.entries.push_back(dTex);
+
+            GPU::EntryObject dSamp{};
+            dSamp.binding = 1;
+            dSamp.visibility = GPU::ShaderStage::fragment;
+            dSamp.type = GPU::EntryObjectType::sampler;
+            dSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            dglDesc.entries.push_back(dSamp);
+
+            downsampleBindGroupLayout = device->createBindGroupLayout(dglDesc);
+        }
+
+        GPU::RenderPipelineDescriptor dsDesc{};
+        dsDesc.vertex.module = shaderModule;
+        dsDesc.vertex.entryPoint = "fxaaVertex";
+
+        dsDesc.topology = GPU::PrimitiveTopology::triangleList;
+        dsDesc.cullMode = GPU::CullMode::none;
+        dsDesc.frontFace = GPU::FrontFace::ccw;
+
+        GPU::FragmentDescriptor dsFrag{};
+        dsFrag.module = shaderModule;
+        dsFrag.entryPoint = "downsampleFragment";
+        GPU::ColorState dsCs{};
+        dsCs.format = colorFormat;
+        dsCs.writeMask = GPU::ColorWrite::all;
+        dsFrag.targets.push_back(dsCs);
+        dsDesc.fragment = dsFrag;
+
+        pipelineDownsample = device->createRenderPipeline(dsDesc);
+    }
+
 #elif defined(ANDROID)
     using namespace systems::leal::campello_renderer::shaders;
 
@@ -1993,6 +2577,109 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     pipelineFlatBlendDoubleSided  = pipelineFlat;
     pipelineTexturedBlendDoubleSided = pipelineTextured;
 
+    // --- FXAA post-process pipeline (Vulkan) ---
+    {
+        if (!fxaaBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor fglDesc{};
+            GPU::EntryObject fTex{};
+            fTex.binding = 0;
+            fTex.visibility = GPU::ShaderStage::fragment;
+            fTex.type = GPU::EntryObjectType::texture;
+            fTex.data.texture.multisampled = false;
+            fTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            fTex.data.texture.viewDimension = GPU::TextureType::tt2d;
+            fglDesc.entries.push_back(fTex);
+
+            GPU::EntryObject fSamp{};
+            fSamp.binding = 1;
+            fSamp.visibility = GPU::ShaderStage::fragment;
+            fSamp.type = GPU::EntryObjectType::sampler;
+            fSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            fglDesc.entries.push_back(fSamp);
+
+            GPU::EntryObject fBuf{};
+            fBuf.binding = 2;
+            fBuf.visibility = GPU::ShaderStage::fragment;
+            fBuf.type = GPU::EntryObjectType::buffer;
+            fBuf.data.buffer.hasDinamicOffaset = false;
+            fBuf.data.buffer.minBindingSize = 16;
+            fBuf.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+            fglDesc.entries.push_back(fBuf);
+
+            fxaaBindGroupLayout = device->createBindGroupLayout(fglDesc);
+        }
+
+        auto fxaaVertModule = device->createShaderModule(kDefaultVulkanFxaaVertShader, kDefaultVulkanFxaaVertShaderSize);
+        auto fxaaFragModule = device->createShaderModule(kDefaultVulkanFxaaFragShader, kDefaultVulkanFxaaFragShaderSize);
+        if (fxaaVertModule && fxaaFragModule) {
+            GPU::RenderPipelineDescriptor fxaaDesc{};
+            fxaaDesc.vertex.module = fxaaVertModule;
+            fxaaDesc.vertex.entryPoint = "main";
+
+            fxaaDesc.topology = GPU::PrimitiveTopology::triangleList;
+            fxaaDesc.cullMode = GPU::CullMode::none;
+            fxaaDesc.frontFace = GPU::FrontFace::ccw;
+
+            GPU::FragmentDescriptor fxaaFrag{};
+            fxaaFrag.module = fxaaFragModule;
+            fxaaFrag.entryPoint = "main";
+            GPU::ColorState fxaaCs{};
+            fxaaCs.format = colorFormat;
+            fxaaCs.writeMask = GPU::ColorWrite::all;
+            fxaaFrag.targets.push_back(fxaaCs);
+            fxaaDesc.fragment = fxaaFrag;
+
+            pipelineFxaa = device->createRenderPipeline(fxaaDesc);
+        }
+    }
+
+    // --- Downsample pipeline (Vulkan) ---
+    {
+        if (!downsampleBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor dglDesc{};
+            GPU::EntryObject dTex{};
+            dTex.binding = 0;
+            dTex.visibility = GPU::ShaderStage::fragment;
+            dTex.type = GPU::EntryObjectType::texture;
+            dTex.data.texture.multisampled = false;
+            dTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            dTex.data.texture.viewDimension = GPU::TextureType::tt2d;
+            dglDesc.entries.push_back(dTex);
+
+            GPU::EntryObject dSamp{};
+            dSamp.binding = 1;
+            dSamp.visibility = GPU::ShaderStage::fragment;
+            dSamp.type = GPU::EntryObjectType::sampler;
+            dSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            dglDesc.entries.push_back(dSamp);
+
+            downsampleBindGroupLayout = device->createBindGroupLayout(dglDesc);
+        }
+
+        auto dsVertModule = device->createShaderModule(kDefaultVulkanFxaaVertShader, kDefaultVulkanFxaaVertShaderSize);
+        auto dsFragModule = device->createShaderModule(kDefaultVulkanDownsampleFragShader, kDefaultVulkanDownsampleFragShaderSize);
+        if (dsVertModule && dsFragModule) {
+            GPU::RenderPipelineDescriptor dsDesc{};
+            dsDesc.vertex.module = dsVertModule;
+            dsDesc.vertex.entryPoint = "main";
+
+            dsDesc.topology = GPU::PrimitiveTopology::triangleList;
+            dsDesc.cullMode = GPU::CullMode::none;
+            dsDesc.frontFace = GPU::FrontFace::ccw;
+
+            GPU::FragmentDescriptor dsFrag{};
+            dsFrag.module = dsFragModule;
+            dsFrag.entryPoint = "main";
+            GPU::ColorState dsCs{};
+            dsCs.format = colorFormat;
+            dsCs.writeMask = GPU::ColorWrite::all;
+            dsFrag.targets.push_back(dsCs);
+            dsDesc.fragment = dsFrag;
+
+            pipelineDownsample = device->createRenderPipeline(dsDesc);
+        }
+    }
+
 #elif defined(_WIN32)
     using namespace systems::leal::campello_renderer::shaders;
 
@@ -2140,6 +2827,117 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     pipelineFlatBlendDoubleSided  = pipelineFlat;
     pipelineTexturedBlendDoubleSided = pipelineTextured;
 
+    // --- FXAA post-process pipeline (DirectX) ---
+    // NOTE: DXIL binaries are currently empty placeholders; FXAA will only work
+    // after shaders are compiled on Windows. See shaders/directx/default.hlsl.
+    {
+        if (!fxaaBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor fglDesc{};
+            GPU::EntryObject fTex{};
+            fTex.binding = 0;
+            fTex.visibility = GPU::ShaderStage::fragment;
+            fTex.type = GPU::EntryObjectType::texture;
+            fTex.data.texture.multisampled = false;
+            fTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            fTex.data.texture.viewDimension = GPU::TextureType::tt2d;
+            fglDesc.entries.push_back(fTex);
+
+            GPU::EntryObject fSamp{};
+            fSamp.binding = 1;
+            fSamp.visibility = GPU::ShaderStage::fragment;
+            fSamp.type = GPU::EntryObjectType::sampler;
+            fSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            fglDesc.entries.push_back(fSamp);
+
+            GPU::EntryObject fBuf{};
+            fBuf.binding = 2;
+            fBuf.visibility = GPU::ShaderStage::fragment;
+            fBuf.type = GPU::EntryObjectType::buffer;
+            fBuf.data.buffer.hasDinamicOffaset = false;
+            fBuf.data.buffer.minBindingSize = 16;
+            fBuf.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+            fglDesc.entries.push_back(fBuf);
+
+            fxaaBindGroupLayout = device->createBindGroupLayout(fglDesc);
+        }
+
+        if (kDefaultDirectXFxaaVertShaderSize > 0 && kDefaultDirectXFxaaPixelShaderSize > 0) {
+            auto fxaaVertModule = device->createShaderModule(kDefaultDirectXFxaaVertShader, kDefaultDirectXFxaaVertShaderSize);
+            auto fxaaPixelModule = device->createShaderModule(kDefaultDirectXFxaaPixelShader, kDefaultDirectXFxaaPixelShaderSize);
+            if (fxaaVertModule && fxaaPixelModule) {
+                GPU::RenderPipelineDescriptor fxaaDesc{};
+                fxaaDesc.vertex.module = fxaaVertModule;
+                fxaaDesc.vertex.entryPoint = "fxaaVertex";
+
+                fxaaDesc.topology = GPU::PrimitiveTopology::triangleList;
+                fxaaDesc.cullMode = GPU::CullMode::none;
+                fxaaDesc.frontFace = GPU::FrontFace::ccw;
+
+                GPU::FragmentDescriptor fxaaFrag{};
+                fxaaFrag.module = fxaaPixelModule;
+                fxaaFrag.entryPoint = "fxaaPixel";
+                GPU::ColorState fxaaCs{};
+                fxaaCs.format = colorFormat;
+                fxaaCs.writeMask = GPU::ColorWrite::all;
+                fxaaFrag.targets.push_back(fxaaCs);
+                fxaaDesc.fragment = fxaaFrag;
+
+                pipelineFxaa = device->createRenderPipeline(fxaaDesc);
+            }
+        }
+    }
+
+    // --- Downsample pipeline (DirectX) ---
+    // NOTE: DXIL binaries are currently empty placeholders; downsample will only work
+    // after shaders are compiled on Windows. See shaders/directx/default.hlsl.
+    {
+        if (!downsampleBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor dglDesc{};
+            GPU::EntryObject dTex{};
+            dTex.binding = 0;
+            dTex.visibility = GPU::ShaderStage::fragment;
+            dTex.type = GPU::EntryObjectType::texture;
+            dTex.data.texture.multisampled = false;
+            dTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            dTex.data.texture.viewDimension = GPU::TextureType::tt2d;
+            dglDesc.entries.push_back(dTex);
+
+            GPU::EntryObject dSamp{};
+            dSamp.binding = 1;
+            dSamp.visibility = GPU::ShaderStage::fragment;
+            dSamp.type = GPU::EntryObjectType::sampler;
+            dSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            dglDesc.entries.push_back(dSamp);
+
+            downsampleBindGroupLayout = device->createBindGroupLayout(dglDesc);
+        }
+
+        if (kDefaultDirectXFxaaVertShaderSize > 0 && kDefaultDirectXDownsamplePixelShaderSize > 0) {
+            auto dsVertModule = device->createShaderModule(kDefaultDirectXFxaaVertShader, kDefaultDirectXFxaaVertShaderSize);
+            auto dsPixelModule = device->createShaderModule(kDefaultDirectXDownsamplePixelShader, kDefaultDirectXDownsamplePixelShaderSize);
+            if (dsVertModule && dsPixelModule) {
+                GPU::RenderPipelineDescriptor dsDesc{};
+                dsDesc.vertex.module = dsVertModule;
+                dsDesc.vertex.entryPoint = "fxaaVertex";
+
+                dsDesc.topology = GPU::PrimitiveTopology::triangleList;
+                dsDesc.cullMode = GPU::CullMode::none;
+                dsDesc.frontFace = GPU::FrontFace::ccw;
+
+                GPU::FragmentDescriptor dsFrag{};
+                dsFrag.module = dsPixelModule;
+                dsFrag.entryPoint = "downsamplePixel";
+                GPU::ColorState dsCs{};
+                dsCs.format = colorFormat;
+                dsCs.writeMask = GPU::ColorWrite::all;
+                dsFrag.targets.push_back(dsCs);
+                dsDesc.fragment = dsFrag;
+
+                pipelineDownsample = device->createRenderPipeline(dsDesc);
+            }
+        }
+    }
+
 #else
     (void)colorFormat;
 #endif
@@ -2171,6 +2969,8 @@ void Renderer::resize(uint32_t width, uint32_t height) {
     if (width == 0 || height == 0) {
         depthTexture = nullptr;
         depthView    = nullptr;
+        sceneColorTexture = nullptr;
+        sceneColorView    = nullptr;
         std::cout << "[Renderer::resize] zero size, cleared depth" << std::endl;
         return;
     }
@@ -2192,6 +2992,9 @@ void Renderer::resize(uint32_t width, uint32_t height) {
             0, 0,
             GPU::TextureType::tt2d);
     }
+
+    // Intermediate scene color target for FXAA / SSAA.
+    ensureSceneColorTexture();
 }
 
 // ---------------------------------------------------------------------------
@@ -2645,6 +3448,8 @@ void Renderer::render(std::shared_ptr<systems::leal::campello_gpu::TextureView> 
 void Renderer::renderToTarget(
     std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView)
 {
+    auto frameStart = std::chrono::steady_clock::now();
+
     if (!asset || (!pipelineFlat && !pipelineTextured && !pipelineDebug &&
                    !pipelineFlatDoubleSided && !pipelineTexturedDoubleSided &&
                    !pipelineFlatBlend && !pipelineTexturedBlend &&
@@ -2678,8 +3483,10 @@ void Renderer::renderToTarget(
     // 1. Compute view-projection from camera override or GLTF camera.
     // ------------------------------------------------------------------
     M4 view;
+    M4 proj;
     if (hasCameraOverride) {
         view = overrideView;
+        proj = overrideProj;
         vpMatrix = overrideProj * view;
     } else {
         double aspect = (renderHeight > 0)
@@ -2692,7 +3499,7 @@ void Renderer::renderToTarget(
             VM::Vector3<double>(0.0, 1.0, 0.0));
 
         static const double kDefaultFov = 60.0 * acos(-1.0) / 180.0;
-        auto proj = M4::perspective(kDefaultFov, aspect, 0.1, 1000.0);
+        proj = M4::perspective(kDefaultFov, aspect, 0.1, 1000.0);
 
         if (asset->cameras && cameraIndex < asset->cameras->size()) {
             auto &scn = (*asset->scenes)[sceneIndex];
@@ -2735,35 +3542,44 @@ void Renderer::renderToTarget(
     // ------------------------------------------------------------------
     {
         if (cameraPositionBuffer) {
+            // CameraUniforms layout (160 bytes):
+            //   [0..15]   cameraPos (float4)
+            //   [16..79]  viewMatrix (float4x4, column-major for Metal)
+            //   [80..143] projMatrix (float4x4, column-major for Metal)
+            //   [144..151] screenSize (float2)
+            float camData[40] = {0};
+
             // Extract camera position from view matrix.
-            // view matrix stores: [R | t] where t = -R * eye
-            // So eye = -R^T * t
-            // For row-major matrix, the translation is at indices 3, 7, 11
-            float camPos[4] = {0, 0, 3, 0}; // default
-            
-            // Use the view matrix we computed above
-            
-            // Extract rotation part (3x3) and translation (3) from view matrix
-            // Row-major: indices [0,1,2] = first row of R, [3] = t.x
-            //            indices [4,5,6] = second row of R, [7] = t.y
-            //            indices [8,9,10] = third row of R, [11] = t.z
             double R[3][3] = {
                 {view.data[0], view.data[1], view.data[2]},
                 {view.data[4], view.data[5], view.data[6]},
                 {view.data[8], view.data[9], view.data[10]}
             };
             double t[3] = {view.data[3], view.data[7], view.data[11]};
-            
-            // eye = -R^T * t
-            camPos[0] = -(float)(R[0][0] * t[0] + R[1][0] * t[1] + R[2][0] * t[2]);
-            camPos[1] = -(float)(R[0][1] * t[0] + R[1][1] * t[1] + R[2][1] * t[2]);
-            camPos[2] = -(float)(R[0][2] * t[0] + R[1][2] * t[1] + R[2][2] * t[2]);
+            camData[0] = -(float)(R[0][0] * t[0] + R[1][0] * t[1] + R[2][0] * t[2]);
+            camData[1] = -(float)(R[0][1] * t[0] + R[1][1] * t[1] + R[2][1] * t[2]);
+            camData[2] = -(float)(R[0][2] * t[0] + R[1][2] * t[1] + R[2][2] * t[2]);
 
-            cameraWorldPos[0] = camPos[0];
-            cameraWorldPos[1] = camPos[1];
-            cameraWorldPos[2] = camPos[2];
+            cameraWorldPos[0] = camData[0];
+            cameraWorldPos[1] = camData[1];
+            cameraWorldPos[2] = camData[2];
 
-            cameraPositionBuffer->upload(0, 16, camPos);
+            // Transpose view matrix to column-major for Metal.
+            for (int row = 0; row < 4; ++row) {
+                for (int col = 0; col < 4; ++col) {
+                    camData[4 + col * 4 + row] = (float)view.data[row * 4 + col];
+                }
+            }
+            // Transpose projection matrix to column-major for Metal.
+            for (int row = 0; row < 4; ++row) {
+                for (int col = 0; col < 4; ++col) {
+                    camData[20 + col * 4 + row] = (float)proj.data[row * 4 + col];
+                }
+            }
+            camData[36] = (float)renderWidth;
+            camData[37] = (float)renderHeight;
+
+            cameraPositionBuffer->upload(0, 160, camData);
         }
     }
 
@@ -2969,102 +3785,7 @@ void Renderer::renderToTarget(
     // Slots 1..N correspond to asset->materials indices 0..N-1.
     // ------------------------------------------------------------------
     if (materialUniformBuffer) {
-        // Helper: build a material slot from material data.
-        // Matches Metal struct layout EXACTLY.
-        // Metal packs floats at 4-byte intervals, but float3 is 16-byte aligned.
-        // Correct offsets (verified from shader struct):
-        //   transmissionFactor = offset 228 (index 57)
-        //   hasTransmissionTexture = offset 232 (index 58)
-        //   viewMode = offset 236 (index 59)
-        auto buildSlot = [](float bc[4], float r0[4], float r1[4],
-                            float metallic, float roughness, float normalScale,
-                            float alphaMode, float alphaCutoff, float unlit,
-                            float hasNormal, float hasEmissive, float hasOcclusion,
-                            float occlusionStrength, float emissiveFactor[3],
-                            float ior,
-                            float specularFactor, float hasSpecularTex, float hasSpecularColorTex,
-                            float specularColorFactor[3],
-                            float sheenColorFactor[3], float sheenRoughnessFactor,
-                            float hasSheenColorTex, float hasSheenRoughnessTex,
-                            float clearcoatFactor, float clearcoatRoughnessFactor,
-                            float hasClearcoatTex, float hasClearcoatRoughnessTex,
-                            float hasClearcoatNormalTex, float clearcoatNormalScale,
-                            float transmissionFactor, float hasTransmissionTex,
-                            float viewModeValue,
-                            float environmentIntensityValue, float iblEnabledValue,
-                            float out[64]) {
-            // Zero initialize
-            for (int i = 0; i < 64; i++) out[i] = 0.f;
-            
-            // [0-2] float4s at offsets 0, 16, 32
-            out[0]  = bc[0]; out[1]  = bc[1]; out[2]  = bc[2];  out[3]  = bc[3];
-            out[4]  = r0[0]; out[5]  = r0[1]; out[6]  = r0[2];  out[7]  = r0[3];
-            out[8]  = r1[0]; out[9]  = r1[1]; out[10] = r1[2];  out[11] = r1[3];
-            
-            // [12-22] floats at offsets 48-88
-            out[12] = metallic;           // 48
-            out[13] = roughness;          // 52
-            out[14] = normalScale;        // 56
-            out[15] = alphaMode;          // 60
-            out[16] = alphaCutoff;        // 64
-            out[17] = unlit;              // 68
-            out[18] = hasNormal;          // 72
-            out[19] = hasEmissive;        // 76
-            out[20] = hasOcclusion;       // 80
-            out[21] = occlusionStrength;  // 84
-            out[22] = 0.f;                // 88 - _padding
-            
-            // emissiveFactor float3 at offset 96 (16-byte aligned)
-            out[24] = emissiveFactor[0];  // 96
-            out[25] = emissiveFactor[1];  // 100
-            out[26] = emissiveFactor[2];  // 104
-            out[27] = ior;                // 108
-            
-            // [28-31] at offsets 112-124
-            out[28] = specularFactor;         // 112
-            out[29] = hasSpecularTex;         // 116
-            out[30] = hasSpecularColorTex;    // 120
-            out[31] = 0.f;                    // 124 - _pad2
-            
-            // specularColorFactor float3 at offset 128? No wait, 124+4=128 which IS 16-aligned
-            // But struct says _pad2 at 124, then specularColorFactor... let me check
-            // After _pad2 at 124, next is 128. 128 is 16-aligned. Good.
-            out[32] = specularColorFactor[0]; // 128
-            out[33] = specularColorFactor[1]; // 132
-            out[34] = specularColorFactor[2]; // 136
-            // _pad3 at 140? No wait, 136+4=140, not 16-aligned
-            // Next float3 needs 16-align, so next is 144
-            // So _pad3 at 140, then sheenColorFactor at 144
-            out[35] = 0.f;                    // 140 - _pad3
-            
-            // sheenColorFactor float3 at offset 144
-            out[36] = sheenColorFactor[0];    // 144
-            out[37] = sheenColorFactor[1];    // 148
-            out[38] = sheenColorFactor[2];    // 152
-            out[39] = sheenRoughnessFactor;   // 156
-            
-            // [40-43] at offsets 160-172
-            out[40] = hasSheenColorTex;       // 160
-            out[41] = hasSheenRoughnessTex;   // 164
-            out[42] = clearcoatFactor;        // 168
-            out[43] = clearcoatRoughnessFactor; // 172
-            
-            // [44-47] at offsets 176-188
-            out[44] = hasClearcoatTex;        // 176
-            out[45] = hasClearcoatRoughnessTex; // 180
-            out[46] = hasClearcoatNormalTex;  // 184
-            out[47] = clearcoatNormalScale;   // 188
-            
-            // transmissionFactor at offset 228 (index 57)
-            // hasTransmissionTexture at offset 232 (index 58)
-            out[57] = transmissionFactor;     // 228
-            out[58] = hasTransmissionTex;     // 232
-            out[59] = viewModeValue;          // 236
-            out[60] = environmentIntensityValue; // 240
-            out[61] = iblEnabledValue;           // 244
-        };
-
-        // Default slot — white, identity UV transform, metallic=1, roughness=1, no textures, no sheen, no clearcoat, no transmission.
+        // Default slot — white, identity UV transform, metallic=1, roughness=1, no textures.
         {
             float bc[4]            = {1.f, 1.f, 1.f, 1.f};
             float row0[4]          = {1.f, 0.f, 0.f, 0.f}; // w=0 → identity fast path
@@ -3072,156 +3793,30 @@ void Renderer::renderToTarget(
             float emissive[3]      = {0.f, 0.f, 0.f};
             float specularColor[3] = {1.f, 1.f, 1.f};
             float sheenColor[3]    = {0.f, 0.f, 0.f};
-            float slot[64];
-            buildSlot(bc, row0, row1, 1.f, 1.f, 1.f, 0.f, 0.5f, 0.f, 0.f, 0.f, 0.f, 1.f,
+            float attenuationColor[3] = {1.f, 1.f, 1.f};
+            float slot[82];
+            buildSlotRaw(bc, row0, row1, 1.f, 1.f, 1.f, 0.f, 0.5f, 0.f, 0.f, 0.f, 0.f, 1.f,
                       emissive, 1.5f, 1.f, 0.f, 0.f, specularColor,
                       sheenColor, 0.f, 0.f, 0.f,
                       0.f, 0.f, 0.f, 0.f, 0.f, 1.f,
-                      0.f, 0.f, (float)viewMode,
+                      0.f, 0.f, 0.f, 0.f, 0.f, attenuationColor,
+                      0.f, 1.3f, 100.f, 400.f, 0.f, 0.f,
+                      0.f, 0.f, 0.f, 0.f,
+                      (float)viewMode,
                       environmentIntensity, iblEnabled ? 1.f : 0.f, slot);
-            materialUniformBuffer->upload(0, (uint64_t)(64 * sizeof(float)), slot);
+            materialUniformBuffer->upload(0, (uint64_t)(82 * sizeof(float)), slot);
         }
 
         if (asset->materials) {
             for (size_t i = 0; i < asset->materials->size(); ++i) {
-                auto &mat = (*asset->materials)[i];
-
-                // Base color factor.
-                float bc[4] = {1.f, 1.f, 1.f, 1.f};
-                float metallic = 1.f;
-                float roughness = 1.f;
-                if (mat.pbrMetallicRoughness) {
-                    bc[0] = (float)mat.pbrMetallicRoughness->baseColorFactor.x();
-                    bc[1] = (float)mat.pbrMetallicRoughness->baseColorFactor.y();
-                    bc[2] = (float)mat.pbrMetallicRoughness->baseColorFactor.z();
-                    bc[3] = (float)mat.pbrMetallicRoughness->baseColorFactor.w();
-                    metallic = (float)mat.pbrMetallicRoughness->metallicFactor;
-                    roughness = (float)mat.pbrMetallicRoughness->roughnessFactor;
-                }
-
-                // KHR_texture_transform for baseColorTexture.
-                float row0[4] = {1.f, 0.f, 0.f, 0.f}; // w=0 → identity fast path
-                float row1[4] = {0.f, 1.f, 0.f, 0.f};
-                if (mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture) {
-                    auto &xfPtr = mat.pbrMetallicRoughness->baseColorTexture->khrTextureTransform;
-                    if (xfPtr) {
-                        float c  = (float)std::cos(xfPtr->rotation);
-                        float s  = (float)std::sin(xfPtr->rotation);
-                        float sx = (float)xfPtr->scale.x();
-                        float sy = (float)xfPtr->scale.y();
-                        float ox = (float)xfPtr->offset.x();
-                        float oy = (float)xfPtr->offset.y();
-                        row0[0] = sx * c;  row0[1] = -sy * s;  row0[2] = ox;  row0[3] = 1.f;
-                        row1[0] = sx * s;  row1[1] =  sy * c;  row1[2] = oy;
-                    }
-                }
-
-                // Normal scale from normalTexture info.
-                float normalScale = 1.f;
-                float hasNormal = 0.f;
-                if (mat.normalTexture) {
-                    normalScale = (float)mat.normalTexture->scale;
-                    hasNormal = 1.f;
-                }
-
-                // Emissive factor and texture.
-                float emissiveFactor[3] = {0.f, 0.f, 0.f};
-                float hasEmissive = 0.f;
-                if (mat.emissiveTexture) {
-                    hasEmissive = 1.f;
-                }
-                emissiveFactor[0] = (float)mat.emissiveFactor.x();
-                emissiveFactor[1] = (float)mat.emissiveFactor.y();
-                emissiveFactor[2] = (float)mat.emissiveFactor.z();
-
-                // Occlusion texture and strength.
-                float hasOcclusion = 0.f;
-                float occlusionStrength = 1.f;
-                if (mat.occlusionTexture) {
-                    hasOcclusion = 1.f;
-                    occlusionStrength = (float)mat.occlusionTexture->strength;
-                }
-
-                // Alpha mode and flags.
-                float alphaMode   = (float)mat.alphaMode;
-                float alphaCutoff = (float)mat.alphaCutoff;
-                float unlit       = mat.khrMaterialsUnlit ? 1.0f : 0.0f;
-
-                // KHR_materials_ior: index of refraction (default 1.5 → F0 = 0.04).
-                float ior = (float)mat.khrMaterialsIor;
-
-                // KHR_materials_specular: specular layer weight and F0 color tint.
-                float specularFactor       = 1.f;
-                float hasSpecularTex       = 0.f;
-                float hasSpecularColorTex  = 0.f;
-                float specularColorFactor[3] = {1.f, 1.f, 1.f};
-                if (mat.khrMaterialsSpecular) {
-                    auto &spec = *mat.khrMaterialsSpecular;
-                    specularFactor          = (float)spec.specularFactor;
-                    specularColorFactor[0]  = (float)spec.specularColorFactor.x();
-                    specularColorFactor[1]  = (float)spec.specularColorFactor.y();
-                    specularColorFactor[2]  = (float)spec.specularColorFactor.z();
-                    if (spec.specularTexture)      hasSpecularTex      = 1.f;
-                    if (spec.specularColorTexture)  hasSpecularColorTex = 1.f;
-                }
-
-                // KHR_materials_sheen: sheen color and roughness.
-                float sheenColorFactor[3]  = {0.f, 0.f, 0.f};
-                float sheenRoughnessFactor = 0.f;
-                float hasSheenColorTex     = 0.f;
-                float hasSheenRoughnessTex = 0.f;
-                if (mat.khrMaterialsSheen) {
-                    auto &sheen = *mat.khrMaterialsSheen;
-                    sheenColorFactor[0]  = (float)sheen.sheenColorFactor.x();
-                    sheenColorFactor[1]  = (float)sheen.sheenColorFactor.y();
-                    sheenColorFactor[2]  = (float)sheen.sheenColorFactor.z();
-                    sheenRoughnessFactor = (float)sheen.sheenRoughnessFactor;
-                    if (sheen.sheenColorTexture)     hasSheenColorTex     = 1.f;
-                    if (sheen.sheenRoughnessTexture) hasSheenRoughnessTex = 1.f;
-                }
-
-                // KHR_materials_clearcoat: layer intensity, roughness, and optional textures.
-                float clearcoatFactor          = 0.f;
-                float clearcoatRoughnessFactor = 0.f;
-                float hasClearcoatTex          = 0.f;
-                float hasClearcoatRoughnessTex = 0.f;
-                float hasClearcoatNormalTex    = 0.f;
-                float clearcoatNormalScale     = 1.f;
-                if (mat.khrMaterialsClearcoat) {
-                    auto &cc = *mat.khrMaterialsClearcoat;
-                    clearcoatFactor          = (float)cc.clearcoatFactor;
-                    clearcoatRoughnessFactor = (float)cc.clearcoatRoughnessFactor;
-                    if (cc.clearcoatTexture)          hasClearcoatTex          = 1.f;
-                    if (cc.clearcoatRoughnessTexture) hasClearcoatRoughnessTex = 1.f;
-                    if (cc.clearcoatNormalTexture) {
-                        hasClearcoatNormalTex = 1.f;
-                        clearcoatNormalScale  = (float)cc.clearcoatNormalTexture->scale;
-                    }
-                }
-
-                // KHR_materials_transmission
-                float transmissionFactor = 0.f;
-                float hasTransmissionTex = 0.f;
-                if (mat.khrMaterialsTransmission) {
-                    transmissionFactor = (float)mat.khrMaterialsTransmission->transmissionFactor;
-                    if (mat.khrMaterialsTransmission->transmissionTexture) {
-                        hasTransmissionTex = 1.f;
-                    }
-                }
-
-                float slot[64];
-                buildSlot(bc, row0, row1, metallic, roughness, normalScale,
-                          alphaMode, alphaCutoff, unlit, hasNormal, hasEmissive, hasOcclusion,
-                          occlusionStrength, emissiveFactor, ior,
-                          specularFactor, hasSpecularTex, hasSpecularColorTex, specularColorFactor,
-                          sheenColorFactor, sheenRoughnessFactor, hasSheenColorTex, hasSheenRoughnessTex,
-                          clearcoatFactor, clearcoatRoughnessFactor,
-                          hasClearcoatTex, hasClearcoatRoughnessTex, hasClearcoatNormalTex, clearcoatNormalScale,
-                          transmissionFactor, hasTransmissionTex, (float)viewMode,
-                          environmentIntensity, iblEnabled ? 1.f : 0.f, slot);
-                
+                float slot[82];
+                buildMaterialSlotFromGltf((*asset->materials)[i],
+                                          (float)viewMode,
+                                          environmentIntensity,
+                                          iblEnabled ? 1.f : 0.f,
+                                          slot);
                 materialUniformBuffer->upload((uint64_t)(i + 1) * kMaterialUniformStride,
-                                              (uint64_t)(64 * sizeof(float)), slot);
+                                              (uint64_t)(82 * sizeof(float)), slot);
             }
         }
     }
@@ -3250,267 +3845,435 @@ void Renderer::renderToTarget(
 
     uploadVisibleNodeTransforms();
 
+    // Sort opaque draws by material then primitive to reduce state changes.
+    std::sort(opaqueQueue.begin(), opaqueQueue.end(),
+        [](const DrawCall &a, const DrawCall &b) {
+            if (a.materialIndex != b.materialIndex) return a.materialIndex < b.materialIndex;
+            return a.primitive < b.primitive;
+        });
+
     // ------------------------------------------------------------------
     // 4. Record render pass and draw calls.
     // ------------------------------------------------------------------
-    GPU::ColorAttachment ca{};
-    ca.view          = colorView;
-    ca.clearValue[0] = clearColor[0];
-    ca.clearValue[1] = clearColor[1];
-    ca.clearValue[2] = clearColor[2];
-    ca.clearValue[3] = clearColor[3];
-    ca.loadOp        = GPU::LoadOp::clear;
-    ca.storeOp       = GPU::StoreOp::store;
-    ca.depthSlice    = 0;
+    // Lazily create scene color texture if FXAA / SSAA was enabled after resize().
+    ensureSceneColorTexture();
 
-    GPU::BeginRenderPassDescriptor rpDesc{};
-    rpDesc.colorAttachments = { ca };
+    bool useSsaa = ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout && sceneColorView;
+    bool useFxaa = fxaaEnabled && !useSsaa && pipelineFxaa && fxaaBindGroupLayout && sceneColorView;
+    bool useIntermediate = useSsaa || useFxaa;
 
-    if (depthView) {
-        GPU::DepthStencilAttachment ds{};
-        ds.view              = depthView;
-        ds.depthClearValue   = 1.0f;
-        ds.depthLoadOp       = GPU::LoadOp::clear;
-        ds.depthStoreOp      = GPU::StoreOp::discard;
-        ds.depthReadOnly     = false;
-        ds.stencilClearValue = 0;
-        ds.stencilLoadOp     = GPU::LoadOp::clear;
-        ds.stencilStoreOp    = GPU::StoreOp::discard;
-        ds.stencilReadOnly   = false;
-        rpDesc.depthStencilAttachment = ds;
-    }
-
-    auto rpe = encoder->beginRenderPass(rpDesc);
-    if (!rpe) return;
-
-    currentPipelineVariant = 0; // reset — renderPrimitive() will set it per draw
-    lastBoundVertexBuffers.fill({}); // reset vertex buffer binding state
-
-    if (renderWidth > 0 && renderHeight > 0) {
-        rpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
-        rpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
-    }
-    // (render debug removed)
-
-    // ------------------------------------------------------------------
-    // Render skybox first (before opaque geometry).
-    // ------------------------------------------------------------------
-    if (skyboxEnabled && pipelineSkybox && environmentMap && skyboxUniformBuffer[currentFrameIndex]) {
-        // Create/update skybox bind group for the current frame.
-        if (!skyboxBindGroup[currentFrameIndex] && skyboxBindGroupLayout) {
-            GPU::BindGroupDescriptor sbDesc{};
-            sbDesc.layout = skyboxBindGroupLayout;
-            sbDesc.entries = {
-                {0, environmentMap},
-                {1, environmentSampler},
-                {2, GPU::BufferBinding{skyboxUniformBuffer[currentFrameIndex], 0, 96}},
-            };
-            skyboxBindGroup[currentFrameIndex] = device->createBindGroup(sbDesc);
-        }
-        if (skyboxBindGroup[currentFrameIndex]) {
-            rpe->setPipeline(pipelineSkybox);
-            rpe->setBindGroup(0, skyboxBindGroup[currentFrameIndex]);
-            // Reset pipeline tracking so renderPrimitive() will rebind its pipeline.
-            currentPipelineVariant = 0;
-            lastBoundVertexBuffers.fill({});
-            rpe->draw(3);
+    // Detect whether any transparent draw uses transmission — if so, we need
+    // screen-space refraction (split opaque/transparent into separate passes).
+    bool needsScreenSpaceRefraction = false;
+    for (auto &draw : transparentQueue) {
+        if (draw.materialIndex >= 0 && asset->materials &&
+            (size_t)draw.materialIndex < asset->materials->size()) {
+            auto &mat = (*asset->materials)[(size_t)draw.materialIndex];
+            if (mat.khrMaterialsTransmission &&
+                mat.khrMaterialsTransmission->transmissionFactor > 0.0f) {
+                needsScreenSpaceRefraction = true;
+                break;
+            }
         }
     }
 
-    for (auto &draw : opaqueQueue) {
-        renderPrimitive(rpe, *draw.primitive, draw.nodeIndex);
+    // When screen-space refraction is needed, create an offscreen texture for
+    // the opaque pass so the transparent pass can sample it.
+    if (needsScreenSpaceRefraction) {
+        uint32_t texW = (uint32_t)((float)renderWidth * ssaaScale);
+        uint32_t texH = (uint32_t)((float)renderHeight * ssaaScale);
+        if (texW < 1) texW = 1;
+        if (texH < 1) texH = 1;
+        if (!opaqueSceneTexture || opaqueSceneTexture->getWidth() != texW ||
+            opaqueSceneTexture->getHeight() != texH) {
+            uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2(std::max(texW, texH)));
+            if (mipLevels < 2) mipLevels = 2;
+            opaqueSceneTexture = device->createTexture(
+                GPU::TextureType::tt2d, cachedColorFormat,
+                texW, texH, 1, mipLevels, 1,
+                (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                    uint32_t(GPU::TextureUsage::textureBinding)));
+            if (opaqueSceneTexture) {
+                opaqueSceneView = opaqueSceneTexture->createView(
+                    cachedColorFormat, 1, GPU::Aspect::all, 0, 0, GPU::TextureType::tt2d);
+            }
+        }
     }
 
-    // Sort transparent draws back-to-front and draw them after all opaque geometry.
-    // nodeTransforms stores the model matrix column-major at [nodeIndex*32 + 16..31];
-    // the world translation is at column 3: offsets 28 (X), 29 (Y), 30 (Z).
-    if (!transparentQueue.empty()) {
-        std::sort(transparentQueue.begin(), transparentQueue.end(),
-            [&](const DrawItem &a, const DrawItem &b) {
-                auto squaredDist = [&](uint64_t ni) -> float {
-                    size_t base = ni * 32;
-                    if (base + 31 >= nodeTransforms.size()) return 0.0f;
-                    float dx = nodeTransforms[base + 28] - cameraWorldPos[0];
-                    float dy = nodeTransforms[base + 29] - cameraWorldPos[1];
-                    float dz = nodeTransforms[base + 30] - cameraWorldPos[2];
-                    return dx*dx + dy*dy + dz*dz;
+    // Update the per-frame bind group with current frame-varying buffers.
+    // Keep binding 22 as the safe placeholder here; we will switch it to
+    // opaqueSceneTexture right before the transparent pass so the opaque
+    // pass does not trigger a Metal read-write conflict.
+    if (bindGroupLayout && frameBindGroup[currentFrameIndex]) {
+        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture ? sceneColorTexture : defaultTexture;
+        GPU::BindGroupDescriptor bgDesc{};
+        bgDesc.layout = bindGroupLayout;
+        bgDesc.entries = {
+            {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+            {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {22, scTex},
+        };
+        frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
+    }
+
+    auto drawSkybox = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe) {
+        if (skyboxEnabled && pipelineSkybox && environmentMap && skyboxUniformBuffer[currentFrameIndex]) {
+            if (!skyboxBindGroup[currentFrameIndex] && skyboxBindGroupLayout) {
+                GPU::BindGroupDescriptor sbDesc{};
+                sbDesc.layout = skyboxBindGroupLayout;
+                sbDesc.entries = {
+                    {0, environmentMap},
+                    {1, environmentSampler},
+                    {2, GPU::BufferBinding{skyboxUniformBuffer[currentFrameIndex], 0, 96}},
                 };
-                return squaredDist(a.nodeIndex) > squaredDist(b.nodeIndex); // farther first
-            });
-        for (auto &draw : transparentQueue) {
+                skyboxBindGroup[currentFrameIndex] = device->createBindGroup(sbDesc);
+            }
+            if (skyboxBindGroup[currentFrameIndex]) {
+                rpe->setPipeline(pipelineSkybox);
+                rpe->setBindGroup(0, skyboxBindGroup[currentFrameIndex]);
+                rpe->draw(3);
+            }
+        }
+    };
+
+    auto drawOpaque = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe) {
+        currentPipelineVariant = 0;
+        lastBoundVertexBuffers.fill({});
+        for (auto &draw : opaqueQueue) {
             renderPrimitive(rpe, *draw.primitive, draw.nodeIndex);
         }
+    };
+
+    auto drawTransparent = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe) {
+        if (!transparentQueue.empty()) {
+            std::sort(transparentQueue.begin(), transparentQueue.end(),
+                [&](const DrawCall &a, const DrawCall &b) {
+                    auto squaredDist = [&](uint64_t ni) -> float {
+                        size_t base = ni * 32;
+                        if (base + 31 >= nodeTransforms.size()) return 0.0f;
+                        float dx = nodeTransforms[base + 28] - cameraWorldPos[0];
+                        float dy = nodeTransforms[base + 29] - cameraWorldPos[1];
+                        float dz = nodeTransforms[base + 30] - cameraWorldPos[2];
+                        return dx*dx + dy*dy + dz*dz;
+                    };
+                    return squaredDist(a.nodeIndex) > squaredDist(b.nodeIndex);
+                });
+            currentPipelineVariant = 0;
+            lastBoundVertexBuffers.fill({});
+            for (auto &draw : transparentQueue) {
+                renderPrimitive(rpe, *draw.primitive, draw.nodeIndex);
+            }
+        }
+    };
+
+    auto setupDepthAttachment = [&](GPU::BeginRenderPassDescriptor &desc, GPU::LoadOp depthLoad, GPU::StoreOp depthStore) {
+        if (depthView) {
+            GPU::DepthStencilAttachment ds{};
+            ds.view              = depthView;
+            ds.depthClearValue   = 1.0f;
+            ds.depthLoadOp       = depthLoad;
+            ds.depthStoreOp      = depthStore;
+            ds.depthReadOnly     = false;
+            ds.stencilClearValue = 0;
+            ds.stencilLoadOp     = GPU::LoadOp::clear;
+            ds.stencilStoreOp    = GPU::StoreOp::discard;
+            ds.stencilReadOnly   = false;
+            desc.depthStencilAttachment = ds;
+        }
+    };
+
+    auto setupViewport = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe) {
+        if (renderWidth > 0 && renderHeight > 0) {
+            rpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
+            rpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+        }
+    };
+
+    if (needsScreenSpaceRefraction && opaqueSceneView) {
+        // --------------------------------------------------------------
+        // Pass 1: Opaque + skybox → opaqueSceneTexture
+        // --------------------------------------------------------------
+        {
+            GPU::ColorAttachment opaqueCa{};
+            opaqueCa.view          = opaqueSceneView;
+            opaqueCa.clearValue[0] = clearColor[0];
+            opaqueCa.clearValue[1] = clearColor[1];
+            opaqueCa.clearValue[2] = clearColor[2];
+            opaqueCa.clearValue[3] = clearColor[3];
+            opaqueCa.loadOp        = GPU::LoadOp::clear;
+            opaqueCa.storeOp       = GPU::StoreOp::store;
+            opaqueCa.depthSlice    = 0;
+
+            GPU::BeginRenderPassDescriptor opaqueDesc{};
+            opaqueDesc.colorAttachments = { opaqueCa };
+            setupDepthAttachment(opaqueDesc, GPU::LoadOp::clear, GPU::StoreOp::store);
+
+            auto opaqueRpe = encoder->beginRenderPass(opaqueDesc);
+            if (opaqueRpe) {
+                setupViewport(opaqueRpe);
+                drawSkybox(opaqueRpe);
+                drawOpaque(opaqueRpe);
+                opaqueRpe->end();
+            }
+        }
+
+        // Generate mipmaps for the opaque scene texture so transmissive materials
+        // can sample roughness-blurred scene color using LOD selection.
+        if (opaqueSceneTexture) {
+            encoder->generateMipmaps(opaqueSceneTexture);
+        }
+
+        // --------------------------------------------------------------
+        // Pass 2: Copy opaque result to the target that transparent will
+        // blend over (sceneColorTexture for FXAA/SSAA, else colorView).
+        // --------------------------------------------------------------
+        std::shared_ptr<GPU::TextureView> transparentTargetView;
+        if (useIntermediate) {
+            transparentTargetView = sceneColorView;
+        } else {
+            transparentTargetView = colorView;
+        }
+
+        if (transparentTargetView) {
+            // Create/update copy bind group for this frame.
+            if (!copyBindGroup[currentFrameIndex] && downsampleBindGroupLayout) {
+                GPU::BindGroupDescriptor cDesc{};
+                cDesc.layout = downsampleBindGroupLayout;
+                cDesc.entries = {
+                    {0, opaqueSceneTexture},
+                    {1, fxaaSampler},
+                };
+                copyBindGroup[currentFrameIndex] = device->createBindGroup(cDesc);
+            }
+
+            GPU::ColorAttachment copyCa{};
+            copyCa.view          = transparentTargetView;
+            copyCa.clearValue[0] = clearColor[0];
+            copyCa.clearValue[1] = clearColor[1];
+            copyCa.clearValue[2] = clearColor[2];
+            copyCa.clearValue[3] = clearColor[3];
+            copyCa.loadOp        = GPU::LoadOp::clear;
+            copyCa.storeOp       = GPU::StoreOp::store;
+            copyCa.depthSlice    = 0;
+
+            GPU::BeginRenderPassDescriptor copyDesc{};
+            copyDesc.colorAttachments = { copyCa };
+
+            auto copyRpe = encoder->beginRenderPass(copyDesc);
+            if (copyRpe) {
+                setupViewport(copyRpe);
+                if (pipelineDownsample && copyBindGroup[currentFrameIndex]) {
+                    copyRpe->setPipeline(pipelineDownsample);
+                    copyRpe->setBindGroup(0, copyBindGroup[currentFrameIndex]);
+                    copyRpe->draw(3);
+                }
+                copyRpe->end();
+            }
+        }
+
+        // --------------------------------------------------------------
+        // Pass 3: Transparent → target (with depth test against opaque)
+        // --------------------------------------------------------------
+        // Switch binding 22 to the mipmapped opaque scene texture so
+        // transmissive materials can sample it without conflicting with
+        // the color attachment (which is sceneColorView or colorView).
+        if (bindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture) {
+            GPU::BindGroupDescriptor bgDesc{};
+            bgDesc.layout = bindGroupLayout;
+            bgDesc.entries = {
+                {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+                {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+                {22, opaqueSceneTexture},
+            };
+            frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
+        }
+
+        {
+            GPU::ColorAttachment transCa{};
+            transCa.view          = transparentTargetView;
+            transCa.clearValue[0] = clearColor[0];
+            transCa.clearValue[1] = clearColor[1];
+            transCa.clearValue[2] = clearColor[2];
+            transCa.clearValue[3] = clearColor[3];
+            transCa.loadOp        = GPU::LoadOp::load;
+            transCa.storeOp       = GPU::StoreOp::store;
+            transCa.depthSlice    = 0;
+
+            GPU::BeginRenderPassDescriptor transDesc{};
+            transDesc.colorAttachments = { transCa };
+            setupDepthAttachment(transDesc, GPU::LoadOp::load, GPU::StoreOp::discard);
+
+            auto transRpe = encoder->beginRenderPass(transDesc);
+            if (transRpe) {
+                setupViewport(transRpe);
+                drawTransparent(transRpe);
+                transRpe->end();
+            }
+        }
+    } else {
+        // --------------------------------------------------------------
+        // Single-pass path (no transmission materials).
+        // --------------------------------------------------------------
+        GPU::ColorAttachment ca{};
+        ca.view          = useIntermediate ? sceneColorView : colorView;
+        ca.clearValue[0] = clearColor[0];
+        ca.clearValue[1] = clearColor[1];
+        ca.clearValue[2] = clearColor[2];
+        ca.clearValue[3] = clearColor[3];
+        ca.loadOp        = GPU::LoadOp::clear;
+        ca.storeOp       = GPU::StoreOp::store;
+        ca.depthSlice    = 0;
+
+        GPU::BeginRenderPassDescriptor rpDesc{};
+        rpDesc.colorAttachments = { ca };
+        setupDepthAttachment(rpDesc, GPU::LoadOp::clear, GPU::StoreOp::discard);
+
+        auto rpe = encoder->beginRenderPass(rpDesc);
+        if (!rpe) return;
+
+        setupViewport(rpe);
+        drawSkybox(rpe);
+        drawOpaque(rpe);
+        drawTransparent(rpe);
+        rpe->end();
     }
 
-    rpe->end();
+    // ------------------------------------------------------------------
+    // 5. SSAA downsample pass (when enabled).
+    // ------------------------------------------------------------------
+    if (useSsaa) {
+        if (!downsampleBindGroup[currentFrameIndex] && downsampleBindGroupLayout) {
+            GPU::BindGroupDescriptor dDesc{};
+            dDesc.layout = downsampleBindGroupLayout;
+            dDesc.entries = {
+                {0, sceneColorTexture},
+                {1, fxaaSampler},
+            };
+            downsampleBindGroup[currentFrameIndex] = device->createBindGroup(dDesc);
+        }
+
+        GPU::ColorAttachment dsCa{};
+        dsCa.view          = colorView;
+        dsCa.clearValue[0] = 0.0f;
+        dsCa.clearValue[1] = 0.0f;
+        dsCa.clearValue[2] = 0.0f;
+        dsCa.clearValue[3] = 1.0f;
+        dsCa.loadOp        = GPU::LoadOp::clear;
+        dsCa.storeOp       = GPU::StoreOp::store;
+        dsCa.depthSlice    = 0;
+
+        GPU::BeginRenderPassDescriptor dsRpDesc{};
+        dsRpDesc.colorAttachments = { dsCa };
+
+        auto dsRpe = encoder->beginRenderPass(dsRpDesc);
+        if (dsRpe) {
+            setupViewport(dsRpe);
+            dsRpe->setPipeline(pipelineDownsample);
+            dsRpe->setBindGroup(0, downsampleBindGroup[currentFrameIndex]);
+            dsRpe->draw(3);
+            dsRpe->end();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 6. FXAA post-process pass (when enabled).
+    // ------------------------------------------------------------------
+    if (useFxaa) {
+        if (!fxaaUniformBuffer[currentFrameIndex]) {
+            fxaaUniformBuffer[currentFrameIndex] = device->createBuffer(16, GPU::BufferUsage::uniform);
+        }
+        if (fxaaUniformBuffer[currentFrameIndex]) {
+            float fxaaData[4] = {
+                1.0f / (float)renderWidth,
+                1.0f / (float)renderHeight,
+                0.0f, 0.0f
+            };
+            fxaaUniformBuffer[currentFrameIndex]->upload(0, 16, fxaaData);
+        }
+
+        if (!fxaaBindGroup[currentFrameIndex] && fxaaBindGroupLayout) {
+            GPU::BindGroupDescriptor fDesc{};
+            fDesc.layout = fxaaBindGroupLayout;
+            fDesc.entries = {
+                {0, sceneColorTexture},
+                {1, fxaaSampler},
+                {2, GPU::BufferBinding{fxaaUniformBuffer[currentFrameIndex], 0, 16}},
+            };
+            fxaaBindGroup[currentFrameIndex] = device->createBindGroup(fDesc);
+        }
+
+        GPU::ColorAttachment fxaaCa{};
+        fxaaCa.view          = colorView;
+        fxaaCa.clearValue[0] = 0.0f;
+        fxaaCa.clearValue[1] = 0.0f;
+        fxaaCa.clearValue[2] = 0.0f;
+        fxaaCa.clearValue[3] = 1.0f;
+        fxaaCa.loadOp        = GPU::LoadOp::clear;
+        fxaaCa.storeOp       = GPU::StoreOp::store;
+        fxaaCa.depthSlice    = 0;
+
+        GPU::BeginRenderPassDescriptor fxaaRpDesc{};
+        fxaaRpDesc.colorAttachments = { fxaaCa };
+
+        auto fxaaRpe = encoder->beginRenderPass(fxaaRpDesc);
+        if (fxaaRpe) {
+            setupViewport(fxaaRpe);
+            fxaaRpe->setPipeline(pipelineFxaa);
+            fxaaRpe->setBindGroup(0, fxaaBindGroup[currentFrameIndex]);
+            fxaaRpe->draw(3);
+            fxaaRpe->end();
+        }
+    }
+
     device->submit(encoder->finish(), frame.fence);
     currentFrameIndex = (currentFrameIndex + 1) % kMaxFramesInFlight;
+
+    // Stats
+    lastFrameStats.opaqueDrawCount = (uint32_t)opaqueQueue.size();
+    lastFrameStats.transparentDrawCount = (uint32_t)transparentQueue.size();
+    lastFrameStats.totalDrawCount = lastFrameStats.opaqueDrawCount + lastFrameStats.transparentDrawCount;
+    uint32_t instanceCount = 0;
+    for (auto& draw : opaqueQueue) instanceCount += draw.instanceCount;
+    for (auto& draw : transparentQueue) instanceCount += draw.instanceCount;
+    lastFrameStats.instanceCount = instanceCount;
+    uint32_t visible = 0;
+    for (auto v : visibleNodeMask) visible += v;
+    lastFrameStats.visibleNodeCount = visible;
+    lastFrameStats.culledNodeCount = (uint32_t)(visibleNodeMask.size() - visible);
+    auto frameEnd = std::chrono::steady_clock::now();
+    lastFrameStats.cpuFrameTimeMs = std::chrono::duration<double, std::milli>(frameEnd - frameStart).count();
 }
 
 void Renderer::update(double dt) {
-    if (!asset || !asset->animations) return;
-    if (animationStates.empty()) return;
-
-    // Clear previous animated values — will be rebuilt from all playing animations.
-    animatedNodes.clear();
-
-    // Process each animation that has a state.
-    for (auto &pair : animationStates) {
-        int32_t animIndex = pair.first;
-        AnimationState &state = pair.second;
-
-        if (animIndex < 0 || (size_t)animIndex >= asset->animations->size()) continue;
-        if (!state.playing) continue;
-
-        // Advance time.
-        state.time += dt;
-
-        // Handle looping or clamping.
-        if (state.time > state.duration) {
-            if (state.loop) {
-                state.time = fmod(state.time, state.duration);
-            } else {
-                state.time = state.duration;
-                state.playing = false;
+    if (!animator || !asset) return;
+    animator->update(dt);
+    // Backward compatibility: apply animated TRS to glTF nodes.
+    for (auto &pair : animator->getAnimatedNodes()) {
+        applyAnimatedTRS(pair.first);
+    }
+    // KHR_animation_pointer: apply animated material/light properties and re-upload.
+    auto modifiedMaterials = animator->applyAnimatedPointers();
+    if (asset->materials && materialUniformBuffer) {
+        for (uint64_t matIdx : modifiedMaterials) {
+            if (matIdx < asset->materials->size()) {
+                uint32_t uniformSlot = (uint32_t)(matIdx + 1);
+                reuploadMaterialSlot(uniformSlot, (*asset->materials)[matIdx], *asset);
             }
         }
-
-        // Sample this animation at its current time.
-        sampleAnimation(animIndex, (float)state.time);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Animation sampling
+// Animation sampling (now delegated to GltfAnimator)
 // ---------------------------------------------------------------------------
-
-void Renderer::sampleAnimation(int32_t animIndex, float time) {
-    if (!asset || !asset->animations) return;
-    if (animIndex < 0 || (size_t)animIndex >= asset->animations->size()) return;
-
-    auto &animation = (*asset->animations)[(size_t)animIndex];
-
-    // Process each channel.
-    for (auto &channel : animation.channels) {
-        if (channel.target.node < 0) continue;
-        if (!asset->nodes || (size_t)channel.target.node >= asset->nodes->size()) continue;
-        if (channel.sampler >= animation.samplers.size()) continue;
-
-        auto &sampler = animation.samplers[channel.sampler];
-        if (!asset->accessors) continue;
-        if (sampler.input >= asset->accessors->size()) continue;
-        if (sampler.output >= asset->accessors->size()) continue;
-
-        auto &inputAcc = (*asset->accessors)[sampler.input];
-        auto &outputAcc = (*asset->accessors)[sampler.output];
-        if (inputAcc.bufferView < 0 || outputAcc.bufferView < 0) continue;
-        if (!asset->bufferViews) continue;
-        if ((size_t)inputAcc.bufferView >= asset->bufferViews->size()) continue;
-        if ((size_t)outputAcc.bufferView >= asset->bufferViews->size()) continue;
-
-        auto &inputBV = (*asset->bufferViews)[(size_t)inputAcc.bufferView];
-        auto &outputBV = (*asset->bufferViews)[(size_t)outputAcc.bufferView];
-        if (!asset->buffers) continue;
-        if ((size_t)inputBV.buffer >= asset->buffers->size()) continue;
-        if ((size_t)outputBV.buffer >= asset->buffers->size()) continue;
-
-        auto &inputBuf = (*asset->buffers)[(size_t)inputBV.buffer];
-        auto &outputBuf = (*asset->buffers)[(size_t)outputBV.buffer];
-
-        // Get keyframe times (input).
-        const float *times = reinterpret_cast<const float*>(
-            inputBuf.data.data() + inputBV.byteOffset + inputAcc.byteOffset);
-        uint32_t keyframeCount = (uint32_t)inputAcc.count;
-        if (keyframeCount == 0) continue;
-
-        // Get keyframe values (output).
-        const uint8_t *values = outputBuf.data.data() + outputBV.byteOffset + outputAcc.byteOffset;
-
-        // Find keyframe interval.
-        uint32_t kf0 = 0, kf1 = 0;
-        float t = 0.0f;
-
-        if (time <= times[0]) {
-            kf0 = kf1 = 0;
-            t = 0.0f;
-        } else if (time >= times[keyframeCount - 1]) {
-            kf0 = kf1 = keyframeCount - 1;
-            t = 0.0f;
-        } else {
-            for (uint32_t i = 0; i < keyframeCount - 1; ++i) {
-                if (time >= times[i] && time < times[i + 1]) {
-                    kf0 = i;
-                    kf1 = i + 1;
-                    float span = times[kf1] - times[kf0];
-                    t = (span > 0.0f) ? (time - times[kf0]) / span : 0.0f;
-                    break;
-                }
-            }
-        }
-
-        // Apply interpolation based on type and path.
-        namespace VM = systems::leal::vector_math;
-        uint64_t nodeIdx = (uint64_t)channel.target.node;
-
-        if (channel.target.path == "translation") {
-            auto &trs = animatedNodes[nodeIdx];
-            trs.hasTranslation = true;
-
-            const float *v0 = reinterpret_cast<const float*>(values) + kf0 * 3;
-            const float *v1 = reinterpret_cast<const float*>(values) + kf1 * 3;
-
-            if (sampler.interpolation == systems::leal::gltf::AnimationInterpolation::aiStep) {
-                trs.translation = VM::Vector3<double>(v0[0], v0[1], v0[2]);
-            } else {
-                // Linear interpolation.
-                double x = v0[0] + (v1[0] - v0[0]) * t;
-                double y = v0[1] + (v1[1] - v0[1]) * t;
-                double z = v0[2] + (v1[2] - v0[2]) * t;
-                trs.translation = VM::Vector3<double>(x, y, z);
-            }
-        } else if (channel.target.path == "rotation") {
-            auto &trs = animatedNodes[nodeIdx];
-            trs.hasRotation = true;
-
-            const float *v0 = reinterpret_cast<const float*>(values) + kf0 * 4;
-            const float *v1 = reinterpret_cast<const float*>(values) + kf1 * 4;
-
-            VM::Quaternion<double> q0(v0[0], v0[1], v0[2], v0[3]);
-            VM::Quaternion<double> q1(v1[0], v1[1], v1[2], v1[3]);
-
-            if (sampler.interpolation == systems::leal::gltf::AnimationInterpolation::aiStep) {
-                trs.rotation = q0;
-            } else {
-                // Spherical linear interpolation for quaternions.
-                trs.rotation = VM::Quaternion<double>::slerp(q0, q1, (double)t);
-            }
-        } else if (channel.target.path == "scale") {
-            auto &trs = animatedNodes[nodeIdx];
-            trs.hasScale = true;
-
-            const float *v0 = reinterpret_cast<const float*>(values) + kf0 * 3;
-            const float *v1 = reinterpret_cast<const float*>(values) + kf1 * 3;
-
-            if (sampler.interpolation == systems::leal::gltf::AnimationInterpolation::aiStep) {
-                trs.scale = VM::Vector3<double>(v0[0], v0[1], v0[2]);
-            } else {
-                // Linear interpolation.
-                double x = v0[0] + (v1[0] - v0[0]) * t;
-                double y = v0[1] + (v1[1] - v0[1]) * t;
-                double z = v0[2] + (v1[2] - v0[2]) * t;
-                trs.scale = VM::Vector3<double>(x, y, z);
-            }
-        }
-        // TODO: "weights" for morph targets (not implemented).
-    }
-}
 
 // Apply animated TRS values to node transforms before computing world matrices.
 void Renderer::applyAnimatedTRS(uint64_t nodeIndex) {
     if (!asset || !asset->nodes || nodeIndex >= asset->nodes->size()) return;
+    if (!animator) return;
 
-    auto it = animatedNodes.find(nodeIndex);
-    if (it == animatedNodes.end()) return;
+    auto it = animator->getAnimatedNodes().find(nodeIndex);
+    if (it == animator->getAnimatedNodes().end()) return;
 
     auto &node = (*asset->nodes)[nodeIndex];
     auto &trs = it->second;
@@ -3542,6 +4305,10 @@ bool Renderer::isDebugModeEnabled() const {
     return viewMode == ViewMode::worldNormal;
 }
 
+RenderStats Renderer::getLastFrameStats() const {
+    return lastFrameStats;
+}
+
 // ---------------------------------------------------------------------------
 // Scene-graph traversal
 // ---------------------------------------------------------------------------
@@ -3564,7 +4331,7 @@ void Renderer::gatherVisibleDraws(uint64_t nodeIndex)
         updateVisibleInstances(nodeIndex);
         auto &mesh = (*asset->meshes)[(size_t)node.mesh];
         for (auto &primitive : mesh.primitives) {
-            DrawItem draw;
+            DrawCall draw;
             draw.primitive = &primitive;
             draw.nodeIndex = nodeIndex;
             draw.materialIndex = resolvePrimitiveMaterial(primitive);
@@ -3623,7 +4390,9 @@ void Renderer::renderPrimitive(
         viewMode == ViewMode::clearcoat ||
         viewMode == ViewMode::clearcoatRoughness ||
         viewMode == ViewMode::clearcoatNormal ||
-        viewMode == ViewMode::transmission;
+        viewMode == ViewMode::transmission ||
+        viewMode == ViewMode::iridescence ||
+        viewMode == ViewMode::anisotropy;
 
     // Get material properties (even without texcoords for transmission/blend mode)
     if (matIdx >= 0 && asset->materials && (size_t)matIdx < asset->materials->size()) {
@@ -4049,6 +4818,241 @@ Renderer::loadEnvironmentMap(
     return tex;
 }
 
+// ---------------------------------------------------------------------------
+// Equirectangular-to-cubemap conversion (CPU)
+// ---------------------------------------------------------------------------
+
+namespace {
+    // Simple IEEE-754 half <-> float conversions.
+    inline float halfToFloat(uint16_t h) {
+        uint32_t sign = (h >> 15) & 0x1;
+        uint32_t exp  = (h >> 10) & 0x1f;
+        uint32_t mant = h & 0x3ff;
+        if (exp == 0) {
+            if (mant == 0) return sign ? -0.0f : 0.0f;
+            float f = mant / 1024.0f;
+            return (sign ? -1.0f : 1.0f) * f * std::pow(2.0f, -14.0f);
+        } else if (exp == 31) {
+            return mant ? std::numeric_limits<float>::quiet_NaN()
+                        : (sign ? -std::numeric_limits<float>::infinity()
+                                : std::numeric_limits<float>::infinity());
+        }
+        uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+        float f;
+        std::memcpy(&f, &f32, sizeof(f));
+        return f;
+    }
+
+    inline uint16_t floatToHalf(float f) {
+        uint32_t f32;
+        std::memcpy(&f32, &f, sizeof(f32));
+        uint32_t sign = (f32 >> 31) & 0x1;
+        uint32_t exp  = ((f32 >> 23) & 0xff);
+        uint32_t mant = f32 & 0x7fffff;
+        if (exp == 0) {
+            // Zero / subnormal -> zero
+            return sign << 15;
+        } else if (exp == 255) {
+            return (sign << 15) | 0x7c00;
+        }
+        int32_t e = int32_t(exp) - 127 + 15;
+        if (e <= 0) {
+            if (e < -10) return sign << 15;
+            mant = (mant | 0x800000) >> (1 - e);
+            return (sign << 15) | (mant >> 13);
+        } else if (e >= 31) {
+            return (sign << 15) | 0x7c00;
+        }
+        return (sign << 15) | (uint16_t(e) << 10) | (mant >> 13);
+    }
+
+    struct Float4 { float r, g, b, a; };
+
+    // Bilinearly sample an equirectangular image at (u,v) and return float4.
+    // u and v are expected in [0,1]; horizontal wrapping is applied.
+    Float4 sampleEquirectangular(const systems::leal::campello_image::Image *img, float u, float v) {
+        namespace Img = systems::leal::campello_image;
+        int w = static_cast<int>(img->getWidth());
+        int h = static_cast<int>(img->getHeight());
+        if (w <= 0 || h <= 0) return {0, 0, 0, 1};
+
+        // Map to pixel coordinates with 0.5 offset (pixel centers).
+        float fx = u * w - 0.5f;
+        float fy = v * h - 0.5f;
+
+        int x0 = static_cast<int>(std::floor(fx));
+        int y0 = static_cast<int>(std::floor(fy));
+        int x1 = x0 + 1;
+        int y1 = y0 + 1;
+        float sx = fx - static_cast<float>(x0);
+        float sy = fy - static_cast<float>(y0);
+
+        // Wrap horizontally, clamp vertically.
+        auto wrapX = [w](int x) { x = x % w; return x < 0 ? x + w : x; };
+        auto clampY = [h](int y) { return y < 0 ? 0 : (y >= h ? h - 1 : y); };
+        x0 = wrapX(x0); x1 = wrapX(x1);
+        y0 = clampY(y0); y1 = clampY(y1);
+
+        auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
+
+        auto samplePixel = [&](int x, int y) -> Float4 {
+            int idx = (y * w + x);
+            Img::ImageFormat fmt = img->getFormat();
+            if (fmt == Img::ImageFormat::rgba8) {
+                const uint8_t *d = static_cast<const uint8_t*>(img->getData());
+                int i = idx * 4;
+                float s = 1.0f / 255.0f;
+                return { d[i] * s, d[i+1] * s, d[i+2] * s, d[i+3] * s };
+            } else if (fmt == Img::ImageFormat::rgba16f) {
+                const uint16_t *d = static_cast<const uint16_t*>(img->getData());
+                int i = idx * 4;
+                return { halfToFloat(d[i]), halfToFloat(d[i+1]),
+                         halfToFloat(d[i+2]), halfToFloat(d[i+3]) };
+            } else {
+                const float *d = static_cast<const float*>(img->getData());
+                int i = idx * 4;
+                return { d[i], d[i+1], d[i+2], d[i+3] };
+            }
+        };
+
+        Float4 p00 = samplePixel(x0, y0);
+        Float4 p10 = samplePixel(x1, y0);
+        Float4 p01 = samplePixel(x0, y1);
+        Float4 p11 = samplePixel(x1, y1);
+
+        Float4 r;
+        r.r = lerp(lerp(p00.r, p10.r, sx), lerp(p01.r, p11.r, sx), sy);
+        r.g = lerp(lerp(p00.g, p10.g, sx), lerp(p01.g, p11.g, sx), sy);
+        r.b = lerp(lerp(p00.b, p10.b, sx), lerp(p01.b, p11.b, sx), sy);
+        r.a = lerp(lerp(p00.a, p10.a, sx), lerp(p01.a, p11.a, sx), sy);
+        return r;
+    }
+
+    // Convert a float4 pixel to the target image format and store at dst.
+    void storePixel(void *dst, int idx, const Float4 &c,
+                    systems::leal::campello_image::ImageFormat fmt) {
+        if (fmt == systems::leal::campello_image::ImageFormat::rgba8) {
+            uint8_t *d = static_cast<uint8_t*>(dst);
+            int i = idx * 4;
+            d[i]   = static_cast<uint8_t>(std::clamp(c.r * 255.0f + 0.5f, 0.0f, 255.0f));
+            d[i+1] = static_cast<uint8_t>(std::clamp(c.g * 255.0f + 0.5f, 0.0f, 255.0f));
+            d[i+2] = static_cast<uint8_t>(std::clamp(c.b * 255.0f + 0.5f, 0.0f, 255.0f));
+            d[i+3] = static_cast<uint8_t>(std::clamp(c.a * 255.0f + 0.5f, 0.0f, 255.0f));
+        } else if (fmt == systems::leal::campello_image::ImageFormat::rgba16f) {
+            uint16_t *d = static_cast<uint16_t*>(dst);
+            int i = idx * 4;
+            d[i]   = floatToHalf(c.r);
+            d[i+1] = floatToHalf(c.g);
+            d[i+2] = floatToHalf(c.b);
+            d[i+3] = floatToHalf(c.a);
+        } else {
+            float *d = static_cast<float*>(dst);
+            int i = idx * 4;
+            d[i]   = c.r;
+            d[i+1] = c.g;
+            d[i+2] = c.b;
+            d[i+3] = c.a;
+        }
+    }
+} // anonymous namespace
+
+std::shared_ptr<systems::leal::campello_gpu::Texture>
+Renderer::loadEquirectangularEnvironmentMap(const std::string &path, uint32_t faceSize)
+{
+    namespace GPU = systems::leal::campello_gpu;
+    namespace Img = systems::leal::campello_image;
+
+    auto img = Img::Image::fromFile(path.c_str());
+    if (!img) return nullptr;
+
+    uint32_t eqW = img->getWidth();
+    uint32_t eqH = img->getHeight();
+    if (eqW == 0 || eqH == 0) return nullptr;
+
+    // Default face size: half the equirectangular height (standard 2:1 projection).
+    uint32_t fsize = faceSize;
+    if (fsize == 0) fsize = eqH / 2;
+    if (fsize == 0) fsize = 1;
+    // Cap at 2048 to avoid unexpectedly huge GPU textures.
+    if (fsize > 2048) fsize = 2048;
+
+    GPU::PixelFormat fmt = GPU::PixelFormat::rgba8unorm;
+    switch (img->getFormat()) {
+        case Img::ImageFormat::rgba8:   fmt = GPU::PixelFormat::rgba8unorm; break;
+        case Img::ImageFormat::rgba16f: fmt = GPU::PixelFormat::rgba16float; break;
+        case Img::ImageFormat::rgba32f: fmt = GPU::PixelFormat::rgba32float; break;
+    }
+
+    auto tex = device->createTexture(
+        GPU::TextureType::ttCube, fmt,
+        fsize, fsize, 1, 1, 1,
+        (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
+                            uint32_t(GPU::TextureUsage::copyDst)));
+    if (!tex) return nullptr;
+
+    // Allocate one face buffer.
+    size_t bytesPerPixel = (img->getFormat() == Img::ImageFormat::rgba8) ? 4 :
+                           (img->getFormat() == Img::ImageFormat::rgba16f) ? 8 : 16;
+    size_t bytesPerFace = fsize * fsize * bytesPerPixel;
+    std::vector<uint8_t> faceData(bytesPerFace);
+
+    const float twoPi = 2.0f * static_cast<float>(M_PI);
+    const float pi    = static_cast<float>(M_PI);
+
+    // Generate each cubemap face by sampling the equirectangular map.
+    for (int face = 0; face < 6; ++face) {
+        for (uint32_t y = 0; y < fsize; ++y) {
+            for (uint32_t x = 0; x < fsize; ++x) {
+                // Map pixel to [-1, 1] with pixel-center offset.
+                float u = 2.0f * (static_cast<float>(x) + 0.5f) / static_cast<float>(fsize) - 1.0f;
+                float v = 2.0f * (static_cast<float>(y) + 0.5f) / static_cast<float>(fsize) - 1.0f;
+
+                // Direction vector for this face (right-handed, +Z forward).
+                float dx = 0.0f, dy = 0.0f, dz = 0.0f;
+                switch (face) {
+                    case 0: dx =  1.0f; dy = -v;   dz = -u;   break; // +X
+                    case 1: dx = -1.0f; dy = -v;   dz =  u;   break; // -X
+                    case 2: dx =  u;    dy =  1.0f; dz =  v;   break; // +Y
+                    case 3: dx =  u;    dy = -1.0f; dz = -v;   break; // -Y
+                    case 4: dx =  u;    dy = -v;   dz =  1.0f; break; // +Z
+                    case 5: dx = -u;    dy = -v;   dz = -1.0f; break; // -Z
+                }
+
+                float len = std::sqrt(dx*dx + dy*dy + dz*dz);
+                if (len > 0.0f) { dx /= len; dy /= len; dz /= len; }
+
+                // Equirectangular UV from direction.
+                // Standard convention: v=0 at top (+Y/zenith), v=1 at bottom (-Y/nadir).
+                float phi   = std::atan2(dz, dx);               // [-pi, pi]
+                float theta = std::asin(std::clamp(dy, -1.0f, 1.0f)); // [-pi/2, pi/2]
+                float eu = phi / twoPi + 0.5f;
+                float ev = 0.5f - theta / pi;
+
+                // Some equirectangular images have a vertical flip; if the result
+                // looks upside-down we can flip v here.
+                Float4 color = sampleEquirectangular(img.get(), eu, ev);
+                storePixel(faceData.data(), static_cast<int>(y * fsize + x), color, img->getFormat());
+            }
+        }
+
+        // Upload this face to the GPU cubemap.
+        auto encoder = device->createCommandEncoder();
+        if (encoder) {
+            auto staging = device->createBuffer(bytesPerFace, GPU::BufferUsage::copySrc);
+            if (staging) {
+                staging->upload(0, bytesPerFace, faceData.data());
+                uint64_t bytesPerRow = fsize * bytesPerPixel;
+                encoder->copyBufferToTexture(staging, 0, bytesPerRow, tex, 0, face);
+                auto fence = device->createFence();
+                device->submit(encoder->finish(), fence);
+                if (fence) fence->wait();
+            }
+        }
+    }
+
+    return tex;
+}
+
 void Renderer::setSkyboxEnabled(bool enabled) {
     skyboxEnabled = enabled;
 }
@@ -4071,6 +5075,60 @@ bool Renderer::isIBLEnabled() const {
 
 float Renderer::getEnvironmentIntensity() const {
     return environmentIntensity;
+}
+
+void Renderer::setFxaaEnabled(bool enabled) {
+    fxaaEnabled = enabled;
+    ensureSceneColorTexture();
+    if (!fxaaEnabled && ssaaScale <= 1.0f) {
+        sceneColorTexture = nullptr;
+        sceneColorView    = nullptr;
+    }
+}
+
+bool Renderer::isFxaaEnabled() const {
+    return fxaaEnabled;
+}
+
+void Renderer::setSsaaScale(float scale) {
+    ssaaScale = scale;
+    ensureSceneColorTexture();
+    if (ssaaScale <= 1.0f && !fxaaEnabled) {
+        sceneColorTexture = nullptr;
+        sceneColorView    = nullptr;
+    }
+}
+
+float Renderer::getSsaaScale() const {
+    return ssaaScale;
+}
+
+void Renderer::ensureSceneColorTexture() {
+    namespace GPU = systems::leal::campello_gpu;
+    using TU = GPU::TextureUsage;
+    bool needsTexture = (fxaaEnabled || ssaaScale > 1.0f)
+                        && cachedColorFormat != GPU::PixelFormat::invalid
+                        && renderWidth > 0 && renderHeight > 0;
+    if (!needsTexture) return;
+
+    uint32_t texW = (uint32_t)((float)renderWidth * ssaaScale);
+    uint32_t texH = (uint32_t)((float)renderHeight * ssaaScale);
+    if (texW < 1) texW = 1;
+    if (texH < 1) texH = 1;
+
+    if (sceneColorTexture && sceneColorTexture->getWidth() == texW && sceneColorTexture->getHeight() == texH) {
+        return; // Already correct size.
+    }
+
+    sceneColorTexture = device->createTexture(
+        GPU::TextureType::tt2d,
+        cachedColorFormat,
+        texW, texH, 1, 1, 1,
+        (TU)(uint32_t(TU::renderTarget) | uint32_t(TU::textureBinding)));
+    if (sceneColorTexture) {
+        sceneColorView = sceneColorTexture->createView(
+            cachedColorFormat, 1, GPU::Aspect::all, 0, 0, GPU::TextureType::tt2d);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4127,116 +5185,51 @@ Renderer::getDefaultBindGroup() const { return defaultBindGroup; }
 // ---------------------------------------------------------------------------
 
 uint32_t Renderer::getAnimationCount() const {
-    if (!asset || !asset->animations) return 0;
-    return (uint32_t)asset->animations->size();
+    return animator ? animator->getAnimationCount() : 0;
 }
 
 std::string Renderer::getAnimationName(uint32_t animationIndex) const {
-    if (!asset || !asset->animations) return {};
-    if (animationIndex >= asset->animations->size()) return {};
-    return (*asset->animations)[animationIndex].name;
+    return animator ? animator->getAnimationName(animationIndex) : "";
 }
 
 double Renderer::getAnimationDuration(uint32_t animationIndex) const {
-    if (!asset || !asset->animations || animationIndex >= asset->animations->size()) return 0.0;
-
-    auto &anim = (*asset->animations)[animationIndex];
-    double maxTime = 0.0;
-    for (auto &sampler : anim.samplers) {
-        if (!asset->accessors || sampler.input >= asset->accessors->size()) continue;
-        auto &inputAcc = (*asset->accessors)[sampler.input];
-        if (inputAcc.bufferView < 0 || !asset->bufferViews) continue;
-        auto &inputBV = (*asset->bufferViews)[(size_t)inputAcc.bufferView];
-        if ((size_t)inputBV.buffer >= asset->buffers->size()) continue;
-        auto &inputBuf = (*asset->buffers)[(size_t)inputBV.buffer];
-
-        const float *times = reinterpret_cast<const float*>(
-            inputBuf.data.data() + inputBV.byteOffset + inputAcc.byteOffset);
-        if (inputAcc.count > 0) {
-            maxTime = std::max(maxTime, (double)times[inputAcc.count - 1]);
-        }
-    }
-    return maxTime;
+    return animator ? animator->getAnimationDuration(animationIndex) : 0.0;
 }
 
 void Renderer::playAnimation(uint32_t animationIndex) {
-    if (!asset || !asset->animations || animationIndex >= asset->animations->size()) return;
-
-    auto &state = animationStates[(int32_t)animationIndex];
-    state.playing = true;
-    // Initialize duration if not set.
-    if (state.duration <= 0.0) {
-        state.duration = getAnimationDuration(animationIndex);
-    }
+    if (animator) animator->playAnimation(animationIndex);
 }
 
 void Renderer::pauseAnimation(uint32_t animationIndex) {
-    auto it = animationStates.find((int32_t)animationIndex);
-    if (it != animationStates.end()) {
-        it->second.playing = false;
-    }
+    if (animator) animator->pauseAnimation(animationIndex);
 }
 
 void Renderer::stopAnimation(uint32_t animationIndex) {
-    auto it = animationStates.find((int32_t)animationIndex);
-    if (it != animationStates.end()) {
-        it->second.playing = false;
-        it->second.time = 0.0;
-    }
-    // Clear animated nodes if no animations are playing.
-    bool anyPlaying = false;
-    for (auto &pair : animationStates) {
-        if (pair.second.playing) {
-            anyPlaying = true;
-            break;
-        }
-    }
-    if (!anyPlaying) {
-        animatedNodes.clear();
-    }
+    if (animator) animator->stopAnimation(animationIndex);
 }
 
 void Renderer::stopAllAnimations() {
-    for (auto &pair : animationStates) {
-        pair.second.playing = false;
-        pair.second.time = 0.0;
-    }
-    animatedNodes.clear();
+    if (animator) animator->stopAllAnimations();
 }
 
 bool Renderer::isAnimationPlaying(uint32_t animationIndex) const {
-    auto it = animationStates.find((int32_t)animationIndex);
-    if (it != animationStates.end()) {
-        return it->second.playing;
-    }
-    return false;
+    return animator ? animator->isAnimationPlaying(animationIndex) : false;
 }
 
 void Renderer::setAnimationLoop(uint32_t animationIndex, bool loop) {
-    if (!asset || !asset->animations || animationIndex >= asset->animations->size()) return;
-    animationStates[(int32_t)animationIndex].loop = loop;
+    if (animator) animator->setAnimationLoop(animationIndex, loop);
 }
 
 bool Renderer::isAnimationLooping(uint32_t animationIndex) const {
-    auto it = animationStates.find((int32_t)animationIndex);
-    if (it != animationStates.end()) {
-        return it->second.loop;
-    }
-    return true; // Default to looping.
+    return animator ? animator->isAnimationLooping(animationIndex) : true;
 }
 
 void Renderer::setAnimationTime(uint32_t animationIndex, double time) {
-    if (!asset || !asset->animations || animationIndex >= asset->animations->size()) return;
-    auto &state = animationStates[(int32_t)animationIndex];
-    state.time = std::max(0.0, std::min(time, state.duration));
+    if (animator) animator->setAnimationTime(animationIndex, time);
 }
 
 double Renderer::getAnimationTime(uint32_t animationIndex) const {
-    auto it = animationStates.find((int32_t)animationIndex);
-    if (it != animationStates.end()) {
-        return it->second.time;
-    }
-    return 0.0;
+    return animator ? animator->getAnimationTime(animationIndex) : 0.0;
 }
 
 // ---------------------------------------------------------------------------
@@ -4300,3 +5293,1226 @@ std::string systems::leal::campello_renderer::getVersion() {
            std::to_string(campello_renderer_VERSION_MINOR) + "." +
            std::to_string(campello_renderer_VERSION_PATCH);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2 — Resource upload helpers (engine-native handles)
+// ---------------------------------------------------------------------------
+
+static size_t getComponentSize(systems::leal::gltf::ComponentType ct) {
+    using CT = systems::leal::gltf::ComponentType;
+    switch (ct) {
+        case CT::ctByte: return 1;
+        case CT::ctUnsignedByte: return 1;
+        case CT::ctShort: return 2;
+        case CT::ctUnsignedShort: return 2;
+        case CT::ctUnsignedInt: return 4;
+        case CT::ctFloat: return 4;
+    }
+    return 1;
+}
+
+static size_t getTypeCount(systems::leal::gltf::AccessorType at) {
+    using AT = systems::leal::gltf::AccessorType;
+    switch (at) {
+        case AT::acScalar: return 1;
+        case AT::acVec2:   return 2;
+        case AT::acVec3:   return 3;
+        case AT::acVec4:   return 4;
+        case AT::acMat2:   return 4;
+        case AT::acMat3:   return 9;
+        case AT::acMat4:   return 16;
+    }
+    return 1;
+}
+
+static std::vector<uint8_t> readAccessorData(const systems::leal::gltf::Accessor& acc,
+                                              const systems::leal::gltf::GLTF& asset) {
+    if (acc.bufferView < 0 || !asset.bufferViews) return {};
+    auto& bv = (*asset.bufferViews)[(size_t)acc.bufferView];
+    if (bv.buffer < 0 || !asset.buffers) return {};
+    auto& buf = (*asset.buffers)[(size_t)bv.buffer];
+    if (buf.data.empty()) return {};
+
+    size_t compSize  = getComponentSize(acc.componentType);
+    size_t typeCount = getTypeCount(acc.type);
+    size_t elementSize = compSize * typeCount;
+    size_t totalSize = elementSize * acc.count;
+    if (totalSize == 0) return {};
+
+    std::vector<uint8_t> result(totalSize);
+    const uint8_t* src = buf.data.data() + bv.byteOffset + acc.byteOffset;
+
+    if (bv.byteStride > 0 && (size_t)bv.byteStride != elementSize) {
+        for (size_t i = 0; i < acc.count; ++i) {
+            std::memcpy(result.data() + i * elementSize,
+                        src + i * bv.byteStride,
+                        elementSize);
+        }
+    } else {
+        std::memcpy(result.data(), src, totalSize);
+    }
+    return result;
+}
+
+static std::shared_ptr<systems::leal::campello_gpu::Buffer>
+    uploadAccessorBuffer(const systems::leal::gltf::Accessor& acc,
+                         const systems::leal::gltf::GLTF& asset,
+                         std::shared_ptr<systems::leal::campello_gpu::Device> device,
+                         systems::leal::campello_gpu::BufferUsage usage) {
+    auto data = readAccessorData(acc, asset);
+    if (data.empty()) return nullptr;
+    return device->createBuffer(data.size(), usage, data.data());
+}
+
+
+GpuMesh* Renderer::uploadMesh(const systems::leal::gltf::Primitive& primitive,
+                              const systems::leal::gltf::GLTF& asset) {
+    namespace GPU = systems::leal::campello_gpu;
+
+    // Check cache.
+    auto cacheIt = meshCache.find(&primitive);
+    if (cacheIt != meshCache.end()) {
+        return cacheIt->second;
+    }
+
+    auto mesh = std::make_unique<GpuMesh>();
+
+    // --- Index buffer ---
+    if (primitive.indices >= 0 && asset.accessors) {
+        auto& idxAcc = (*asset.accessors)[(size_t)primitive.indices];
+        auto idxBuf = uploadAccessorBuffer(idxAcc, asset, device, GPU::BufferUsage::index);
+        if (idxBuf) {
+            mesh->indexBuffer = idxBuf;
+            mesh->indexCount  = (uint32_t)idxAcc.count;
+        }
+    }
+
+    // --- Draco path ---
+    if (primitive.khrDracoMeshCompression) {
+        auto& draco = *primitive.khrDracoMeshCompression;
+        // Draco indices.
+        if (!draco.decodedIndices.empty()) {
+            size_t indexSize = draco.decodedIndices.size() * sizeof(uint32_t);
+            mesh->indexBuffer = device->createBuffer(
+                indexSize, GPU::BufferUsage::index,
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(draco.decodedIndices.data())));
+            mesh->indexCount = (uint32_t)draco.decodedIndices.size();
+        }
+        // Draco attributes.
+        auto bindDracoAttr = [&](const std::string& semantic, uint32_t slot) {
+            auto it = draco.decodedAttributes.find(semantic);
+            if (it != draco.decodedAttributes.end() && !it->second.empty()) {
+                mesh->vertexBuffers[slot] = device->createBuffer(
+                    it->second.size(), GPU::BufferUsage::vertex,
+                    const_cast<uint8_t*>(it->second.data()));
+            }
+        };
+        bindDracoAttr("POSITION",    VERTEX_SLOT_POSITION);
+        bindDracoAttr("NORMAL",      VERTEX_SLOT_NORMAL);
+        bindDracoAttr("TANGENT",     VERTEX_SLOT_TANGENT);
+        bindDracoAttr("TEXCOORD_0",  VERTEX_SLOT_TEXCOORD0);
+        bindDracoAttr("JOINTS_0",    VERTEX_SLOT_JOINTS);
+        bindDracoAttr("WEIGHTS_0",   VERTEX_SLOT_WEIGHTS);
+
+        // Vertex count from POSITION accessor or decoded data.
+        auto posIt = draco.decodedAttributes.find("POSITION");
+        if (posIt != draco.decodedAttributes.end() && !posIt->second.empty()) {
+            // Draco POSITION is float3 (12 bytes per vertex)
+            mesh->vertexCount = (uint32_t)(posIt->second.size() / 12);
+        }
+    } else {
+        // --- Standard path ---
+        auto bindAttr = [&](const std::string& semantic, uint32_t slot) {
+            auto it = primitive.attributes.find(semantic);
+            if (it == primitive.attributes.end() || !asset.accessors) return;
+            int64_t accIdx = it->second;
+            if (accIdx < 0 || (size_t)accIdx >= asset.accessors->size()) return;
+            auto& acc = (*asset.accessors)[(size_t)accIdx];
+            auto buf = uploadAccessorBuffer(acc, asset, device, GPU::BufferUsage::vertex);
+            if (buf) {
+                mesh->vertexBuffers[slot] = buf;
+                if (semantic == "POSITION") {
+                    mesh->vertexCount = (uint32_t)acc.count;
+                }
+            }
+        };
+        bindAttr("POSITION",   VERTEX_SLOT_POSITION);
+        bindAttr("NORMAL",     VERTEX_SLOT_NORMAL);
+        bindAttr("TANGENT",    VERTEX_SLOT_TANGENT);
+        bindAttr("TEXCOORD_0", VERTEX_SLOT_TEXCOORD0);
+        bindAttr("JOINTS_0",   VERTEX_SLOT_JOINTS);
+        bindAttr("WEIGHTS_0",  VERTEX_SLOT_WEIGHTS);
+    }
+
+    GpuMesh* result = mesh.get();
+    meshCache[&primitive] = result;
+    meshPool.push_back(std::move(mesh));
+    return result;
+}
+
+
+GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& material,
+                                      const systems::leal::gltf::GLTF& asset) {
+    namespace GPU = systems::leal::campello_gpu;
+
+    // Find material index for cache lookup.
+    int64_t materialIndex = -1;
+    if (asset.materials) {
+        for (size_t i = 0; i < asset.materials->size(); ++i) {
+            if (&(*asset.materials)[i] == &material) {
+                materialIndex = (int64_t)i;
+                break;
+            }
+        }
+    }
+    if (materialIndex >= 0) {
+        auto cacheIt = materialCache.find(materialIndex);
+        if (cacheIt != materialCache.end()) {
+            return cacheIt->second;
+        }
+    }
+
+    // Reuse existing bind groups if this material was already processed by setScene().
+    if (materialIndex >= 0 &&
+        (size_t)materialIndex < materialBindGroups.size() &&
+        materialBindGroups[materialIndex]) {
+        auto mat = std::make_unique<GpuMaterial>();
+        mat->bindGroup     = materialBindGroups[materialIndex];
+        mat->flatBindGroup = flatMaterialBindGroups[materialIndex];
+        mat->uniformSlot   = (uint32_t)(materialIndex + 1);
+        mat->doubleSided   = material.doubleSided;
+        mat->alphaBlend    = (material.alphaMode == systems::leal::gltf::AlphaMode::blend);
+        mat->alphaMask     = (material.alphaMode == systems::leal::gltf::AlphaMode::mask);
+        mat->transmission  = (material.khrMaterialsTransmission && material.khrMaterialsTransmission->transmissionFactor > 0.0f);
+        GpuMaterial* result = mat.get();
+        materialCache[materialIndex] = result;
+        materialPool.push_back(std::move(mat));
+        return result;
+    }
+
+    // --- Ensure shared defaults exist ---
+    if (!defaultSampler) {
+        GPU::SamplerDescriptor sd{};
+        sd.addressModeU  = GPU::WrapMode::repeat;
+        sd.addressModeV  = GPU::WrapMode::repeat;
+        sd.addressModeW  = GPU::WrapMode::repeat;
+        sd.magFilter     = GPU::FilterMode::fmLinear;
+        sd.minFilter     = GPU::FilterMode::fmLinear;
+        sd.lodMinClamp   = 0.0;
+        sd.lodMaxClamp   = 1000.0;
+        sd.maxAnisotropy = 1.0;
+        defaultSampler = device->createSampler(sd);
+    }
+    if (!defaultTexture) {
+        uint8_t white[4] = {255, 255, 255, 255};
+        defaultTexture = device->createTexture(
+            GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm_srgb,
+            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+        if (defaultTexture) defaultTexture->upload(0, 4, white);
+    }
+    // (Other default textures are lazily created in setScene; skip here for brevity.)
+
+    // --- Upload referenced textures ---
+    auto ensureTexture = [&](int64_t imageIndex, bool srgb) -> std::shared_ptr<GPU::Texture> {
+        if (imageIndex < 0 || !asset.images) return nullptr;
+        if ((size_t)imageIndex >= gpuTextures.size()) gpuTextures.resize(imageIndex + 1);
+        if (gpuTextures[(size_t)imageIndex]) return gpuTextures[(size_t)imageIndex];
+
+        auto& image = (*asset.images)[(size_t)imageIndex];
+        std::shared_ptr<systems::leal::campello_image::Image> img;
+        if (!image.data.empty()) {
+            img = systems::leal::campello_image::Image::fromMemory(
+                image.data.data(), image.data.size());
+        } else if (image.bufferView != -1 && asset.bufferViews && asset.buffers) {
+            auto& bufferView = (*asset.bufferViews)[image.bufferView];
+            auto& buffer     = (*asset.buffers)[bufferView.buffer];
+            if (!buffer.data.empty()) {
+                const uint8_t* src = buffer.data.data() + bufferView.byteOffset;
+                img = systems::leal::campello_image::Image::fromMemory(src, bufferView.byteLength);
+            }
+        } else if (!image.uri.empty()) {
+            std::string imagePath = image.uri;
+            if (!assetBasePath.empty() && imagePath.find(":") == std::string::npos && imagePath.front() != '/') {
+                imagePath = assetBasePath + imagePath;
+            }
+            img = systems::leal::campello_image::Image::fromFile(imagePath.c_str());
+        }
+        if (!img) return nullptr;
+
+        auto fmt = GPU::PixelFormat::rgba8unorm;
+        switch (img->getFormat()) {
+            case systems::leal::campello_image::ImageFormat::rgba8:
+                fmt = srgb ? GPU::PixelFormat::rgba8unorm_srgb : GPU::PixelFormat::rgba8unorm;
+                break;
+            case systems::leal::campello_image::ImageFormat::rgba16f:
+                fmt = GPU::PixelFormat::rgba16float;
+                break;
+            case systems::leal::campello_image::ImageFormat::rgba32f:
+                fmt = GPU::PixelFormat::rgba32float;
+                break;
+        }
+        auto texture = device->createTexture(
+            GPU::TextureType::tt2d, fmt,
+            img->getWidth(), img->getHeight(), 1, 1, 1,
+            GPU::TextureUsage::textureBinding);
+        if (texture) {
+            texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
+        }
+        gpuTextures[(size_t)imageIndex] = texture;
+        return texture;
+    };
+
+    auto getTextureAndSampler = [&](const std::shared_ptr<systems::leal::gltf::TextureInfo>& texInfo,
+                                    std::shared_ptr<GPU::Texture>& outTex,
+                                    std::shared_ptr<GPU::Sampler>& outSamp,
+                                    bool srgb = false) {
+        if (!texInfo || texInfo->index < 0 || !asset.textures) return;
+        size_t texIdx = (size_t)texInfo->index;
+        if (texIdx >= asset.textures->size()) return;
+        auto& gt = (*asset.textures)[texIdx];
+        int64_t imgIdx = (gt.ext_texture_webp >= 0) ? gt.ext_texture_webp : gt.source;
+        if (imgIdx >= 0) {
+            outTex = ensureTexture(imgIdx, srgb);
+        }
+        if (gt.sampler >= 0 && asset.samplers &&
+            (size_t)gt.sampler < asset.samplers->size()) {
+            if ((size_t)gt.sampler >= gpuSamplers.size()) gpuSamplers.resize(gt.sampler + 1);
+            if (!gpuSamplers[(size_t)gt.sampler]) {
+                auto& gs = (*asset.samplers)[(size_t)gt.sampler];
+                GPU::SamplerDescriptor sd{};
+                sd.addressModeU  = static_cast<GPU::WrapMode>(gs.wrapS);
+                sd.addressModeV  = static_cast<GPU::WrapMode>(gs.wrapT);
+                sd.addressModeW  = GPU::WrapMode::repeat;
+                sd.magFilter     = (gs.magFilter == systems::leal::gltf::FilterMode::fmNearest)
+                                       ? GPU::FilterMode::fmNearest : GPU::FilterMode::fmLinear;
+                sd.minFilter     = (gs.minFilter == systems::leal::gltf::FilterMode::fmNearest ||
+                                    gs.minFilter == systems::leal::gltf::FilterMode::fmNearestMipmapNearest ||
+                                    gs.minFilter == systems::leal::gltf::FilterMode::fmNearestMipmapLinear)
+                                       ? GPU::FilterMode::fmNearest : GPU::FilterMode::fmLinear;
+                sd.lodMinClamp   = 0.0;
+                sd.lodMaxClamp   = 1000.0;
+                sd.maxAnisotropy = 1.0;
+                gpuSamplers[(size_t)gt.sampler] = device->createSampler(sd);
+            }
+            outSamp = gpuSamplers[(size_t)gt.sampler];
+        }
+    };
+
+    // --- Gather textures ---
+    std::shared_ptr<GPU::Texture> baseColorTex = defaultTexture;
+    std::shared_ptr<GPU::Sampler> baseColorSamp = defaultSampler;
+    if (material.pbrMetallicRoughness && material.pbrMetallicRoughness->baseColorTexture) {
+        getTextureAndSampler(material.pbrMetallicRoughness->baseColorTexture, baseColorTex, baseColorSamp, true);
+    }
+
+    std::shared_ptr<GPU::Texture> mrTex = defaultTexture;
+    std::shared_ptr<GPU::Sampler> mrSamp = defaultSampler;
+    if (material.pbrMetallicRoughness && material.pbrMetallicRoughness->metallicRoughnessTexture) {
+        getTextureAndSampler(material.pbrMetallicRoughness->metallicRoughnessTexture, mrTex, mrSamp);
+    }
+
+    std::shared_ptr<GPU::Texture> normalTex = defaultTexture;
+    std::shared_ptr<GPU::Sampler> normalSamp = defaultSampler;
+    if (material.normalTexture) {
+        getTextureAndSampler(material.normalTexture, normalTex, normalSamp);
+    }
+
+    std::shared_ptr<GPU::Texture> emissiveTex = defaultTexture;
+    std::shared_ptr<GPU::Sampler> emissiveSamp = defaultSampler;
+    if (material.emissiveTexture) {
+        getTextureAndSampler(material.emissiveTexture, emissiveTex, emissiveSamp, true);
+    }
+
+    std::shared_ptr<GPU::Texture> occlusionTex = defaultTexture;
+    std::shared_ptr<GPU::Sampler> occlusionSamp = defaultSampler;
+    if (material.occlusionTexture) {
+        getTextureAndSampler(material.occlusionTexture, occlusionTex, occlusionSamp);
+    }
+
+    std::shared_ptr<GPU::Texture> specularTex = defaultTexture;
+    std::shared_ptr<GPU::Sampler> specularSamp = defaultSampler;
+    if (material.khrMaterialsSpecular && material.khrMaterialsSpecular->specularTexture) {
+        getTextureAndSampler(material.khrMaterialsSpecular->specularTexture, specularTex, specularSamp);
+    }
+
+    std::shared_ptr<GPU::Texture> specularColorTex = defaultTexture;
+    std::shared_ptr<GPU::Sampler> specularColorSamp = defaultSampler;
+    if (material.khrMaterialsSpecular && material.khrMaterialsSpecular->specularColorTexture) {
+        getTextureAndSampler(material.khrMaterialsSpecular->specularColorTexture, specularColorTex, specularColorSamp, true);
+    }
+
+    std::shared_ptr<GPU::Texture> sheenColorTex = defaultTexture;
+    {
+        std::shared_ptr<GPU::Sampler> unused = defaultSampler;
+        if (material.khrMaterialsSheen && material.khrMaterialsSheen->sheenColorTexture)
+            getTextureAndSampler(material.khrMaterialsSheen->sheenColorTexture, sheenColorTex, unused, true);
+    }
+
+    std::shared_ptr<GPU::Texture> sheenRoughnessTex = defaultTexture;
+    {
+        std::shared_ptr<GPU::Sampler> unused = defaultSampler;
+        if (material.khrMaterialsSheen && material.khrMaterialsSheen->sheenRoughnessTexture)
+            getTextureAndSampler(material.khrMaterialsSheen->sheenRoughnessTexture, sheenRoughnessTex, unused);
+    }
+
+    std::shared_ptr<GPU::Texture> clearcoatTex = defaultTexture;
+    {
+        std::shared_ptr<GPU::Sampler> unused = defaultSampler;
+        if (material.khrMaterialsClearcoat && material.khrMaterialsClearcoat->clearcoatTexture)
+            getTextureAndSampler(material.khrMaterialsClearcoat->clearcoatTexture, clearcoatTex, unused);
+    }
+
+    std::shared_ptr<GPU::Texture> clearcoatRoughnessTex = defaultTexture;
+    {
+        std::shared_ptr<GPU::Sampler> unused = defaultSampler;
+        if (material.khrMaterialsClearcoat && material.khrMaterialsClearcoat->clearcoatRoughnessTexture)
+            getTextureAndSampler(material.khrMaterialsClearcoat->clearcoatRoughnessTexture, clearcoatRoughnessTex, unused);
+    }
+
+    std::shared_ptr<GPU::Texture> clearcoatNormalTex = defaultTexture;
+    {
+        std::shared_ptr<GPU::Sampler> unused = defaultSampler;
+        if (material.khrMaterialsClearcoat && material.khrMaterialsClearcoat->clearcoatNormalTexture)
+            getTextureAndSampler(material.khrMaterialsClearcoat->clearcoatNormalTexture, clearcoatNormalTex, unused);
+    }
+
+    std::shared_ptr<GPU::Texture> transmissionTex = defaultTexture;
+    std::shared_ptr<GPU::Sampler> transmissionSamp = defaultSampler;
+    if (material.khrMaterialsTransmission && material.khrMaterialsTransmission->transmissionTexture) {
+        getTextureAndSampler(material.khrMaterialsTransmission->transmissionTexture, transmissionTex, transmissionSamp);
+    }
+
+    std::shared_ptr<GPU::Texture> thicknessTex = defaultTexture;
+    std::shared_ptr<GPU::Sampler> thicknessSamp = defaultSampler;
+    if (material.khrMaterialsVolume && material.khrMaterialsVolume->thicknessTexture) {
+        getTextureAndSampler(material.khrMaterialsVolume->thicknessTexture, thicknessTex, thicknessSamp);
+    }
+
+    std::shared_ptr<GPU::Texture> iridescenceTex = defaultTexture;
+    std::shared_ptr<GPU::Sampler> iridescenceSamp = defaultSampler;
+    if (material.khrMaterialsIridescence && material.khrMaterialsIridescence->iridescenceTexture) {
+        getTextureAndSampler(material.khrMaterialsIridescence->iridescenceTexture, iridescenceTex, iridescenceSamp);
+    }
+
+    std::shared_ptr<GPU::Texture> iridescenceThicknessTex = defaultTexture;
+    std::shared_ptr<GPU::Sampler> iridescenceThicknessSamp = defaultSampler;
+    if (material.khrMaterialsIridescence && material.khrMaterialsIridescence->iridescenceThicknessTexture) {
+        getTextureAndSampler(material.khrMaterialsIridescence->iridescenceThicknessTexture, iridescenceThicknessTex, iridescenceThicknessSamp);
+    }
+
+    std::shared_ptr<GPU::Texture> anisotropicTex = defaultTexture;
+    std::shared_ptr<GPU::Sampler> anisotropicSamp = defaultSampler;
+    if (material.khrMaterialsAnisotropy && material.khrMaterialsAnisotropy->anisotropyTexture) {
+        getTextureAndSampler(material.khrMaterialsAnisotropy->anisotropyTexture, anisotropicTex, anisotropicSamp);
+    }
+
+    // --- Determine uniform slot ---
+    uint32_t uniformSlot = 0;
+    if (materialIndex >= 0) {
+        uniformSlot = (uint32_t)(materialIndex + 1);
+    } else {
+        // Standalone upload — find next free slot.
+        static uint32_t nextStandaloneSlot = 10000; // arbitrary high range to avoid collision
+        uniformSlot = nextStandaloneSlot++;
+    }
+
+    // --- Ensure material uniform buffer is large enough ---
+    uint64_t requiredSize = (uint64_t)(uniformSlot + 1) * kMaterialUniformStride;
+    if (!materialUniformBuffer || materialUniformBuffer->getLength() < requiredSize) {
+        uint64_t newSize = std::max(requiredSize, (uint64_t)4096 * kMaterialUniformStride);
+        materialUniformBuffer = device->createBuffer(newSize, GPU::BufferUsage::vertex);
+    }
+
+    // --- Upload material uniform data ---
+    {
+        float slot[82];
+        buildMaterialSlotFromGltf(material,
+                                  (float)viewMode,
+                                  environmentIntensity,
+                                  iblEnabled ? 1.f : 0.f,
+                                  slot);
+        materialUniformBuffer->upload((uint64_t)uniformSlot * kMaterialUniformStride,
+                                      (uint64_t)(82 * sizeof(float)), slot);
+    }
+
+    // --- Create bind groups ---
+    GPU::BindGroupDescriptor bgDesc{};
+    bgDesc.layout  = bindGroupLayout;
+    bgDesc.entries = {
+        {0,  baseColorTex},
+        {1,  baseColorSamp},
+        {2,  mrTex},
+        {3,  mrSamp},
+        {4,  normalTex},
+        {5,  normalSamp},
+        {6,  emissiveTex},
+        {7,  emissiveSamp},
+        {8,  occlusionTex},
+        {9,  occlusionSamp},
+        {11, specularTex},
+        {12, specularSamp},
+        {13, specularColorTex},
+        {14, specularColorSamp},
+        {15, sheenColorTex},
+        {16, sheenRoughnessTex},
+        {17, clearcoatTex},
+        {18, clearcoatRoughnessTex},
+        {19, clearcoatNormalTex},
+        {20, transmissionTex},
+        {21, environmentMap ? environmentMap : defaultTexture},
+        {23, thicknessTex},
+        {24, iridescenceTex},
+        {25, iridescenceThicknessTex},
+        {26, anisotropicTex},
+        {17, GPU::BufferBinding{materialUniformBuffer,
+                                (uint64_t)uniformSlot * kMaterialUniformStride,
+                                kMaterialUniformStride}},
+    };
+    auto bindGroup = device->createBindGroup(bgDesc);
+
+    GPU::BindGroupDescriptor flatBgDesc{};
+    flatBgDesc.layout  = bindGroupLayout;
+    flatBgDesc.entries = {
+        {17, GPU::BufferBinding{materialUniformBuffer,
+                                (uint64_t)uniformSlot * kMaterialUniformStride,
+                                kMaterialUniformStride}},
+    };
+    auto flatBindGroup = device->createBindGroup(flatBgDesc);
+
+    auto mat = std::make_unique<GpuMaterial>();
+    mat->bindGroup     = bindGroup;
+    mat->flatBindGroup = flatBindGroup;
+    mat->uniformSlot   = uniformSlot;
+    mat->doubleSided   = material.doubleSided;
+    mat->alphaBlend    = (material.alphaMode == systems::leal::gltf::AlphaMode::blend);
+    mat->alphaMask     = (material.alphaMode == systems::leal::gltf::AlphaMode::mask);
+    mat->transmission  = (material.khrMaterialsTransmission && material.khrMaterialsTransmission->transmissionFactor > 0.0f);
+
+    GpuMaterial* result = mat.get();
+    if (materialIndex >= 0) {
+        materialCache[materialIndex] = result;
+    }
+    materialPool.push_back(std::move(mat));
+    return result;
+}
+
+void Renderer::reuploadMaterialSlot(uint32_t uniformSlot,
+                                    const systems::leal::gltf::Material& material,
+                                    const systems::leal::gltf::GLTF& /*asset*/) {
+    if (!materialUniformBuffer) return;
+    float slot[82];
+    buildMaterialSlotFromGltf(material,
+                              (float)viewMode,
+                              environmentIntensity,
+                              iblEnabled ? 1.f : 0.f,
+                              slot);
+    materialUniformBuffer->upload((uint64_t)uniformSlot * kMaterialUniformStride,
+                                  (uint64_t)(82 * sizeof(float)), slot);
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 3 — RenderScene submission API
+// ---------------------------------------------------------------------------
+
+void Renderer::render(const RenderScene& scene,
+                      std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView) {
+    auto frameStart = std::chrono::steady_clock::now();
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM  = systems::leal::vector_math;
+    using M4 = VM::Matrix4<double>;
+
+    if (!colorView) return;
+    if (!pipelineFlat && !pipelineTextured && !pipelineDebug) return;
+
+    // Frame-in-flight synchronization.
+    auto &frame = frameResources[currentFrameIndex];
+    if (frame.fence) frame.fence->wait();
+
+    transformBuffer      = frame.transformBuffer;
+    cameraPositionBuffer = frame.cameraPositionBuffer;
+    lightsUniformBuffer  = frame.lightsUniformBuffer;
+
+    auto encoder = device->createCommandEncoder();
+    if (!encoder) return;
+
+    // Camera matrices from scene.
+    M4 view = scene.camera.view;
+    M4 proj = scene.camera.projection;
+    vpMatrix = proj * view;
+
+    // Upload camera position buffer.
+    if (cameraPositionBuffer) {
+        float camData[40] = {0};
+        double R[3][3] = {
+            {view.data[0], view.data[1], view.data[2]},
+            {view.data[4], view.data[5], view.data[6]},
+            {view.data[8], view.data[9], view.data[10]}
+        };
+        double t[3] = {view.data[3], view.data[7], view.data[11]};
+        camData[0] = -(float)(R[0][0]*t[0] + R[1][0]*t[1] + R[2][0]*t[2]);
+        camData[1] = -(float)(R[0][1]*t[0] + R[1][1]*t[1] + R[2][1]*t[2]);
+        camData[2] = -(float)(R[0][2]*t[0] + R[1][2]*t[1] + R[2][2]*t[2]);
+        cameraWorldPos[0] = camData[0];
+        cameraWorldPos[1] = camData[1];
+        cameraWorldPos[2] = camData[2];
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 4; ++col) {
+                camData[4 + col*4 + row]  = (float)view.data[row*4 + col];
+                camData[20 + col*4 + row] = (float)proj.data[row*4 + col];
+            }
+        }
+        camData[36] = (float)renderWidth;
+        camData[37] = (float)renderHeight;
+        cameraPositionBuffer->upload(0, 160, camData);
+    }
+
+    // Update per-frame bind group (lights + camera + placeholder texture).
+    if (bindGroupLayout && frameBindGroup[currentFrameIndex]) {
+        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture ? sceneColorTexture : defaultTexture;
+        GPU::BindGroupDescriptor bgDesc{};
+        bgDesc.layout = bindGroupLayout;
+        bgDesc.entries = {
+            {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+            {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {22, scTex},
+        };
+        frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
+    }
+
+    // Upload lights.
+    if (lightsUniformBuffer) {
+        struct LightDataGPU {
+            float position[4];
+            float color[4];
+            float direction[4];
+            float spotAngles[4];
+        };
+        struct LightsUniformGPU {
+            uint32_t count;
+            float padding[3];
+            LightDataGPU lights[4];
+        };
+        LightsUniformGPU lightsData = {};
+        lightsData.count = (uint32_t)std::min(scene.lights.size(), size_t(4));
+        for (size_t i = 0; i < lightsData.count; ++i) {
+            auto &l = scene.lights[i];
+            lightsData.lights[i].position[0] = (float)l.position.x();
+            lightsData.lights[i].position[1] = (float)l.position.y();
+            lightsData.lights[i].position[2] = (float)l.position.z();
+            lightsData.lights[i].position[3] = (float)l.type;
+            lightsData.lights[i].color[0] = (float)l.color.x();
+            lightsData.lights[i].color[1] = (float)l.color.y();
+            lightsData.lights[i].color[2] = (float)l.color.z();
+            lightsData.lights[i].color[3] = l.intensity;
+            lightsData.lights[i].direction[0] = (float)l.direction.x();
+            lightsData.lights[i].direction[1] = (float)l.direction.y();
+            lightsData.lights[i].direction[2] = (float)l.direction.z();
+            lightsData.lights[i].direction[3] = l.range;
+            lightsData.lights[i].spotAngles[0] = l.innerConeAngle;
+            lightsData.lights[i].spotAngles[1] = l.outerConeAngle;
+        }
+        if (lightsData.count == 0 && defaultLightEnabled) {
+            lightsData.count = 1;
+            lightsData.lights[0].position[0] = 0.5f / 1.2247448f;
+            lightsData.lights[0].position[1] = 1.0f / 1.2247448f;
+            lightsData.lights[0].position[2] = 0.5f / 1.2247448f;
+            lightsData.lights[0].position[3] = 0.0f;
+            lightsData.lights[0].color[0] = 1.0f;
+            lightsData.lights[0].color[1] = 1.0f;
+            lightsData.lights[0].color[2] = 1.0f;
+            lightsData.lights[0].color[3] = 5.0f;
+        }
+        lightsUniformBuffer->upload(0, sizeof(LightsUniformGPU), &lightsData);
+    }
+
+    // Pre-upload all draw-call transforms sequentially into transformBuffer.
+    size_t totalDraws = scene.opaque.size() + scene.transparent.size();
+    uint64_t requiredBytes = (uint64_t)(totalDraws + 1) * 128;
+    if (!transformBuffer || transformBuffer->getLength() < requiredBytes) {
+        uint64_t newSize = std::max(requiredBytes, (uint64_t)4096 * 128);
+        transformBuffer = device->createBuffer(newSize, GPU::BufferUsage::vertex);
+        frame.transformBuffer = transformBuffer;
+    }
+    std::vector<uint64_t> transformOffsets;
+    transformOffsets.reserve(totalDraws);
+    uint64_t txOffset = 0;
+    auto uploadOneTransform = [&](const systems::leal::campello_renderer::DrawCall& draw) {
+        float matrices[32] = {0};
+        auto mvp = vpMatrix * draw.worldTransform;
+        for (int i = 0; i < 16; ++i) matrices[i] = (float)mvp.data[i];
+        for (int i = 0; i < 16; ++i) matrices[i + 16] = (float)draw.worldTransform.data[i];
+        transformBuffer->upload(txOffset, 128, matrices);
+        transformOffsets.push_back(txOffset);
+        txOffset += 128;
+    };
+    for (auto &draw : scene.opaque)   uploadOneTransform(draw);
+    for (auto &draw : scene.transparent) uploadOneTransform(draw);
+
+    // ------------------------------------------------------------------
+    // Render pass with FXAA / SSAA support.
+    // ------------------------------------------------------------------
+    ensureSceneColorTexture();
+
+    bool useSsaa = ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout && sceneColorView;
+    bool useFxaa = fxaaEnabled && !useSsaa && pipelineFxaa && fxaaBindGroupLayout && sceneColorView;
+    bool useIntermediate = useSsaa || useFxaa;
+
+    // Update per-frame bind group (lights + camera + placeholder texture).
+    if (bindGroupLayout && frameBindGroup[currentFrameIndex]) {
+        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture ? sceneColorTexture : defaultTexture;
+        GPU::BindGroupDescriptor bgDesc{};
+        bgDesc.layout = bindGroupLayout;
+        bgDesc.entries = {
+            {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+            {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {22, scTex},
+        };
+        frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
+    }
+
+    // Patch per-frame globals (viewMode, environmentIntensity, iblEnabled) into all
+    // material slots referenced by this scene. Standalone-uploaded materials bake
+    // these values at upload time; this ensures they stay current.
+    if (materialUniformBuffer) {
+        std::unordered_set<GpuMaterial*> seenMaterials;
+        auto patchGlobals = [&](const systems::leal::campello_renderer::DrawCall& draw) {
+            if (!draw.material || !seenMaterials.insert(draw.material).second) return;
+            uint64_t slotOffset = (uint64_t)draw.material->uniformSlot * kMaterialUniformStride;
+            if (slotOffset + 288 > materialUniformBuffer->getLength()) return;
+            float globals[4] = {
+                (float)viewMode,
+                environmentIntensity,
+                iblEnabled ? 1.0f : 0.0f,
+                0.0f // padding
+            };
+            materialUniformBuffer->upload(slotOffset + 272, 16, globals);
+        };
+        for (auto& draw : scene.opaque) patchGlobals(draw);
+        for (auto& draw : scene.transparent) patchGlobals(draw);
+        // Also patch default slot 0 (used by fallback / unlit draws).
+        float globals[4] = {
+            (float)viewMode,
+            environmentIntensity,
+            iblEnabled ? 1.0f : 0.0f,
+            0.0f
+        };
+        materialUniformBuffer->upload(272, 16, globals);
+    }
+
+    // Detect whether any transparent draw needs screen-space refraction.
+    bool needsScreenSpaceRefraction = false;
+    for (auto &draw : scene.transparent) {
+        if (draw.material && draw.material->transmission) {
+            needsScreenSpaceRefraction = true;
+            break;
+        }
+    }
+
+    // Opaque draws — sort by material then mesh to reduce state changes.
+    std::vector<systems::leal::campello_renderer::DrawCall> sortedOpaque = scene.opaque;
+    std::sort(sortedOpaque.begin(), sortedOpaque.end(),
+        [](const systems::leal::campello_renderer::DrawCall &a,
+           const systems::leal::campello_renderer::DrawCall &b) {
+            if (!a.material || !b.material) return a.material < b.material;
+            if (a.material->alphaBlend != b.material->alphaBlend)
+                return !a.material->alphaBlend;
+            if (a.material->doubleSided != b.material->doubleSided)
+                return !a.material->doubleSided;
+            if (a.material != b.material) return a.material < b.material;
+            return a.mesh < b.mesh;
+        });
+
+    auto drawSkybox = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe) {
+        if (skyboxEnabled && pipelineSkybox && environmentMap) {
+            if (!skyboxUniformBuffer[currentFrameIndex]) {
+                skyboxUniformBuffer[currentFrameIndex] = device->createBuffer(96, GPU::BufferUsage::uniform);
+            }
+            if (skyboxUniformBuffer[currentFrameIndex]) {
+                auto invVP = vpMatrix.inverted();
+                float skyboxData[24] = {0};
+                for (int row = 0; row < 4; ++row) {
+                    for (int col = 0; col < 4; ++col) {
+                        skyboxData[col*4 + row] = (float)invVP.data[row*4 + col];
+                    }
+                }
+                skyboxData[16] = (float)renderWidth;
+                skyboxData[17] = (float)renderHeight;
+                skyboxData[20] = cameraWorldPos[0];
+                skyboxData[21] = cameraWorldPos[1];
+                skyboxData[22] = cameraWorldPos[2];
+                skyboxUniformBuffer[currentFrameIndex]->upload(0, 96, reinterpret_cast<uint8_t*>(skyboxData));
+            }
+            if (!skyboxBindGroup[currentFrameIndex] && skyboxBindGroupLayout) {
+                GPU::BindGroupDescriptor sbDesc{};
+                sbDesc.layout = skyboxBindGroupLayout;
+                sbDesc.entries = {
+                    {0, environmentMap},
+                    {1, environmentSampler},
+                    {2, GPU::BufferBinding{skyboxUniformBuffer[currentFrameIndex], 0, 96}},
+                };
+                skyboxBindGroup[currentFrameIndex] = device->createBindGroup(sbDesc);
+            }
+            if (skyboxBindGroup[currentFrameIndex]) {
+                rpe->setPipeline(pipelineSkybox);
+                rpe->setBindGroup(0, skyboxBindGroup[currentFrameIndex]);
+                rpe->draw(3);
+            }
+        }
+    };
+
+    size_t drawIdx = 0;
+
+    if (needsScreenSpaceRefraction) {
+        // ------------------------------------------------------------------
+        // Multi-pass path: opaque → offscreen texture → transparent with refraction.
+        // ------------------------------------------------------------------
+        uint32_t texW = (uint32_t)((float)renderWidth * ssaaScale);
+        uint32_t texH = (uint32_t)((float)renderHeight * ssaaScale);
+        if (texW < 1) texW = 1;
+        if (texH < 1) texH = 1;
+        if (!opaqueSceneTexture || opaqueSceneTexture->getWidth() != texW ||
+            opaqueSceneTexture->getHeight() != texH) {
+            uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2(std::max(texW, texH)));
+            if (mipLevels < 2) mipLevels = 2;
+            opaqueSceneTexture = device->createTexture(
+                GPU::TextureType::tt2d, cachedColorFormat,
+                texW, texH, 1, mipLevels, 1,
+                (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                    uint32_t(GPU::TextureUsage::textureBinding)));
+            if (opaqueSceneTexture) {
+                opaqueSceneView = opaqueSceneTexture->createView(
+                    cachedColorFormat, 1, GPU::Aspect::all, 0, 0, GPU::TextureType::tt2d);
+            }
+        }
+
+        // Pass 1: Opaque + skybox → opaqueSceneTexture.
+        if (opaqueSceneView) {
+            GPU::ColorAttachment opaqueCa{};
+            opaqueCa.view          = opaqueSceneView;
+            opaqueCa.clearValue[0] = clearColor[0];
+            opaqueCa.clearValue[1] = clearColor[1];
+            opaqueCa.clearValue[2] = clearColor[2];
+            opaqueCa.clearValue[3] = clearColor[3];
+            opaqueCa.loadOp        = GPU::LoadOp::clear;
+            opaqueCa.storeOp       = GPU::StoreOp::store;
+            opaqueCa.depthSlice    = 0;
+
+            GPU::BeginRenderPassDescriptor opaqueDesc{};
+            opaqueDesc.colorAttachments = { opaqueCa };
+            if (depthView) {
+                GPU::DepthStencilAttachment ds{};
+                ds.view              = depthView;
+                ds.depthClearValue   = 1.0f;
+                ds.depthLoadOp       = GPU::LoadOp::clear;
+                ds.depthStoreOp      = GPU::StoreOp::store;
+                ds.depthReadOnly     = false;
+                ds.stencilClearValue = 0;
+                ds.stencilLoadOp     = GPU::LoadOp::clear;
+                ds.stencilStoreOp    = GPU::StoreOp::discard;
+                ds.stencilReadOnly   = false;
+                opaqueDesc.depthStencilAttachment = ds;
+            }
+
+            auto opaqueRpe = encoder->beginRenderPass(opaqueDesc);
+            if (opaqueRpe) {
+                if (renderWidth > 0 && renderHeight > 0) {
+                    opaqueRpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
+                    opaqueRpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+                }
+                drawSkybox(opaqueRpe);
+                currentPipelineVariant = 0;
+                lastBoundVertexBuffers.fill({});
+                drawIdx = 0;
+                for (auto &draw : sortedOpaque) {
+                    renderPrimitive(opaqueRpe, draw, transformOffsets[drawIdx++]);
+                }
+                opaqueRpe->end();
+            }
+
+            if (opaqueSceneTexture) {
+                encoder->generateMipmaps(opaqueSceneTexture);
+            }
+        }
+
+        // Pass 2: Copy opaque result to the target that transparent will blend over.
+        std::shared_ptr<GPU::TextureView> transparentTargetView;
+        if (useIntermediate) {
+            transparentTargetView = sceneColorView;
+        } else {
+            transparentTargetView = colorView;
+        }
+
+        if (transparentTargetView) {
+            if (!copyBindGroup[currentFrameIndex] && downsampleBindGroupLayout) {
+                GPU::BindGroupDescriptor cDesc{};
+                cDesc.layout = downsampleBindGroupLayout;
+                cDesc.entries = {
+                    {0, opaqueSceneTexture},
+                    {1, fxaaSampler},
+                };
+                copyBindGroup[currentFrameIndex] = device->createBindGroup(cDesc);
+            }
+
+            GPU::ColorAttachment copyCa{};
+            copyCa.view          = transparentTargetView;
+            copyCa.clearValue[0] = clearColor[0];
+            copyCa.clearValue[1] = clearColor[1];
+            copyCa.clearValue[2] = clearColor[2];
+            copyCa.clearValue[3] = clearColor[3];
+            copyCa.loadOp        = GPU::LoadOp::clear;
+            copyCa.storeOp       = GPU::StoreOp::store;
+            copyCa.depthSlice    = 0;
+
+            GPU::BeginRenderPassDescriptor copyDesc{};
+            copyDesc.colorAttachments = { copyCa };
+
+            auto copyRpe = encoder->beginRenderPass(copyDesc);
+            if (copyRpe) {
+                if (renderWidth > 0 && renderHeight > 0) {
+                    copyRpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
+                    copyRpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+                }
+                if (pipelineDownsample && copyBindGroup[currentFrameIndex]) {
+                    copyRpe->setPipeline(pipelineDownsample);
+                    copyRpe->setBindGroup(0, copyBindGroup[currentFrameIndex]);
+                    copyRpe->draw(3);
+                }
+                copyRpe->end();
+            }
+        }
+
+        // Switch binding 22 to the mipmapped opaque scene texture for transmission.
+        if (bindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture) {
+            GPU::BindGroupDescriptor bgDesc{};
+            bgDesc.layout = bindGroupLayout;
+            bgDesc.entries = {
+                {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+                {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+                {22, opaqueSceneTexture},
+            };
+            frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
+        }
+
+        // Pass 3: Transparent → target (with depth test against opaque).
+        if (transparentTargetView) {
+            GPU::ColorAttachment transCa{};
+            transCa.view          = transparentTargetView;
+            transCa.clearValue[0] = clearColor[0];
+            transCa.clearValue[1] = clearColor[1];
+            transCa.clearValue[2] = clearColor[2];
+            transCa.clearValue[3] = clearColor[3];
+            transCa.loadOp        = GPU::LoadOp::load;
+            transCa.storeOp       = GPU::StoreOp::store;
+            transCa.depthSlice    = 0;
+
+            GPU::BeginRenderPassDescriptor transDesc{};
+            transDesc.colorAttachments = { transCa };
+            if (depthView) {
+                GPU::DepthStencilAttachment ds{};
+                ds.view              = depthView;
+                ds.depthClearValue   = 1.0f;
+                ds.depthLoadOp       = GPU::LoadOp::load;
+                ds.depthStoreOp      = GPU::StoreOp::discard;
+                ds.depthReadOnly     = false;
+                ds.stencilClearValue = 0;
+                ds.stencilLoadOp     = GPU::LoadOp::clear;
+                ds.stencilStoreOp    = GPU::StoreOp::discard;
+                ds.stencilReadOnly   = false;
+                transDesc.depthStencilAttachment = ds;
+            }
+
+            auto transRpe = encoder->beginRenderPass(transDesc);
+            if (transRpe) {
+                if (renderWidth > 0 && renderHeight > 0) {
+                    transRpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
+                    transRpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+                }
+                currentPipelineVariant = 0;
+                lastBoundVertexBuffers.fill({});
+                drawIdx = (size_t)sortedOpaque.size();
+                for (auto &draw : scene.transparent) {
+                    renderPrimitive(transRpe, draw, transformOffsets[drawIdx++]);
+                }
+                transRpe->end();
+            }
+        }
+    } else {
+        // ------------------------------------------------------------------
+        // Single-pass path (no transmission materials).
+        // ------------------------------------------------------------------
+        GPU::BeginRenderPassDescriptor desc{};
+        GPU::ColorAttachment ca{};
+        ca.view = useIntermediate ? sceneColorView : colorView;
+        ca.clearValue[0] = clearColor[0];
+        ca.clearValue[1] = clearColor[1];
+        ca.clearValue[2] = clearColor[2];
+        ca.clearValue[3] = clearColor[3];
+        ca.loadOp  = GPU::LoadOp::clear;
+        ca.storeOp = GPU::StoreOp::store;
+        ca.depthSlice = 0;
+        desc.colorAttachments.push_back(ca);
+        if (depthView) {
+            GPU::DepthStencilAttachment ds{};
+            ds.view = depthView;
+            ds.depthClearValue = 1.0f;
+            ds.depthLoadOp  = GPU::LoadOp::clear;
+            ds.depthStoreOp = GPU::StoreOp::store;
+            ds.depthReadOnly = false;
+            ds.stencilClearValue = 0;
+            ds.stencilLoadOp  = GPU::LoadOp::clear;
+            ds.stencilStoreOp = GPU::StoreOp::discard;
+            ds.stencilReadOnly = false;
+            desc.depthStencilAttachment = ds;
+        }
+
+        auto rpe = encoder->beginRenderPass(desc);
+        if (!rpe) return;
+        if (renderWidth > 0 && renderHeight > 0) {
+            rpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
+            rpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+        }
+
+        drawSkybox(rpe);
+
+        currentPipelineVariant = 0;
+        lastBoundVertexBuffers.fill({});
+        drawIdx = 0;
+        for (auto &draw : sortedOpaque) {
+            renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
+        }
+
+        // Transparent draws (already sorted by caller).
+        currentPipelineVariant = 0;
+        lastBoundVertexBuffers.fill({});
+        for (auto &draw : scene.transparent) {
+            renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
+        }
+
+        rpe->end();
+    }
+
+    // ------------------------------------------------------------------
+    // SSAA downsample pass (when enabled).
+    // ------------------------------------------------------------------
+    if (useSsaa) {
+        if (!downsampleBindGroup[currentFrameIndex] && downsampleBindGroupLayout) {
+            GPU::BindGroupDescriptor dDesc{};
+            dDesc.layout = downsampleBindGroupLayout;
+            dDesc.entries = {
+                {0, sceneColorTexture},
+                {1, fxaaSampler},
+            };
+            downsampleBindGroup[currentFrameIndex] = device->createBindGroup(dDesc);
+        }
+
+        GPU::ColorAttachment dsCa{};
+        dsCa.view          = colorView;
+        dsCa.clearValue[0] = 0.0f;
+        dsCa.clearValue[1] = 0.0f;
+        dsCa.clearValue[2] = 0.0f;
+        dsCa.clearValue[3] = 1.0f;
+        dsCa.loadOp        = GPU::LoadOp::clear;
+        dsCa.storeOp       = GPU::StoreOp::store;
+        dsCa.depthSlice    = 0;
+
+        GPU::BeginRenderPassDescriptor dsRpDesc{};
+        dsRpDesc.colorAttachments = { dsCa };
+
+        auto dsRpe = encoder->beginRenderPass(dsRpDesc);
+        if (dsRpe) {
+            if (renderWidth > 0 && renderHeight > 0) {
+                dsRpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
+                dsRpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+            }
+            dsRpe->setPipeline(pipelineDownsample);
+            dsRpe->setBindGroup(0, downsampleBindGroup[currentFrameIndex]);
+            dsRpe->draw(3);
+            dsRpe->end();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // FXAA post-process pass (when enabled).
+    // ------------------------------------------------------------------
+    if (useFxaa) {
+        if (!fxaaUniformBuffer[currentFrameIndex]) {
+            fxaaUniformBuffer[currentFrameIndex] = device->createBuffer(16, GPU::BufferUsage::uniform);
+        }
+        if (fxaaUniformBuffer[currentFrameIndex]) {
+            float fxaaData[4] = {
+                1.0f / (float)renderWidth,
+                1.0f / (float)renderHeight,
+                0.0f, 0.0f
+            };
+            fxaaUniformBuffer[currentFrameIndex]->upload(0, 16, fxaaData);
+        }
+
+        if (!fxaaBindGroup[currentFrameIndex] && fxaaBindGroupLayout) {
+            GPU::BindGroupDescriptor fDesc{};
+            fDesc.layout = fxaaBindGroupLayout;
+            fDesc.entries = {
+                {0, sceneColorTexture},
+                {1, fxaaSampler},
+                {2, GPU::BufferBinding{fxaaUniformBuffer[currentFrameIndex], 0, 16}},
+            };
+            fxaaBindGroup[currentFrameIndex] = device->createBindGroup(fDesc);
+        }
+
+        GPU::ColorAttachment fxaaCa{};
+        fxaaCa.view          = colorView;
+        fxaaCa.clearValue[0] = 0.0f;
+        fxaaCa.clearValue[1] = 0.0f;
+        fxaaCa.clearValue[2] = 0.0f;
+        fxaaCa.clearValue[3] = 1.0f;
+        fxaaCa.loadOp        = GPU::LoadOp::clear;
+        fxaaCa.storeOp       = GPU::StoreOp::store;
+        fxaaCa.depthSlice    = 0;
+
+        GPU::BeginRenderPassDescriptor fxaaRpDesc{};
+        fxaaRpDesc.colorAttachments = { fxaaCa };
+
+        auto fxaaRpe = encoder->beginRenderPass(fxaaRpDesc);
+        if (fxaaRpe) {
+            if (renderWidth > 0 && renderHeight > 0) {
+                fxaaRpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
+                fxaaRpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+            }
+            fxaaRpe->setPipeline(pipelineFxaa);
+            fxaaRpe->setBindGroup(0, fxaaBindGroup[currentFrameIndex]);
+            fxaaRpe->draw(3);
+            fxaaRpe->end();
+        }
+    }
+
+    device->submit(encoder->finish(), frame.fence);
+    currentFrameIndex = (currentFrameIndex + 1) % kMaxFramesInFlight;
+
+    // Stats
+    lastFrameStats.opaqueDrawCount = (uint32_t)scene.opaque.size();
+    lastFrameStats.transparentDrawCount = (uint32_t)scene.transparent.size();
+    lastFrameStats.totalDrawCount = lastFrameStats.opaqueDrawCount + lastFrameStats.transparentDrawCount;
+    uint32_t instanceCount = 0;
+    for (auto& draw : scene.opaque) instanceCount += draw.instanceCount;
+    for (auto& draw : scene.transparent) instanceCount += draw.instanceCount;
+    lastFrameStats.instanceCount = instanceCount;
+    lastFrameStats.visibleNodeCount = lastFrameStats.totalDrawCount;
+    lastFrameStats.culledNodeCount = 0;
+    auto frameEnd = std::chrono::steady_clock::now();
+    lastFrameStats.cpuFrameTimeMs = std::chrono::duration<double, std::milli>(frameEnd - frameStart).count();
+}
+
+
+void Renderer::renderPrimitive(
+    const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+    const systems::leal::campello_renderer::DrawCall &draw,
+    uint64_t transformOffset)
+{
+    namespace GPU = systems::leal::campello_gpu;
+    if (!draw.mesh || !draw.material) return;
+
+    // --- 1. Pipeline selection ---
+    bool doubleSided = draw.material->doubleSided;
+    bool useBlend    = draw.material->alphaBlend;
+
+    int wantedVariant = 2; // textured default
+    std::shared_ptr<GPU::RenderPipeline> pipeline = pipelineTextured;
+
+    if (doubleSided) {
+        pipeline = useBlend ? pipelineTexturedBlendDoubleSided : pipelineTexturedDoubleSided;
+        wantedVariant = useBlend ? 9 : 5;
+    } else {
+        pipeline = useBlend ? pipelineTexturedBlend : pipelineTextured;
+        wantedVariant = useBlend ? 7 : 2;
+    }
+
+    if (viewMode == ViewMode::worldNormal) {
+        wantedVariant = 3;
+        pipeline = pipelineDebug;
+    }
+
+    if (pipeline && wantedVariant != currentPipelineVariant) {
+        rpe->setPipeline(pipeline);
+        currentPipelineVariant = wantedVariant;
+    }
+
+    // --- 2. Bind bind groups ---
+    bool needsTextures = (wantedVariant == 2 || wantedVariant == 5 ||
+                          wantedVariant == 7 || wantedVariant == 9);
+    if (needsTextures) {
+        auto bg = draw.material->bindGroup ? draw.material->bindGroup : defaultBindGroup;
+        if (bg) rpe->setBindGroup(0, bg);
+        if (frameBindGroup[currentFrameIndex]) {
+            rpe->setBindGroup(1, frameBindGroup[currentFrameIndex]);
+        }
+    } else {
+        auto bg = draw.material->flatBindGroup ? draw.material->flatBindGroup : defaultFlatBindGroup;
+        if (bg) rpe->setBindGroup(0, bg);
+    }
+
+    // --- 3. Bind transform ---
+    if (transformBuffer) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_MVP, transformBuffer, transformOffset);
+    }
+
+    // --- 4. Bind instance matrix ---
+    if (draw.instanceCount > 1 && draw.mesh->vertexBuffers[VERTEX_SLOT_INSTANCE_MATRIX]) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_INSTANCE_MATRIX,
+                                 draw.mesh->vertexBuffers[VERTEX_SLOT_INSTANCE_MATRIX], 0);
+    } else if (defaultInstanceMatrixBuffer) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_INSTANCE_MATRIX, defaultInstanceMatrixBuffer, 0);
+    }
+
+    // --- 5. Bind material uniforms ---
+    if (materialUniformBuffer && draw.material) {
+        uint64_t matOffset = (uint64_t)draw.material->uniformSlot * kMaterialUniformStride;
+        if (matOffset + kMaterialUniformStride <= materialUniformBuffer->getLength()) {
+            setVertexBufferIfChanged(rpe, VERTEX_SLOT_MATERIAL, materialUniformBuffer, matOffset);
+        }
+    }
+
+    // --- 6. Bind joint matrices ---
+    if (draw.jointMatrixBuffer) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_JOINT_MATRICES, draw.jointMatrixBuffer, 0);
+    } else if (defaultJointMatrixBuffer) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_JOINT_MATRICES, defaultJointMatrixBuffer, 0);
+    }
+
+    // --- 6. Bind vertex attributes ---
+    auto &vb = draw.mesh->vertexBuffers;
+    if (vb[VERTEX_SLOT_POSITION]) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_POSITION, vb[VERTEX_SLOT_POSITION], 0);
+    }
+    if (vb[VERTEX_SLOT_NORMAL]) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_NORMAL, vb[VERTEX_SLOT_NORMAL], 0);
+    }
+    if (vb[VERTEX_SLOT_TANGENT]) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_TANGENT, vb[VERTEX_SLOT_TANGENT], 0);
+    } else if (fallbackTangentBuffer) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_TANGENT, fallbackTangentBuffer, 0);
+    }
+    if (vb[VERTEX_SLOT_TEXCOORD0]) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD0, vb[VERTEX_SLOT_TEXCOORD0], 0);
+    } else if (fallbackUVBuffer) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD0, fallbackUVBuffer, 0);
+    }
+    if (vb[VERTEX_SLOT_JOINTS]) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_JOINTS, vb[VERTEX_SLOT_JOINTS], 0);
+    } else if (fallbackJointBuffer) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_JOINTS, fallbackJointBuffer, 0);
+    }
+    if (vb[VERTEX_SLOT_WEIGHTS]) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_WEIGHTS, vb[VERTEX_SLOT_WEIGHTS], 0);
+    } else if (fallbackWeightBuffer) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_WEIGHTS, fallbackWeightBuffer, 0);
+    }
+
+    // --- 7. Draw ---
+    if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
+        rpe->setIndexBuffer(draw.mesh->indexBuffer, GPU::IndexFormat::uint32, 0);
+        rpe->drawIndexed(draw.mesh->indexCount, draw.instanceCount);
+    } else {
+        rpe->draw(draw.mesh->vertexCount, draw.instanceCount);
+    }
+}
+

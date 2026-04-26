@@ -1,5 +1,72 @@
 # Changelog
 
+## [0.5.0] - 2026-04-25
+
+### Added
+- **KHR_materials_iridescence** — Thin-film interference for soap-bubble / oil-slick effects:
+  - `iridescenceTexture` (binding 24) and `iridescenceThicknessTexture` (binding 25)
+  - `ThinFilmIridescence()` helper in Metal shader computes optical path difference for RGB wavelengths
+  - Modulates `F0` in direct and IBL specular paths
+- **KHR_materials_anisotropy** — Directional specular highlights (brushed metal):
+  - Tangent-space anisotropic GGX BRDF with `aspect = sqrt(1.0 - 0.9 * strength)`
+  - `anisotropicTexture` (binding 26): R channel = strength, G channel = rotation (0–1 → 0–2π)
+  - View mode hotkey `p` in macOS example
+- **ECS refactor — engine-native render API** (Phase 1–3):
+  - New public structs: `GpuMesh`, `GpuMaterial`, `DrawCall`, `CameraData`, `LightData`, `RenderScene`
+  - `uploadMesh()` / `uploadMaterial()` — decouple GPU resource upload from glTF scene ownership
+  - `render(const RenderScene& scene, colorView)` — flat draw-list submission instead of recursive node traversal
+  - New optional header-only bridge: `inc/campello_renderer/ecs.hpp`
+- **Animation extraction** — `GltfAnimator` moved to standalone `inc/campello_renderer/animation.hpp` + `src/animation.cpp`:
+  - `KHR_animation_pointer` support: material and light properties can be animated via glTF pointer targets
+  - `reuploadMaterialSlot()` syncs animated material properties back to GPU uniform buffer
+- **Performance counters** — `RenderStats` exposes `opaqueDrawCount`, `transparentDrawCount`, `totalDrawCount`, `culledNodeCount`, `visibleNodeCount`, `cpuFrameTimeMs`
+- **View mode expansions** — `iridescence` (`o`), `anisotropy` (`p`), `dispersion` (`z`) debug visualization modes
+
+### Changed
+- Upgraded `campello_gpu` dependency from v0.11.1 to v0.12.0
+- `kMaterialUniformStride` bumped from 256 to 512 bytes to accommodate expanded `MaterialUniforms` struct (288 bytes)
+- Metal shader: `MaterialUniforms` expanded to 82 floats (anisotropy, iridescence, dispersion fields)
+
+## [0.4.0] - 2026-04-23
+
+### Added
+- **Equirectangular-to-cubemap environment map loading** — CPU-based conversion from single 2:1 equirectangular images to GPU cubemaps:
+  - `loadEquirectangularEnvironmentMap(path, faceSize = 0)` — loads `.hdr`, `.exr`, `.png`, `.jpg`, `.webp`
+  - Bilinear filtering during conversion for smooth face generation
+  - Auto face-size: half the equirectangular height (capped at 2048)
+  - Preserves source pixel format (`rgba8` → `rgba8unorm`, `rgba16f` → `rgba16float`, `rgba32f` → `rgba32float`)
+  - Standard graphics convention: v=0 at zenith (+Y), v=1 at nadir (-Y)
+- **macOS example environment map UI**:
+  - `Lighting → Load Environment Map…` (Cmd+Shift+E) — file picker for equirectangular HDR/EXR/LDR images
+  - `Lighting → Background Mode` submenu — one-click switch between:
+    - Solid Color (dark clear + skybox/IBL off)
+    - Skybox only (cubemap background, no IBL)
+    - Skybox + IBL (cubemap background + image-based lighting)
+  - Auto-enables skybox and IBL when a new environment map is loaded
+- **KHR_materials_transmission + KHR_materials_volume** — Proper environment-based transmission:
+  - Replaced simple alpha-reduction with physical refraction via `refract()` and environment cubemap sampling
+  - Fresnel-mixed transmission: `(1 - F) * transmission * (1 - metallic)`
+  - Diffuse/ambient/IBL-diffuse terms are scaled by `(1 - transmittance)`; specular/clearcoat remain
+  - KHR_materials_volume attenuation via Beer-Lambert law: `exp(-thickness / attenuationDistance * (1 - attenuationColor))`
+  - **Fixed long-standing `MaterialUniforms` layout bug** — CPU-side offsets for `transmissionFactor`, `hasTransmissionTexture`, `viewMode`, `environmentIntensity`, and `iblEnabled` were 36 bytes late due to an index gap, causing the shader to read zeros for these fields
+  - Bumped `kMaterialUniformStride` from 256 to 512 bytes to accommodate the expanded struct (288 bytes) while maintaining Metal's 256-byte vertex buffer offset alignment
+
+## [0.3.0] - 2026-04-23
+
+### Added
+- **FXAA post-process anti-aliasing** — Fullscreen post-process pass based on FXAA 3.11:
+  - `setFxaaEnabled(bool)` / `isFxaaEnabled()` API
+  - Intermediate `sceneColorTexture` render target when FXAA is active
+  - `fxaaVertex` / `fxaaFragment` shaders in `default.metal`
+  - Clamp-to-edge sampler to avoid edge artifacts
+  - macOS example menu item: `Lighting → FXAA` (Cmd+Shift+A)
+- **SSAA (Super-Sample Anti-Aliasing)** — Render scene at scaled resolution and bilinear downsample:
+  - `setSsaaScale(float)` / `getSsaaScale()` API (1.0 = off, 1.5, 2.0)
+  - `sceneColorTexture` created at `width * scale` × `height * scale`
+  - `downsampleFragment` shader for all platforms (Metal, Vulkan, DirectX HLSL)
+  - FXAA is automatically disabled when SSAA is active (SSAA supersedes FXAA)
+  - macOS example submenu: `Lighting → SSAA` (Off / 1.5× / 2.0×)
+
 ## [0.2.1] - 2026-04-23
 
 ### Fixed

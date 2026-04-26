@@ -14,8 +14,62 @@
 #include <campello_gpu/bind_group.hpp>
 #include <campello_gpu/bind_group_layout.hpp>
 #include <campello_renderer/image.hpp>
+#include <campello_renderer/animation.hpp>
+#include <vector_math/vector_math.hpp>
 
 namespace systems::leal::campello_renderer {
+
+    struct GpuMesh {
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> indexBuffer;
+        uint32_t indexCount = 0;
+        std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, 6> vertexBuffers; // POSITION, NORMAL, UV, TANGENT, JOINTS, WEIGHTS
+        uint32_t vertexCount = 0;
+        // topology, index format, bounds — reserved for future phases
+    };
+
+    struct GpuMaterial {
+        std::shared_ptr<systems::leal::campello_gpu::BindGroup> bindGroup;     // textures + samplers
+        std::shared_ptr<systems::leal::campello_gpu::BindGroup> flatBindGroup; // fallback for flat pipeline
+        uint32_t uniformSlot = 0; // index into the global material uniform buffer
+        bool doubleSided = false;
+        bool alphaBlend = false;
+        bool alphaMask = false;
+        bool transmission = false; // true if KHR_materials_transmission is active
+    };
+
+    struct DrawCall {
+        GpuMesh* mesh = nullptr;
+        GpuMaterial* material = nullptr;
+        systems::leal::vector_math::Matrix4<double> worldTransform;
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> jointMatrixBuffer; // nullptr if unskinned
+        uint32_t jointCount = 0;
+        uint32_t instanceCount = 1;
+    };
+
+    struct CameraData {
+        systems::leal::vector_math::Matrix4<double> view;
+        systems::leal::vector_math::Matrix4<double> projection;
+        systems::leal::vector_math::Vector3<double> position;
+    };
+
+    struct LightData {
+        systems::leal::vector_math::Vector3<double> direction;
+        systems::leal::vector_math::Vector3<double> position;
+        systems::leal::vector_math::Vector3<double> color;
+        float intensity = 0.0f;
+        float range = 0.0f;
+        float innerConeAngle = 0.0f;
+        float outerConeAngle = 0.0f;
+        int type = 0; // 0 = directional, 1 = point, 2 = spot
+    };
+
+    struct RenderScene {
+        CameraData camera;
+        std::vector<LightData> lights;
+        std::vector<DrawCall> opaque;
+        std::vector<DrawCall> transparent;
+    };
+
 
     enum class ViewMode : uint32_t {
         normal = 0,
@@ -36,6 +90,19 @@ namespace systems::leal::campello_renderer {
         clearcoatNormal = 15,
         transmission = 16,
         environment = 17,
+        iridescence = 18,
+        anisotropy = 19,
+        dispersion = 20,
+    };
+
+    struct RenderStats {
+        uint32_t opaqueDrawCount = 0;
+        uint32_t transparentDrawCount = 0;
+        uint32_t totalDrawCount = 0;
+        uint32_t culledNodeCount = 0;
+        uint32_t visibleNodeCount = 0;
+        uint32_t instanceCount = 0;
+        double cpuFrameTimeMs = 0.0;
     };
 
     class Renderer {
@@ -68,6 +135,7 @@ namespace systems::leal::campello_renderer {
     private:
         std::shared_ptr<systems::leal::campello_gpu::Device> device;
         std::shared_ptr<systems::leal::gltf::GLTF> asset;
+        std::string assetBasePath;
         uint32_t sceneIndex  = 0;
         uint32_t cameraIndex = 0;
         std::vector<std::shared_ptr<Image>> images;
@@ -78,6 +146,14 @@ namespace systems::leal::campello_renderer {
         // Per-GLTF-sampler GPU samplers and per-material bind groups.
         std::vector<std::shared_ptr<systems::leal::campello_gpu::Sampler>>        gpuSamplers;
         std::vector<std::shared_ptr<systems::leal::campello_gpu::BindGroup>>      materialBindGroups;
+
+        // Engine-native resource pools — owned by the renderer, independent of glTF lifetime.
+        std::vector<std::unique_ptr<GpuMesh>>     meshPool;
+        std::vector<std::unique_ptr<GpuMaterial>> materialPool;
+
+        // Look-up caches from glTF indices/handles to engine-native handles.
+        std::unordered_map<const systems::leal::gltf::Primitive*, GpuMesh*>     meshCache;
+        std::unordered_map<int64_t, GpuMaterial*>                               materialCache;
 
         // Minimal bind groups for flat pipeline variants (no textures/samplers).
         // Only contains the material uniform buffer at binding 17 so the fragment
@@ -140,14 +216,24 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineSkybox;
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> skyboxBindGroupLayout;
 
+        // FXAA post-process pipeline — fullscreen triangle that samples scene color texture.
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFxaa;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> fxaaBindGroupLayout;
+
+        // SSAA downsample pipeline — bilinear downsample from scaled scene texture.
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineDownsample;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> downsampleBindGroupLayout;
+
         // Environment map / IBL
         std::shared_ptr<systems::leal::campello_gpu::Texture>          environmentMap;
         std::shared_ptr<systems::leal::campello_gpu::TextureView>      environmentMapView;
         std::shared_ptr<systems::leal::campello_gpu::Sampler>          environmentSampler;
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        environmentBindGroup;
         bool skyboxEnabled = false;
-        bool iblEnabled = false;
+        bool iblEnabled = true;
         float environmentIntensity = 1.0f;
+        bool fxaaEnabled = false;
+        float ssaaScale = 1.0f;
 
         // Active shading / inspection mode.
         ViewMode viewMode = ViewMode::normal;
@@ -181,6 +267,19 @@ namespace systems::leal::campello_renderer {
         // Per-frame uniform buffer for skybox: invVP (64) + screenSize (8) + cameraPos (12) + pad = 96 bytes.
         std::shared_ptr<systems::leal::campello_gpu::Buffer>           skyboxUniformBuffer[kMaxFramesInFlight];
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        skyboxBindGroup[kMaxFramesInFlight];
+
+        // FXAA / SSAA resources — intermediate scene texture + per-frame bind groups.
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          sceneColorTexture;
+        std::shared_ptr<systems::leal::campello_gpu::TextureView>      sceneColorView;
+        std::shared_ptr<systems::leal::campello_gpu::Sampler>          fxaaSampler;
+        std::shared_ptr<systems::leal::campello_gpu::Buffer>           fxaaUniformBuffer[kMaxFramesInFlight];
+        std::shared_ptr<systems::leal::campello_gpu::BindGroup>        fxaaBindGroup[kMaxFramesInFlight];
+        std::shared_ptr<systems::leal::campello_gpu::BindGroup>        downsampleBindGroup[kMaxFramesInFlight];
+
+        // Screen-space refraction resources.
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          opaqueSceneTexture;
+        std::shared_ptr<systems::leal::campello_gpu::TextureView>      opaqueSceneView;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroup>        copyBindGroup[kMaxFramesInFlight];
         struct FrameResources {
             std::shared_ptr<systems::leal::campello_gpu::Buffer> transformBuffer;
             std::shared_ptr<systems::leal::campello_gpu::Buffer> cameraPositionBuffer;
@@ -296,14 +395,23 @@ namespace systems::leal::campello_renderer {
         float cameraWorldPos[3] = {0.0f, 0.0f, 3.0f};
 
         // Transparent (BLEND) draws collected during opaque traversal, sorted and drawn after.
-        struct DrawItem {
-            const systems::leal::gltf::Primitive *primitive;
-            uint64_t nodeIndex;
+        // Internal DrawCall — carries legacy glTF fields until Phase 3.
+        // Shadows the public DrawCall defined above.
+        struct DrawCall {
+            GpuMesh* mesh = nullptr;
+            GpuMaterial* material = nullptr;
+            systems::leal::vector_math::Matrix4<double> worldTransform;
+            std::shared_ptr<systems::leal::campello_gpu::Buffer> jointMatrixBuffer;
+            uint32_t jointCount = 0;
+            uint32_t instanceCount = 1;
+            // Legacy fields — will be removed in Phase 3 when renderPrimitive() is refactored.
+            const systems::leal::gltf::Primitive* primitive = nullptr;
+            uint64_t nodeIndex = 0;
             int64_t materialIndex = -1;
             bool transparent = false;
         };
-        std::vector<DrawItem> opaqueQueue;
-        std::vector<DrawItem> transparentQueue;
+        std::vector<DrawCall> opaqueQueue;
+        std::vector<DrawCall> transparentQueue;
 
         // Active KHR_materials_variants index. -1 = use each primitive's default material.
         int32_t activeVariant = -1;
@@ -313,31 +421,14 @@ namespace systems::leal::campello_renderer {
         // ------------------------------------------------------------------
         float clearColor[4] = {0.08f, 0.08f, 0.10f, 1.0f};
         bool punctualLightsEnabled = true;
+
+        RenderStats lastFrameStats;
         bool defaultLightEnabled = true;
 
-        // Per-animation state for multi-animation support.
-        struct AnimationState {
-            double time = 0.0;           // Current animation time in seconds
-            bool playing = false;        // true = playing, false = paused
-            bool loop = true;            // true = loop, false = stop at end
-            double duration = 0.0;       // Duration from keyframe data
-        };
-        std::unordered_map<int32_t, AnimationState> animationStates;
+        // Standalone animation helper — extracted in Phase 5.
+        std::unique_ptr<GltfAnimator> animator;
 
-        // Animated node transforms — merged from all playing animations.
-        // Maps node index to animated TRS values.
-        struct AnimatedTRS {
-            bool hasTranslation = false;
-            bool hasRotation = false;
-            bool hasScale = false;
-            systems::leal::vector_math::Vector3<double> translation;
-            systems::leal::vector_math::Quaternion<double> rotation;
-            systems::leal::vector_math::Vector3<double> scale;
-        };
-        std::unordered_map<uint64_t, AnimatedTRS> animatedNodes;
-
-        // Animation sampling helpers.
-        void sampleAnimation(int32_t animIndex, float time);
+        // Animation sampling helpers (legacy, kept for internal use).
         void applyAnimatedTRS(uint64_t nodeIndex);
 
         static systems::leal::vector_math::Matrix4<double> nodeLocalMatrix(
@@ -364,6 +455,12 @@ namespace systems::leal::campello_renderer {
             const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
             const systems::leal::gltf::Primitive &primitive,
             uint64_t nodeIndex);
+
+        // New ECS-path primitive renderer.
+        void renderPrimitive(
+            const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+            const systems::leal::campello_renderer::DrawCall& draw,
+            uint64_t transformOffset);
 
         void setVertexBufferIfChanged(
             const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
@@ -399,6 +496,26 @@ namespace systems::leal::campello_renderer {
         void setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset);
         std::shared_ptr<systems::leal::gltf::GLTF> getAsset();
 
+        // Sets the base directory for resolving relative external image URIs
+        // in .gltf files (e.g. "textures/baseColor.png"). Must be called before
+        // setScene() or uploadMaterial() for external textures to load.
+        void setAssetBasePath(const std::string& path);
+        std::string getAssetBasePath() const;
+
+        // Upload a single primitive's geometry and return an engine-native handle.
+        GpuMesh* uploadMesh(const systems::leal::gltf::Primitive& primitive,
+                            const systems::leal::gltf::GLTF& asset);
+
+        // Upload a material's textures/uniforms and return an engine-native handle.
+        GpuMaterial* uploadMaterial(const systems::leal::gltf::Material& material,
+                                    const systems::leal::gltf::GLTF& asset);
+
+        // Re-upload a single material slot to the GPU material uniform buffer.
+        // Used by KHR_animation_pointer to sync animated material properties.
+        void reuploadMaterialSlot(uint32_t uniformSlot,
+                                  const systems::leal::gltf::Material& material,
+                                  const systems::leal::gltf::GLTF& asset);
+
         void setCamera(uint32_t index);
         void setScene(uint32_t index);
 
@@ -421,6 +538,10 @@ namespace systems::leal::campello_renderer {
         // Render to an externally provided color target (e.g., an MTKView drawable
         // texture on macOS). The renderer's own depth buffer (from resize()) is used.
         void render(std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView);
+
+        // Render a fully-prepared scene description (ECS-driven path).
+        void render(const RenderScene& scene,
+                    std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView);
 
         void update(double dt);
 
@@ -490,12 +611,33 @@ namespace systems::leal::campello_renderer {
             const std::string &py, const std::string &ny,
             const std::string &pz, const std::string &nz);
 
+        // Load a single equirectangular image (2:1 aspect ratio) and convert
+        // it to a cubemap on the CPU. Supports PNG, JPEG, HDR, EXR.
+        // faceSize is the desired size of each cubemap face; 0 means auto
+        // (half the equirectangular height). Returns nullptr on failure.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> loadEquirectangularEnvironmentMap(
+            const std::string &path, uint32_t faceSize = 0);
+
         void setSkyboxEnabled(bool enabled);
         void setIBLEnabled(bool enabled);
         void setEnvironmentIntensity(float intensity);
         bool isSkyboxEnabled() const;
         bool isIBLEnabled() const;
         float getEnvironmentIntensity() const;
+
+        void setFxaaEnabled(bool enabled);
+        bool isFxaaEnabled() const;
+
+        void setSsaaScale(float scale);
+        float getSsaaScale() const;
+
+        std::shared_ptr<systems::leal::campello_gpu::Device> getDevice() const { return device; }
+
+        // Returns statistics from the last completed frame.
+        RenderStats getLastFrameStats() const;
+
+    private:
+        void ensureSceneColorTexture();
 
         // Accessors for uploaded GPU resources.
         std::shared_ptr<systems::leal::campello_gpu::Buffer>  getGpuBuffer(uint32_t index) const;
