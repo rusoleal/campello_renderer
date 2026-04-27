@@ -69,7 +69,11 @@ void GltfAnimator::update(double dt) {
         state.time += dt;
 
         if (state.time > state.duration) {
-            if (state.loop) {
+            if (state.duration <= 0.0) {
+                // Zero-duration animation: clamp to 0 and keep playing so
+                // single-keyframe or pose-only clips don't hit fmod(x,0).
+                state.time = 0.0;
+            } else if (state.loop) {
                 state.time = fmod(state.time, state.duration);
             } else {
                 state.time = state.duration;

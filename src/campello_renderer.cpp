@@ -29,6 +29,8 @@
 #endif
 
 #include <campello_image/image.hpp>
+#include <campello_image/texture_data.hpp>
+#include <campello_image/gpu_format_bridge.hpp>
 
 using namespace systems::leal::campello_renderer;
 
@@ -361,6 +363,116 @@ static void buildMaterialSlotFromGltf(const systems::leal::gltf::Material& mat,
 }
 
 // ---------------------------------------------------------------------------
+// KHR_texture_basisu helpers
+// ---------------------------------------------------------------------------
+
+namespace {
+
+static systems::leal::campello_image::TextureFormat chooseBasisTargetFormat(
+    const std::shared_ptr<systems::leal::campello_gpu::Device>& device)
+{
+    using namespace systems::leal::campello_gpu;
+    using namespace systems::leal::campello_image;
+
+    if (!device) return TextureFormat::rgba8;
+
+    auto features = device->getFeatures();
+
+    // Prefer ASTC on Apple and modern mobile.
+    if (features.count(Feature::astcTextureCompression)) {
+        return TextureFormat::astc_4x4_unorm;
+    }
+    // BC7 on desktop.
+    if (features.count(Feature::bcTextureCompression)) {
+        return TextureFormat::bc7_rgba_unorm;
+    }
+    // ETC2 on older mobile.
+    if (features.count(Feature::etc2TextureCompression)) {
+        return TextureFormat::etc2_rgb8unorm;
+    }
+
+    return TextureFormat::rgba8;
+}
+
+static systems::leal::campello_gpu::PixelFormat textureDataFormatToPixelFormat(
+    systems::leal::campello_image::TextureFormat tfmt,
+    bool wantsSrgb)
+{
+    using TF = systems::leal::campello_image::TextureFormat;
+    using PF = systems::leal::campello_gpu::PixelFormat;
+
+    switch (tfmt) {
+        case TF::rgba8:
+            return wantsSrgb ? PF::rgba8unorm_srgb : PF::rgba8unorm;
+        case TF::bc7_rgba_unorm:
+            return wantsSrgb ? PF::bc7_rgba_unorm_srgb : PF::bc7_rgba_unorm;
+        case TF::astc_4x4_unorm:
+            // campello_gpu only exposes the sRGB ASTC variant.
+            return PF::astc_4x4_unorm_srgb;
+        case TF::etc2_rgb8unorm:
+            return wantsSrgb ? PF::etc2_rgb8unorm_srgb : PF::etc2_rgb8unorm;
+        default:
+            return wantsSrgb ? PF::rgba8unorm_srgb : PF::rgba8unorm;
+    }
+}
+
+static bool uploadTextureDataWithMips(
+    const std::shared_ptr<systems::leal::campello_gpu::Device>& device,
+    const std::shared_ptr<systems::leal::campello_gpu::Texture>& texture,
+    const systems::leal::campello_image::TextureData& texData)
+{
+    using namespace systems::leal::campello_gpu;
+
+    // Calculate total staging size.
+    size_t totalBytes = 0;
+    for (uint32_t mip = 0; mip < texData.getMipLevelCount(); ++mip) {
+        totalBytes += texData.getDataSize(mip);
+    }
+
+    auto staging = device->createBuffer(totalBytes, BufferUsage::copySrc);
+    if (!staging) return false;
+
+    size_t offset = 0;
+    for (uint32_t mip = 0; mip < texData.getMipLevelCount(); ++mip) {
+        staging->upload(offset, texData.getDataSize(mip),
+                        const_cast<void*>(texData.getData(mip)));
+        offset += texData.getDataSize(mip);
+    }
+
+    auto encoder = device->createCommandEncoder();
+    if (!encoder) return false;
+
+    offset = 0;
+    for (uint32_t mip = 0; mip < texData.getMipLevelCount(); ++mip) {
+        uint32_t mipWidth  = std::max(1u, texData.getWidth()  >> mip);
+        uint32_t mipHeight = std::max(1u, texData.getHeight() >> mip);
+
+        uint32_t blockW = texData.getBlockWidth();
+        uint32_t blockH = texData.getBlockHeight();
+        uint32_t blockBytes = texData.getBlockBytes();
+
+        uint64_t bytesPerRow = 0;
+        if (texData.isCompressed()) {
+            uint32_t blocksX = (mipWidth + blockW - 1) / blockW;
+            bytesPerRow = static_cast<uint64_t>(blocksX) * blockBytes;
+        } else {
+            bytesPerRow = static_cast<uint64_t>(mipWidth) * blockBytes;
+        }
+
+        encoder->copyBufferToTexture(staging, offset, bytesPerRow, texture, mip, 0);
+        offset += texData.getDataSize(mip);
+    }
+
+    auto fence = device->createFence();
+    device->submit(encoder->finish(), fence);
+    if (fence) fence->wait();
+
+    return true;
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
 
@@ -557,11 +669,14 @@ void Renderer::setScene(uint32_t index) {
     // This scan covers all materials (not just the active scene) because
     // gpuTextures persists across setScene() calls.
     std::unordered_set<int64_t> srgbImageIndices;
+    std::unordered_set<int64_t> basisuImageIndices;
     if (asset->textures && asset->materials) {
         auto imageIndexForTex = [&](int64_t texIdx) -> int64_t {
             if (texIdx < 0 || (size_t)texIdx >= asset->textures->size()) return -1;
             auto &gt = (*asset->textures)[(size_t)texIdx];
-            return (gt.ext_texture_webp >= 0) ? gt.ext_texture_webp : gt.source;
+            if (gt.khr_texture_basisu >= 0) return gt.khr_texture_basisu;
+            if (gt.ext_texture_webp >= 0) return gt.ext_texture_webp;
+            return gt.source;
         };
         for (auto &mat : *asset->materials) {
             if (mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture)
@@ -576,6 +691,13 @@ void Renderer::setScene(uint32_t index) {
                 srgbImageIndices.insert(imageIndexForTex(mat.khrMaterialsSheen->sheenColorTexture->index));
         }
         srgbImageIndices.erase(-1); // remove sentinel from any unresolved lookups
+
+        // Collect image indices that are KHR_texture_basisu targets.
+        for (auto &tex : *asset->textures) {
+            if (tex.khr_texture_basisu >= 0) {
+                basisuImageIndices.insert(tex.khr_texture_basisu);
+            }
+        }
     }
 
     namespace GPU = systems::leal::campello_gpu;
@@ -595,13 +717,53 @@ void Renderer::setScene(uint32_t index) {
     };
 
     // Decode and upload images referenced by this scene.
+    systems::leal::campello_image::TextureFormat basisTargetFormat = chooseBasisTargetFormat(device);
     for (int a = 0; a < (int)info->images.size(); a++) {
         if (info->images[a]) {
             if (gpuTextures[a] == nullptr) {
                 auto &image = (*asset->images)[a];
                 bool wantsSrgb = srgbImageIndices.count(a) > 0;
+                bool isBasisu  = basisuImageIndices.count(a) > 0;
 
-                if (image.data.size() > 0) {
+                if (isBasisu) {
+                    // ------------------------------------------------------------------
+                    // KHR_texture_basisu path — use TextureData for GPU-compressed upload.
+                    // ------------------------------------------------------------------
+                    std::shared_ptr<systems::leal::campello_image::TextureData> texData;
+                    if (image.data.size() > 0) {
+                        texData = systems::leal::campello_image::TextureData::fromMemory(
+                            image.data.data(), image.data.size(), basisTargetFormat);
+                    } else if (image.bufferView != -1) {
+                        auto &bufferView = (*asset->bufferViews)[image.bufferView];
+                        auto &buffer     = (*asset->buffers)[bufferView.buffer];
+                        if (!buffer.data.empty()) {
+                            const uint8_t *src = buffer.data.data() + bufferView.byteOffset;
+                            texData = systems::leal::campello_image::TextureData::fromMemory(
+                                src, bufferView.byteLength, basisTargetFormat);
+                        }
+                    } else if (!image.uri.empty()) {
+                        std::string imagePath = image.uri;
+                        if (!assetBasePath.empty() && imagePath.find(":") == std::string::npos && imagePath.front() != '/') {
+                            imagePath = assetBasePath + imagePath;
+                        }
+                        texData = systems::leal::campello_image::TextureData::fromFile(imagePath.c_str(), basisTargetFormat);
+                    }
+
+                    if (texData != nullptr) {
+                        auto fmt = textureDataFormatToPixelFormat(texData->getFormat(), wantsSrgb);
+                        auto texture = device->createTexture(
+                            GPU::TextureType::tt2d, fmt,
+                            texData->getWidth(), texData->getHeight(), 1,
+                            texData->getMipLevelCount(), 1,
+                            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                                (uint32_t)GPU::TextureUsage::copyDst));
+                        if (texture != nullptr) {
+                            if (uploadTextureDataWithMips(device, texture, *texData)) {
+                                gpuTextures[a] = texture;
+                            }
+                        }
+                    }
+                } else if (image.data.size() > 0) {
                     // Data:uri images are already decoded by the gltf library.
                     auto img = systems::leal::campello_image::Image::fromMemory(
                         image.data.data(), image.data.size());
@@ -2961,6 +3123,9 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 }
 
 void Renderer::resize(uint32_t width, uint32_t height) {
+    if (renderWidth == width && renderHeight == height) {
+        return;
+    }
     std::cout << "[Renderer::resize] " << renderWidth << "x" << renderHeight
               << " → " << width << "x" << height << std::endl;
     renderWidth  = width;
@@ -3887,7 +4052,6 @@ void Renderer::renderToTarget(
         if (!opaqueSceneTexture || opaqueSceneTexture->getWidth() != texW ||
             opaqueSceneTexture->getHeight() != texH) {
             uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2(std::max(texW, texH)));
-            if (mipLevels < 2) mipLevels = 2;
             opaqueSceneTexture = device->createTexture(
                 GPU::TextureType::tt2d, cachedColorFormat,
                 texW, texH, 1, mipLevels, 1,
@@ -4278,14 +4442,24 @@ void Renderer::applyAnimatedTRS(uint64_t nodeIndex) {
     auto &node = (*asset->nodes)[nodeIndex];
     auto &trs = it->second;
 
+    bool modified = false;
     if (trs.hasTranslation) {
         node.translation = trs.translation;
+        modified = true;
     }
     if (trs.hasRotation) {
         node.rotation = trs.rotation;
+        modified = true;
     }
     if (trs.hasScale) {
         node.scale = trs.scale;
+        modified = true;
+    }
+    // If the node was originally authored with a matrix, nodeLocalMatrix()
+    // prefers that matrix over TRS.  Reset it to identity so the animated
+    // TRS is actually used.
+    if (modified) {
+        node.matrix = systems::leal::vector_math::Matrix4<double>::identity();
     }
 }
 
@@ -6074,7 +6248,6 @@ void Renderer::render(const RenderScene& scene,
         if (!opaqueSceneTexture || opaqueSceneTexture->getWidth() != texW ||
             opaqueSceneTexture->getHeight() != texH) {
             uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2(std::max(texW, texH)));
-            if (mipLevels < 2) mipLevels = 2;
             opaqueSceneTexture = device->createTexture(
                 GPU::TextureType::tt2d, cachedColorFormat,
                 texW, texH, 1, mipLevels, 1,

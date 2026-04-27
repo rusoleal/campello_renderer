@@ -107,6 +107,9 @@ namespace systems::leal::campello_renderer {
 
     class Renderer {
     public:
+        uint32_t getRenderWidth() const  { return renderWidth; }
+        uint32_t getRenderHeight() const { return renderHeight; }
+
         // Vertex buffer slot convention — must match the pipeline's vertex descriptor
         // and the shader bindings.
         static constexpr uint32_t VERTEX_SLOT_POSITION   = 0;  // float3 POSITION

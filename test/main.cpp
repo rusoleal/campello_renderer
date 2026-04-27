@@ -75,12 +75,48 @@ static const char *kGltfWithMesh = R"({
     "scenes": [{ "name": "Scene", "nodes": [0] }]
 })";
 
+static const char *kGltfWithBasisuTexture = R"({
+    "asset": { "version": "2.0" },
+    "extensionsUsed": ["KHR_texture_basisu"],
+    "scene": 0,
+    "images": [
+        { "uri": "fallback.png" },
+        { "uri": "compressed.ktx2" }
+    ],
+    "textures": [{
+        "source": 0,
+        "extensions": {
+            "KHR_texture_basisu": { "source": 1 }
+        }
+    }],
+    "materials": [{
+        "pbrMetallicRoughness": {
+            "baseColorTexture": { "index": 0 }
+        }
+    }],
+    "meshes": [{
+        "primitives": [{
+            "attributes": { "POSITION": 0 },
+            "material": 0
+        }]
+    }],
+    "accessors": [
+        { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }
+    ],
+    "bufferViews": [
+        { "buffer": 0, "byteOffset": 0, "byteLength": 36 }
+    ],
+    "buffers": [{ "byteLength": 36 }],
+    "nodes": [{ "mesh": 0 }],
+    "scenes": [{ "nodes": [0] }]
+})";
+
 // ---------------------------------------------------------------------------
 // Version
 // ---------------------------------------------------------------------------
 
 TEST(VersionTest, ReturnsExpectedVersion) {
-    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.5.0");
+    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.6.0");
 }
 
 TEST(VersionTest, VersionIsNonEmpty) {
@@ -192,6 +228,17 @@ TEST(SetAssetTest, SetAssetThenClearThenSetAgain) {
     renderer.setAsset(asset);
     renderer.setAsset(nullptr);
     renderer.setAsset(asset);
+    EXPECT_EQ(renderer.getAsset(), asset);
+}
+
+TEST(SetAssetTest, SetAssetWithBasisuTextureDoesNotCrash) {
+    auto asset = GLTF::loadGLTF(kGltfWithBasisuTexture, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    ASSERT_TRUE(asset->textures != nullptr);
+    ASSERT_EQ(asset->textures->size(), 1u);
+    EXPECT_EQ((*asset->textures)[0].khr_texture_basisu, 1);
+    Renderer renderer(nullptr);
+    EXPECT_NO_THROW(renderer.setAsset(asset));
     EXPECT_EQ(renderer.getAsset(), asset);
 }
 

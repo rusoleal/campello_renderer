@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.0] - 2026-04-27
+
+### Added
+- **KHR_texture_basisu support** — GPU-compressed texture loading via `campello_image::TextureData`:
+  - `setScene()` detects images referenced by `KHR_texture_basisu` and transcodes them to the optimal GPU format for the device
+  - Format selection hierarchy: ASTC 4×4 (Apple/modern mobile) → BC7 (desktop) → ETC2 (older mobile) → RGBA8 (fallback)
+  - Full mip chain upload via `copyBufferToTexture` for compressed and uncompressed formats
+  - `imageIndexForTex` now resolves `khr_texture_basisu` before `ext_texture_webp` and `source`
+  - New test: `SetAssetTest.SetAssetWithBasisuTextureDoesNotCrash`
+
+### Changed
+- Upgraded `campello_image` dependency from v0.4.0 to v0.5.0 (local override available at `/Users/rubenleal/Projects/campello_image`)
+- `dependencies/campello_image.cmake` now supports local path override (matching `campello_gpu.cmake` pattern)
+
 ## [0.5.0] - 2026-04-25
 
 ### Added

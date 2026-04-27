@@ -1,6 +1,6 @@
 # campello_renderer TODO
 
-## Current State (v0.5.0)
+## Current State (v0.6.0)
 
 ### What works
 - `setAsset(shared_ptr<GLTF>)` — loads asset, allocates GPU buffer/texture/sampler/bind-group slot arrays
@@ -210,7 +210,10 @@ The gltf library (v0.4.1) parses **23 extensions** into structured data. The ren
 
 ### KHR_texture_basisu (KTX2)
 
-- [ ] **`KHR_texture_basisu`** — parsed as `Texture::khr_texture_basisu` (image index). KTX2 / Basis Universal compressed GPU textures. Requires `campello_gpu` to support compressed texture formats (BC7, ETC2, ASTC) and a KTX2 decoder (e.g., `basisu` transcoder).
+- [x] **`KHR_texture_basisu`** — parsed as `Texture::khr_texture_basisu` (image index). KTX2 / Basis Universal compressed GPU textures transcoded via `campello_image::TextureData`:
+  - Format selection: ASTC 4×4 → BC7 → ETC2 → RGBA8 fallback based on `device->getFeatures()`
+  - Full mip chain uploaded via `copyBufferToTexture`
+  - `imageIndexForTex` resolves `khr_texture_basisu` before `ext_texture_webp` and `source`
 
 ### Compression (call before rendering)
 

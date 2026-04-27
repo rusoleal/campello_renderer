@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`campello_renderer` (v0.5.0) is a C++20 shared library that provides a 3D rendering layer on top of custom dependencies:
-- **campello_gpu** (v0.12.0) — low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
+`campello_renderer` (v0.6.0) is a C++20 shared library that provides a 3D rendering layer on top of custom dependencies:
+- **campello_gpu** (v0.13.0) — low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
 - **gltf** (v0.4.1) — GLTF/GLB asset loader
-- **campello_image** (v0.4.0) — image decoding (PNG, JPEG, WebP, HDR, OpenEXR)
+- **campello_image** (v0.5.0) — image decoding (PNG, JPEG, WebP, HDR, OpenEXR)
 
 The library is consumed as a CMake dependency and targets Android, macOS, iOS, Windows, and Linux. macOS is the primary development/test platform.
 
@@ -124,7 +124,7 @@ Tests cover: version string, construction, `setAsset`/`getAsset`, `setScene`, `s
 
 ## Versioning
 
-Version is defined in `CMakeLists.txt` (`project(campello_renderer VERSION 0.5.0)`) and propagated to `campello_renderer_config.h` via `configure_file`.
+Version is defined in `CMakeLists.txt` (`project(campello_renderer VERSION 0.6.0)`) and propagated to `campello_renderer_config.h` via `configure_file`.
 
 **When upgrading the package version, update the version string in ALL of these locations:**
 1. `CMakeLists.txt` — `project(campello_renderer VERSION x.x.x)`
