@@ -27,9 +27,13 @@
 #include <campello_gpu/descriptors/bind_group_layout_descriptor.hpp>
 #include <campello_gpu/descriptors/bind_group_descriptor.hpp>
 #include <campello_gpu/shader_module.hpp>
+#if defined(__APPLE__)
 #include "shaders/metal_default.h"
+#elif defined(__ANDROID__) || defined(__linux__)
 #include "shaders/vulkan_default.h"
+#elif defined(_WIN32)
 #include "shaders/directx_default.h"
+#endif
 
 using namespace systems::leal::gltf;
 
