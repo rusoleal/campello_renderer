@@ -18,6 +18,7 @@
 
 ### Changed
 - Upgraded `campello_gpu` dependency from v0.13.0 to v0.13.1
+- Upgraded `gltf` dependency from v0.4.1 to v0.4.2 (adds `KHR_texture_procedurals` extension support)
 - Regenerated embedded shader headers (Metal, Vulkan, DirectX) from latest shader sources
 
 ### Fixed

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `campello_renderer` (v0.7.0) is a C++20 shared library that provides a 3D rendering layer on top of custom dependencies:
 - **campello_gpu** (v0.13.1) — low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
-- **gltf** (v0.4.1) — GLTF/GLB asset loader
+- **gltf** (v0.4.2) — GLTF/GLB asset loader
 - **campello_image** (v0.5.0) — image decoding (PNG, JPEG, WebP, HDR, OpenEXR)
 
 The library is consumed as a CMake dependency and targets Android, macOS, iOS, Windows, and Linux. macOS is the primary development/test platform.
