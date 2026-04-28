@@ -15,6 +15,7 @@
 #include <campello_gpu/bind_group_layout.hpp>
 #include <campello_renderer/image.hpp>
 #include <campello_renderer/animation.hpp>
+#include <campello_renderer/procedural_texture_baker.hpp>
 #include <vector_math/vector_math.hpp>
 
 namespace systems::leal::campello_renderer {
@@ -22,9 +23,11 @@ namespace systems::leal::campello_renderer {
     struct GpuMesh {
         std::shared_ptr<systems::leal::campello_gpu::Buffer> indexBuffer;
         uint32_t indexCount = 0;
+        systems::leal::campello_gpu::IndexFormat indexFormat =
+            systems::leal::campello_gpu::IndexFormat::uint32;
         std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, 6> vertexBuffers; // POSITION, NORMAL, UV, TANGENT, JOINTS, WEIGHTS
         uint32_t vertexCount = 0;
-        // topology, index format, bounds — reserved for future phases
+        // topology, bounds — reserved for future phases
     };
 
     struct GpuMaterial {
@@ -428,6 +431,11 @@ namespace systems::leal::campello_renderer {
         RenderStats lastFrameStats;
         bool defaultLightEnabled = true;
 
+        // KHR_texture_procedurals — load-time baked textures.
+        // Key: "graph:<index>:output:<name>"  Value: baked GPU texture.
+        std::unordered_map<std::string, std::shared_ptr<systems::leal::campello_gpu::Texture>> proceduralBakedTextures;
+        int proceduralBakeSize = 1024;
+
         // Standalone animation helper — extracted in Phase 5.
         std::unique_ptr<GltfAnimator> animator;
 
@@ -633,6 +641,12 @@ namespace systems::leal::campello_renderer {
 
         void setSsaaScale(float scale);
         float getSsaaScale() const;
+
+        // KHR_texture_procedurals bake controls.
+        // Sets the resolution for load-time procedural texture baking.
+        // Default is 1024. Must be called before setScene() to take effect.
+        void setProceduralBakeSize(int size);
+        int getProceduralBakeSize() const;
 
         std::shared_ptr<systems::leal::campello_gpu::Device> getDevice() const { return device; }
 

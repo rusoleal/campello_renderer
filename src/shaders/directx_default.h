@@ -9,9 +9,10 @@
 //   dxc -T vs_6_0 -E fxaaVertex  default.hlsl -Fo fxaa_vs.dxil
 //   dxc -T ps_6_0 -E fxaaPixel   default.hlsl -Fo fxaa_ps.dxil
 //   dxc -T ps_6_0 -E downsamplePixel default.hlsl -Fo downsample_ps.dxil
+//   dxc -T cs_6_0 -E proceduralBakeKernel default.hlsl -Fo procedural_bake.dxil
 //
 // Then generate this header (PowerShell):
-//   python3 gen_directx_header.py default_vs.dxil default_ps.dxil fxaa_vs.dxil fxaa_ps.dxil downsample_ps.dxil > directx_default.h
+//   python3 gen_directx_header.py default_vs.dxil default_ps.dxil fxaa_vs.dxil fxaa_ps.dxil downsample_ps.dxil procedural_bake.dxil > directx_default.h
 //
 // Or using the CMake custom target added for WIN32 builds (see CMakeLists.txt TODO).
 
@@ -31,5 +32,8 @@ static const unsigned int  kDefaultDirectXFxaaPixelShaderSize = 0;
 
 static const unsigned char kDefaultDirectXDownsamplePixelShader[1] = {0};
 static const unsigned int  kDefaultDirectXDownsamplePixelShaderSize = 0;
+
+static const unsigned char kDefaultDirectXProceduralBakeShader[1] = {0};
+static const unsigned int kDefaultDirectXProceduralBakeShaderSize = 0;
 
 } // namespace systems::leal::campello_renderer::shaders

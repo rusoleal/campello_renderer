@@ -501,6 +501,7 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         quantizedPipelines.clear();
         dracoPrimitiveBuffers.clear();
         deinterleavedBuffers.clear();
+        proceduralBakedTextures.clear();
         meshPool.clear();
         materialPool.clear();
         meshCache.clear();
@@ -1386,6 +1387,70 @@ void Renderer::setScene(uint32_t index) {
     // ------------------------------------------------------------------
     // Build GPU samplers from GLTF samplers.
     // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // KHR_texture_procedurals — bake procedural graphs into textures.
+    // ------------------------------------------------------------------
+    if (asset->khrTextureProcedurals && !asset->khrTextureProcedurals->procedurals.empty()) {
+        auto& procedurals = asset->khrTextureProcedurals->procedurals;
+        for (auto& mat : *asset->materials) {
+            auto bakeIfNeeded = [&](const std::shared_ptr<systems::leal::gltf::TextureInfo>& texInfo) {
+                if (!texInfo || !texInfo->khrTextureProcedurals) return;
+                int64_t graphIdx = texInfo->khrTextureProcedurals->index;
+                const std::string& outputName = texInfo->khrTextureProcedurals->output;
+                if (graphIdx < 0 || graphIdx >= (int64_t)procedurals.size()) return;
+
+                std::string key = "graph:" + std::to_string(graphIdx) + ":output:" + outputName;
+                if (proceduralBakedTextures.count(key)) return; // already baked
+
+                const auto& graph = procedurals[graphIdx];
+                auto pixels = device
+                    ? bakeProceduralTextureGPU(device, *asset, graph, outputName,
+                                                proceduralBakeSize, proceduralBakeSize)
+                    : bakeProceduralTexture(*asset, graph, outputName,
+                                             proceduralBakeSize, proceduralBakeSize);
+                auto texture = device->createTexture(
+                    GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
+                    proceduralBakeSize, proceduralBakeSize, 1, 1, 1,
+                    GPU::TextureUsage::textureBinding);
+                if (texture) {
+                    texture->upload(0, pixels.size(), pixels.data());
+                    proceduralBakedTextures[key] = texture;
+                }
+            };
+
+            if (mat.pbrMetallicRoughness) {
+                bakeIfNeeded(mat.pbrMetallicRoughness->baseColorTexture);
+                bakeIfNeeded(mat.pbrMetallicRoughness->metallicRoughnessTexture);
+            }
+            bakeIfNeeded(mat.normalTexture);
+            bakeIfNeeded(mat.emissiveTexture);
+            bakeIfNeeded(mat.occlusionTexture);
+            if (mat.khrMaterialsTransmission)
+                bakeIfNeeded(mat.khrMaterialsTransmission->transmissionTexture);
+            if (mat.khrMaterialsClearcoat) {
+                bakeIfNeeded(mat.khrMaterialsClearcoat->clearcoatTexture);
+                bakeIfNeeded(mat.khrMaterialsClearcoat->clearcoatRoughnessTexture);
+                bakeIfNeeded(mat.khrMaterialsClearcoat->clearcoatNormalTexture);
+            }
+            if (mat.khrMaterialsSheen) {
+                bakeIfNeeded(mat.khrMaterialsSheen->sheenColorTexture);
+                bakeIfNeeded(mat.khrMaterialsSheen->sheenRoughnessTexture);
+            }
+            if (mat.khrMaterialsSpecular) {
+                bakeIfNeeded(mat.khrMaterialsSpecular->specularTexture);
+                bakeIfNeeded(mat.khrMaterialsSpecular->specularColorTexture);
+            }
+            if (mat.khrMaterialsVolume)
+                bakeIfNeeded(mat.khrMaterialsVolume->thicknessTexture);
+            if (mat.khrMaterialsIridescence) {
+                bakeIfNeeded(mat.khrMaterialsIridescence->iridescenceTexture);
+                bakeIfNeeded(mat.khrMaterialsIridescence->iridescenceThicknessTexture);
+            }
+            if (mat.khrMaterialsAnisotropy)
+                bakeIfNeeded(mat.khrMaterialsAnisotropy->anisotropyTexture);
+        }
+    }
+
     gpuSamplers.clear();
     if (asset->samplers) {
         gpuSamplers.resize(asset->samplers->size());
@@ -1426,6 +1491,20 @@ void Renderer::setScene(uint32_t index) {
                 if (!texInfo || texInfo->index < 0 || !asset->textures) {
                     return;
                 }
+
+                // KHR_texture_procedurals: use baked texture if available.
+                if (texInfo->khrTextureProcedurals) {
+                    int64_t graphIdx = texInfo->khrTextureProcedurals->index;
+                    const std::string& outputName = texInfo->khrTextureProcedurals->output;
+                    std::string key = "graph:" + std::to_string(graphIdx) + ":output:" + outputName;
+                    auto it = proceduralBakedTextures.find(key);
+                    if (it != proceduralBakedTextures.end() && it->second) {
+                        outTex = it->second;
+                        outSamp = defaultSampler;
+                        return;
+                    }
+                }
+
                 size_t texIdx = (size_t)texInfo->index;
                 if (texIdx >= asset->textures->size()) return;
 
@@ -5277,6 +5356,14 @@ float Renderer::getSsaaScale() const {
     return ssaaScale;
 }
 
+void Renderer::setProceduralBakeSize(int size) {
+    proceduralBakeSize = std::max(1, size);
+}
+
+int Renderer::getProceduralBakeSize() const {
+    return proceduralBakeSize;
+}
+
 void Renderer::ensureSceneColorTexture() {
     namespace GPU = systems::leal::campello_gpu;
     using TU = GPU::TextureUsage;
@@ -5558,6 +5645,10 @@ GpuMesh* Renderer::uploadMesh(const systems::leal::gltf::Primitive& primitive,
         if (idxBuf) {
             mesh->indexBuffer = idxBuf;
             mesh->indexCount  = (uint32_t)idxAcc.count;
+            using CT = systems::leal::gltf::ComponentType;
+            mesh->indexFormat = (idxAcc.componentType == CT::ctUnsignedShort)
+                ? GPU::IndexFormat::uint16
+                : GPU::IndexFormat::uint32;
         }
     }
 
@@ -6114,8 +6205,13 @@ void Renderer::render(const RenderScene& scene,
     auto uploadOneTransform = [&](const systems::leal::campello_renderer::DrawCall& draw) {
         float matrices[32] = {0};
         auto mvp = vpMatrix * draw.worldTransform;
-        for (int i = 0; i < 16; ++i) matrices[i] = (float)mvp.data[i];
-        for (int i = 0; i < 16; ++i) matrices[i + 16] = (float)draw.worldTransform.data[i];
+        // Transpose from row-major (vector_math) to column-major (Metal) format.
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 4; ++col) {
+                matrices[col * 4 + row]      = (float)mvp.data[row * 4 + col];
+                matrices[16 + col * 4 + row] = (float)draw.worldTransform.data[row * 4 + col];
+            }
+        }
         transformBuffer->upload(txOffset, 128, matrices);
         transformOffsets.push_back(txOffset);
         txOffset += 128;
@@ -6682,7 +6778,7 @@ void Renderer::renderPrimitive(
 
     // --- 7. Draw ---
     if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
-        rpe->setIndexBuffer(draw.mesh->indexBuffer, GPU::IndexFormat::uint32, 0);
+        rpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
         rpe->drawIndexed(draw.mesh->indexCount, draw.instanceCount);
     } else {
         rpe->draw(draw.mesh->vertexCount, draw.instanceCount);

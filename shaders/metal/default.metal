@@ -1110,3 +1110,360 @@ fragment float4 downsampleFragment(FxaaOut in [[stage_in]],
     float2 uv = in.position.xy / float2(sceneTex.get_width(), sceneTex.get_height());
     return sceneTex.sample(sceneSampler, uv);
 }
+
+// ---------------------------------------------------------------------------
+// Procedural texture bake compute shader — uber-shader VM interpreter.
+//
+// Each thread evaluates the full procedural graph for one pixel.
+// The graph is flattened to an array of ProceduralNode structs (bytecode).
+// A fixed-size register file of float4 values holds intermediate results.
+//
+// Bindings:
+//   [[buffer(0)]]  — ProceduralBakeUniforms (constant)
+//   [[buffer(1)]]  — ProceduralNode[] node bytecode (read-only storage)
+//   [[buffer(2)]]  — float4[] output pixels (read-write storage)
+// ---------------------------------------------------------------------------
+
+struct ProceduralNode {
+    float4   value;     // inline constant / parameters
+    uint32_t op;        // ProceduralOp opcode
+    uint32_t outReg;    // output register index
+    uint32_t inA;       // input register A  (0xFFFFFFFF = none)
+    uint32_t inB;       // input register B
+    uint32_t inC;       // input register C
+    uint32_t inD;       // input register D
+    uint32_t flags;     // type / swizzle / presence mask
+    uint32_t pad;
+};
+
+struct ProceduralBakeUniforms {
+    uint32_t width;
+    uint32_t height;
+    uint32_t nodeCount;
+    uint32_t outputReg;
+    uint32_t outputComponents; // 1=float, 2=vec2, 3=vec3/color3, 4=color4
+    uint32_t pad[3];
+};
+
+// Opcodes — must match C++ ProceduralOp enum exactly.
+constant uint32_t OP_CONSTANT      = 0;
+constant uint32_t OP_TEXCOORD      = 1;
+constant uint32_t OP_ADD           = 2;
+constant uint32_t OP_SUBTRACT      = 3;
+constant uint32_t OP_MULTIPLY      = 4;
+constant uint32_t OP_DIVIDE        = 5;
+constant uint32_t OP_FLOOR         = 6;
+constant uint32_t OP_MODULO        = 7;
+constant uint32_t OP_ABS           = 8;
+constant uint32_t OP_CLAMP         = 9;
+constant uint32_t OP_POWER         = 10;
+constant uint32_t OP_SQRT          = 11;
+constant uint32_t OP_MAX           = 12;
+constant uint32_t OP_MIN           = 13;
+constant uint32_t OP_SIN           = 14;
+constant uint32_t OP_COS           = 15;
+constant uint32_t OP_DOTPRODUCT    = 16;
+constant uint32_t OP_CROSSPRODUCT  = 17;
+constant uint32_t OP_LENGTH        = 18;
+constant uint32_t OP_DISTANCE      = 19;
+constant uint32_t OP_NORMALIZE     = 20;
+constant uint32_t OP_MIX           = 21;
+constant uint32_t OP_NOISE2D       = 22;
+constant uint32_t OP_CHECKERBOARD  = 23;
+constant uint32_t OP_PLACE2D       = 24;
+constant uint32_t OP_SWIZZLE       = 25;
+constant uint32_t OP_COMBINE       = 26;
+constant uint32_t OP_EXTRACT       = 27;
+constant uint32_t OP_IFGREATER     = 28;
+constant uint32_t OP_IFEQUAL       = 29;
+
+// Presence flags occupy bits 8-11 so they don't collide with swizzle
+// (bits 0-7), extract (bits 0-1), or combine count (bits 0-3).
+constant uint32_t FLAG_HAS_A = 0x0100;
+constant uint32_t FLAG_HAS_B = 0x0200;
+constant uint32_t FLAG_HAS_C = 0x0400;
+constant uint32_t FLAG_HAS_D = 0x0800;
+
+// Noise permutation table (identical to CPU baker).
+constant int kPerm[512] = {
+    151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,
+    8,99,37,240,21,10,23,190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,
+    35,11,32,57,177,33,88,237,149,56,87,174,20,125,136,171,168,68,175,74,165,71,
+    134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,105,92,41,
+    55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,
+    18,169,200,196,135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,
+    250,124,123,5,202,38,147,118,126,255,82,85,212,207,206,59,227,47,16,58,17,182,
+    189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,153,101,155,167,43,
+    172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,
+    228,251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,
+    107,49,192,214,31,181,199,106,157,184,84,204,176,115,121,50,45,127,4,150,254,
+    138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180,
+    151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,
+    8,99,37,240,21,10,23,190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,
+    35,11,32,57,177,33,88,237,149,56,87,174,20,125,136,171,168,68,175,74,165,71,
+    134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,105,92,41,
+    55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,
+    18,169,200,196,135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,
+    250,124,123,5,202,38,147,118,126,255,82,85,212,207,206,59,227,47,16,58,17,182,
+    189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,153,101,155,167,43,
+    172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,
+    228,251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,
+    107,49,192,214,31,181,199,106,157,184,84,204,176,115,121,50,45,127,4,150,254,
+    138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180
+};
+
+static inline float fade(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+static inline float lerp(float a, float b, float t) {
+    return a + t * (b - a);
+}
+
+static inline float grad(int hash, float x, float y) {
+    int h = hash & 7;
+    float u = h < 4 ? x : -x;
+    float v = h < 2 || h == 5 || h == 6 ? y : -y;
+    return u + v;
+}
+
+static float perlin2D(float x, float y) {
+    int X = int(floor(x)) & 255;
+    int Y = int(floor(y)) & 255;
+    x -= floor(x);
+    y -= floor(y);
+    float u = fade(x);
+    float v = fade(y);
+    int A = kPerm[X] + Y;
+    int B = kPerm[X + 1] + Y;
+    return lerp(v, lerp(u, grad(kPerm[A], x, y), grad(kPerm[B], x - 1.0f, y)),
+                   lerp(u, grad(kPerm[A + 1], x, y - 1.0f), grad(kPerm[B + 1], x - 1.0f, y - 1.0f)));
+}
+
+static float noise2D(float x, float y) {
+    return (perlin2D(x, y) + 1.0f) * 0.5f;
+}
+
+static float fbm2D(float x, float y, int octaves, float lacunarity, float gain) {
+    float total = 0.0f;
+    float amplitude = 1.0f;
+    float frequency = 1.0f;
+    float maxValue = 0.0f;
+    for (int i = 0; i < octaves; i++) {
+        total += noise2D(x * frequency, y * frequency) * amplitude;
+        maxValue += amplitude;
+        amplitude *= gain;
+        frequency *= lacunarity;
+    }
+    return total / maxValue;
+}
+
+kernel void proceduralBakeKernel(
+    uint3                           tpitg      [[thread_position_in_threadgroup]],
+    uint3                           tpg        [[threadgroup_position_in_grid]],
+    uint3                           tptg       [[threads_per_threadgroup]],
+    constant ProceduralBakeUniforms &uniforms  [[buffer(0)]],
+    device const ProceduralNode    *nodes      [[buffer(1)]],
+    device float4                  *outPixels  [[buffer(2)]])
+{
+    // campello_gpu dispatches 1-D threadgroups of size (threadExecutionWidth,1,1).
+    // We reconstruct a flat thread index and divide by threads-per-workgroup to
+    // get the pixel index, so that exactly one work-group maps to one pixel.
+    uint flatThread = tpg.y * (uniforms.width * tptg.x) + tpg.x * tptg.x + tpitg.x;
+    uint pixelIndex = flatThread / tptg.x;
+    if (pixelIndex >= uniforms.width * uniforms.height) return;
+
+    uint x = pixelIndex % uniforms.width;
+    uint y = pixelIndex / uniforms.width;
+
+    const uint32_t REG_COUNT = 64;
+    float4 regs[REG_COUNT];
+    for (uint32_t i = 0; i < REG_COUNT; i++) regs[i] = float4(0.0f);
+
+    float u = (float(x) + 0.5f) / float(uniforms.width);
+    float v = (float(y) + 0.5f) / float(uniforms.height);
+
+    for (uint32_t n = 0; n < uniforms.nodeCount; n++) {
+        ProceduralNode node = nodes[n];
+        float4 a = (node.flags & FLAG_HAS_A) ? regs[node.inA] : float4(0.0f);
+        float4 b = (node.flags & FLAG_HAS_B) ? regs[node.inB] : float4(0.0f);
+        float4 c = (node.flags & FLAG_HAS_C) ? regs[node.inC] : float4(0.0f);
+        float4 d = (node.flags & FLAG_HAS_D) ? regs[node.inD] : float4(0.0f);
+
+        float4 r = float4(0.0f);
+
+        switch (node.op) {
+            case OP_CONSTANT:
+                r = node.value;
+                break;
+            case OP_TEXCOORD:
+                r = float4(u, v, 0.0f, 0.0f);
+                break;
+            case OP_ADD:
+                r = a + b;
+                break;
+            case OP_SUBTRACT:
+                r = a - b;
+                break;
+            case OP_MULTIPLY:
+                r = a * b;
+                break;
+            case OP_DIVIDE:
+                r = float4(
+                    b.x != 0.0f ? a.x / b.x : 0.0f,
+                    b.y != 0.0f ? a.y / b.y : 0.0f,
+                    b.z != 0.0f ? a.z / b.z : 0.0f,
+                    b.w != 0.0f ? a.w / b.w : 0.0f);
+                break;
+            case OP_FLOOR:
+                r = floor(a);
+                break;
+            case OP_MODULO: {
+                float4 bv = b;
+                bv.x = bv.x == 0.0f ? 1e-6f : bv.x;
+                bv.y = bv.y == 0.0f ? 1e-6f : bv.y;
+                bv.z = bv.z == 0.0f ? 1e-6f : bv.z;
+                bv.w = bv.w == 0.0f ? 1e-6f : bv.w;
+                float4 m = fmod(a, bv);
+                m.x = m.x < 0.0f ? m.x + abs(bv.x) : m.x;
+                m.y = m.y < 0.0f ? m.y + abs(bv.y) : m.y;
+                m.z = m.z < 0.0f ? m.z + abs(bv.z) : m.z;
+                m.w = m.w < 0.0f ? m.w + abs(bv.w) : m.w;
+                r = m;
+                break;
+            }
+            case OP_ABS:
+                r = abs(a);
+                break;
+            case OP_CLAMP:
+                r = clamp(a, b, c);
+                break;
+            case OP_POWER:
+                r = pow(a, b);
+                break;
+            case OP_SQRT:
+                r = sqrt(abs(a));
+                break;
+            case OP_MAX:
+                r = max(a, b);
+                break;
+            case OP_MIN:
+                r = min(a, b);
+                break;
+            case OP_SIN:
+                r = sin(a);
+                break;
+            case OP_COS:
+                r = cos(a);
+                break;
+            case OP_DOTPRODUCT:
+                r.x = dot(a.xyz, b.xyz);
+                break;
+            case OP_CROSSPRODUCT:
+                r.xyz = cross(a.xyz, b.xyz);
+                break;
+            case OP_LENGTH:
+                r.x = length(a.xyz);
+                break;
+            case OP_DISTANCE:
+                r.x = distance(a.xyz, b.xyz);
+                break;
+            case OP_NORMALIZE:
+                r.xyz = normalize(a.xyz);
+                break;
+            case OP_MIX:
+                r = mix(a, b, c.x);
+                break;
+            case OP_NOISE2D: {
+                float u_in = (node.flags & FLAG_HAS_A) ? a.x : u;
+                float v_in = (node.flags & FLAG_HAS_A) ? a.y : v;
+                int octaves   = int(node.value.x);
+                float lacun   = node.value.y;
+                float gain    = node.value.z;
+                float scale   = node.value.w;
+                if (octaves < 1) octaves = 1;
+                if (octaves > 8) octaves = 8;
+                float val = fbm2D(u_in * scale, v_in * scale, octaves, lacun, gain);
+                r = float4(val, val, val, 1.0f);
+                break;
+            }
+            case OP_CHECKERBOARD: {
+                float u_in = (node.flags & FLAG_HAS_A) ? a.x : u;
+                float v_in = (node.flags & FLAG_HAS_A) ? a.y : v;
+                float tx = node.value.x;
+                float ty = node.value.y;
+                bool check = (int(floor(u_in * tx)) + int(floor(v_in * ty))) % 2 == 0;
+                r = check ? b : c;
+                break;
+            }
+            case OP_PLACE2D: {
+                float u_in = (node.flags & FLAG_HAS_A) ? a.x : u;
+                float v_in = (node.flags & FLAG_HAS_A) ? a.y : v;
+                float2 offset  = node.value.xy;
+                float2 scale   = node.value.zw;
+                float rot = node.flags & FLAG_HAS_B ? b.x : 0.0f;
+                float2 pivot = float2(0.5f, 0.5f);
+                float2 uv = float2(u_in, v_in);
+                float cosR = cos(rot);
+                float sinR = sin(rot);
+                float2 rv = uv - pivot;
+                float2 rotUV = float2(rv.x * cosR - rv.y * sinR, rv.x * sinR + rv.y * cosR);
+                rotUV += pivot;
+                float2 outUV = (rotUV - pivot) * scale + pivot + offset;
+                r = float4(outUV.x, outUV.y, 0.0f, 0.0f);
+                break;
+            }
+            case OP_SWIZZLE: {
+                uint32_t sx = (node.flags >> 0) & 3;
+                uint32_t sy = (node.flags >> 2) & 3;
+                uint32_t sz = (node.flags >> 4) & 3;
+                uint32_t sw = (node.flags >> 6) & 3;
+                float4 v = a;
+                r.x = (sx == 0) ? v.x : (sx == 1) ? v.y : (sx == 2) ? v.z : v.w;
+                r.y = (sy == 0) ? v.x : (sy == 1) ? v.y : (sy == 2) ? v.z : v.w;
+                r.z = (sz == 0) ? v.x : (sz == 1) ? v.y : (sz == 2) ? v.z : v.w;
+                r.w = (sw == 0) ? v.x : (sw == 1) ? v.y : (sw == 2) ? v.z : v.w;
+                break;
+            }
+            case OP_COMBINE: {
+                uint32_t count = node.flags & 0xFF;
+                r.x = a.x;
+                r.y = count > 1 ? b.x : 0.0f;
+                r.z = count > 2 ? c.x : 0.0f;
+                r.w = count > 3 ? d.x : 1.0f;
+                break;
+            }
+            case OP_EXTRACT: {
+                uint32_t comp = node.flags & 3;
+                r = float4(a[comp], a[comp], a[comp], a[comp]);
+                break;
+            }
+            case OP_IFGREATER:
+                r = a.x > b.x ? c : d;
+                break;
+            case OP_IFEQUAL:
+                r = abs(a.x - b.x) < 1e-5f ? c : d;
+                break;
+            default:
+                break;
+        }
+
+        regs[node.outReg] = r;
+    }
+
+    float4 final = regs[uniforms.outputReg];
+    uint32_t comp = uniforms.outputComponents;
+    if (comp == 1) {
+        // Match CPU baker: float outputs only populate the R channel.
+        final = float4(final.x, 0.0f, 0.0f, 1.0f);
+    } else if (comp == 2) {
+        final = float4(final.x, final.y, 0.0f, 1.0f);
+    } else if (comp == 3) {
+        final = float4(final.x, final.y, final.z, 1.0f);
+    } else if (comp == 4) {
+        final = float4(final.x, final.y, final.z, final.w);
+    }
+
+    uint32_t idx = y * uniforms.width + x;
+    outPixels[idx] = saturate(final);
+}

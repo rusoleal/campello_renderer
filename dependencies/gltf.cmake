@@ -10,13 +10,23 @@ endif()
 
 include(FetchContent)
 
-FetchContent_Declare(
-        extern_gltf
-        #SOURCE_DIR ../src/gpu/vulkan_android
-        GIT_REPOSITORY https://github.com/rusoleal/gltf
-        GIT_TAG        v0.4.1
-)
+# Use local gltf for rapid iteration, otherwise fetch from GitHub.
+set(GLTF_LOCAL_PATH "/Users/rubenleal/Projects/gltf")
 
+if(EXISTS "${GLTF_LOCAL_PATH}/CMakeLists.txt")
+    message(STATUS "Using local gltf: ${GLTF_LOCAL_PATH}")
+    FetchContent_Declare(
+            extern_gltf
+            SOURCE_DIR ${GLTF_LOCAL_PATH}
+    )
+else()
+    message(STATUS "Fetching gltf v0.4.1 from GitHub")
+    FetchContent_Declare(
+            extern_gltf
+            GIT_REPOSITORY https://github.com/rusoleal/gltf
+            GIT_TAG        v0.4.1
+    )
+endif()
 
 if(NOT extern_gltf_POPULATED)
     FetchContent_GetProperties(extern_gltf)

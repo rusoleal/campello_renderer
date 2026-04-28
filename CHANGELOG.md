@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.7.0] - 2026-04-28
+
+### Added
+- **KHR_texture_procedurals support** — Load-time procedural texture baking:
+  - CPU baker `bakeProceduralTexture()` evaluates node graphs (constant, mix, noise2D, checkerboard, sin, place2D, image, swizzle, combine, extract, ifGreater, length, distance, crossProduct, normalize)
+  - GPU baker `bakeProceduralTextureGPU()` dispatches a compute shader per pixel; falls back to CPU for unsupported nodes (e.g. `image`) or pipeline creation failures
+  - `setProceduralBakeSize(int)` / `getProceduralBakeSize()` controls resolution (default 1024)
+  - `setScene()` automatically bakes procedural textures referenced by materials and caches them keyed by `"graph:<index>:output:<name>"`
+  - New public header: `inc/campello_renderer/procedural_texture_baker.hpp`
+  - 23 procedural baker tests: 16 CPU (`ProceduralBakerTest`) + 7 GPU (`ProceduralBakerGPUTest`)
+- **Offscreen rendering test suite** — GPU integration tests without window/swapchain:
+  - `OffscreenRenderTest` fixture creates real GPU textures with `renderTarget | copySrc`, renders, and reads back pixels for verification
+  - 7 tests covering: basic clear color, multiple consecutive renders (frame ring buffer), resize, mesh rendering, ECS path rendering, BGRA8 pixel format
+- **ECS path matrix transpose fix** — `uploadOneTransform` now transposes row-major `vector_math::Matrix4` to column-major `float4x4` for Metal shaders, matching the glTF path behavior
+- **`GpuMesh::indexFormat`** — New field defaults to `uint32`; `uploadMesh()` sets it from glTF accessor component type (`UNSIGNED_SHORT` → `uint16`). ECS `renderPrimitive()` uses the mesh's format instead of hardcoding `uint32`
+
+### Changed
+- Upgraded `campello_gpu` dependency from v0.13.0 to v0.13.1
+- Regenerated embedded shader headers (Metal, Vulkan, DirectX) from latest shader sources
+
+### Fixed
+- ECS offscreen rendering now correctly renders geometry (was rendering only clear color due to garbage MVP matrices)
+- glTF meshes with `UNSIGNED_SHORT` indices now render correctly via the ECS path
+
 ## [0.6.0] - 2026-04-27
 
 ### Added

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project(campello_renderer VERSION 0.6.0)
+project(campello_renderer VERSION 0.7.0)
 
 configure_file(src/campello_renderer_config.h.in campello_renderer_config.h)
 
@@ -31,6 +31,7 @@ set(DEPENDENCIES
 add_library(${PROJECT_NAME} SHARED
     src/campello_renderer.cpp
     src/animation.cpp
+    src/procedural_texture_baker.cpp
 )
 
 # Enable Unity Build for faster compilation

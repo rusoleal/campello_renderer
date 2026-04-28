@@ -19,12 +19,12 @@ if(EXISTS "${CAMPELLO_GPU_LOCAL_PATH}/CMakeLists.txt")
             SOURCE_DIR ${CAMPELLO_GPU_LOCAL_PATH}
     )
 else()
-    message(STATUS "Fetching campello_gpu v0.13.0 from GitHub")
+    message(STATUS "Fetching campello_gpu v0.13.1 from GitHub")
     include(FetchContent)
     FetchContent_Declare(
             extern_campello_gpu
             GIT_REPOSITORY https://github.com/rusoleal/campello_gpu
-            GIT_TAG        v0.13.0
+            GIT_TAG        v0.13.1
     )
 endif()
 
