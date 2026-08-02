@@ -156,3 +156,14 @@ Expected equality of these values:
   "0.1.1"
 ```
 Always verify tests pass after version bumps.
+
+## Releasing
+
+1. Add a new `## [x.y.z] - YYYY-MM-DD` entry to `CHANGELOG.md` (Added/Changed/Fixed sections), matching the style of existing entries.
+2. Bump the version in all locations listed under Versioning above; rebuild and run `ctest` to confirm the version-string test passes.
+3. Commit and push to `main`.
+4. Create the GitHub release with `gh release create vX.Y.Z --title vX.Y.Z ...` — pushing the tag triggers `.github/workflows/release.yml` (`on: push: tags: 'v*'`), which builds Linux/Windows/macOS/iOS/Android packages and attaches them via `softprops/action-gh-release`.
+5. **Wait for that workflow to finish** (`gh run watch <run-id>` or `gh run list --workflow release.yml`) before writing the final release notes — its `create-release` job runs with `generate_release_notes: true` and no explicit `body`, which overwrites whatever notes were set at creation time with GitHub's raw auto-generated commit list.
+6. Once CI has finished, set the real release notes with `gh release edit vX.Y.Z --notes "..."`. The release description must contain:
+   - A short (3–6 bullet) summary of the version's highlights, drawn from the new `CHANGELOG.md` entry — not the raw auto-generated commit list.
+   - A link to the full changelog detail, e.g. `https://github.com/rusoleal/campello_renderer/blob/vX.Y.Z/CHANGELOG.md#xyz---yyyy-mm-dd`.
