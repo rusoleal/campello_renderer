@@ -21,6 +21,7 @@ void GltfAnimator::setAsset(std::shared_ptr<gltf::GLTF> newAsset) {
     asset = std::move(newAsset);
     animationStates.clear();
     animatedNodes.clear();
+    animatedWeights.clear();
 }
 
 void GltfAnimator::initDuration(int32_t animIndex) {
@@ -57,6 +58,7 @@ void GltfAnimator::update(double dt) {
     if (animationStates.empty()) return;
 
     animatedNodes.clear();
+    animatedWeights.clear();
     animatedPointers.clear();
 
     for (auto &pair : animationStates) {
@@ -219,16 +221,43 @@ void GltfAnimator::sampleAnimation(int32_t animIndex, float time) {
                     v0[1] + (v1[1] - v0[1]) * t,
                     v0[2] + (v1[2] - v0[2]) * t);
             }
+        } else if (channel.target.path == "weights") {
+            // Output accessor is scalar, packed as numTargets floats per
+            // keyframe (interleaved across all morph targets of the node's
+            // mesh), per the glTF 2.0 spec's "weights" animation channel.
+            auto &node = (*asset->nodes)[(size_t)channel.target.node];
+            if (node.mesh < 0 || !asset->meshes || (size_t)node.mesh >= asset->meshes->size()) continue;
+            auto &mesh = (*asset->meshes)[(size_t)node.mesh];
+            if (mesh.primitives.empty()) continue;
+            size_t numTargets = mesh.primitives[0].targets.size();
+            if (numTargets == 0) continue;
+
+            const float *v0 = reinterpret_cast<const float*>(values) + kf0 * numTargets;
+            auto &outWeights = animatedWeights[nodeIdx];
+            outWeights.resize(numTargets);
+            if (sampler.interpolation == gltf::AnimationInterpolation::aiStep) {
+                for (size_t i = 0; i < numTargets; ++i) outWeights[i] = v0[i];
+            } else {
+                const float *v1 = reinterpret_cast<const float*>(values) + kf1 * numTargets;
+                for (size_t i = 0; i < numTargets; ++i) {
+                    outWeights[i] = v0[i] + (v1[i] - v0[i]) * t;
+                }
+            }
         }
     }
 }
 
 void GltfAnimator::clearAnimatedNodes() {
     animatedNodes.clear();
+    animatedWeights.clear();
 }
 
 const std::unordered_map<uint64_t, GltfAnimator::AnimatedTRS>& GltfAnimator::getAnimatedNodes() const {
     return animatedNodes;
+}
+
+const std::unordered_map<uint64_t, std::vector<float>>& GltfAnimator::getAnimatedWeights() const {
+    return animatedWeights;
 }
 
 void GltfAnimator::playAnimation(uint32_t animationIndex) {
@@ -260,6 +289,7 @@ void GltfAnimator::stopAnimation(uint32_t animationIndex) {
     }
     if (!anyPlaying) {
         animatedNodes.clear();
+        animatedWeights.clear();
         animatedPointers.clear();
     }
 }
@@ -270,6 +300,7 @@ void GltfAnimator::stopAllAnimations() {
         pair.second.time = 0.0;
     }
     animatedNodes.clear();
+    animatedWeights.clear();
     animatedPointers.clear();
 }
 

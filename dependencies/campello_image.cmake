@@ -11,7 +11,7 @@ endif()
 include(FetchContent)
 
 # Use local campello_image for rapid iteration, otherwise fetch from GitHub.
-set(CAMPELLO_IMAGE_LOCAL_PATH "/Users/rubenleal/Projects/campello_image")
+set(CAMPELLO_IMAGE_LOCAL_PATH "/Users/rubenleal/Documents/GitHub/campello_image")
 
 if(EXISTS "${CAMPELLO_IMAGE_LOCAL_PATH}/CMakeLists.txt")
     message(STATUS "Using local campello_image: ${CAMPELLO_IMAGE_LOCAL_PATH}")

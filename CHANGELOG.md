@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.8.0] - 2026-08-02
+
+### Added
+- **Sparse accessor support** — `resolveAccessorBytes()` resolves any vertex attribute accessor's base bufferView data (or an implicit zero base if absent) with `accessor.sparse` indices/values overlaid on top. Applied to the deinterleaving pass, COLOR_0 conversion, and morph target deltas. Scoped to vertex attributes only — sparse `primitive.indices` is not handled (rare in practice).
+- **Morph target support** — POSITION and NORMAL blending (TANGENT not implemented) for up to 8 targets per primitive:
+  - `GltfAnimator` gained an `animatedWeights` map + `getAnimatedWeights()`, and `sampleAnimation()` now handles the `"weights"` animation channel path (linear and step interpolation)
+  - `Renderer::updateMorphWeights()` resolves weight precedence (`node.weights` > `mesh.weights` > animated override) into a per-node `MorphInfo` uniform each frame
+  - New vertex buffer slots 21–23 (`MorphInfo`, position deltas, normal deltas), bound in both the primary glTF-driven `renderPrimitive()` path and the ECS `drawDrawCall()` path (the latter always binds the zero-weight fallback, since standalone `uploadMesh()` meshes don't carry morph data)
+  - Metal shader blends targets before skinning, matching glTF's evaluation order
+- **COLOR_0 and multi-UV (`texCoord`) support** — `COLOR_0` (VEC3/VEC4, float or normalized ubyte/ushort) is normalized to a canonical float4 buffer and multiplied into `baseColor` per spec; every texture reference now respects its own `texCoord` index (0 or 1) via a per-material bitmask and `selectUV()` in the shader, instead of always sampling `TEXCOORD_0`. New vertex slots 6 (COLOR_0) and 7 (TEXCOORD_1).
+- **KHR_materials_iridescence rewritten** to the actual Khronos reference algorithm (multi-bounce Airy summation with CIE XYZ sensitivity curves), replacing a naive 3-wavelength cosine approximation.
+- **KHR_materials_emissive_strength** — `emissiveFactor` is now multiplied by the extension's strength before upload (was previously ignored).
+- **On-demand rendering** in the macOS example — MTKView's continuous CVDisplayLink drives a per-tick dirty-flag gate (`requestRedraw`/`_needsRedraw`) instead of manual `setNeedsDisplay:` invalidation, avoiding cross-display vsync races while still skipping GPU work for static scenes.
+- Embedded default environment map replaced with a genuine 1024×512 Radiance HDR (was an 8-bit tonemapped JPEG that hard-capped highlights at 1.0), with exposure correction (`kBuiltinEnvironmentExposure`) calibrated against the source HDRI's real radiance values; built-in cubemap bake resolution raised from 128px to 512px per face.
+
+### Changed
+- Upgraded `gltf` dependency from v0.4.2 to v0.5.0.
+- Upgraded `campello_gpu` dependency from v0.21.0 to v0.21.1.
+- Fixed stale `campello_gpu.cmake` / `campello_image.cmake` local-path overrides pointing at nonexistent `/Users/rubenleal/Projects/...` directories (silently always falling back to GitHub fetch for local dev builds); now point at the actual local checkouts.
+
+### Fixed
+- **Animation delta-time bug (macOS example)** — `drawInMTKView:` was advancing the animation clock by a hardcoded 1/60s every call regardless of actual elapsed time, so any frame slower than 16.7ms (heavy scenes, the per-frame `waitForIdle()`, GPU contention) silently ran animations in slow motion. Now measures real elapsed time via `CACurrentMediaTime()`, captured every display-link tick (so idle/static periods don't accumulate into a catch-up jump when animation resumes) and clamped to 0.25s for genuine stalls.
+- **MaterialUniforms iridescence offset bug** — a phantom padding float inserted before `iridescenceFactor` (based on a false assumption that Metal needed alignment padding between two plain floats) shifted every field from `iridescenceFactor` through `dispersion` one float late relative to the compiled Metal struct layout, silently disabling `KHR_materials_iridescence` for every asset using it.
+- **Transparent draw-order sort** — used the node's own local translation as a distance proxy, which ties (and falls to undefined `std::sort` order) for coincident "shell" meshes sharing a parent with zero local offset; now uses `nodeWorldBounds[nodeIndex]`'s center.
+- **Metallic materials routed to the flat pipeline** — materials with `metallicFactor > 0` but no textures (e.g. `metallicFactor` defaulting to 1.0 when omitted) were rendered with zero reflections; now routed to the textured/IBL pipeline like other reflective materials.
+- **UNSIGNED_BYTE index buffers** — the index-format ternary defaulted any non-`UNSIGNED_SHORT` component type to `uint32`, including the spec-legal but uncommon `UNSIGNED_BYTE`, reading 4× too much data per index from a 1-byte-per-index buffer and producing corrupted geometry. Now widened to `uint16` at scene-load time.
+- `fragmentMain_flat` was dropping `emissiveFactor` entirely (materials with near-black `baseColor` + `KHR_materials_emissive_strength` and no textures rendered invisible).
+- Skybox fragment shader was missing tonemapping, clipping/saturating raw HDR background values.
+- `__weak` local variable in `ViewController.mm` (compiles under MRC, not ARC) caused a hard compile error.
+
 ## [0.7.0] - 2026-04-28
 
 ### Added

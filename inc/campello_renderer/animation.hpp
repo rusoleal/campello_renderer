@@ -45,6 +45,9 @@ public:
     // Returns the map of animated node transforms.
     const std::unordered_map<uint64_t, AnimatedTRS>& getAnimatedNodes() const;
 
+    // Returns the map of animated morph target weights, keyed by node index.
+    const std::unordered_map<uint64_t, std::vector<float>>& getAnimatedWeights() const;
+
     // Returns the map of animated pointer values (KHR_animation_pointer).
     const std::unordered_map<std::string, std::vector<float>>& getAnimatedPointers() const;
 
@@ -74,6 +77,7 @@ private:
     std::shared_ptr<systems::leal::gltf::GLTF> asset;
     std::unordered_map<int32_t, AnimationState> animationStates;
     std::unordered_map<uint64_t, AnimatedTRS> animatedNodes;
+    std::unordered_map<uint64_t, std::vector<float>> animatedWeights;
     std::unordered_map<std::string, std::vector<float>> animatedPointers;
 
     void initDuration(int32_t animIndex);

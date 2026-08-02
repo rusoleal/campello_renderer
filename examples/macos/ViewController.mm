@@ -19,6 +19,7 @@
 #import <gltf/gltf.hpp>
 
 #import <simd/simd.h>
+#import <QuartzCore/QuartzCore.h>
 #include <future>
 #include <vector>
 
@@ -152,8 +153,8 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
     BOOL    _rightMouseDown;
     BOOL    _debugModeEnabled;
     CGSize  _lastDrawableSize;
-
-    dispatch_queue_t _renderQueue;
+    BOOL    _needsRedraw;
+    CFTimeInterval _lastTickTime;
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +182,17 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
     _metalView.clearColor              = MTLClearColorMake(0.08, 0.08, 0.10, 1.0);
     _metalView.delegate                = self;
     _metalView.preferredFramesPerSecond = 60;
+    // Keep MTKView's own internal CVDisplayLink running continuously rather
+    // than driving redraws via setNeedsDisplay: on a Mac with multiple
+    // displays at different refresh rates (e.g. 60Hz + 144Hz), the display
+    // link is the only thing that reliably tracks whichever screen the
+    // window is actually on. Manually invalidating via setNeedsDisplay races
+    // against that per-display vsync and occasionally presents a stale
+    // drawable while a newer one is still in flight — visible as flicker /
+    // "old camera position" frames during interaction, worse under load.
+    // Instead, drawInMTKView: is called every tick but skips all GPU work
+    // via the _needsRedraw flag when nothing actually changed, so a static
+    // scene still costs effectively nothing.
     [container addSubview:_metalView];
 
     // Transparent overlay view for drag-and-drop.
@@ -205,8 +217,6 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
 // ---------------------------------------------------------------------------
 
 - (void)setupGPU {
-    _renderQueue = dispatch_queue_create("com.campello.render", DISPATCH_QUEUE_SERIAL);
-
     _device = gpu::Device::createDefaultDevice(nullptr);
     if (!_device) {
         NSLog(@"campello_gpu: failed to create device");
@@ -220,14 +230,38 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
     _renderer->createDefaultPipelines(gpu::PixelFormat::bgra8unorm);
 
     CGSize sz = _metalView.drawableSize;
-    dispatch_sync(_renderQueue, ^{
-        _renderer->resize((uint32_t)sz.width, (uint32_t)sz.height);
-    });
+    _renderer->resize((uint32_t)sz.width, (uint32_t)sz.height);
+   
     _lastDrawableSize = sz;
     
     _debugModeEnabled = NO;
 
     NSLog(@"ViewMode hotkeys: 0 normal, 1 worldNormal, 2 baseColor, 3 metallic, 4 roughness, 5 occlusion, 6 emissive, 7 alpha, 8 uv0, 9 specularFactor, q specularColor, w sheenColor, e sheenRoughness, r clearcoat, t clearcoatRoughness, y clearcoatNormal, u transmission, i environment");
+
+    // Render the first frame once setup is complete.
+    _needsRedraw = YES;
+}
+
+// ---------------------------------------------------------------------------
+// On-demand redraw scheduling
+// ---------------------------------------------------------------------------
+
+// Call after any change that affects what's on screen (camera move, asset
+// load, menu/hotkey toggle, resize). MTKView's internal display link keeps
+// calling drawInMTKView: every tick regardless (see loadView for why); this
+// flag just tells the next tick to actually do the GPU work instead of
+// skipping it. All call sites are on the main thread.
+- (void)requestRedraw {
+    _needsRedraw = YES;
+}
+
+- (BOOL)anyAnimationPlaying {
+    if (!_renderer) return NO;
+    uint32_t count = _renderer->getAnimationCount();
+    for (uint32_t i = 0; i < count; ++i) {
+        if (_renderer->isAnimationPlaying(i)) return YES;
+    }
+    return NO;
 }
 
 // ---------------------------------------------------------------------------
@@ -276,24 +310,24 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
 
     NSLog(@"campello_renderer_macos: loaded %@", url.lastPathComponent);
 
-    dispatch_sync(_renderQueue, ^{
-        _renderer->setAsset(asset);
-        _camera.fitBounds(_renderer->getBoundsRadius());
+    _renderer->setAsset(asset);
+    _camera.fitBounds(_renderer->getBoundsRadius());
 
-        uint32_t animCount = _renderer->getAnimationCount();
-        NSLog(@"Animations found: %u", animCount);
-        for (uint32_t i = 0; i < animCount; ++i) {
-            NSLog(@"  Animation %u: %s (duration: %.2fs)", 
-                  i, 
-                  _renderer->getAnimationName(i).c_str(),
-                  _renderer->getAnimationDuration(i));
-        }
+    uint32_t animCount = _renderer->getAnimationCount();
+    NSLog(@"Animations found: %u", animCount);
+    for (uint32_t i = 0; i < animCount; ++i) {
+        NSLog(@"  Animation %u: %s (duration: %.2fs)", 
+              i, 
+              _renderer->getAnimationName(i).c_str(),
+              _renderer->getAnimationDuration(i));
+    }
 
-        if (animCount > 0) {
-            _renderer->playAnimation(0);
-            NSLog(@"Auto-playing animation: %s", _renderer->getAnimationName(0).c_str());
-        }
-    });
+    if (animCount > 0) {
+        _renderer->playAnimation(0);
+        NSLog(@"Auto-playing animation: %s", _renderer->getAnimationName(0).c_str());
+    }
+   
+    [self requestRedraw];
 }
 
 // ---------------------------------------------------------------------------
@@ -301,45 +335,80 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
 // ---------------------------------------------------------------------------
 
 - (void)drawInMTKView:(MTKView *)view {
-    if (!_renderer || !_renderQueue) return;
+    if (!_renderer) return;
+
+    // Measured unconditionally, on every tick, even the ones that skip all
+    // GPU work below — this is what keeps the gap accurate. MTKView invokes
+    // this delegate method every vsync tick regardless (see loadView), so
+    // consecutive calls are ~1 vsync apart even while the scene is static;
+    // only a genuinely stalled/backgrounded app produces a larger gap, which
+    // the clamp below bounds to a single catch-up step instead of a jump.
+    CFTimeInterval now = CACurrentMediaTime();
+    double dt = (_lastTickTime > 0) ? (now - _lastTickTime) : (1.0 / 60.0);
+    _lastTickTime = now;
+    if (dt < 0.0) dt = 0.0;
+    if (dt > 0.25) dt = 0.25;
+
+    // Called every tick of MTKView's internal, per-display-correct vsync
+    // timer. Skip all GPU work — including acquiring a drawable — unless
+    // something actually changed, so a static scene costs nothing beyond
+    // this flag check.
+    BOOL animating = [self anyAnimationPlaying];
+    if (!_needsRedraw && !animating) return;
+    _needsRedraw = NO;
 
     id<CAMetalDrawable> drawable = view.currentDrawable;
     if (!drawable || !drawable.texture) return;
     if (drawable.texture.pixelFormat == MTLPixelFormatInvalid) return;
 
-    dispatch_sync(_renderQueue, ^{
-        // Update animations (call with 1/60s delta time for 60fps).
-        _renderer->update(1.0 / 60.0);
+    // Update animations using the real elapsed time since the last tick —
+    // a fixed 1/60s here silently ran every animation in slow motion
+    // whenever a frame took longer than one vsync interval (heavy scenes,
+    // the waitForIdle() below, GPU contention), since the animation clock
+    // was advanced by less than the wall-clock time that actually passed.
+    _renderer->update(dt);
 
-        // Use the ACTUAL drawable texture size for rendering.
-        CGSize sz = CGSizeMake(drawable.texture.width, drawable.texture.height);
-        if (sz.width == 0 || sz.height == 0) return;
+    // Use the ACTUAL drawable texture size for rendering.
+    CGSize sz = CGSizeMake(drawable.texture.width, drawable.texture.height);
+    if (sz.width == 0 || sz.height == 0) return;
 
-        BOOL didResize = NO;
-        if (sz.width != _lastDrawableSize.width || sz.height != _lastDrawableSize.height) {
-            NSLog(@"[RESIZE] drawable %.0fx%.0f → last %.0fx%.0f  (calling resize %dx%d)",
-                  sz.width, sz.height, _lastDrawableSize.width, _lastDrawableSize.height,
-                  (int)sz.width, (int)sz.height);
-            _renderer->resize((uint32_t)sz.width, (uint32_t)sz.height);
-            _lastDrawableSize = sz;
-            didResize = YES;
-        }
-        
-        float aspect = (float)(sz.width / sz.height);
-        simd_float4x4 viewMat = _camera.viewMatrix();
-        simd_float4x4 projMat = _camera.projectionMatrix(aspect);
-        _renderer->setCameraMatrices((const float *)&viewMat, (const float *)&projMat);
+    BOOL didResize = NO;
+    if (sz.width != _lastDrawableSize.width || sz.height != _lastDrawableSize.height) {
+        NSLog(@"[RESIZE] drawable %.0fx%.0f → last %.0fx%.0f  (calling resize %dx%d)",
+              sz.width, sz.height, _lastDrawableSize.width, _lastDrawableSize.height,
+              (int)sz.width, (int)sz.height);
+        _renderer->resize((uint32_t)sz.width, (uint32_t)sz.height);
+        _lastDrawableSize = sz;
+        didResize = YES;
+    }
 
-        // Render to the current drawable's texture.
-        auto colorView = gpu::TextureView::fromNative((__bridge void *)drawable.texture);
-        if (colorView) _renderer->render(colorView);
+    float aspect = (float)(sz.width / sz.height);
+    simd_float4x4 viewMat = _camera.viewMatrix();
+    simd_float4x4 projMat = _camera.projectionMatrix(aspect);
+    _renderer->setCameraMatrices((const float *)&viewMat, (const float *)&projMat);
 
-        if (didResize) {
-            NSLog(@"[RESIZE] frame submitted after resize to %dx%d", (int)sz.width, (int)sz.height);
-        }
+    // Render to the current drawable's texture.
+    auto colorView = gpu::TextureView::fromNative((__bridge void *)drawable.texture);
+    if (colorView) _renderer->render(colorView);
 
-        [drawable present];
-    });
+    if (didResize) {
+        NSLog(@"[RESIZE] frame submitted after resize to %dx%d", (int)sz.width, (int)sz.height);
+    }
+
+    // Renderer::render() submits GPU work asynchronously and returns without
+    // waiting for it to finish. Calling [drawable present] directly (as
+    // opposed to tying presentation to the command buffer via
+    // presentDrawable:, which our GPU abstraction doesn't expose here) does
+    // NOT wait for that GPU work to complete — it schedules presentation
+    // "as soon as possible". Since drawables cycle through a pool, that lets
+    // the compositor show a drawable before this frame's render has
+    // actually finished writing to it, i.e. whatever was left over from a
+    // few frames ago in that same physical texture. Wait for the GPU here so
+    // the texture is guaranteed complete before it's shown.
+    if (_device) {
+        _device->waitForIdle();
+    }
+    [drawable present];
 }
 
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
@@ -347,6 +416,7 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
     // depth texture size to the real drawable texture size.  On macOS
     // the drawable pool can lag behind drawableSizeWillChange: by a
     // frame, so resizing here creates a depth/color attachment mismatch.
+    [self requestRedraw];
 }
 
 // ---------------------------------------------------------------------------
@@ -367,22 +437,22 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
 }
 
 - (IBAction)toggleDebugMode:(id)sender {
-    if (!_renderer || !_renderQueue) return;
+    if (!_renderer) return;
 
-    dispatch_sync(_renderQueue, ^{
-        rend::ViewMode nextMode = _renderer->getViewMode() == rend::ViewMode::worldNormal
-            ? rend::ViewMode::normal
-            : rend::ViewMode::worldNormal;
-        _renderer->setViewMode(nextMode);
-        
-        // Update menu item state
-        if ([sender isKindOfClass:[NSMenuItem class]]) {
-            NSMenuItem *item = (NSMenuItem *)sender;
-            item.state = (_renderer->getViewMode() == rend::ViewMode::worldNormal)
-                ? NSControlStateValueOn
-                : NSControlStateValueOff;
-        }
-    });
+    rend::ViewMode nextMode = _renderer->getViewMode() == rend::ViewMode::worldNormal
+        ? rend::ViewMode::normal
+        : rend::ViewMode::worldNormal;
+    _renderer->setViewMode(nextMode);
+    
+    // Update menu item state
+    if ([sender isKindOfClass:[NSMenuItem class]]) {
+        NSMenuItem *item = (NSMenuItem *)sender;
+        item.state = (_renderer->getViewMode() == rend::ViewMode::worldNormal)
+            ? NSControlStateValueOn
+            : NSControlStateValueOff;
+    }
+   
+    [self requestRedraw];
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +478,7 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
     } else {
         _camera.orbit(-dx * 0.005f, dy * 0.005f);
     }
+    [self requestRedraw];
 }
 
 - (void)rightMouseDown:(NSEvent *)event {
@@ -423,11 +494,13 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
     float dy = (float)(pos.y - _lastMousePos.y);
     _lastMousePos = pos;
     _camera.pan(dx, dy);
+    [self requestRedraw];
 }
 
 - (void)scrollWheel:(NSEvent *)event {
     float delta = (float)event.deltaY;
     _camera.zoom(event.hasPreciseScrollingDeltas ? delta * 0.2f : delta);
+    [self requestRedraw];
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -440,11 +513,11 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
 }
 
 - (void)applyViewMode:(rend::ViewMode)mode {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        _renderer->setViewMode(mode);
-        _debugModeEnabled = (mode == rend::ViewMode::worldNormal);
-    });
+    if (!_renderer) return;
+    _renderer->setViewMode(mode);
+    _debugModeEnabled = (mode == rend::ViewMode::worldNormal);
+   
+    [self requestRedraw];
     NSLog(@"View mode: %@", ViewModeName(mode));
 }
 
@@ -453,76 +526,76 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
 // ---------------------------------------------------------------------------
 
 - (IBAction)togglePunctualLights:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        bool enabled = !_renderer->isPunctualLightsEnabled();
-        _renderer->setPunctualLightsEnabled(enabled);
-        NSLog(@"Punctual lights: %@", enabled ? @"ON" : @"OFF");
-    });
+    if (!_renderer) return;
+    bool enabled = !_renderer->isPunctualLightsEnabled();
+    _renderer->setPunctualLightsEnabled(enabled);
+    NSLog(@"Punctual lights: %@", enabled ? @"ON" : @"OFF");
+   
     if ([sender isKindOfClass:[NSMenuItem class]]) {
         NSMenuItem *item = (NSMenuItem *)sender;
         item.state = _renderer->isPunctualLightsEnabled() ? NSControlStateValueOn : NSControlStateValueOff;
     }
+    [self requestRedraw];
 }
 
 - (IBAction)toggleDefaultLight:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        bool enabled = !_renderer->isDefaultLightEnabled();
-        _renderer->setDefaultLightEnabled(enabled);
-        NSLog(@"Default light: %@", enabled ? @"ON" : @"OFF");
-    });
+    if (!_renderer) return;
+    bool enabled = !_renderer->isDefaultLightEnabled();
+    _renderer->setDefaultLightEnabled(enabled);
+    NSLog(@"Default light: %@", enabled ? @"ON" : @"OFF");
+   
     if ([sender isKindOfClass:[NSMenuItem class]]) {
         NSMenuItem *item = (NSMenuItem *)sender;
         item.state = _renderer->isDefaultLightEnabled() ? NSControlStateValueOn : NSControlStateValueOff;
     }
+    [self requestRedraw];
 }
 
 - (IBAction)setBackgroundDark:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        _renderer->setClearColor(0.08f, 0.08f, 0.10f, 1.0f);
-    });
+    if (!_renderer) return;
+    _renderer->setClearColor(0.08f, 0.08f, 0.10f, 1.0f);
+   
+    [self requestRedraw];
 }
 
 - (IBAction)setBackgroundGray:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        _renderer->setClearColor(0.35f, 0.35f, 0.38f, 1.0f);
-    });
+    if (!_renderer) return;
+    _renderer->setClearColor(0.35f, 0.35f, 0.38f, 1.0f);
+   
+    [self requestRedraw];
 }
 
 - (IBAction)setBackgroundLight:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        _renderer->setClearColor(0.78f, 0.82f, 0.88f, 1.0f);
-    });
+    if (!_renderer) return;
+    _renderer->setClearColor(0.78f, 0.82f, 0.88f, 1.0f);
+   
+    [self requestRedraw];
 }
 
 - (IBAction)toggleSkybox:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        bool enabled = !_renderer->isSkyboxEnabled();
-        _renderer->setSkyboxEnabled(enabled);
-        NSLog(@"Skybox: %@", enabled ? @"ON" : @"OFF");
-    });
+    if (!_renderer) return;
+    bool enabled = !_renderer->isSkyboxEnabled();
+    _renderer->setSkyboxEnabled(enabled);
+    NSLog(@"Skybox: %@", enabled ? @"ON" : @"OFF");
+   
     if ([sender isKindOfClass:[NSMenuItem class]]) {
         NSMenuItem *item = (NSMenuItem *)sender;
         item.state = _renderer->isSkyboxEnabled() ? NSControlStateValueOn : NSControlStateValueOff;
     }
+    [self requestRedraw];
 }
 
 - (IBAction)toggleIBL:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        bool enabled = !_renderer->isIBLEnabled();
-        _renderer->setIBLEnabled(enabled);
-        NSLog(@"IBL: %@", enabled ? @"ON" : @"OFF");
-    });
+    if (!_renderer) return;
+    bool enabled = !_renderer->isIBLEnabled();
+    _renderer->setIBLEnabled(enabled);
+    NSLog(@"IBL: %@", enabled ? @"ON" : @"OFF");
+   
     if ([sender isKindOfClass:[NSMenuItem class]]) {
         NSMenuItem *item = (NSMenuItem *)sender;
         item.state = _renderer->isIBLEnabled() ? NSControlStateValueOn : NSControlStateValueOff;
     }
+    [self requestRedraw];
 }
 
 - (IBAction)loadEnvironmentMap:(id)sender {
@@ -540,83 +613,83 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
         NSString *path = url.path;
         std::string cppPath = std::string([path UTF8String]);
 
-        dispatch_sync(_renderQueue, ^{
-            auto tex = _renderer->loadEquirectangularEnvironmentMap(cppPath, 0);
-            if (tex) {
-                _renderer->setEnvironmentMap(tex);
-                _renderer->setSkyboxEnabled(true);
-                _renderer->setIBLEnabled(true);
-                NSLog(@"Environment map loaded: %@", path.lastPathComponent);
-            } else {
-                NSLog(@"Failed to load environment map: %@", path);
-            }
-        });
+        auto tex = _renderer->loadEquirectangularEnvironmentMap(cppPath, 0);
+        if (tex) {
+            _renderer->setEnvironmentMap(tex);
+            _renderer->setSkyboxEnabled(true);
+            _renderer->setIBLEnabled(true);
+            NSLog(@"Environment map loaded: %@", path.lastPathComponent);
+        } else {
+            NSLog(@"Failed to load environment map: %@", path);
+        }
+   
+        [self requestRedraw];
     }];
 }
 
 - (IBAction)setBackgroundSolid:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        _renderer->setSkyboxEnabled(false);
-        _renderer->setIBLEnabled(false);
-        _renderer->setClearColor(0.08f, 0.08f, 0.10f, 1.0f);
-    });
+    if (!_renderer) return;
+    _renderer->setSkyboxEnabled(false);
+    _renderer->setIBLEnabled(false);
+    _renderer->setClearColor(0.08f, 0.08f, 0.10f, 1.0f);
+   
+    [self requestRedraw];
     NSLog(@"Background: Solid Color (Dark)");
 }
 
 - (IBAction)setBackgroundSkybox:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        _renderer->setSkyboxEnabled(true);
-        _renderer->setIBLEnabled(false);
-    });
+    if (!_renderer) return;
+    _renderer->setSkyboxEnabled(true);
+    _renderer->setIBLEnabled(false);
+   
+    [self requestRedraw];
     NSLog(@"Background: Skybox");
 }
 
 - (IBAction)setBackgroundSkyboxIBL:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        _renderer->setSkyboxEnabled(true);
-        _renderer->setIBLEnabled(true);
-    });
+    if (!_renderer) return;
+    _renderer->setSkyboxEnabled(true);
+    _renderer->setIBLEnabled(true);
+   
+    [self requestRedraw];
     NSLog(@"Background: Skybox + IBL");
 }
 
 - (IBAction)toggleFXAA:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        bool enabled = !_renderer->isFxaaEnabled();
-        _renderer->setFxaaEnabled(enabled);
-        NSLog(@"FXAA: %@", enabled ? @"ON" : @"OFF");
-    });
+    if (!_renderer) return;
+    bool enabled = !_renderer->isFxaaEnabled();
+    _renderer->setFxaaEnabled(enabled);
+    NSLog(@"FXAA: %@", enabled ? @"ON" : @"OFF");
+   
     if ([sender isKindOfClass:[NSMenuItem class]]) {
         NSMenuItem *item = (NSMenuItem *)sender;
         item.state = _renderer->isFxaaEnabled() ? NSControlStateValueOn : NSControlStateValueOff;
     }
+    [self requestRedraw];
 }
 
 - (IBAction)setSsaaOff:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        _renderer->setSsaaScale(1.0f);
-        NSLog(@"SSAA: OFF");
-    });
+    if (!_renderer) return;
+    _renderer->setSsaaScale(1.0f);
+    NSLog(@"SSAA: OFF");
+   
+    [self requestRedraw];
 }
 
 - (IBAction)setSsaa15x:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        _renderer->setSsaaScale(1.5f);
-        NSLog(@"SSAA: 1.5×");
-    });
+    if (!_renderer) return;
+    _renderer->setSsaaScale(1.5f);
+    NSLog(@"SSAA: 1.5×");
+   
+    [self requestRedraw];
 }
 
 - (IBAction)setSsaa20x:(id)sender {
-    if (!_renderer || !_renderQueue) return;
-    dispatch_sync(_renderQueue, ^{
-        _renderer->setSsaaScale(2.0f);
-        NSLog(@"SSAA: 2.0×");
-    });
+    if (!_renderer) return;
+    _renderer->setSsaaScale(2.0f);
+    NSLog(@"SSAA: 2.0×");
+   
+    [self requestRedraw];
 }
 
 - (BOOL)acceptsFirstResponder { return YES; }

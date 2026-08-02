@@ -50,7 +50,16 @@ using namespace metal;
 // ---------------------------------------------------------------------------
 
 // Per-material constants uploaded to buffer slot 17.
-// Layout (256-byte stride for Metal alignment):
+// Layout (368 bytes, within the 512-byte per-slot stride). Offsets below are
+// the actual Metal-compiled byte offsets (verified against MSL's alignment
+// rules: float4 members require 16-byte alignment and pull in implicit
+// padding before them; plain float members after another plain float need
+// NO padding). Keep this comment in sync with the struct below by hand —
+// a previous drift here (a phantom pad float assumed before iridescenceFactor
+// that Metal never actually inserts) shifted every field from
+// iridescenceFactor through dispersion one float late relative to what the
+// CPU-side uniform builder (buildSlotRaw in campello_renderer.cpp) wrote,
+// silently zeroing KHR_materials_iridescence for every asset that used it.
 //   [0..15]   baseColorFactor         — RGBA multiplier for base color
 //   [16..31]  uvTransformRow0         — row 0 of KHR_texture_transform [a, b, tx, hasTransform]
 //   [32..47]  uvTransformRow1         — row 1 of KHR_texture_transform [c, d, ty, 0]
@@ -64,43 +73,50 @@ using namespace metal;
 //   [76..79]  hasEmissiveTexture      — 0=no emissive map, 1=has emissive map
 //   [80..83]  hasOcclusionTexture     — 0=no occlusion map, 1=has occlusion map
 //   [84..87]  occlusionStrength       — scalar occlusion strength (default 1.0)
-//   [88..91]  _padding                — explicit pad; Metal inserts 4 more implicit bytes before float3
-//   [96..107] emissiveFactor          — RGB emissive factor (float3, 16-byte aligned in Metal → offset 96)
-//   [108..111] ior                    — KHR_materials_ior index of refraction (default 1.5)
-//   [112..115] specularFactor         — KHR_materials_specular scalar weight (default 1.0)
-//   [116..119] hasSpecularTexture     — 0=no specular texture, 1=has specular texture (A channel)
-//   [120..123] hasSpecularColorTexture — 0=no specular color texture, 1=has specular color texture (RGB)
-//   [124..127] _pad2                  — explicit pad before float3
-//   [128..139] specularColorFactor    — KHR_materials_specular F0 color tint (float3, default [1,1,1])
-//   [140..143] _pad3                  — explicit pad before float3
-//   [144..155] sheenColorFactor       — KHR_materials_sheen color (float3, default [0,0,0])
-//   [156..159] sheenRoughnessFactor   — KHR_materials_sheen roughness (default 0.0)
-//   [160..163] hasSheenColorTexture   — 0=no sheen color texture, 1=has sheen color texture (RGB sRGB)
-//   [164..167] hasSheenRoughnessTexture — 0=no sheen roughness texture, 1=has sheen roughness texture (R)
-//   [168..171] clearcoatFactor         — KHR_materials_clearcoat layer intensity (default 0.0)
-//   [172..175] clearcoatRoughnessFactor — KHR_materials_clearcoat roughness (default 0.0)
-//   [176..179] hasClearcoatTexture     — 0=no, 1=has clearcoat intensity texture (R channel)
-//   [180..183] hasClearcoatRoughnessTexture — 0=no, 1=has clearcoat roughness texture (G channel)
-//   [184..187] hasClearcoatNormalTexture — 0=no, 1=has clearcoat normal texture
-//   [188..191] clearcoatNormalScale    — clearcoat normal map intensity (default 1.0)
-//   [192..195] transmissionFactor      — KHR_materials_transmission scalar (default 0.0 = opaque)
-//   [196..199] hasTransmissionTexture  — 0=no, 1=has transmission texture (R channel)
-//   [200..203] thicknessFactor         — KHR_materials_volume thickness (default 0.0)
-//   [204..207] attenuationDistance     — KHR_materials_volume mean free path (default +inf)
-//   [208..223] attenuationColor        — KHR_materials_volume absorption tint (float3, default [1,1,1])
-//   [224..227] viewMode                — renderer inspection mode enum
-//   [228..231] environmentIntensity    — IBL/environment multiplier
-//   [232..235] iblEnabled              — 0=no IBL, 1=IBL active
-//   [236..239] iridescenceFactor       — KHR_materials_iridescence scalar
-//   [240..243] iridescenceIor          — thin-film IOR
-//   [244..247] iridescenceThicknessMin — thin-film thickness minimum (nm)
-//   [248..251] iridescenceThicknessMax — thin-film thickness maximum (nm)
-//   [252..255] hasIridescenceTexture   — 0=no, 1=has iridescence texture
-//   [256..259] hasIridescenceThicknessTexture — 0=no, 1=has thickness texture
-//   [260..263] anisotropyStrength      — KHR_materials_anisotropy strength
-//   [264..267] anisotropicRotation     — rotation angle (radians)
-//   [268..271] hasAnisotropicTexture   — 0=no, 1=has anisotropy texture
-//   [272..275] dispersion              — KHR_materials_dispersion scalar (default 0.0)
+//   [88..91]  _padding                — explicit pad; Metal inserts 4 more implicit bytes before float4
+//   [96..111] emissiveFactor          — RGB emissive factor (float4, 16-byte aligned in Metal → offset 96)
+//   [112..115] ior                    — KHR_materials_ior index of refraction (default 1.5)
+//   [116..119] specularFactor         — KHR_materials_specular scalar weight (default 1.0)
+//   [120..123] hasSpecularTexture     — 0=no specular texture, 1=has specular texture (A channel)
+//   [124..127] hasSpecularColorTexture — 0=no specular color texture, 1=has specular color texture (RGB)
+//   [128..131] _pad2                  — explicit pad; Metal inserts 12 more implicit bytes before float4
+//   [144..159] specularColorFactor    — KHR_materials_specular F0 color tint (float4, default [1,1,1])
+//   [160..163] _pad3                  — explicit pad; Metal inserts 12 more implicit bytes before float4
+//   [176..191] sheenColorFactor       — KHR_materials_sheen color (float4, default [0,0,0])
+//   [192..195] sheenRoughnessFactor   — KHR_materials_sheen roughness (default 0.0)
+//   [196..199] hasSheenColorTexture   — 0=no sheen color texture, 1=has sheen color texture (RGB sRGB)
+//   [200..203] hasSheenRoughnessTexture — 0=no sheen roughness texture, 1=has sheen roughness texture (R)
+//   [204..207] clearcoatFactor         — KHR_materials_clearcoat layer intensity (default 0.0)
+//   [208..211] clearcoatRoughnessFactor — KHR_materials_clearcoat roughness (default 0.0)
+//   [212..215] hasClearcoatTexture     — 0=no, 1=has clearcoat intensity texture (R channel)
+//   [216..219] hasClearcoatRoughnessTexture — 0=no, 1=has clearcoat roughness texture (G channel)
+//   [220..223] hasClearcoatNormalTexture — 0=no, 1=has clearcoat normal texture
+//   [224..227] clearcoatNormalScale    — clearcoat normal map intensity (default 1.0)
+//   [228..231] transmissionFactor      — KHR_materials_transmission scalar (default 0.0 = opaque)
+//   [232..235] hasTransmissionTexture  — 0=no, 1=has transmission texture (R channel)
+//   [236..239] thicknessFactor         — KHR_materials_volume thickness (default 0.0)
+//   [240..243] attenuationDistance     — KHR_materials_volume mean free path (default +inf)
+//   [244..247] hasThicknessTexture     — 0=no, 1=has thickness texture
+//   [248..251] _padVol                 — explicit pad; Metal inserts 4 more implicit bytes before float4
+//   [256..271] attenuationColor        — KHR_materials_volume absorption tint (float4, default [1,1,1])
+//   [272..275] viewMode                — renderer inspection mode enum
+//   [276..279] environmentIntensity    — IBL/environment multiplier
+//   [280..283] iblEnabled              — 0=no IBL, 1=IBL active
+//   [284..287] iridescenceFactor       — KHR_materials_iridescence scalar (no padding before this: two
+//                                        plain floats back to back need none)
+//   [288..291] iridescenceIor          — thin-film IOR
+//   [292..295] iridescenceThicknessMin — thin-film thickness minimum (nm)
+//   [296..299] iridescenceThicknessMax — thin-film thickness maximum (nm)
+//   [300..303] hasIridescenceTexture   — 0=no, 1=has iridescence texture
+//   [304..307] hasIridescenceThicknessTexture — 0=no, 1=has thickness texture
+//   [308..311] anisotropyStrength      — KHR_materials_anisotropy strength
+//   [312..315] anisotropicRotation     — rotation angle (radians)
+//   [316..319] hasAnisotropicTexture   — 0=no, 1=has anisotropy texture
+//   [320..323] dispersion              — KHR_materials_dispersion scalar (default 0.0)
+//   [336..351] normalUvTransformRow0   — independent KHR_texture_transform for normalTexture:
+//                                        row 0 [a, b, tx, hasTransform] (Metal inserts 12 implicit
+//                                        bytes at [324..335] before this float4)
+//   [352..367] normalUvTransformRow1   — row 1 [c, d, ty, unused]
 struct MaterialUniforms {
     float4 baseColorFactor;
     float4 uvTransformRow0;
@@ -154,7 +170,40 @@ struct MaterialUniforms {
     float  anisotropyRotation;
     float  hasAnisotropicTexture;
     float  dispersion;            // KHR_materials_dispersion (default 0.0)
+    float4 normalUvTransformRow0; // independent KHR_texture_transform for normalTexture
+    float4 normalUvTransformRow1;
+    // KHR spec: each texture reference has its own texCoord index (which
+    // TEXCOORD_n set it samples), independent of every other texture on the
+    // same material — e.g. occlusionTexture very commonly uses TEXCOORD_1
+    // (a separate baked-AO UV set) while baseColorTexture uses TEXCOORD_0.
+    // One bit per texture slot: set when that texture uses TEXCOORD_1
+    // instead of TEXCOORD_0. See TexCoord1Bit_* constants below.
+    float texCoord1Mask;
 };
+
+// Bit assignment for MaterialUniforms.texCoord1Mask — must match the order
+// textures are declared in fragmentMain_textured's argument list.
+constant uint kUV1BaseColor        = 1u << 0;
+constant uint kUV1MetallicRoughness = 1u << 1;
+constant uint kUV1Normal           = 1u << 2;
+constant uint kUV1Emissive         = 1u << 3;
+constant uint kUV1Occlusion        = 1u << 4;
+constant uint kUV1Specular         = 1u << 5;
+constant uint kUV1SpecularColor    = 1u << 6;
+constant uint kUV1SheenColor       = 1u << 7;
+constant uint kUV1SheenRoughness   = 1u << 8;
+constant uint kUV1Clearcoat        = 1u << 9;
+constant uint kUV1ClearcoatRoughness = 1u << 10;
+constant uint kUV1ClearcoatNormal  = 1u << 11;
+constant uint kUV1Transmission     = 1u << 12;
+constant uint kUV1Thickness        = 1u << 13;
+constant uint kUV1Iridescence      = 1u << 14;
+constant uint kUV1IridescenceThickness = 1u << 15;
+constant uint kUV1Anisotropic      = 1u << 16;
+
+inline float2 selectUV(float2 uv0, float2 uv1, float packedMask, uint bit) {
+    return (uint(packedMask) & bit) != 0 ? uv1 : uv0;
+}
 
 struct CameraUniforms {
     float4   cameraPos;
@@ -193,9 +242,11 @@ struct VertexIn {
     float4 tangent   [[attribute(3)]];
     uint4  joints    [[attribute(4)]];
     float4 weights   [[attribute(5)]];
+    float4 color0    [[attribute(6)]]; // COLOR_0, normalized to float4 on upload; (1,1,1,1) fallback
+    float2 texcoord1 [[attribute(7)]]; // TEXCOORD_1; (0,0) fallback
 };
 
-// VertexOut carries only geometric interpolants — 5 user attribute slots,
+// VertexOut carries only geometric interpolants — 7 user attribute slots,
 // well within Metal's limit of 32. All material constants are read in the
 // fragment shader directly from the constant MaterialUniforms buffer (slot 17).
 struct VertexOut {
@@ -205,6 +256,9 @@ struct VertexOut {
     float3 worldTangent;
     float3 worldBitangent;
     float2 texcoord0;
+    float2 normalUV;
+    float2 texcoord1;
+    float4 color0;
 };
 
 // ---------------------------------------------------------------------------
@@ -219,14 +273,35 @@ struct NodeTransforms {
     float4x4 model;
 };
 
+// Morph targets: packed as [targetCount, hasNormal, vertexCount, weights[8]]
+// to match the 11-float buffer the renderer uploads per node (updateMorphWeights).
+// Delta buffers are laid out target-major: target t's deltas for vertex v are
+// at index t * vertexCount + v, selected by [[vertex_id]] below.
+struct MorphInfo {
+    float targetCount;
+    float hasNormal;
+    float vertexCount;
+    float weights[8];
+};
+
 vertex VertexOut vertexMain(
     VertexIn                  in   [[stage_in]],
     device const NodeTransforms *nodeTransforms  [[buffer(16)]],
     constant MaterialUniforms &mat [[buffer(17)]],
     device const float4x4    *instanceMatrices   [[buffer(19)]],
-    device const float4x4    *jointMatrices      [[buffer(20)]])
+    device const float4x4    *jointMatrices      [[buffer(20)]],
+    constant MorphInfo       &morph              [[buffer(21)]],
+    device const float3      *morphPositions     [[buffer(22)]],
+    device const float3      *morphNormals       [[buffer(23)]],
+    uint                       vertexID          [[vertex_id]])
 {
     // Apply KHR_texture_transform when hasUVTransform flag (row0.w) is set.
+    // NOTE: transformedUV becomes VertexOut.texcoord0, the shared fallback UV
+    // every other texture's selectUV() call reads when its own texCoord1 bit
+    // is unset — it must stay TEXCOORD_0-based (transformed or not) so that
+    // fallback stays correct regardless of what baseColorTexture itself does.
+    // baseColorTexture's own possible texCoord=1 is applied separately, in
+    // the fragment shader, without touching this shared value.
     float2 transformedUV;
     if (mat.uvTransformRow0.w > 0.5) {
         float3 uv3   = float3(in.texcoord0, 1.0);
@@ -236,9 +311,42 @@ vertex VertexOut vertexMain(
         transformedUV = in.texcoord0;
     }
 
+    // normalTexture commonly carries its own KHR_texture_transform, distinct
+    // from baseColorTexture's (e.g. a tiled micro-detail normal map on a
+    // material with only a flat baseColorFactor) — must not reuse transformedUV.
+    float2 normalUV;
+    if (mat.normalUvTransformRow0.w > 0.5) {
+        // KHR_texture_transform is assumed to be authored against TEXCOORD_0
+        // even if normalTexture separately specifies texCoord=1 — combining
+        // both is a rare enough combination that it's not handled here.
+        float3 uv3n = float3(in.texcoord0, 1.0);
+        normalUV = float2(dot(mat.normalUvTransformRow0.xyz, uv3n),
+                          dot(mat.normalUvTransformRow1.xyz, uv3n));
+    } else {
+        normalUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1Normal);
+    }
+
+    // Morph targets applied before skinning, per glTF 2.0's evaluation order.
+    float3 morphedPosition = in.position;
+    float3 morphedNormal = in.normal;
+    uint morphTargetCount = uint(morph.targetCount);
+    if (morphTargetCount > 0) {
+        uint morphVertexCount = uint(morph.vertexCount);
+        bool morphHasNormal = morph.hasNormal > 0.5;
+        for (uint i = 0; i < morphTargetCount; i++) {
+            float w = morph.weights[i];
+            if (w != 0.0) {
+                morphedPosition += w * morphPositions[i * morphVertexCount + vertexID];
+                if (morphHasNormal) {
+                    morphedNormal += w * morphNormals[i * morphVertexCount + vertexID];
+                }
+            }
+        }
+    }
+
     // Skeletal mesh skinning: blend up to 4 joint matrices.
-    float4 skinnedPos = float4(in.position, 1.0);
-    float3 skinnedNormal = in.normal;
+    float4 skinnedPos = float4(morphedPosition, 1.0);
+    float3 skinnedNormal = morphedNormal;
     float3 skinnedTangent = in.tangent.xyz;
     float weightSum = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
     if (weightSum > 0.001 && jointMatrices != nullptr) {
@@ -250,8 +358,8 @@ vertex VertexOut vertexMain(
             if (w > 0.0) {
                 uint j = in.joints[i];
                 float4x4 jm = jointMatrices[j];
-                skinnedPos    += w * (jm * float4(in.position, 1.0));
-                skinnedNormal += w * (jm * float4(in.normal, 0.0)).xyz;
+                skinnedPos    += w * (jm * float4(morphedPosition, 1.0));
+                skinnedNormal += w * (jm * float4(morphedNormal, 0.0)).xyz;
                 skinnedTangent += w * (jm * float4(in.tangent.xyz, 0.0)).xyz;
             }
         }
@@ -292,6 +400,9 @@ vertex VertexOut vertexMain(
     out.worldTangent   = T;
     out.worldBitangent = B;
     out.texcoord0      = transformedUV;
+    out.normalUV       = normalUV;
+    out.texcoord1      = in.texcoord1;
+    out.color0         = in.color0;
 
     return out;
 }
@@ -303,7 +414,7 @@ fragment float4 fragmentMain_flat(
     VertexOut                 in  [[stage_in]],
     constant MaterialUniforms &mat [[buffer(17)]])
 {
-    float4 baseColor = mat.baseColorFactor;
+    float4 baseColor = mat.baseColorFactor * in.color0;
 
     // KHR_materials_transmission (simplified): additional transparency
     if (mat.transmissionFactor > 0.0) {
@@ -388,7 +499,7 @@ fragment float4 fragmentMain_flat(
     float3 diffuse = baseColor.rgb * NdotL * 0.8;
     float3 ambientColor = baseColor.rgb * ambient;
 
-    return float4(ambientColor + diffuse, baseColor.a);
+    return float4(ambientColor + diffuse + mat.emissiveFactor.xyz, baseColor.a);
 }
 
 // ---------------------------------------------------------------------------
@@ -450,31 +561,109 @@ float F_Schlick_scalar(float F0, float cosTheta) {
 
 // ---------------------------------------------------------------------------
 // Thin-film iridescence — KHR_materials_iridescence
-// Simplified analytical model: interference of reflected light from a thin
-// film. Returns an RGB Fresnel-like factor that modulates the base specular F0.
+// Port of the Khronos glTF-Sample-Viewer reference implementation (Belcour &
+// Barla, "A Practical Extension to Microfacet Theory for the Modeling of
+// Varying Iridescence"): multi-bounce Airy summation (m=0,1,2) over the
+// film's two interfaces with CIE XYZ sensitivity curves, rather than a naive
+// per-RGB-wavelength cosine approximation. The naive model gets the
+// interference *frequency* right but not the actual hue produced at a given
+// viewing angle (it was showing purple head-on / yellow at grazing angles
+// where the Khronos viewer — and this asset was authored against exactly
+// that viewer — shows blue head-on / purple at grazing).
 // ---------------------------------------------------------------------------
-float3 ThinFilmIridescence(float cosTheta, float thickness, float ior) {
-    // Wavelengths for RGB in nanometers
-    const float3 wavelengths = float3(650.0, 530.0, 470.0);
+constant float3x3 kXyzToRec709 = float3x3(
+    float3( 3.2404542, -0.9692660,  0.0556434),
+    float3(-1.5371385,  1.8760108, -0.2040259),
+    float3(-0.4985314,  0.0415560,  1.0572252)
+);
 
-    // Refracted angle via Snell's law
-    float sinTheta2 = 1.0 - cosTheta * cosTheta;
-    float cosTheta2 = sqrt(max(1.0 - sinTheta2 / (ior * ior), 0.0));
+float3 Fresnel0ToIor(float3 fresnel0) {
+    float3 sqrtF0 = sqrt(clamp(fresnel0, 0.0, 0.9999));
+    return (float3(1.0) + sqrtF0) / (float3(1.0) - sqrtF0);
+}
 
-    // Optical path difference
-    float opticalPath = 2.0 * ior * thickness * cosTheta2;
+// Unpolarized Fresnel reflectance at a dielectric/dielectric interface.
+float FresnelDielectric(float cosTheta1, float n1, float n2) {
+    float sinTheta2Sq = (n1 * n1) / (n2 * n2) * (1.0 - cosTheta1 * cosTheta1);
+    if (sinTheta2Sq > 1.0) return 1.0; // total internal reflection
+    float cosTheta2 = sqrt(1.0 - sinTheta2Sq);
+    float r_s = (n1 * cosTheta1 - n2 * cosTheta2) / (n1 * cosTheta1 + n2 * cosTheta2);
+    float r_p = (n2 * cosTheta1 - n1 * cosTheta2) / (n2 * cosTheta1 + n1 * cosTheta2);
+    return 0.5 * (r_s * r_s + r_p * r_p);
+}
 
-    // Phase for each wavelength
-    float3 phase = 6.28318530718 * opticalPath / wavelengths;
+float3 FresnelDielectric3(float cosTheta1, float n1, float3 n2) {
+    float3 sinTheta2Sq = (float3(n1 * n1) / (n2 * n2)) * (1.0 - cosTheta1 * cosTheta1);
+    float3 cosTheta2 = sqrt(clamp(float3(1.0) - sinTheta2Sq, float3(0.0), float3(1.0)));
+    float3 r_s = (n1 * cosTheta1 - n2 * cosTheta2) / (n1 * cosTheta1 + n2 * cosTheta2);
+    float3 r_p = (n2 * cosTheta1 - n1 * cosTheta2) / (n2 * cosTheta1 + n1 * cosTheta2);
+    return 0.5 * (r_s * r_s + r_p * r_p);
+}
 
-    // Fresnel reflection at air-film interface
-    float R = pow((1.0 - ior) / (1.0 + ior), 2.0);
+// Evaluate CIE XYZ sensitivity curves (as a sum of Gaussians in Fourier
+// space) for a given optical path difference (nanometers) and phase shift,
+// then convert to linear sRGB.
+float3 EvalSensitivity(float opd, float3 shift) {
+    float phase = 2.0 * M_PI_F * opd * 1.0e-9;
+    float3 val = float3(5.4856e-13, 4.4201e-13, 5.2481e-13);
+    float3 pos = float3(1.6810e+06, 1.7953e+06, 2.2084e+06);
+    float3 var = float3(4.3278e+09, 9.3046e+09, 6.6121e+09);
 
-    // First-order interference
-    float3 interference = 0.5 + 0.5 * cos(phase);
+    float3 xyz = val * sqrt(2.0 * M_PI_F * var) * cos(pos * phase + shift) * exp(-phase * phase * var);
+    xyz.x += 9.7470e-14 * sqrt(2.0 * M_PI_F * 4.5282e+09) * cos(2.2399e+06 * phase + shift.x) * exp(-4.5282e+09 * phase * phase);
+    xyz /= 1.0685e-7;
 
-    // Combine with base Fresnel
-    return saturate(interference * (1.0 - R) + R);
+    return kXyzToRec709 * xyz;
+}
+
+// Fresnel reflectance of a thin dielectric film (thickness in nm, IOR eta2)
+// sitting on top of a base material with Fresnel-0 reflectance baseF0,
+// viewed from a medium of IOR outsideIOR (1.0 = air) at cosTheta1 = NdotV.
+float3 EvalIridescence(float outsideIOR, float eta2, float cosTheta1, float thinFilmThickness, float3 baseF0) {
+    // Force iridescenceIor -> outsideIOR as thinFilmThickness -> 0, so a
+    // vanishing film smoothly falls back to the uncoated base F0.
+    float iridescenceIor = mix(outsideIOR, eta2, smoothstep(0.0, 0.03, thinFilmThickness));
+    float sinTheta2Sq = (outsideIOR * outsideIOR) / (iridescenceIor * iridescenceIor)
+                        * (1.0 - cosTheta1 * cosTheta1);
+    float cosTheta2Sq = 1.0 - sinTheta2Sq;
+    if (cosTheta2Sq < 0.0) {
+        return float3(1.0); // total internal reflection at the first interface
+    }
+    float cosTheta2 = sqrt(cosTheta2Sq);
+
+    // First interface: outside medium -> film.
+    float R12   = FresnelDielectric(cosTheta1, outsideIOR, iridescenceIor);
+    float T121  = 1.0 - R12;
+    float phi12 = (iridescenceIor < outsideIOR) ? M_PI_F : 0.0;
+    float phi21 = M_PI_F - phi12;
+
+    // Second interface: film -> base material.
+    float3 baseIOR = Fresnel0ToIor(baseF0);
+    float3 R23      = FresnelDielectric3(cosTheta2, iridescenceIor, baseIOR);
+    float3 phi23    = float3(baseIOR.x < iridescenceIor ? M_PI_F : 0.0,
+                             baseIOR.y < iridescenceIor ? M_PI_F : 0.0,
+                             baseIOR.z < iridescenceIor ? M_PI_F : 0.0);
+
+    // Phase shift and optical path difference for this viewing angle.
+    float  opd = 2.0 * iridescenceIor * thinFilmThickness * cosTheta2;
+    float3 phi = float3(phi21) + phi23;
+
+    // Multi-bounce (Airy summation) compound terms.
+    float3 R123 = clamp(float3(R12) * R23, float3(1e-5), float3(0.9999));
+    float3 r123 = sqrt(R123);
+    float3 Rs   = (T121 * T121) * R23 / (float3(1.0) - R123);
+
+    float3 C0 = float3(R12) + Rs;
+    float3 I  = C0;
+
+    float3 Cm = Rs - float3(T121);
+    for (int m = 1; m <= 2; ++m) {
+        Cm *= r123;
+        float3 Sm = 2.0 * EvalSensitivity(float(m) * opd, float(m) * phi);
+        I += Cm * Sm;
+    }
+
+    return max(I, float3(0.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -533,15 +722,27 @@ fragment float4 fragmentMain_textured(
     texture2d<float> iridescenceThicknessTexture [[texture(25)]],
     texture2d<float> anisotropicTexture          [[texture(26)]])
 {
+    // uv is the shared TEXCOORD_0-based fallback every other texture below
+    // reads unless it opts into texCoord=1 via its own selectUV() call.
     float2 uv = in.texcoord0;
 
-    // Sample base color texture.
-    float4 baseColor = baseColorTexture.sample(baseColorSampler, uv) * mat.baseColorFactor;
+    // baseColorTexture's own texCoord=1 is only honored when it has no
+    // KHR_texture_transform of its own — when it does, uv (== in.texcoord0)
+    // already carries that transform and combining both isn't handled (see
+    // transformedUV's comment in vertexMain).
+    float2 baseColorUV = (mat.uvTransformRow0.w > 0.5)
+        ? uv : selectUV(uv, in.texcoord1, mat.texCoord1Mask, kUV1BaseColor);
+
+    // Sample base color texture. COLOR_0 (glTF spec): finalBaseColor =
+    // baseColorFactor * baseColorTexture * COLOR_0. Fallback COLOR_0 is
+    // (1,1,1,1), so this is a no-op for primitives without vertex colors.
+    float4 baseColor = baseColorTexture.sample(baseColorSampler, baseColorUV) * mat.baseColorFactor * in.color0;
 
     // KHR_materials_transmission: sample texture R channel to scale transmissionFactor
     float transmission = mat.transmissionFactor;
     if (mat.hasTransmissionTexture > 0.5) {
-        float transmissionTex = transmissionTexture.sample(baseColorSampler, uv).r;
+        float2 transUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1Transmission);
+        float transmissionTex = transmissionTexture.sample(baseColorSampler, transUV).r;
         transmission *= transmissionTex;
     }
 
@@ -566,7 +767,8 @@ fragment float4 fragmentMain_textured(
     }
 
     // Metallic-roughness.
-    float4 mrSample = metallicRoughnessTexture.sample(metallicRoughnessSampler, uv);
+    float2 mrUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1MetallicRoughness);
+    float4 mrSample = metallicRoughnessTexture.sample(metallicRoughnessSampler, mrUV);
     float metallic  = mrSample.b * mat.metallicFactor;
     float roughness = clamp(mrSample.g * mat.roughnessFactor, 0.04, 1.0);
 
@@ -575,7 +777,7 @@ fragment float4 fragmentMain_textured(
     float3 B = normalize(in.worldBitangent);
     float3 N;
     if (mat.hasNormalTexture > 0.5) {
-        float3 ns = normalTexture.sample(normalSampler, uv).rgb * 2.0 - 1.0;
+        float3 ns = normalTexture.sample(normalSampler, in.normalUV).rgb * 2.0 - 1.0;
         ns.xy *= mat.normalScale;
         float3 Nbase = normalize(in.worldNormal);
         N = normalize(float3x3(T, B, Nbase) * normalize(ns));
@@ -583,34 +785,40 @@ fragment float4 fragmentMain_textured(
         N = normalize(in.worldNormal);
     }
 
-    // Occlusion.
+    // Occlusion. Very commonly authored on its own baked TEXCOORD_1 UV set,
+    // distinct from the main material's TEXCOORD_0.
     float occlusion = 1.0;
     if (mat.hasOcclusionTexture > 0.5) {
-        float occ = occlusionTexture.sample(occlusionSampler, uv).r;
+        float2 occUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1Occlusion);
+        float occ = occlusionTexture.sample(occlusionSampler, occUV).r;
         occlusion = mix(1.0, occ, mat.occlusionStrength);
     }
 
     // Emissive.
     float3 emissive = mat.emissiveFactor.xyz;
     if (mat.hasEmissiveTexture > 0.5) {
-        emissive *= emissiveTexture.sample(emissiveSampler, uv).rgb;
+        float2 emisUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1Emissive);
+        emissive *= emissiveTexture.sample(emissiveSampler, emisUV).rgb;
     }
 
     float specularFactor = mat.specularFactor;
     if (mat.hasSpecularTexture > 0.5) {
-        specularFactor *= specularTexture.sample(specularSampler, uv).a;
+        float2 specUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1Specular);
+        specularFactor *= specularTexture.sample(specularSampler, specUV).a;
     }
 
     float3 specularColor = mat.specularColorFactor.xyz;
     if (mat.hasSpecularColorTexture > 0.5) {
-        specularColor *= specularColorTexture.sample(specularColorSampler, uv).rgb;
+        float2 specColUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1SpecularColor);
+        specularColor *= specularColorTexture.sample(specularColorSampler, specColUV).rgb;
     }
 
     // Anisotropy.
     float anisoStrength = mat.anisotropyStrength;
     float anisoRotation = mat.anisotropyRotation;
     if (mat.hasAnisotropicTexture > 0.5) {
-        float2 anisoTex = anisotropicTexture.sample(baseColorSampler, uv).rg;
+        float2 anisoUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1Anisotropic);
+        float2 anisoTex = anisotropicTexture.sample(baseColorSampler, anisoUV).rg;
         anisoStrength *= anisoTex.r;
         anisoRotation += anisoTex.g * 2.0 * M_PI_F;
     }
@@ -618,14 +826,20 @@ fragment float4 fragmentMain_textured(
     // KHR_materials_iridescence: sample factor and thickness.
     float iridescenceFactor = mat.iridescenceFactor;
     if (mat.hasIridescenceTexture > 0.5) {
-        iridescenceFactor *= iridescenceTexture.sample(baseColorSampler, uv).r;
+        float2 iridUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1Iridescence);
+        iridescenceFactor *= iridescenceTexture.sample(baseColorSampler, iridUV).r;
     }
-    float iridescenceThickness = mat.iridescenceThicknessMin;
+    // Per KHR_materials_iridescence, iridescenceThicknessMinimum only matters
+    // as the low end of the texture-driven range; with no thickness texture
+    // the material is at its nominal iridescenceThicknessMaximum, not the
+    // (min+max) average — averaging shifted the interference phase (and
+    // therefore the rendered hue at any given angle) away from what the
+    // Khronos reference implementation produces for texture-less materials.
+    float iridescenceThickness = mat.iridescenceThicknessMax;
     if (mat.hasIridescenceThicknessTexture > 0.5) {
-        iridescenceThickness += (mat.iridescenceThicknessMax - mat.iridescenceThicknessMin)
-                              * iridescenceThicknessTexture.sample(baseColorSampler, uv).g;
-    } else {
-        iridescenceThickness = (mat.iridescenceThicknessMin + mat.iridescenceThicknessMax) * 0.5;
+        float2 iridThickUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1IridescenceThickness);
+        iridescenceThickness = mix(mat.iridescenceThicknessMin, mat.iridescenceThicknessMax,
+                                   iridescenceThicknessTexture.sample(baseColorSampler, iridThickUV).g);
     }
 
     if (mat.viewMode > VIEW_MODE_NORMAL + 0.5) {
@@ -659,27 +873,41 @@ fragment float4 fragmentMain_textured(
     // Reuse baseColorSampler — Metal allows only 16 sampler slots (0–15).
     float3 sheenColor = mat.sheenColorFactor.xyz;
     if (mat.hasSheenColorTexture > 0.5) {
-        sheenColor *= sheenColorTexture.sample(baseColorSampler, uv).rgb;
+        float2 sheenColUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1SheenColor);
+        sheenColor *= sheenColorTexture.sample(baseColorSampler, sheenColUV).rgb;
     }
     float sheenRoughness = clamp(mat.sheenRoughnessFactor, 0.07f, 1.0f);
     if (mat.hasSheenRoughnessTexture > 0.5) {
-        sheenRoughness = clamp(sheenRoughness * sheenRoughnessTexture.sample(baseColorSampler, uv).r, 0.07f, 1.0f);
+        float2 sheenRoughUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1SheenRoughness);
+        sheenRoughness = clamp(sheenRoughness * sheenRoughnessTexture.sample(baseColorSampler, sheenRoughUV).r, 0.07f, 1.0f);
     }
 
     // KHR_materials_clearcoat.
     float ccFactor = mat.clearcoatFactor;
-    if (mat.hasClearcoatTexture > 0.5)
-        ccFactor *= clearcoatTexture.sample(baseColorSampler, uv).r;
+    if (mat.hasClearcoatTexture > 0.5) {
+        float2 ccUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1Clearcoat);
+        ccFactor *= clearcoatTexture.sample(baseColorSampler, ccUV).r;
+    }
     ccFactor = clamp(ccFactor, 0.0f, 1.0f);
 
     float ccRoughness = clamp(mat.clearcoatRoughnessFactor, 0.001f, 1.0f);
     if (mat.hasClearcoatRoughnessTexture > 0.5) {
-        ccRoughness = clamp(ccRoughness * clearcoatRoughnessTexture.sample(baseColorSampler, uv).g, 0.001f, 1.0f);
+        float2 ccRoughUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1ClearcoatRoughness);
+        ccRoughness = clamp(ccRoughness * clearcoatRoughnessTexture.sample(baseColorSampler, ccRoughUV).g, 0.001f, 1.0f);
     }
 
-    float3 ccN = N;
+    // Per spec: "If clearcoatNormalTexture is not given, no normal mapping is
+    // applied to the clear coat layer, even if normal mapping is applied to
+    // the base material" — so the fallback must be the smooth geometric
+    // normal, not the base layer's (possibly normal-mapped) N. Reusing N here
+    // made a mirror-smooth clearcoat (clearcoatRoughnessFactor default 0)
+    // reflect the environment through the SAME high-frequency tiled normal
+    // perturbation as the base paint, breaking it into a sparkly/speckled
+    // mess instead of one smooth, coherent reflection.
+    float3 ccN = normalize(in.worldNormal);
     if (mat.hasClearcoatNormalTexture > 0.5) {
-        float3 ccNS = clearcoatNormalTexture.sample(baseColorSampler, uv).rgb * 2.0f - 1.0f;
+        float2 ccNormUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1ClearcoatNormal);
+        float3 ccNS = clearcoatNormalTexture.sample(baseColorSampler, ccNormUV).rgb * 2.0f - 1.0f;
         ccNS.xy *= mat.clearcoatNormalScale;
         float3 T2    = normalize(in.worldTangent);
         float3 B2    = normalize(in.worldBitangent);
@@ -708,26 +936,31 @@ fragment float4 fragmentMain_textured(
         float3 envDiffuse = environmentMap.sample(baseColorSampler, N).rgb;
         iblDiffuse = baseColor.rgb * (1.0 - metallic) * envDiffuse * mat.environmentIntensity * 0.3;
 
-        // Specular: sample using reflection direction.
+        // Roughness-based LOD so rough surfaces reflect a blurred (lower mip)
+        // environment instead of always sampling the sharpest level.
+        float envMaxLod = max(float(environmentMap.get_num_mip_levels()) - 1.0, 0.0);
+
+        // Specular: sample using reflection direction, blurred by roughness.
         float3 R = reflect(-viewDir, N);
-        float3 envSpecular = environmentMap.sample(baseColorSampler, R).rgb;
+        float3 envSpecular = environmentMap.sample(baseColorSampler, R, level(roughness * envMaxLod)).rgb;
         // Simple Fresnel approximation for IBL specular.
         float f0_scalar = (mat.ior - 1.0) / (mat.ior + 1.0);
         f0_scalar *= f0_scalar;
         float3 F0 = mix(float3(f0_scalar) * mat.specularColorFactor.xyz, baseColor.rgb, metallic);
         // Apply thin-film iridescence to IBL Fresnel.
         if (iridescenceFactor > 0.0) {
-            float3 iridF0 = ThinFilmIridescence(NdotV, iridescenceThickness, mat.iridescenceIor);
+            float3 iridF0 = EvalIridescence(1.0, mat.iridescenceIor, NdotV, iridescenceThickness, F0);
             F0 = mix(F0, iridF0, iridescenceFactor);
         }
         float fresnel = pow(1.0 - NdotV, 5.0);
         float3 F = F0 + (float3(1.0) - F0) * fresnel;
         iblSpecular = envSpecular * F * mat.environmentIntensity;
 
-        // IBL clearcoat: sample environment with clearcoat normal and Fresnel.
+        // IBL clearcoat: sample environment with clearcoat normal and Fresnel,
+        // blurred by the clearcoat layer's own roughness.
         if (ccFactor > 0.0) {
             float3 ccR = reflect(-viewDir, ccN);
-            float3 envCC = environmentMap.sample(baseColorSampler, ccR).rgb;
+            float3 envCC = environmentMap.sample(baseColorSampler, ccR, level(ccRoughness * envMaxLod)).rgb;
             float ccFresnel = F_Schlick_scalar(0.04f, ccNdotV);
             iblClearcoat = envCC * ccFresnel * ccFactor * mat.environmentIntensity;
         }
@@ -746,7 +979,8 @@ fragment float4 fragmentMain_textured(
         // Sample thickness texture if present (modulates thicknessFactor).
         float thickness = mat.thicknessFactor;
         if (mat.hasThicknessTexture > 0.5) {
-            thickness *= thicknessTexture.sample(baseColorSampler, uv).r;
+            float2 thickUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1Thickness);
+            thickness *= thicknessTexture.sample(baseColorSampler, thickUV).r;
         }
 
         // Determine the UV at which to sample the opaque scene.
@@ -792,7 +1026,15 @@ fragment float4 fragmentMain_textured(
             sampleUV[0] = sampleUV[1] = sampleUV[2] = in.clipPosition.xy / camera.screenSize;
         }
 
-        constexpr sampler scSampler(coord::normalized, filter::linear, address::clamp_to_edge);
+        // mip_filter::linear is required for the explicit level(lod) below to have
+        // any effect — with the MSL default (mip_filter::none), level() is ignored
+        // and the base mip is always sampled, silently defeating the roughness-based
+        // transmission blur (the visual mechanism for a frosted-glass look).
+        // mip_filter::linear is required for the explicit level(lod) below to have
+        // any effect — with the MSL default (mip_filter::none), level() is ignored
+        // and the base mip is always sampled, silently defeating the roughness-based
+        // transmission blur (the visual mechanism for a frosted-glass look).
+        constexpr sampler scSampler(coord::normalized, filter::linear, mip_filter::linear, address::clamp_to_edge);
         // Official glTF-Sample-Viewer LOD formula:
         // lod = log2(textureWidth) * perceptualRoughness * clamp(ior * 2.0 - 2.0, 0.0, 1.0)
         float iorScale = clamp(mat.ior * 2.0 - 2.0, 0.0, 1.0);
@@ -844,7 +1086,10 @@ fragment float4 fragmentMain_textured(
             return float4(iblDiffuse + iblSpecular, 1.0);
         }
         if (abs(mat.viewMode - VIEW_MODE_IRIDESCENCE) < 0.5) {
-            float3 iridF0 = ThinFilmIridescence(NdotV, iridescenceThickness, mat.iridescenceIor);
+            float dbgF0Scalar = (mat.ior - 1.0) / (mat.ior + 1.0);
+            dbgF0Scalar *= dbgF0Scalar;
+            float3 dbgBaseF0 = mix(float3(dbgF0Scalar) * mat.specularColorFactor.xyz, baseColor.rgb, metallic);
+            float3 iridF0 = EvalIridescence(1.0, mat.iridescenceIor, NdotV, iridescenceThickness, dbgBaseF0);
             return float4(iridF0 * iridescenceFactor, 1.0);
         }
         if (abs(mat.viewMode - VIEW_MODE_ANISOTROPY) < 0.5) {
@@ -910,18 +1155,22 @@ fragment float4 fragmentMain_textured(
         f0_scalar *= f0_scalar;
 
         float spec = mat.specularFactor;
-        if (mat.hasSpecularTexture > 0.5)
-            spec *= specularTexture.sample(specularSampler, uv).a;
+        if (mat.hasSpecularTexture > 0.5) {
+            float2 specUV2 = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1Specular);
+            spec *= specularTexture.sample(specularSampler, specUV2).a;
+        }
 
         float3 specColor = mat.specularColorFactor.xyz;
-        if (mat.hasSpecularColorTexture > 0.5)
-            specColor *= specularColorTexture.sample(specularColorSampler, uv).rgb;
+        if (mat.hasSpecularColorTexture > 0.5) {
+            float2 specColUV2 = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1SpecularColor);
+            specColor *= specularColorTexture.sample(specularColorSampler, specColUV2).rgb;
+        }
 
         float3 F0_dielectric = min(float3(f0_scalar) * specColor, float3(1.0)) * spec;
         float3 F0 = mix(F0_dielectric, baseColor.rgb, metallic);
         // Apply thin-film iridescence to direct-light specular F0.
         if (iridescenceFactor > 0.0) {
-            float3 iridF0 = ThinFilmIridescence(NdotV, iridescenceThickness, mat.iridescenceIor);
+            float3 iridF0 = EvalIridescence(1.0, mat.iridescenceIor, NdotV, iridescenceThickness, F0);
             F0 = mix(F0, iridF0, iridescenceFactor);
         }
 
@@ -959,8 +1208,16 @@ fragment float4 fragmentMain_textured(
         totalClearcoat += float3(cc_D * cc_V * cc_F) * ccFactor * ccNdotL * lightColor;
     }
 
+    // Occlusion (baked AO) applies only to indirect/ambient light, never to
+    // direct (punctual) lights — those already have their own visibility via
+    // NdotL. totalDiffuse/totalSpecular/totalSheen/totalClearcoat come from
+    // the direct-light loop above and must stay untouched by it; ambientColor
+    // (our no-IBL placeholder) and the real IBL diffuse/specular terms are
+    // the indirect ones and are what occlusion is meant to darken.
     float3 ambientColor = baseColor.rgb * 0.25 * occlusion;
-    float3 diffuse      = totalDiffuse * occlusion;
+    float3 diffuse      = totalDiffuse;
+    iblDiffuse  *= occlusion;
+    iblSpecular *= occlusion;
 
     // Scale diffuse/ambient terms by (1 - transmittance); specular/clearcoat remain.
     float diffuseScale = 1.0 - transmittance;
@@ -968,10 +1225,14 @@ fragment float4 fragmentMain_textured(
     diffuse      *= diffuseScale;
     iblDiffuse   *= diffuseScale;
 
+    // KHR_materials_clearcoat: coated_material = mix(material, clearcoat_brdf, clearcoat*fresnel).
+    // The whole underlying material response — including emission and any
+    // transmitted light — sits below the coat and must be attenuated by it,
+    // not just the diffuse/specular lobes.
     float ccAmbientAtten = 1.0f - ccFactor * F_Schlick_scalar(0.04f, ccNdotV);
-    float3 finalColor = (ambientColor + diffuse + totalSpecular + totalSheen + iblDiffuse + iblSpecular) * ccAmbientAtten
-                        + totalClearcoat + iblClearcoat + emissive
-                        + transmitted * transmittance;
+    float3 finalColor = (ambientColor + diffuse + totalSpecular + totalSheen + iblDiffuse + iblSpecular
+                         + emissive + transmitted * transmittance) * ccAmbientAtten
+                        + totalClearcoat + iblClearcoat;
 
     // Reinhard tone mapping.
     finalColor = finalColor / (float3(1.0) + finalColor);
@@ -1014,7 +1275,18 @@ fragment float4 skyboxFragment(SkyboxOut in [[stage_in]],
     );
     float4 worldFar = u.invVP * float4(ndc, 1.0, 1.0);
     float3 worldDir = normalize(worldFar.xyz / worldFar.w - u.cameraPos.xyz);
-    return envMap.sample(envSampler, worldDir);
+    float3 color = envMap.sample(envSampler, worldDir).rgb;
+
+    // Match the Reinhard tonemapping every material's fragment shader applies
+    // (see fragmentMain_textured/_flat) before writing to the 8-bit swapchain.
+    // The environment is genuine HDR (sky/sun routinely exceed 1.0, more so
+    // now that the built-in default is baked with a 6x exposure correction —
+    // see createBuiltinDefaultEnvironmentMap), so returning it raw here hard
+    // -clips to solid white/saturated colors at the output format instead of
+    // compressing smoothly like every reflection of the same environment does.
+    color = color / (float3(1.0) + color);
+
+    return float4(color, 1.0);
 }
 
 // ---------------------------------------------------------------------------

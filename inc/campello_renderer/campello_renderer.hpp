@@ -18,6 +18,8 @@
 #include <campello_renderer/procedural_texture_baker.hpp>
 #include <vector_math/vector_math.hpp>
 
+namespace systems::leal::campello_image { class Image; }
+
 namespace systems::leal::campello_renderer {
 
     struct GpuMesh {
@@ -121,12 +123,20 @@ namespace systems::leal::campello_renderer {
         static constexpr uint32_t VERTEX_SLOT_TANGENT    = 3;  // float4 TANGENT
         static constexpr uint32_t VERTEX_SLOT_JOINTS     = 4;  // uint4  JOINTS_0  (joint indices)
         static constexpr uint32_t VERTEX_SLOT_WEIGHTS    = 5;  // float4 WEIGHTS_0 (joint weights)
+        static constexpr uint32_t VERTEX_SLOT_COLOR0     = 6;  // float4 COLOR_0
+        static constexpr uint32_t VERTEX_SLOT_TEXCOORD1  = 7;  // float2 TEXCOORD_1
         static constexpr uint32_t VERTEX_SLOT_MVP        = 16; // float4x4, row-major MVP matrix (per-node)
         static constexpr uint32_t VERTEX_SLOT_MATERIAL   = 17; // MaterialUniforms (112 bytes, 256 stride)
         static constexpr uint32_t VERTEX_SLOT_CAMERA     = 18; // CameraPosition (float3 world space)
         static constexpr uint32_t VERTEX_SLOT_LIGHTS     = 15; // LightsUniforms - use slot 15 to avoid conflict
         static constexpr uint32_t VERTEX_SLOT_INSTANCE_MATRIX = 19; // float4x4 per-instance transform (EXT_mesh_gpu_instancing)
         static constexpr uint32_t VERTEX_SLOT_JOINT_MATRICES  = 20; // float4x4[] joint matrix palette (per-skin)
+        // Morph targets: these are raw device buffers (not part of the
+        // [[stage_in]] vertex descriptor, since target count varies per
+        // primitive), read directly in vertexMain via [[vertex_id]] indexing.
+        static constexpr uint32_t VERTEX_SLOT_MORPH_INFO      = 21; // MorphInfo (targetCount, hasNormal, vertexCount, weights[8])
+        static constexpr uint32_t VERTEX_SLOT_MORPH_POSITION  = 22; // float3[targetCount * vertexCount] position deltas
+        static constexpr uint32_t VERTEX_SLOT_MORPH_NORMAL    = 23; // float3[targetCount * vertexCount] normal deltas
                                                                //   [0..15]  baseColorFactor
                                                                //   [16..31] uvTransformRow0 (.w = hasTransform)
                                                                //   [32..47] uvTransformRow1
@@ -177,9 +187,53 @@ namespace systems::leal::campello_renderer {
         };
         std::unordered_map<const systems::leal::gltf::Primitive *, DracoBuffers> dracoPrimitiveBuffers;
 
+        // Morph target (mesh.primitives[].targets) GPU data, built once per
+        // primitive in setScene(). Position deltas are supported for any
+        // primitive with targets; normal deltas only when every target
+        // supplies a NORMAL accessor. TANGENT morphing is not implemented —
+        // rare in practice relative to POSITION/NORMAL (facial/blend-shape
+        // rigs almost never morph tangents). Target deltas are frequently
+        // sparse (most vertices unaffected by a given target), resolved via
+        // the same resolveAccessorBytes() used for sparse vertex attributes.
+        static constexpr uint32_t kMaxMorphTargets = 8;
+        struct MorphGpuData {
+            std::shared_ptr<systems::leal::campello_gpu::Buffer> positionDeltas; // [target][vertex] float3, packed
+            std::shared_ptr<systems::leal::campello_gpu::Buffer> normalDeltas;   // same layout, null if unavailable
+            uint32_t targetCount = 0;
+            uint32_t vertexCount = 0;
+        };
+        std::unordered_map<const systems::leal::gltf::Primitive *, MorphGpuData> morphBuffers;
+
+        // Per-node morph weights (mesh.weights default, node.weights override,
+        // animation "weights" channel override on top of that), packed as
+        // MorphInfo and re-uploaded once per frame for every node that has
+        // morph targets. One small buffer per such node, updated in place
+        // (not recreated) each frame — see uploadVisibleNodeTransforms.
+        std::unordered_map<uint64_t, std::shared_ptr<systems::leal::campello_gpu::Buffer>> morphNodeUniformBuffers;
+        // Shared MorphInfo(targetCount=0) buffer bound for primitives with no
+        // morph targets, so the vertex shader's blend loop is a no-op without
+        // needing a separate "hasMorphTargets" branch/uniform.
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> defaultMorphInfoBuffer;
+
         // Deinterleaved vertex attribute buffers for accessors in buffer views with
         // byteStride > 0. Key is accessor index; value is a contiguous GPU buffer.
         std::unordered_map<int64_t, std::shared_ptr<systems::leal::campello_gpu::Buffer>> deinterleavedBuffers;
+
+        // Widened index buffers for UNSIGNED_BYTE (componentType 5121) index
+        // accessors — glTF explicitly allows this, but neither Metal nor
+        // campello_gpu::IndexFormat has an 8-bit index type, so 1-byte-per-
+        // index data is expanded to uint16 once here. Key is the index
+        // accessor's own index (primitive.indices), not a vertex accessor.
+        std::unordered_map<int64_t, std::shared_ptr<systems::leal::campello_gpu::Buffer>> widenedIndexBuffers;
+
+        // COLOR_0 accessors normalized to a canonical float4 GPU buffer.
+        // glTF allows COLOR_0 as VEC3 or VEC4, float or normalized ubyte/ushort
+        // — rather than adding componentType/VEC3-vs-VEC4 as yet another
+        // pipeline-variant axis (on top of quantized/doubleSided/blend), every
+        // representation is converted to float4 (VEC3 gets alpha=1, integers
+        // are divided by their normalized max) once here. Key is the COLOR_0
+        // accessor's own index.
+        std::unordered_map<int64_t, std::shared_ptr<systems::leal::campello_gpu::Buffer>> color0Buffers;
 
         // Shared resources created on first setScene() call.
         std::shared_ptr<systems::leal::campello_gpu::Sampler>          defaultSampler;
@@ -267,6 +321,13 @@ namespace systems::leal::campello_renderer {
         // and a fallback zero-UV buffer for primitives without TEXCOORD_0.
         std::shared_ptr<systems::leal::campello_gpu::Buffer> fallbackUVBuffer;
         std::shared_ptr<systems::leal::campello_gpu::Buffer> fallbackTangentBuffer;
+        // Fallback for primitives without TEXCOORD_1 (zero UV — harmless since
+        // it's only sampled by textures that explicitly opt into texCoord=1).
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> fallbackTexCoord1Buffer;
+        // Fallback for primitives without COLOR_0, filled with (1,1,1,1) rather
+        // than zero so the shader can unconditionally multiply baseColor by
+        // whatever's bound at this slot without a separate "hasColor0" branch.
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> fallbackColor0Buffer;
 
         // Frame-in-flight ring buffer (3 frames) — prevents CPU overwriting GPU data.
         static constexpr uint32_t kMaxFramesInFlight = 3;
@@ -391,6 +452,21 @@ namespace systems::leal::campello_renderer {
 
         // Tracks last-bound vertex buffer per slot within a render pass to avoid
         // redundant setVertexBuffer() calls (Metal debug layer asserts on these).
+        //
+        // Must be cleared exactly once per *distinct Metal encoder*, not once per
+        // draw-pass call or once per frame: callers that draw opaque then transparent
+        // on the SAME encoder (single-pass path) must NOT clear between them, or the
+        // next setVertexBuffer() call becomes redundant from Metal's point of view;
+        // callers that draw on genuinely DIFFERENT encoders (two-pass path's
+        // opaqueRpe/transRpe, or the next frame's encoder) MUST clear, or the cache
+        // wrongly thinks slots are already bound on an encoder that has nothing bound
+        // yet, and required setVertexBuffer() calls get skipped ("missing
+        // vertexDescriptor buffer binding"). This can't be inferred from the
+        // encoder's pointer at runtime: RenderPassEncoder objects are short-lived and
+        // the allocator routinely reuses a just-freed one's address for the next one
+        // (both across frames and within one frame's own opaque/copy/transparent
+        // sub-passes), so callers must say explicitly whether they're continuing on
+        // the same encoder as their last draw call.
         struct BoundVertexBuffer {
             const systems::leal::campello_gpu::Buffer *buffer = nullptr;
             uint64_t offset = 0;
@@ -489,6 +565,7 @@ namespace systems::leal::campello_renderer {
         bool isBoundsVisible(const Bounds &bounds) const;
         void uploadVisibleNodeTransforms();
         void updateVisibleInstances(uint64_t nodeIndex);
+        void updateMorphWeights(uint64_t nodeIndex);
 
         // Skeletal mesh skinning.
         void computeSkinningTransforms();
@@ -655,6 +732,31 @@ namespace systems::leal::campello_renderer {
 
     private:
         void ensureSceneColorTexture();
+
+        // Grows (or lazily creates) a zero-filled fallback vertex buffer so it can
+        // cover at least `requiredBytes`. These buffers stand in for missing
+        // per-vertex attributes (TANGENT, TEXCOORD_0, JOINTS_0, WEIGHTS_0) and must
+        // be at least as large as the biggest primitive in the current scene needs —
+        // a fixed size silently under-covers large meshes, which Metal's draw
+        // validation catches as a "vertex buffer too small for maxVertexID" abort.
+        void ensureFallbackBuffer(std::shared_ptr<systems::leal::campello_gpu::Buffer> &buf,
+                                   uint64_t requiredBytes);
+
+        // Shared equirectangular-to-cubemap conversion, used by both
+        // loadEquirectangularEnvironmentMap() and the built-in default map.
+        // intensityScale multiplies radiance values during the bake (not the
+        // same knob as setEnvironmentIntensity(), which scales at render
+        // time for every environment map, built-in or user-loaded) — it
+        // exists so the built-in map's specific exposure calibration can be
+        // corrected once here without changing what environmentIntensity=1.0
+        // means for a user's own loaded HDRI.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> convertEquirectangularImageToCubemap(
+            const std::shared_ptr<systems::leal::campello_image::Image> &img, uint32_t faceSize,
+            float intensityScale = 1.0f);
+
+        // Decodes the embedded default skybox (a small real photo, not a flat
+        // placeholder) so IBL has something plausible to reflect out of the box.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> createBuiltinDefaultEnvironmentMap();
 
         // Accessors for uploaded GPU resources.
         std::shared_ptr<systems::leal::campello_gpu::Buffer>  getGpuBuffer(uint32_t index) const;

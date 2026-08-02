@@ -11,7 +11,7 @@ endif()
 include(FetchContent)
 
 # Use local gltf for rapid iteration, otherwise fetch from GitHub.
-set(GLTF_LOCAL_PATH "/Users/rubenleal/Projects/gltf")
+set(GLTF_LOCAL_PATH "/Users/rubenleal/Documents/GitHub/gltf")
 
 if(EXISTS "${GLTF_LOCAL_PATH}/CMakeLists.txt")
     message(STATUS "Using local gltf: ${GLTF_LOCAL_PATH}")
@@ -20,11 +20,11 @@ if(EXISTS "${GLTF_LOCAL_PATH}/CMakeLists.txt")
             SOURCE_DIR ${GLTF_LOCAL_PATH}
     )
 else()
-    message(STATUS "Fetching gltf v0.4.2 from GitHub")
+    message(STATUS "Fetching gltf v0.5.0 from GitHub")
     FetchContent_Declare(
             extern_gltf
             GIT_REPOSITORY https://github.com/rusoleal/gltf
-            GIT_TAG        v0.4.2
+            GIT_TAG        v0.5.0
     )
 endif()
 

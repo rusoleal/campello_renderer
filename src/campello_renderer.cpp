@@ -28,18 +28,112 @@
 #include "shaders/directx_default.h"
 #endif
 
+#include "environments/default_environment.h"
+
 #include <campello_image/image.hpp>
 #include <campello_image/texture_data.hpp>
 #include <campello_image/gpu_format_bridge.hpp>
 
 using namespace systems::leal::campello_renderer;
 
+// ---------------------------------------------------------------------------
+// Generic accessor resolution (sparse accessors, shared by regular vertex
+// attributes and morph target deltas).
+// ---------------------------------------------------------------------------
+
+static size_t gltfComponentSize(systems::leal::gltf::ComponentType ct) {
+    using CT = systems::leal::gltf::ComponentType;
+    switch (ct) {
+        case CT::ctByte: return 1;
+        case CT::ctUnsignedByte: return 1;
+        case CT::ctShort: return 2;
+        case CT::ctUnsignedShort: return 2;
+        case CT::ctUnsignedInt: return 4;
+        case CT::ctFloat: return 4;
+        default: return 4; // glTF 2.1 types (double/half-float/64-bit int) not in real-world use yet
+    }
+}
+
+static size_t gltfTypeCount(systems::leal::gltf::AccessorType at) {
+    using AT = systems::leal::gltf::AccessorType;
+    switch (at) {
+        case AT::acScalar: return 1;
+        case AT::acVec2:   return 2;
+        case AT::acVec3:   return 3;
+        case AT::acVec4:   return 4;
+        case AT::acMat2:   return 4;
+        case AT::acMat3:   return 9;
+        case AT::acMat4:   return 16;
+    }
+    return 1;
+}
+
+// Reads an accessor's actual per-element data as tightly-packed bytes
+// (elementSize * acc.count), applying its sparse override (if any) on top of
+// the base data. Per spec, an accessor with sparse but no bufferView has an
+// implicit all-zero base — every element not covered by the sparse index
+// list stays zero. Used both for regular vertex attributes (POSITION/NORMAL/
+// COLOR_0/...) that happen to be sparse, and for morph target deltas, which
+// are very commonly sparse (most vertices are unaffected by any one target).
+static std::vector<uint8_t> resolveAccessorBytes(
+    const systems::leal::gltf::Accessor &acc,
+    const systems::leal::gltf::GLTF &asset)
+{
+    size_t compSize   = gltfComponentSize(acc.componentType);
+    size_t typeCount   = gltfTypeCount(acc.type);
+    size_t elementSize = compSize * typeCount;
+    size_t totalSize   = elementSize * acc.count;
+    std::vector<uint8_t> result(totalSize, 0);
+    if (totalSize == 0) return result;
+
+    if (acc.bufferView >= 0 && asset.bufferViews && (size_t)acc.bufferView < asset.bufferViews->size()) {
+        auto &bv = (*asset.bufferViews)[(size_t)acc.bufferView];
+        if (asset.buffers && (size_t)bv.buffer < asset.buffers->size()) {
+            auto &buf = (*asset.buffers)[(size_t)bv.buffer];
+            if (!buf.data.empty()) {
+                size_t stride = bv.byteStride > 0 ? (size_t)bv.byteStride : elementSize;
+                const uint8_t *src = buf.data.data() + bv.byteOffset + acc.byteOffset;
+                for (size_t i = 0; i < acc.count; ++i) {
+                    std::memcpy(result.data() + i * elementSize, src + i * stride, elementSize);
+                }
+            }
+        }
+    }
+
+    if (acc.sparse && asset.bufferViews && asset.buffers) {
+        auto &sp = *acc.sparse;
+        if ((size_t)sp.indices.bufferView < asset.bufferViews->size() &&
+            (size_t)sp.values.bufferView < asset.bufferViews->size()) {
+            auto &idxBV = (*asset.bufferViews)[(size_t)sp.indices.bufferView];
+            auto &valBV = (*asset.bufferViews)[(size_t)sp.values.bufferView];
+            if ((size_t)idxBV.buffer < asset.buffers->size() && (size_t)valBV.buffer < asset.buffers->size()) {
+                auto &idxBuf = (*asset.buffers)[(size_t)idxBV.buffer];
+                auto &valBuf = (*asset.buffers)[(size_t)valBV.buffer];
+                if (!idxBuf.data.empty() && !valBuf.data.empty()) {
+                    size_t idxCompSize = gltfComponentSize(sp.indices.componentType);
+                    const uint8_t *idxSrc = idxBuf.data.data() + idxBV.byteOffset + sp.indices.byteOffset;
+                    const uint8_t *valSrc = valBuf.data.data() + valBV.byteOffset + sp.values.byteOffset;
+                    for (uint64_t i = 0; i < sp.count; ++i) {
+                        uint64_t elemIndex = 0;
+                        std::memcpy(&elemIndex, idxSrc + i * idxCompSize, idxCompSize);
+                        if (elemIndex >= acc.count) continue;
+                        std::memcpy(result.data() + elemIndex * elementSize,
+                                    valSrc + i * elementSize, elementSize);
+                    }
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
 // Byte size of one material slot in materialUniformBuffer.
 // Layout: float4 baseColorFactor (16 B) + float4 uvTransformRow0 (16 B) + float4 uvTransformRow1 (16 B).
 // Must be a multiple of 256 for Metal vertex buffer offset alignment.
 static constexpr uint64_t kMaterialUniformStride = 512;
 
-// Low-level material uniform slot layout (81 floats = 324 bytes).
+// Low-level material uniform slot layout (93 floats = 372 bytes).
 // Must match the Metal shader struct exactly.
 static void buildSlotRaw(float bc[4], float r0[4], float r1[4],
                          float metallic, float roughness, float normalScale,
@@ -63,11 +157,13 @@ static void buildSlotRaw(float bc[4], float r0[4], float r1[4],
                          float anisotropyStrength, float anisotropyRotation,
                          float hasAnisotropicTex,
                          float dispersion,
+                         float normalR0[4], float normalR1[4],
+                         float texCoord1Mask,
                          float viewModeValue,
                          float environmentIntensityValue, float iblEnabledValue,
-                         float out[82]) {
+                         float out[93]) {
     // Zero initialize
-    for (int i = 0; i < 82; i++) out[i] = 0.f;
+    for (int i = 0; i < 93; i++) out[i] = 0.f;
     
     // [0-11] float4s at offsets 0, 16, 32
     out[0]  = bc[0]; out[1]  = bc[1]; out[2]  = bc[2];  out[3]  = bc[3];
@@ -150,25 +246,97 @@ static void buildSlotRaw(float bc[4], float r0[4], float r1[4],
     out[68] = viewModeValue;          // 272
     out[69] = environmentIntensityValue; // 276
     out[70] = iblEnabledValue;           // 280
-    out[71] = 0.f;                       // 284 - pad to 288
-    out[72] = iridescenceFactor;         // 288
-    out[73] = iridescenceIor;            // 292
-    out[74] = iridescenceThicknessMin;   // 296
-    out[75] = iridescenceThicknessMax;   // 300
-    out[76] = hasIridescenceTex;         // 304
-    out[77] = hasIridescenceThicknessTex;// 308
-    out[78] = anisotropyStrength;        // 312
-    out[79] = anisotropyRotation;        // 316
-    out[80] = hasAnisotropicTex;         // 320
-    out[81] = dispersion;                // 324
+    // iblEnabled and iridescenceFactor are both plain scalar floats with no
+    // float4 in between, so Metal needs no padding here — a phantom pad float
+    // was previously inserted at this point, pushing iridescenceFactor and
+    // every field through dispersion one float (4 bytes) later than where the
+    // compiled Metal struct actually places them. The shader ended up reading
+    // iridescenceFactor from what was really the padding slot (always 0.0),
+    // silently killing KHR_materials_iridescence for every asset that used it
+    // (e.g. a fully-transmissive lens with iridescenceFactor=1 rendered with
+    // zero reflectance, i.e. plain black instead of a reflective coating).
+    out[71] = iridescenceFactor;         // 284
+    out[72] = iridescenceIor;            // 288
+    out[73] = iridescenceThicknessMin;   // 292
+    out[74] = iridescenceThicknessMax;   // 296
+    out[75] = hasIridescenceTex;         // 300
+    out[76] = hasIridescenceThicknessTex;// 304
+    out[77] = anisotropyStrength;        // 308
+    out[78] = anisotropyRotation;        // 312
+    out[79] = hasAnisotropicTex;         // 316
+    out[80] = dispersion;                // 320
+
+    out[81] = 0.f;                       // 324 - implicit pad to 16-byte align
+    out[82] = 0.f;                       // 328 - implicit pad
+    out[83] = 0.f;                       // 332 - implicit pad
+
+    // normalUvTransformRow0/Row1: independent KHR_texture_transform for
+    // normalTexture, since it commonly uses a different UV tiling than
+    // baseColorTexture (e.g. a repeated micro-detail normal map on a
+    // material with a flat baseColorFactor and no baseColorTexture at all).
+    out[84] = normalR0[0]; // 336
+    out[85] = normalR0[1]; // 340
+    out[86] = normalR0[2]; // 344
+    out[87] = normalR0[3]; // 348
+    out[88] = normalR1[0]; // 352
+    out[89] = normalR1[1]; // 356
+    out[90] = normalR1[2]; // 360
+    out[91] = 0.f;         // 364 - w (unused)
+    out[92] = texCoord1Mask; // 368 - plain scalar float after a float4, no padding needed
 }
 
-// Read a gltf::Material and fill a 81-float uniform slot.
+// Convert a glTF sampler minFilter to the GPU filter mode, preserving the
+// mip-mapping variant (GPU::FilterMode and gltf::FilterMode share the same
+// WebGL-derived numeric values). All uploaded 2D textures get a full mip
+// chain, so an unspecified minFilter (glTF leaves this implementation
+// defined) defaults to trilinear rather than collapsing to a single mip
+// level — otherwise tiled textures (e.g. a 30x-tiled normal map) alias into
+// visible speckle/moiré instead of blending smoothly across mip levels.
+static systems::leal::campello_gpu::FilterMode gltfMinFilterToGpu(systems::leal::gltf::FilterMode f) {
+    namespace GPU = systems::leal::campello_gpu;
+    namespace GLTF = systems::leal::gltf;
+    switch (f) {
+        case GLTF::FilterMode::fmNearest:              return GPU::FilterMode::fmNearest;
+        case GLTF::FilterMode::fmLinear:                return GPU::FilterMode::fmLinear;
+        case GLTF::FilterMode::fmNearestMipmapNearest:  return GPU::FilterMode::fmNearestMipmapNearest;
+        case GLTF::FilterMode::fmLinearMipmapNearest:   return GPU::FilterMode::fmLinearMipmapNearest;
+        case GLTF::FilterMode::fmNearestMipmapLinear:   return GPU::FilterMode::fmNearestMipmapLinear;
+        case GLTF::FilterMode::fmLinearMipmapLinear:    return GPU::FilterMode::fmLinearMipmapLinear;
+        default:                                        return GPU::FilterMode::fmLinearMipmapLinear;
+    }
+}
+
+static systems::leal::campello_gpu::FilterMode gltfMagFilterToGpu(systems::leal::gltf::FilterMode f) {
+    namespace GPU = systems::leal::campello_gpu;
+    namespace GLTF = systems::leal::gltf;
+    return (f == GLTF::FilterMode::fmNearest) ? GPU::FilterMode::fmNearest : GPU::FilterMode::fmLinear;
+}
+
+// Compute a KHR_texture_transform's UV-remap matrix rows. row0.w doubles as
+// a "hasTransform" flag consumed by the shader; identity (untransformed) UV
+// is represented as row0 = {1,0,0,0}, row1 = {0,1,0,0}.
+static void computeUvTransformRows(const std::shared_ptr<systems::leal::gltf::KHRTextureTransform>& xfPtr,
+                                   float row0[4], float row1[4]) {
+    row0[0] = 1.f; row0[1] = 0.f; row0[2] = 0.f; row0[3] = 0.f;
+    row1[0] = 0.f; row1[1] = 1.f; row1[2] = 0.f; row1[3] = 0.f;
+    if (xfPtr) {
+        float c  = (float)std::cos(xfPtr->rotation);
+        float s  = (float)std::sin(xfPtr->rotation);
+        float sx = (float)xfPtr->scale.x();
+        float sy = (float)xfPtr->scale.y();
+        float ox = (float)xfPtr->offset.x();
+        float oy = (float)xfPtr->offset.y();
+        row0[0] = sx * c;  row0[1] = -sy * s;  row0[2] = ox;  row0[3] = 1.f;
+        row1[0] = sx * s;  row1[1] =  sy * c;  row1[2] = oy;
+    }
+}
+
+// Read a gltf::Material and fill a 93-float uniform slot.
 static void buildMaterialSlotFromGltf(const systems::leal::gltf::Material& mat,
                                       float viewModeValue,
                                       float environmentIntensityValue,
                                       float iblEnabledValue,
-                                      float out[82]) {
+                                      float out[93]) {
     // Base color factor.
     float bc[4] = {1.f, 1.f, 1.f, 1.f};
     float metallic = 1.f;
@@ -183,39 +351,41 @@ static void buildMaterialSlotFromGltf(const systems::leal::gltf::Material& mat,
     }
 
     // KHR_texture_transform for baseColorTexture.
-    float row0[4] = {1.f, 0.f, 0.f, 0.f}; // w=0 → identity fast path
-    float row1[4] = {0.f, 1.f, 0.f, 0.f};
-    if (mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture) {
-        auto &xfPtr = mat.pbrMetallicRoughness->baseColorTexture->khrTextureTransform;
-        if (xfPtr) {
-            float c  = (float)std::cos(xfPtr->rotation);
-            float s  = (float)std::sin(xfPtr->rotation);
-            float sx = (float)xfPtr->scale.x();
-            float sy = (float)xfPtr->scale.y();
-            float ox = (float)xfPtr->offset.x();
-            float oy = (float)xfPtr->offset.y();
-            row0[0] = sx * c;  row0[1] = -sy * s;  row0[2] = ox;  row0[3] = 1.f;
-            row1[0] = sx * s;  row1[1] =  sy * c;  row1[2] = oy;
-        }
-    }
+    float row0[4], row1[4];
+    computeUvTransformRows(
+        (mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture)
+            ? mat.pbrMetallicRoughness->baseColorTexture->khrTextureTransform : nullptr,
+        row0, row1);
 
-    // Normal scale from normalTexture info.
+    // Normal scale from normalTexture info, and its own (independent)
+    // KHR_texture_transform — normal maps are frequently tiled at a
+    // different scale than baseColorTexture (e.g. car-paint flake detail,
+    // fabric weave), so this must not reuse baseColorTexture's transform.
     float normalScale = 1.f;
     float hasNormal = 0.f;
+    float normalRow0[4], normalRow1[4];
+    computeUvTransformRows(mat.normalTexture ? mat.normalTexture->khrTextureTransform : nullptr,
+                           normalRow0, normalRow1);
     if (mat.normalTexture) {
         normalScale = (float)mat.normalTexture->scale;
         hasNormal = 1.f;
     }
 
-    // Emissive factor and texture.
+    // Emissive factor and texture. KHR_materials_emissive_strength lifts the
+    // [0,1]-clamped emissiveFactor past 1.0 (e.g. headlights/brakelights
+    // that are otherwise near-black baseColorFactor and rely entirely on a
+    // strong emissive term to read as a bright light rather than a dark
+    // panel); fold it in here so the rest of the pipeline just sees a
+    // regular (possibly HDR) emissiveFactor.
     float emissiveFactor[3] = {0.f, 0.f, 0.f};
     float hasEmissive = 0.f;
     if (mat.emissiveTexture) {
         hasEmissive = 1.f;
     }
-    emissiveFactor[0] = (float)mat.emissiveFactor.x();
-    emissiveFactor[1] = (float)mat.emissiveFactor.y();
-    emissiveFactor[2] = (float)mat.emissiveFactor.z();
+    float emissiveStrength = (float)mat.khrMaterialsEmissiveStrength;
+    emissiveFactor[0] = (float)mat.emissiveFactor.x() * emissiveStrength;
+    emissiveFactor[1] = (float)mat.emissiveFactor.y() * emissiveStrength;
+    emissiveFactor[2] = (float)mat.emissiveFactor.z() * emissiveStrength;
 
     // Occlusion texture and strength.
     float hasOcclusion = 0.f;
@@ -343,6 +513,51 @@ static void buildMaterialSlotFromGltf(const systems::leal::gltf::Material& mat,
     // KHR_materials_dispersion
     float dispersion = (float)mat.khrMaterialsDispersion;
 
+    // Each texture reference carries its own texCoord index (which
+    // TEXCOORD_n set it samples) independent of every other texture on the
+    // material — e.g. occlusionTexture very commonly uses TEXCOORD_1 (a
+    // separate baked-AO UV set) while baseColorTexture uses TEXCOORD_0. We
+    // only have vertex data for TEXCOORD_0/1, so any texCoord > 0 maps to
+    // our TEXCOORD_1 slot. Bit layout must match kUV1* in the Metal shader.
+    uint32_t texCoord1Mask = 0;
+    auto usesUV1 = [](const auto &texInfo) -> bool {
+        return texInfo && texInfo->texCoord > 0;
+    };
+    if (mat.pbrMetallicRoughness) {
+        if (usesUV1(mat.pbrMetallicRoughness->baseColorTexture)) texCoord1Mask |= (1u << 0);
+        if (usesUV1(mat.pbrMetallicRoughness->metallicRoughnessTexture)) texCoord1Mask |= (1u << 1);
+    }
+    if (usesUV1(mat.normalTexture)) texCoord1Mask |= (1u << 2);
+    if (usesUV1(mat.emissiveTexture)) texCoord1Mask |= (1u << 3);
+    if (usesUV1(mat.occlusionTexture)) texCoord1Mask |= (1u << 4);
+    if (mat.khrMaterialsSpecular) {
+        auto &spec = *mat.khrMaterialsSpecular;
+        if (usesUV1(spec.specularTexture)) texCoord1Mask |= (1u << 5);
+        if (usesUV1(spec.specularColorTexture)) texCoord1Mask |= (1u << 6);
+    }
+    if (mat.khrMaterialsSheen) {
+        auto &sheen = *mat.khrMaterialsSheen;
+        if (usesUV1(sheen.sheenColorTexture)) texCoord1Mask |= (1u << 7);
+        if (usesUV1(sheen.sheenRoughnessTexture)) texCoord1Mask |= (1u << 8);
+    }
+    if (mat.khrMaterialsClearcoat) {
+        auto &cc = *mat.khrMaterialsClearcoat;
+        if (usesUV1(cc.clearcoatTexture)) texCoord1Mask |= (1u << 9);
+        if (usesUV1(cc.clearcoatRoughnessTexture)) texCoord1Mask |= (1u << 10);
+        if (usesUV1(cc.clearcoatNormalTexture)) texCoord1Mask |= (1u << 11);
+    }
+    if (mat.khrMaterialsTransmission && usesUV1(mat.khrMaterialsTransmission->transmissionTexture))
+        texCoord1Mask |= (1u << 12);
+    if (mat.khrMaterialsVolume && usesUV1(mat.khrMaterialsVolume->thicknessTexture))
+        texCoord1Mask |= (1u << 13);
+    if (mat.khrMaterialsIridescence) {
+        auto &irid = *mat.khrMaterialsIridescence;
+        if (usesUV1(irid.iridescenceTexture)) texCoord1Mask |= (1u << 14);
+        if (usesUV1(irid.iridescenceThicknessTexture)) texCoord1Mask |= (1u << 15);
+    }
+    if (mat.khrMaterialsAnisotropy && usesUV1(mat.khrMaterialsAnisotropy->anisotropyTexture))
+        texCoord1Mask |= (1u << 16);
+
     buildSlotRaw(bc, row0, row1, metallic, roughness, normalScale,
                  alphaMode, alphaCutoff, unlit, hasNormal, hasEmissive, hasOcclusion,
                  occlusionStrength, emissiveFactor, ior,
@@ -357,6 +572,8 @@ static void buildMaterialSlotFromGltf(const systems::leal::gltf::Material& mat,
                  hasIridescenceTex, hasIridescenceThicknessTex,
                  anisotropyStrength, anisotropyRotation, hasAnisotropicTex,
                  dispersion,
+                 normalRow0, normalRow1,
+                 (float)texCoord1Mask,
                  viewModeValue,
                  environmentIntensityValue, iblEnabledValue,
                  out);
@@ -501,6 +718,8 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         quantizedPipelines.clear();
         dracoPrimitiveBuffers.clear();
         deinterleavedBuffers.clear();
+        widenedIndexBuffers.clear();
+        color0Buffers.clear();
         proceduralBakedTextures.clear();
         meshPool.clear();
         materialPool.clear();
@@ -558,6 +777,15 @@ void Renderer::setCamera(uint32_t index) {
     cameraIndex = index;
 }
 
+void Renderer::ensureFallbackBuffer(std::shared_ptr<systems::leal::campello_gpu::Buffer> &buf,
+                                     uint64_t requiredBytes)
+{
+    namespace GPU = systems::leal::campello_gpu;
+    if (buf && buf->getLength() >= requiredBytes) return;
+    std::vector<uint8_t> zeros(requiredBytes, 0);
+    buf = device->createBuffer(requiredBytes, GPU::BufferUsage::vertex, zeros.data());
+}
+
 void Renderer::setScene(uint32_t index) {
     if (asset == nullptr) return;
     if (device == nullptr) return;
@@ -591,69 +819,43 @@ void Renderer::setScene(uint32_t index) {
     // Upload any Draco-decompressed buffers to GPU.
     uploadDracoBuffers(info);
 
-    // Deinterleave vertex attributes from buffer views with byteStride > 0.
-    // The pipeline vertex layouts assume tightly packed data (stride = attribute
-    // size). Interleaved data shares a buffer view with a common stride, so we
-    // extract each accessor into its own contiguous GPU buffer.
+    // Resolve vertex attribute accessors that need their own dedicated GPU
+    // buffer rather than a raw slice of the original glTF buffer: either
+    // interleaved (buffer view byteStride > 0, needs extraction into a
+    // tightly-packed buffer since the pipeline vertex layouts assume
+    // stride == attribute size) or sparse (needs the base+override overlay
+    // resolveAccessorBytes performs — a sparse accessor's raw bytes alone
+    // are not the actual per-vertex data).
     deinterleavedBuffers.clear();
     if (asset->meshes && asset->accessors && asset->bufferViews) {
-        auto getComponentSize = [](systems::leal::gltf::ComponentType ct) -> size_t {
-            using CT = systems::leal::gltf::ComponentType;
-            switch (ct) {
-                case CT::ctByte: return 1;
-                case CT::ctUnsignedByte: return 1;
-                case CT::ctShort: return 2;
-                case CT::ctUnsignedShort: return 2;
-                case CT::ctUnsignedInt: return 4;
-                case CT::ctFloat: return 4;
-            }
-            return 1;
-        };
-        auto getTypeCount = [](systems::leal::gltf::AccessorType at) -> size_t {
-            using AT = systems::leal::gltf::AccessorType;
-            switch (at) {
-                case AT::acScalar: return 1;
-                case AT::acVec2:   return 2;
-                case AT::acVec3:   return 3;
-                case AT::acVec4:   return 4;
-                case AT::acMat2:   return 4;
-                case AT::acMat3:   return 9;
-                case AT::acMat4:   return 16;
-            }
-            return 1;
-        };
-
         for (auto &mesh : *asset->meshes) {
             for (auto &primitive : mesh.primitives) {
                 for (auto &[semantic, accIdx] : primitive.attributes) {
                     if (accIdx < 0 || (size_t)accIdx >= asset->accessors->size()) continue;
                     auto &acc = (*asset->accessors)[(size_t)accIdx];
-                    if (acc.bufferView < 0 || (size_t)acc.bufferView >= asset->bufferViews->size()) continue;
-                    auto &bv = (*asset->bufferViews)[(size_t)acc.bufferView];
-                    if (bv.byteStride <= 0) continue;
+                    bool interleaved = false;
+                    if (acc.bufferView >= 0 && (size_t)acc.bufferView < asset->bufferViews->size()) {
+                        interleaved = (*asset->bufferViews)[(size_t)acc.bufferView].byteStride > 0;
+                    }
+                    if (!interleaved && !acc.sparse) continue;
                     if (deinterleavedBuffers.count(accIdx)) continue;
 
-                    size_t compSize = getComponentSize(acc.componentType);
-                    size_t typeCount = getTypeCount(acc.type);
-                    size_t elementSize = compSize * typeCount;
-                    size_t totalSize = elementSize * acc.count;
-                    if (totalSize == 0) continue;
+                    size_t elementSize = gltfComponentSize(acc.componentType) * gltfTypeCount(acc.type);
+                    if (elementSize == 0 || acc.count == 0) continue;
 
-                    auto &buf = (*asset->buffers)[bv.buffer];
-                    if (buf.data.empty()) continue;
+                    std::vector<uint8_t> resolved = resolveAccessorBytes(acc, *asset);
 
                     size_t paddedElementSize = (elementSize + 3) & ~size_t(3); // round up to 4
                     std::vector<uint8_t> deinterleaved(paddedElementSize * acc.count, 0);
-                    const uint8_t *src = buf.data.data() + bv.byteOffset + acc.byteOffset;
                     for (size_t i = 0; i < acc.count; ++i) {
                         std::memcpy(deinterleaved.data() + i * paddedElementSize,
-                                    src + i * bv.byteStride,
+                                    resolved.data() + i * elementSize,
                                     elementSize);
                     }
 
                     using BU = systems::leal::campello_gpu::BufferUsage;
                     auto gpuBuf = device->createBuffer(
-                        totalSize, BU::vertex,
+                        deinterleaved.size(), BU::vertex,
                         deinterleaved.data());
                     if (gpuBuf) {
                         deinterleavedBuffers[accIdx] = gpuBuf;
@@ -661,6 +863,172 @@ void Renderer::setScene(uint32_t index) {
                 }
             }
         }
+
+        // Widen UNSIGNED_BYTE index accessors to uint16. glTF explicitly
+        // permits 8-bit indices, but Metal (and campello_gpu::IndexFormat)
+        // only supports 16- and 32-bit index buffers — reading a 1-byte-per-
+        // index buffer as anything wider walks past its actual data,
+        // producing effectively random triangle indices (huge, degenerate,
+        // or wildly out-of-range geometry).
+        widenedIndexBuffers.clear();
+        for (auto &mesh : *asset->meshes) {
+            for (auto &primitive : mesh.primitives) {
+                int64_t accIdx = primitive.indices;
+                if (accIdx < 0 || (size_t)accIdx >= asset->accessors->size()) continue;
+                auto &acc = (*asset->accessors)[(size_t)accIdx];
+                if (acc.componentType != systems::leal::gltf::ComponentType::ctUnsignedByte) continue;
+                if (acc.bufferView < 0 || (size_t)acc.bufferView >= asset->bufferViews->size()) continue;
+                if (widenedIndexBuffers.count(accIdx)) continue;
+
+                auto &bv = (*asset->bufferViews)[(size_t)acc.bufferView];
+                auto &buf = (*asset->buffers)[bv.buffer];
+                if (buf.data.empty()) continue;
+
+                const uint8_t *src = buf.data.data() + bv.byteOffset + acc.byteOffset;
+                size_t stride = bv.byteStride > 0 ? (size_t)bv.byteStride : 1;
+                std::vector<uint16_t> widened(acc.count);
+                for (size_t i = 0; i < acc.count; ++i) {
+                    widened[i] = src[i * stride];
+                }
+
+                using BU = systems::leal::campello_gpu::BufferUsage;
+                auto gpuBuf = device->createBuffer(
+                    widened.size() * sizeof(uint16_t), BU::index, widened.data());
+                if (gpuBuf) {
+                    widenedIndexBuffers[accIdx] = gpuBuf;
+                }
+            }
+        }
+
+        // Normalize every COLOR_0 accessor to float4 (see color0Buffers doc
+        // comment in the header for why).
+        color0Buffers.clear();
+        for (auto &mesh : *asset->meshes) {
+            for (auto &primitive : mesh.primitives) {
+                auto it = primitive.attributes.find("COLOR_0");
+                if (it == primitive.attributes.end()) continue;
+                int64_t accIdx = it->second;
+                if (accIdx < 0 || (size_t)accIdx >= asset->accessors->size()) continue;
+                if (color0Buffers.count(accIdx)) continue;
+                auto &acc = (*asset->accessors)[(size_t)accIdx];
+
+                using CT = systems::leal::gltf::ComponentType;
+                using AT = systems::leal::gltf::AccessorType;
+                size_t numComp = (acc.type == AT::acVec4) ? 4 : 3; // spec: COLOR_0 is VEC3 or VEC4
+                size_t compSize;
+                switch (acc.componentType) {
+                    case CT::ctUnsignedByte:  compSize = 1; break;
+                    case CT::ctUnsignedShort: compSize = 2; break;
+                    default:                  compSize = 4; break; // float
+                }
+                size_t elementSize = compSize * numComp;
+                if (elementSize == 0 || acc.count == 0) continue;
+
+                // resolveAccessorBytes handles both the base (bufferView, or
+                // implicit zero when absent) and any sparse override overlay.
+                std::vector<uint8_t> resolved = resolveAccessorBytes(acc, *asset);
+
+                std::vector<float> widened(acc.count * 4);
+                for (size_t i = 0; i < acc.count; ++i) {
+                    const uint8_t *elem = resolved.data() + i * elementSize;
+                    float comp[4] = {0.0f, 0.0f, 0.0f, 1.0f}; // VEC3 implies alpha = 1
+                    for (size_t c = 0; c < numComp; ++c) {
+                        switch (acc.componentType) {
+                            case CT::ctUnsignedByte:
+                                comp[c] = elem[c] / 255.0f;
+                                break;
+                            case CT::ctUnsignedShort: {
+                                uint16_t v;
+                                std::memcpy(&v, elem + c * 2, 2);
+                                comp[c] = v / 65535.0f;
+                                break;
+                            }
+                            default: {
+                                float v;
+                                std::memcpy(&v, elem + c * 4, 4);
+                                comp[c] = v;
+                                break;
+                            }
+                        }
+                    }
+                    std::memcpy(&widened[i * 4], comp, 4 * sizeof(float));
+                }
+
+                using BU2 = systems::leal::campello_gpu::BufferUsage;
+                auto gpuBuf = device->createBuffer(
+                    widened.size() * sizeof(float), BU2::vertex, widened.data());
+                if (gpuBuf) {
+                    color0Buffers[accIdx] = gpuBuf;
+                }
+            }
+        }
+    }
+
+    // Morph targets: pack each primitive's target deltas into [target][vertex]
+    // float3 buffers (position always, normal only if every target supplies
+    // one). resolveAccessorBytes handles sparse deltas transparently — the
+    // common case, since most vertices are unaffected by any one target.
+    morphBuffers.clear();
+    if (asset->meshes && asset->accessors) {
+        namespace GPU = systems::leal::campello_gpu;
+        for (auto &mesh : *asset->meshes) {
+            for (auto &primitive : mesh.primitives) {
+                if (primitive.targets.empty()) continue;
+
+                auto posIt = primitive.attributes.find("POSITION");
+                if (posIt == primitive.attributes.end()) continue;
+                if (posIt->second < 0 || (size_t)posIt->second >= asset->accessors->size()) continue;
+                uint32_t vertexCount = (uint32_t)(*asset->accessors)[(size_t)posIt->second].count;
+                if (vertexCount == 0) continue;
+
+                size_t targetCount = std::min(primitive.targets.size(), (size_t)kMaxMorphTargets);
+                bool allHaveNormal = true;
+                for (size_t t = 0; t < targetCount; t++) {
+                    if (!primitive.targets[t].count("NORMAL")) { allHaveNormal = false; break; }
+                }
+
+                std::vector<float> posDeltas(targetCount * vertexCount * 3, 0.0f);
+                std::vector<float> normDeltas;
+                if (allHaveNormal) normDeltas.assign(targetCount * vertexCount * 3, 0.0f);
+
+                bool anyTarget = false;
+                for (size_t t = 0; t < targetCount; t++) {
+                    auto &target = primitive.targets[t];
+                    auto pit = target.find("POSITION");
+                    if (pit != target.end() && pit->second < asset->accessors->size()) {
+                        auto &acc = (*asset->accessors)[(size_t)pit->second];
+                        std::vector<uint8_t> bytes = resolveAccessorBytes(acc, *asset);
+                        size_t n = std::min((size_t)vertexCount, (size_t)acc.count);
+                        std::memcpy(posDeltas.data() + t * vertexCount * 3, bytes.data(), n * 3 * sizeof(float));
+                        anyTarget = true;
+                    }
+                    if (allHaveNormal) {
+                        auto nit = target.find("NORMAL");
+                        auto &acc = (*asset->accessors)[(size_t)nit->second];
+                        std::vector<uint8_t> bytes = resolveAccessorBytes(acc, *asset);
+                        size_t n = std::min((size_t)vertexCount, (size_t)acc.count);
+                        std::memcpy(normDeltas.data() + t * vertexCount * 3, bytes.data(), n * 3 * sizeof(float));
+                    }
+                }
+                if (!anyTarget) continue;
+
+                MorphGpuData gpuData;
+                gpuData.targetCount = (uint32_t)targetCount;
+                gpuData.vertexCount = vertexCount;
+                gpuData.positionDeltas = device->createBuffer(
+                    posDeltas.size() * sizeof(float), GPU::BufferUsage::vertex, posDeltas.data());
+                if (allHaveNormal) {
+                    gpuData.normalDeltas = device->createBuffer(
+                        normDeltas.size() * sizeof(float), GPU::BufferUsage::vertex, normDeltas.data());
+                }
+                morphBuffers[&primitive] = gpuData;
+            }
+        }
+    }
+    if (!defaultMorphInfoBuffer) {
+        float zero[11] = {0};
+        defaultMorphInfoBuffer = device->createBuffer(
+            sizeof(zero), systems::leal::campello_gpu::BufferUsage::vertex, zero);
     }
 
     // Scan ALL materials in the asset to determine which image indices carry
@@ -717,6 +1085,11 @@ void Renderer::setScene(uint32_t index) {
         return GPU::PixelFormat::rgba8unorm;
     };
 
+    // Textures uploaded below with more than one mip level still need
+    // generateMipmaps() run once to actually populate levels 1+; batched into
+    // a single command buffer after the loop rather than one per texture.
+    std::vector<std::shared_ptr<GPU::Texture>> texturesNeedingMips;
+
     // Decode and upload images referenced by this scene.
     systems::leal::campello_image::TextureFormat basisTargetFormat = chooseBasisTargetFormat(device);
     for (int a = 0; a < (int)info->images.size(); a++) {
@@ -770,13 +1143,17 @@ void Renderer::setScene(uint32_t index) {
                         image.data.data(), image.data.size());
                     if (img != nullptr) {
                         auto fmt = imageFormatToPixelFormat(img->getFormat(), wantsSrgb);
+                        uint32_t mipLevels = 1 + (uint32_t)std::floor(
+                            std::log2((double)std::max(img->getWidth(), img->getHeight())));
                         auto texture = device->createTexture(
                             GPU::TextureType::tt2d, fmt,
-                            img->getWidth(), img->getHeight(), 1, 1, 1,
-                            GPU::TextureUsage::textureBinding);
+                            img->getWidth(), img->getHeight(), 1, mipLevels, 1,
+                            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                                (uint32_t)GPU::TextureUsage::copyDst));
                         if (texture != nullptr) {
                             texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
                             gpuTextures[a] = texture;
+                            if (mipLevels > 1) texturesNeedingMips.push_back(texture);
                         }
                     }
                 } else if (image.bufferView != -1) {
@@ -787,13 +1164,17 @@ void Renderer::setScene(uint32_t index) {
                         auto img = systems::leal::campello_image::Image::fromMemory(src, bufferView.byteLength);
                         if (img != nullptr) {
                             auto fmt = imageFormatToPixelFormat(img->getFormat(), wantsSrgb);
+                            uint32_t mipLevels = 1 + (uint32_t)std::floor(
+                                std::log2((double)std::max(img->getWidth(), img->getHeight())));
                             auto texture = device->createTexture(
                                 GPU::TextureType::tt2d, fmt,
-                                img->getWidth(), img->getHeight(), 1, 1, 1,
-                                GPU::TextureUsage::textureBinding);
+                                img->getWidth(), img->getHeight(), 1, mipLevels, 1,
+                                (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                                    (uint32_t)GPU::TextureUsage::copyDst));
                             if (texture != nullptr) {
                                 texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
                                 gpuTextures[a] = texture;
+                                if (mipLevels > 1) texturesNeedingMips.push_back(texture);
                             }
                         }
                     }
@@ -806,19 +1187,41 @@ void Renderer::setScene(uint32_t index) {
                     auto img = systems::leal::campello_image::Image::fromFile(imagePath.c_str());
                     if (img != nullptr) {
                         auto fmt = imageFormatToPixelFormat(img->getFormat(), wantsSrgb);
+                        uint32_t mipLevels = 1 + (uint32_t)std::floor(
+                            std::log2((double)std::max(img->getWidth(), img->getHeight())));
                         auto texture = device->createTexture(
                             GPU::TextureType::tt2d, fmt,
-                            img->getWidth(), img->getHeight(), 1, 1, 1,
-                            GPU::TextureUsage::textureBinding);
+                            img->getWidth(), img->getHeight(), 1, mipLevels, 1,
+                            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                                (uint32_t)GPU::TextureUsage::copyDst));
                         if (texture != nullptr) {
                             texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
                             gpuTextures[a] = texture;
+                            if (mipLevels > 1) texturesNeedingMips.push_back(texture);
                         }
                     }
                 }
             }
         } else {
             gpuTextures[a] = nullptr;
+        }
+    }
+
+    // Generate mip chains for every texture uploaded above with more than one
+    // level. Without this, textures viewed either minified (distant/small on
+    // screen) or with a large KHR_texture_transform tiling scale (common for
+    // repeating detail normal maps) alias badly — sampling always reads mip 0
+    // at full frequency, which shows up as speckled noise in lit/specular
+    // output even though the base texture and mesh normals are both correct.
+    if (!texturesNeedingMips.empty()) {
+        auto mipEncoder = device->createCommandEncoder();
+        if (mipEncoder) {
+            for (auto &tex : texturesNeedingMips) {
+                mipEncoder->generateMipmaps(tex);
+            }
+            auto fence = device->createFence();
+            device->submit(mipEncoder->finish(), fence);
+            if (fence) fence->wait();
         }
     }
 
@@ -1243,8 +1646,17 @@ void Renderer::setScene(uint32_t index) {
         if (defaultClearcoatNormalTexture) defaultClearcoatNormalTexture->upload(0, 4, flatNormal);
     }
 
-    // Default environment map: 1x1x6 medium-bright gray cube — used when no environment is set.
-    // Brighter than physical black so transmission materials look reasonable out of the box.
+    // Default environment map — used when no environment is set. A small
+    // embedded real skybox photo (see createBuiltinDefaultEnvironmentMap),
+    // so IBL reflections have real spatial/roughness variation out of the
+    // box instead of a flat placeholder color.
+    if (!environmentMap) {
+        environmentMap = createBuiltinDefaultEnvironmentMap();
+    }
+
+    // Fallback if the embedded skybox ever fails to decode/upload (e.g. GPU
+    // resource exhaustion): a flat medium-bright gray cube, brighter than
+    // physical black so transmission materials still look reasonable.
     if (!environmentMap) {
         uint8_t darkGray[4] = {140, 150, 160, 255}; // ~0.55 linear, slightly blue-ish (sky-like)
         auto defaultEnvTex = device->createTexture(
@@ -1460,15 +1872,11 @@ void Renderer::setScene(uint32_t index) {
             sd.addressModeU  = static_cast<GPU::WrapMode>(gs.wrapS);
             sd.addressModeV  = static_cast<GPU::WrapMode>(gs.wrapT);
             sd.addressModeW  = GPU::WrapMode::repeat;
-            sd.magFilter     = (gs.magFilter == systems::leal::gltf::FilterMode::fmNearest)
-                                   ? GPU::FilterMode::fmNearest : GPU::FilterMode::fmLinear;
-            sd.minFilter     = (gs.minFilter == systems::leal::gltf::FilterMode::fmNearest ||
-                                gs.minFilter == systems::leal::gltf::FilterMode::fmNearestMipmapNearest ||
-                                gs.minFilter == systems::leal::gltf::FilterMode::fmNearestMipmapLinear)
-                                   ? GPU::FilterMode::fmNearest : GPU::FilterMode::fmLinear;
+            sd.magFilter     = gltfMagFilterToGpu(gs.magFilter);
+            sd.minFilter     = gltfMinFilterToGpu(gs.minFilter);
             sd.lodMinClamp   = 0.0;
             sd.lodMaxClamp   = 1000.0;
-            sd.maxAnisotropy = 1.0;
+            sd.maxAnisotropy = 8.0;
             gpuSamplers[s]   = device->createSampler(sd);
         }
     }
@@ -1947,18 +2355,43 @@ void Renderer::setScene(uint32_t index) {
         totalJointMatrixBytes = gpuOffset;
     }
 
-    // Fallback buffers for primitives without JOINTS_0 / WEIGHTS_0.
-    if (!fallbackJointBuffer) {
-        constexpr uint64_t kFallbackJointSize = 256 * 1024; // enough zero uint4s
-        std::vector<uint8_t> zeros(kFallbackJointSize, 0);
-        fallbackJointBuffer = device->createBuffer(
-            kFallbackJointSize, GPU::BufferUsage::vertex, zeros.data());
-    }
-    if (!fallbackWeightBuffer) {
-        constexpr uint64_t kFallbackWeightSize = 256 * 1024; // enough zero float4s
-        std::vector<uint8_t> zeros(kFallbackWeightSize, 0);
-        fallbackWeightBuffer = device->createBuffer(
-            kFallbackWeightSize, GPU::BufferUsage::vertex, zeros.data());
+    // Fallback buffers for primitives missing TANGENT / TEXCOORD_0 / JOINTS_0 /
+    // WEIGHTS_0. Must cover the largest primitive's vertex count in THIS scene —
+    // a fixed size silently under-covers big meshes, which Metal's draw
+    // validation catches as "vertex buffer too small for maxVertexID" (a hard
+    // abort under the debug layer, undefined behavior otherwise).
+    {
+        uint64_t maxVertexCount = 0;
+        if (asset->meshes && asset->accessors) {
+            for (auto &mesh : *asset->meshes) {
+                for (auto &prim : mesh.primitives) {
+                    auto posIt = prim.attributes.find("POSITION");
+                    if (posIt == prim.attributes.end()) continue;
+                    int64_t accIdx = posIt->second;
+                    if (accIdx < 0 || (size_t)accIdx >= asset->accessors->size()) continue;
+                    uint64_t count = (*asset->accessors)[(size_t)accIdx].count;
+                    maxVertexCount = std::max(maxVertexCount, count);
+                }
+            }
+        }
+        constexpr uint64_t kMinFallbackVertexCount = 16384; // 256KB / 16 bytes-per-vertex baseline
+        uint64_t vertexCapacity = std::max(maxVertexCount, kMinFallbackVertexCount);
+
+        ensureFallbackBuffer(fallbackUVBuffer,        vertexCapacity * 8);  // float2
+        ensureFallbackBuffer(fallbackTangentBuffer,   vertexCapacity * 16); // float4
+        ensureFallbackBuffer(fallbackJointBuffer,     vertexCapacity * 16); // uint4
+        ensureFallbackBuffer(fallbackWeightBuffer,    vertexCapacity * 16); // float4
+        ensureFallbackBuffer(fallbackTexCoord1Buffer, vertexCapacity * 8);  // float2
+
+        // COLOR_0 fallback must read as white (1,1,1,1), not zero — it's
+        // unconditionally multiplied into baseColor, so a zero fallback would
+        // make every primitive without real vertex colors render black.
+        uint64_t color0Bytes = vertexCapacity * 16; // float4
+        if (!fallbackColor0Buffer || fallbackColor0Buffer->getLength() < color0Bytes) {
+            std::vector<float> ones(vertexCapacity * 4, 1.0f);
+            fallbackColor0Buffer = device->createBuffer(
+                color0Bytes, GPU::BufferUsage::vertex, ones.data());
+        }
     }
     // Default identity joint matrix for non-skinned draws.
     if (!defaultJointMatrixBuffer) {
@@ -2162,6 +2595,13 @@ void Renderer::createQuantizedPipelinesIfNeeded() {
     base.vertex.buffers.push_back(makeLayout(
         weightsComponentType, GPU::AccessorType::acVec4,
         qWeightsStride, GPU::StepMode::vertex, VERTEX_SLOT_WEIGHTS, weightsNormalized));
+    // COLOR_0 (normalized to float4 on upload — see color0Buffers) / TEXCOORD_1 (float2).
+    base.vertex.buffers.push_back(makeLayout(
+        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec4,
+        16.0, GPU::StepMode::vertex, VERTEX_SLOT_COLOR0, false));
+    base.vertex.buffers.push_back(makeLayout(
+        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec2,
+        8.0, GPU::StepMode::vertex, VERTEX_SLOT_TEXCOORD1, false));
 
     GPU::DepthStencilDescriptor ds{};
     ds.format              = GPU::PixelFormat::depth32float;
@@ -2361,6 +2801,13 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     base.vertex.buffers.push_back(makeLayout(
         weightsComponentType, GPU::AccessorType::acVec4,
         weightsStride, GPU::StepMode::vertex, VERTEX_SLOT_WEIGHTS, weightsNormalized));
+    // COLOR_0 (normalized to float4 on upload — see color0Buffers) / TEXCOORD_1 (float2).
+    base.vertex.buffers.push_back(makeLayout(
+        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec4,
+        16.0, GPU::StepMode::vertex, VERTEX_SLOT_COLOR0));
+    base.vertex.buffers.push_back(makeLayout(
+        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec2,
+        8.0, GPU::StepMode::vertex, VERTEX_SLOT_TEXCOORD1));
 
     GPU::DepthStencilDescriptor ds{};
     ds.format              = GPU::PixelFormat::depth32float;
@@ -3612,6 +4059,7 @@ void Renderer::computeNodeTransform(
 
     // Apply animation if active — modifies node TRS before computing matrix.
     applyAnimatedTRS(nodeIndex);
+    updateMorphWeights(nodeIndex);
 
     auto local = nodeLocalMatrix(node);
     auto  world = parentWorld * local;
@@ -4038,7 +4486,9 @@ void Renderer::renderToTarget(
             float specularColor[3] = {1.f, 1.f, 1.f};
             float sheenColor[3]    = {0.f, 0.f, 0.f};
             float attenuationColor[3] = {1.f, 1.f, 1.f};
-            float slot[82];
+            float normalRow0[4] = {1.f, 0.f, 0.f, 0.f}; // w=0 → identity fast path
+            float normalRow1[4] = {0.f, 1.f, 0.f, 0.f};
+            float slot[93];
             buildSlotRaw(bc, row0, row1, 1.f, 1.f, 1.f, 0.f, 0.5f, 0.f, 0.f, 0.f, 0.f, 1.f,
                       emissive, 1.5f, 1.f, 0.f, 0.f, specularColor,
                       sheenColor, 0.f, 0.f, 0.f,
@@ -4046,21 +4496,23 @@ void Renderer::renderToTarget(
                       0.f, 0.f, 0.f, 0.f, 0.f, attenuationColor,
                       0.f, 1.3f, 100.f, 400.f, 0.f, 0.f,
                       0.f, 0.f, 0.f, 0.f,
+                      normalRow0, normalRow1,
+                      0.f,
                       (float)viewMode,
                       environmentIntensity, iblEnabled ? 1.f : 0.f, slot);
-            materialUniformBuffer->upload(0, (uint64_t)(82 * sizeof(float)), slot);
+            materialUniformBuffer->upload(0, (uint64_t)(93 * sizeof(float)), slot);
         }
 
         if (asset->materials) {
             for (size_t i = 0; i < asset->materials->size(); ++i) {
-                float slot[82];
+                float slot[93];
                 buildMaterialSlotFromGltf((*asset->materials)[i],
                                           (float)viewMode,
                                           environmentIntensity,
                                           iblEnabled ? 1.f : 0.f,
                                           slot);
                 materialUniformBuffer->upload((uint64_t)(i + 1) * kMaterialUniformStride,
-                                              (uint64_t)(82 * sizeof(float)), slot);
+                                              (uint64_t)(93 * sizeof(float)), slot);
             }
         }
     }
@@ -4179,6 +4631,14 @@ void Renderer::renderToTarget(
         }
     };
 
+    // drawOpaque always starts a fresh encoder from the vertex-buffer cache's
+    // point of view (every call site either begins a brand-new encoder, or is
+    // the first draw call of the frame) so it always resets. drawTransparent
+    // takes an explicit flag: the two-pass path gives it a genuinely different
+    // encoder from drawOpaque's (must reset), while the single-pass path
+    // reuses the SAME encoder for both (must NOT reset — see
+    // lastBoundVertexBuffers's doc comment for why re-clearing mid-encoder
+    // causes a Metal debug-layer abort).
     auto drawOpaque = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe) {
         currentPipelineVariant = 0;
         lastBoundVertexBuffers.fill({});
@@ -4187,11 +4647,35 @@ void Renderer::renderToTarget(
         }
     };
 
-    auto drawTransparent = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe) {
+    auto drawTransparent = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe, bool freshEncoder) {
         if (!transparentQueue.empty()) {
             std::sort(transparentQueue.begin(), transparentQueue.end(),
                 [&](const DrawCall &a, const DrawCall &b) {
+                    // Sort by each primitive's actual world-space bounding-box
+                    // center (nodeWorldBounds — already correctly transforms
+                    // the mesh's own local extent by the node's world matrix),
+                    // not the node's raw translation. A node's translation is
+                    // only the node's own pivot, which can sit anywhere
+                    // relative to its mesh's actual vertices (e.g. two
+                    // coincident front/back "shell" surfaces sharing a parent
+                    // whose local translation is zero for both — using
+                    // translation alone made every such pair compare equal
+                    // regardless of camera angle, so std::sort's tie-breaking
+                    // — not true depth — decided draw order, letting one
+                    // shell always render on top of the other from every
+                    // viewing direction instead of whichever is actually
+                    // nearer the camera).
                     auto squaredDist = [&](uint64_t ni) -> float {
+                        if (ni < nodeWorldBounds.size() && nodeWorldBounds[ni].valid) {
+                            auto &b = nodeWorldBounds[ni];
+                            float cx = (float)((b.min.x() + b.max.x()) * 0.5);
+                            float cy = (float)((b.min.y() + b.max.y()) * 0.5);
+                            float cz = (float)((b.min.z() + b.max.z()) * 0.5);
+                            float dx = cx - cameraWorldPos[0];
+                            float dy = cy - cameraWorldPos[1];
+                            float dz = cz - cameraWorldPos[2];
+                            return dx*dx + dy*dy + dz*dz;
+                        }
                         size_t base = ni * 32;
                         if (base + 31 >= nodeTransforms.size()) return 0.0f;
                         float dx = nodeTransforms[base + 28] - cameraWorldPos[0];
@@ -4202,7 +4686,9 @@ void Renderer::renderToTarget(
                     return squaredDist(a.nodeIndex) > squaredDist(b.nodeIndex);
                 });
             currentPipelineVariant = 0;
-            lastBoundVertexBuffers.fill({});
+            if (freshEncoder) {
+                lastBoundVertexBuffers.fill({});
+            }
             for (auto &draw : transparentQueue) {
                 renderPrimitive(rpe, *draw.primitive, draw.nodeIndex);
             }
@@ -4349,7 +4835,7 @@ void Renderer::renderToTarget(
             auto transRpe = encoder->beginRenderPass(transDesc);
             if (transRpe) {
                 setupViewport(transRpe);
-                drawTransparent(transRpe);
+                drawTransparent(transRpe, /*freshEncoder=*/true);
                 transRpe->end();
             }
         }
@@ -4377,7 +4863,7 @@ void Renderer::renderToTarget(
         setupViewport(rpe);
         drawSkybox(rpe);
         drawOpaque(rpe);
-        drawTransparent(rpe);
+        drawTransparent(rpe, /*freshEncoder=*/false);
         rpe->end();
     }
 
@@ -4542,6 +5028,64 @@ void Renderer::applyAnimatedTRS(uint64_t nodeIndex) {
     }
 }
 
+// Recompute this node's active morph weights (mesh.weights default,
+// node.weights override, animation "weights" channel override on top of
+// that — same precedence pattern as applyAnimatedTRS) and re-upload its
+// MorphInfo buffer. A cheap no-op for the overwhelming majority of nodes
+// that have no morph targets at all.
+void Renderer::updateMorphWeights(uint64_t nodeIndex) {
+    if (!asset || !asset->nodes || nodeIndex >= asset->nodes->size()) return;
+    auto &node = (*asset->nodes)[nodeIndex];
+    if (node.mesh < 0 || !asset->meshes || (size_t)node.mesh >= asset->meshes->size()) return;
+    auto &mesh = (*asset->meshes)[(size_t)node.mesh];
+    if (mesh.primitives.empty() || mesh.primitives[0].targets.empty()) return;
+
+    size_t targetCount = mesh.primitives[0].targets.size();
+    if (targetCount > kMaxMorphTargets) targetCount = kMaxMorphTargets;
+
+    std::vector<float> weights(targetCount, 0.0f);
+    if (!node.weights.empty()) {
+        for (size_t i = 0; i < targetCount && i < node.weights.size(); i++) weights[i] = (float)node.weights[i];
+    } else if (!mesh.weights.empty()) {
+        for (size_t i = 0; i < targetCount && i < mesh.weights.size(); i++) weights[i] = (float)mesh.weights[i];
+    }
+    if (animator) {
+        auto &animWeights = animator->getAnimatedWeights();
+        auto wit = animWeights.find(nodeIndex);
+        if (wit != animWeights.end()) {
+            for (size_t i = 0; i < targetCount && i < wit->second.size(); i++) weights[i] = wit->second[i];
+        }
+    }
+
+    // hasNormalDeltas/vertexCount come from the first primitive's cached
+    // MorphGpuData — targets are technically per-primitive, but in practice
+    // every primitive of a mesh shares the same target layout, and packing
+    // a per-primitive variant of this would need a second buffer per draw
+    // rather than one cheap per-node buffer per frame.
+    bool hasNormal = false;
+    uint32_t vertexCount = 0;
+    auto mbIt = morphBuffers.find(&mesh.primitives[0]);
+    if (mbIt != morphBuffers.end()) {
+        hasNormal = mbIt->second.normalDeltas != nullptr;
+        vertexCount = mbIt->second.vertexCount;
+    }
+
+    // MorphInfo layout: [targetCount, hasNormalTargets, vertexCount, weights[8]] = 11 floats.
+    float data[11] = {0};
+    data[0] = (float)targetCount;
+    data[1] = hasNormal ? 1.0f : 0.0f;
+    data[2] = (float)vertexCount;
+    for (size_t i = 0; i < targetCount; i++) data[3 + i] = weights[i];
+
+    namespace GPU = systems::leal::campello_gpu;
+    auto &buf = morphNodeUniformBuffers[nodeIndex];
+    if (!buf) {
+        buf = device->createBuffer(sizeof(data), GPU::BufferUsage::uniform, data);
+    } else {
+        buf->upload(0, sizeof(data), data);
+    }
+}
+
 void Renderer::setViewMode(ViewMode mode) {
     viewMode = mode;
 }
@@ -4588,7 +5132,15 @@ void Renderer::gatherVisibleDraws(uint64_t nodeIndex)
             draw.primitive = &primitive;
             draw.nodeIndex = nodeIndex;
             draw.materialIndex = resolvePrimitiveMaterial(primitive);
-            draw.transparent = (viewMode == ViewMode::normal) && isTransparentMaterial(draw.materialIndex);
+            // Route by real material transparency regardless of debug view mode —
+            // gating this on ViewMode::normal used to force transmissive/blend
+            // materials into the single-pass opaque path during debug inspection,
+            // where their depth-write-disabled blend pipeline let later opaque
+            // draws (e.g. objects behind glass) paint over them with no depth
+            // conflict. That made debug views (roughness, clearcoat, etc.) show
+            // unreliable, camera-angle-dependent results for such materials
+            // instead of the actual per-pixel value.
+            draw.transparent = isTransparentMaterial(draw.materialIndex);
             if (draw.transparent) {
                 transparentQueue.push_back(draw);
             } else {
@@ -4658,21 +5210,37 @@ void Renderer::renderPrimitive(
             useBlend = true;
         }
 
-        if (hasTexcoord) {
+        // A significantly metallic material needs the textured pipeline too,
+        // for the same reason as sheen/clearcoat/transmission below: metallic
+        // is a factor-only property (no texture required — metallicFactor
+        // defaults to 1.0 when omitted entirely, e.g. a plain shiny metal
+        // frame with only a baseColorFactor), but the flat shader has no IBL/
+        // specular code whatsoever. A metal's entire visual identity is its
+        // environment reflection — rendered flat it just reads as a diffuse
+        // gray/tinted plastic with no reflections at all.
+        bool isMetallic = mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->metallicFactor > 0.01;
+
+        // KHR_materials_sheen/clearcoat/transmission only need the textured
+        // pipeline for its IBL/specular shading model — none of them require
+        // UV coordinates to be meaningful, since they can be driven purely by
+        // factor values with no texture at all (e.g. a plain glass material:
+        // just transmissionFactor, no textures, hence no TEXCOORD_0). Gating
+        // this behind hasTexcoord routed such primitives to the flat shader,
+        // which has no IBL/specular/transmission code whatsoever — glass
+        // rendered as flat alpha with zero reflection instead of translucent
+        // with a Fresnel highlight.
+        if (mat.khrMaterialsSheen || mat.khrMaterialsClearcoat || mat.khrMaterialsTransmission ||
+            isMetallic || needsTexturedView) {
+            hasTexture = true;
+        } else if (hasTexcoord) {
             if ((mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture) ||
                 mat.normalTexture ||
                 mat.occlusionTexture ||
                 mat.emissiveTexture ||
                 (mat.khrMaterialsSpecular &&
-                 (mat.khrMaterialsSpecular->specularTexture || mat.khrMaterialsSpecular->specularColorTexture)) ||
-                mat.khrMaterialsSheen ||
-                mat.khrMaterialsClearcoat ||
-                mat.khrMaterialsTransmission ||
-                needsTexturedView) {
+                 (mat.khrMaterialsSpecular->specularTexture || mat.khrMaterialsSpecular->specularColorTexture))) {
                 hasTexture = true;
             }
-        } else if (needsTexturedView) {
-            hasTexture = true;
         }
     }
 
@@ -4834,6 +5402,23 @@ void Renderer::renderPrimitive(
                 setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD0, fallbackUVBuffer, 0);
             }
         }
+        // TEXCOORD_1: bind real data or fallback zero buffer. Assumes the
+        // Draco decoder yields float2 (true for all Draco assets seen so
+        // far); a quantized TEXCOORD_1 under Draco is not specially handled.
+        if (!bindDracoAttribute("TEXCOORD_1", VERTEX_SLOT_TEXCOORD1)) {
+            if (fallbackTexCoord1Buffer) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD1, fallbackTexCoord1Buffer, 0);
+            }
+        }
+        // COLOR_0: bind real data or fallback white buffer. Assumes the
+        // Draco decoder yields float4 — VEC3 or quantized Draco COLOR_0 (rarer)
+        // is not converted the way the non-Draco path below converts it, and
+        // would bind with a mismatched stride if encountered.
+        if (!bindDracoAttribute("COLOR_0", VERTEX_SLOT_COLOR0)) {
+            if (fallbackColor0Buffer) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_COLOR0, fallbackColor0Buffer, 0);
+            }
+        }
 
         // JOINTS_0 / WEIGHTS_0 for skeletal meshes
         if (!bindDracoAttribute("JOINTS_0", VERTEX_SLOT_JOINTS)) {
@@ -4853,6 +5438,19 @@ void Renderer::renderPrimitive(
             if (it == primitive.attributes.end()) return false;
             int64_t accIdx = it->second;
             auto &acc = (*asset->accessors)[accIdx];
+
+            // COLOR_0 is always normalized to a canonical float4 buffer
+            // (see color0Buffers doc comment) regardless of its source
+            // VEC3/VEC4, componentType, or normalized flag.
+            if (semantic == "COLOR_0") {
+                auto colorIt = color0Buffers.find(accIdx);
+                if (colorIt != color0Buffers.end() && colorIt->second) {
+                    setVertexBufferIfChanged(rpe, slot, colorIt->second, 0);
+                    return true;
+                }
+                return false;
+            }
+
             if (acc.bufferView < 0) return false;
             auto &bv  = (*asset->bufferViews)[(size_t)acc.bufferView];
 
@@ -4885,6 +5483,20 @@ void Renderer::renderPrimitive(
                 setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD0, fallbackUVBuffer, 0);
             }
         }
+        // TEXCOORD_1: bind real data or fallback zero buffer. Assumes float2
+        // (no quantized-TEXCOORD_1 detection, unlike TEXCOORD_0).
+        if (!bindAttribute("TEXCOORD_1", VERTEX_SLOT_TEXCOORD1)) {
+            if (fallbackTexCoord1Buffer) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD1, fallbackTexCoord1Buffer, 0);
+            }
+        }
+        // COLOR_0: bind real data (normalized to float4 by color0Buffers) or
+        // fallback white buffer.
+        if (!bindAttribute("COLOR_0", VERTEX_SLOT_COLOR0)) {
+            if (fallbackColor0Buffer) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_COLOR0, fallbackColor0Buffer, 0);
+            }
+        }
 
         // JOINTS_0 / WEIGHTS_0 for skeletal meshes
         if (!bindAttribute("JOINTS_0", VERTEX_SLOT_JOINTS)) {
@@ -4898,7 +5510,41 @@ void Renderer::renderPrimitive(
             }
         }
     }
-    
+
+    // Morph targets: bind per-primitive delta buffers + this node's active
+    // weights. The fallback MorphInfo(targetCount=0) makes the shader's
+    // blend loop a no-op, so no separate "hasMorphTargets" branch is needed
+    // in the shader. The delta-buffer fallbacks reuse fallbackTangentBuffer
+    // (float4, zero-filled, already sized to this scene's largest primitive)
+    // purely so a real, large-enough buffer is bound even when unused —
+    // targetCount=0 means the shader never actually indexes into it, but an
+    // undersized/absent binding could still trip Metal's buffer validation.
+    {
+        auto morphIt = morphBuffers.find(&primitive);
+        if (morphIt != morphBuffers.end() && morphIt->second.positionDeltas) {
+            setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_POSITION, morphIt->second.positionDeltas, 0);
+            if (morphIt->second.normalDeltas) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_NORMAL, morphIt->second.normalDeltas, 0);
+            } else if (fallbackTangentBuffer) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_NORMAL, fallbackTangentBuffer, 0);
+            }
+            auto weightIt = morphNodeUniformBuffers.find(nodeIndex);
+            if (weightIt != morphNodeUniformBuffers.end() && weightIt->second) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_INFO, weightIt->second, 0);
+            } else if (defaultMorphInfoBuffer) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_INFO, defaultMorphInfoBuffer, 0);
+            }
+        } else {
+            if (defaultMorphInfoBuffer) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_INFO, defaultMorphInfoBuffer, 0);
+            }
+            if (fallbackTangentBuffer) {
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_POSITION, fallbackTangentBuffer, 0);
+                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_NORMAL, fallbackTangentBuffer, 0);
+            }
+        }
+    }
+
     // Skip drawing if we couldn't bind a position buffer
     if (!positionBound) return;
 
@@ -4912,6 +5558,15 @@ void Renderer::renderPrimitive(
     } else if (primitive.indices >= 0) {
         // Use standard GLTF index buffer.
         auto &idxAcc = (*asset->accessors)[(size_t)primitive.indices];
+        // UNSIGNED_BYTE indices were widened to a dedicated uint16 buffer at
+        // scene-load time (see setScene) — Metal has no 8-bit index format.
+        auto widenedIt = widenedIndexBuffers.find(primitive.indices);
+        if (widenedIt != widenedIndexBuffers.end() && widenedIt->second) {
+            rpe->setIndexBuffer(widenedIt->second,
+                                systems::leal::campello_gpu::IndexFormat::uint16, 0);
+            rpe->drawIndexed((uint32_t)idxAcc.count, instanceCount);
+            return;
+        }
         if (idxAcc.bufferView >= 0) {
             auto &idxBV  = (*asset->bufferViews)[(size_t)idxAcc.bufferView];
             auto  idxBuf = gpuBuffers[idxBV.buffer];
@@ -5041,9 +5696,13 @@ Renderer::loadEnvironmentMap(
         case Img::ImageFormat::rgba32f: fmt = GPU::PixelFormat::rgba32float; break;
     }
 
+    // Full mip chain so roughness-based IBL sampling can select a blurred
+    // level instead of always reading the sharpest (mip 0) reflection.
+    uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2((double)std::max(w, h)));
+
     auto tex = device->createTexture(
         GPU::TextureType::ttCube, fmt,
-        w, h, 1, 1, 1,
+        w, h, 1, mipLevels, 1,
         (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
                             uint32_t(GPU::TextureUsage::copyDst)));
     if (!tex) return nullptr;
@@ -5063,6 +5722,7 @@ Renderer::loadEnvironmentMap(
         for (int i = 0; i < 6; ++i) {
             encoder->copyBufferToTexture(staging, i * bytesPerFace, bytesPerRow, tex, 0, i);
         }
+        encoder->generateMipmaps(tex);
         auto fence = device->createFence();
         device->submit(encoder->finish(), fence);
         if (fence) fence->wait();
@@ -5212,10 +5872,22 @@ namespace {
 std::shared_ptr<systems::leal::campello_gpu::Texture>
 Renderer::loadEquirectangularEnvironmentMap(const std::string &path, uint32_t faceSize)
 {
-    namespace GPU = systems::leal::campello_gpu;
     namespace Img = systems::leal::campello_image;
 
     auto img = Img::Image::fromFile(path.c_str());
+    if (!img) return nullptr;
+
+    return convertEquirectangularImageToCubemap(img, faceSize);
+}
+
+std::shared_ptr<systems::leal::campello_gpu::Texture>
+Renderer::convertEquirectangularImageToCubemap(
+    const std::shared_ptr<systems::leal::campello_image::Image> &img, uint32_t faceSize,
+    float intensityScale)
+{
+    namespace GPU = systems::leal::campello_gpu;
+    namespace Img = systems::leal::campello_image;
+
     if (!img) return nullptr;
 
     uint32_t eqW = img->getWidth();
@@ -5236,9 +5908,13 @@ Renderer::loadEquirectangularEnvironmentMap(const std::string &path, uint32_t fa
         case Img::ImageFormat::rgba32f: fmt = GPU::PixelFormat::rgba32float; break;
     }
 
+    // Full mip chain so roughness-based IBL sampling can select a blurred
+    // level instead of always reading the sharpest (mip 0) reflection.
+    uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2((double)fsize));
+
     auto tex = device->createTexture(
         GPU::TextureType::ttCube, fmt,
-        fsize, fsize, 1, 1, 1,
+        fsize, fsize, 1, mipLevels, 1,
         (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
                             uint32_t(GPU::TextureUsage::copyDst)));
     if (!tex) return nullptr;
@@ -5284,6 +5960,9 @@ Renderer::loadEquirectangularEnvironmentMap(const std::string &path, uint32_t fa
                 // Some equirectangular images have a vertical flip; if the result
                 // looks upside-down we can flip v here.
                 Float4 color = sampleEquirectangular(img.get(), eu, ev);
+                color.r *= intensityScale;
+                color.g *= intensityScale;
+                color.b *= intensityScale;
                 storePixel(faceData.data(), static_cast<int>(y * fsize + x), color, img->getFormat());
             }
         }
@@ -5303,7 +5982,50 @@ Renderer::loadEquirectangularEnvironmentMap(const std::string &path, uint32_t fa
         }
     }
 
+    // Generate the mip chain now that all 6 faces are uploaded, so
+    // roughness-based IBL sampling can select a blurred level.
+    auto mipEncoder = device->createCommandEncoder();
+    if (mipEncoder) {
+        mipEncoder->generateMipmaps(tex);
+        auto fence = device->createFence();
+        device->submit(mipEncoder->finish(), fence);
+        if (fence) fence->wait();
+    }
+
     return tex;
+}
+
+// ---------------------------------------------------------------------------
+// Built-in default environment map.
+//
+// Embedded as a 1024x512 equirectangular Radiance HDR photo — "Kiara 5 Noon"
+// by Greg Zaal (Poly Haven, CC0), a clear midday desert sky. Real (linear,
+// non-tonemapped) radiance data, not an 8-bit JPEG: sky/sun highlights
+// exceed 1.0, so reflective/metallic/iridescent materials get real specular
+// punch out of the box instead of being capped at the ~1.0 ceiling an LDR
+// source image imposes. Gives IBL real spatial variation (sky gradient, sun,
+// horizon detail) before the caller ever loads a real skybox.
+// ---------------------------------------------------------------------------
+std::shared_ptr<systems::leal::campello_gpu::Texture>
+Renderer::createBuiltinDefaultEnvironmentMap()
+{
+    namespace Img = systems::leal::campello_image;
+    using namespace systems::leal::campello_renderer::environments;
+
+    auto img = Img::Image::fromMemory(kDefaultEnvironmentHdr, kDefaultEnvironmentHdrSize);
+    if (!img) return nullptr;
+
+    // This HDRI is calibrated in absolute real-world radiance units (Poly
+    // Haven), where a clear sky away from the sun disc is genuinely quite
+    // dim — well under 1.0 — even though the sun itself peaks past 300,000.
+    // At intensityScale=1 that reads as a dim/muted environment for typical
+    // (non-sun-facing) reflections; empirically 6x reads as a well-exposed
+    // "vibrant" sky without blowing out the already very bright sun.
+    constexpr float kBuiltinEnvironmentExposure = 6.0f;
+
+    // 512px per face — roughly matches the 1024x512 equirect source's own
+    // detail without upsampling past it.
+    return convertEquirectangularImageToCubemap(img, 512, kBuiltinEnvironmentExposure);
 }
 
 void Renderer::setSkyboxEnabled(bool enabled) {
@@ -5641,14 +6363,31 @@ GpuMesh* Renderer::uploadMesh(const systems::leal::gltf::Primitive& primitive,
     // --- Index buffer ---
     if (primitive.indices >= 0 && asset.accessors) {
         auto& idxAcc = (*asset.accessors)[(size_t)primitive.indices];
-        auto idxBuf = uploadAccessorBuffer(idxAcc, asset, device, GPU::BufferUsage::index);
-        if (idxBuf) {
-            mesh->indexBuffer = idxBuf;
-            mesh->indexCount  = (uint32_t)idxAcc.count;
-            using CT = systems::leal::gltf::ComponentType;
-            mesh->indexFormat = (idxAcc.componentType == CT::ctUnsignedShort)
-                ? GPU::IndexFormat::uint16
-                : GPU::IndexFormat::uint32;
+        using CT = systems::leal::gltf::ComponentType;
+        if (idxAcc.componentType == CT::ctUnsignedByte) {
+            // glTF explicitly allows 8-bit indices, but Metal (and
+            // campello_gpu::IndexFormat) only supports 16/32-bit — widen to
+            // uint16 here rather than uploading the raw 1-byte-per-index
+            // data and mislabeling it as a wider format (which reads past
+            // the actual buffer into whatever memory follows).
+            auto raw = readAccessorData(idxAcc, asset);
+            std::vector<uint16_t> widened(raw.begin(), raw.end());
+            auto idxBuf = device->createBuffer(
+                widened.size() * sizeof(uint16_t), GPU::BufferUsage::index, widened.data());
+            if (idxBuf) {
+                mesh->indexBuffer = idxBuf;
+                mesh->indexCount  = (uint32_t)idxAcc.count;
+                mesh->indexFormat = GPU::IndexFormat::uint16;
+            }
+        } else {
+            auto idxBuf = uploadAccessorBuffer(idxAcc, asset, device, GPU::BufferUsage::index);
+            if (idxBuf) {
+                mesh->indexBuffer = idxBuf;
+                mesh->indexCount  = (uint32_t)idxAcc.count;
+                mesh->indexFormat = (idxAcc.componentType == CT::ctUnsignedShort)
+                    ? GPU::IndexFormat::uint16
+                    : GPU::IndexFormat::uint32;
+            }
         }
     }
 
@@ -5848,15 +6587,11 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                 sd.addressModeU  = static_cast<GPU::WrapMode>(gs.wrapS);
                 sd.addressModeV  = static_cast<GPU::WrapMode>(gs.wrapT);
                 sd.addressModeW  = GPU::WrapMode::repeat;
-                sd.magFilter     = (gs.magFilter == systems::leal::gltf::FilterMode::fmNearest)
-                                       ? GPU::FilterMode::fmNearest : GPU::FilterMode::fmLinear;
-                sd.minFilter     = (gs.minFilter == systems::leal::gltf::FilterMode::fmNearest ||
-                                    gs.minFilter == systems::leal::gltf::FilterMode::fmNearestMipmapNearest ||
-                                    gs.minFilter == systems::leal::gltf::FilterMode::fmNearestMipmapLinear)
-                                       ? GPU::FilterMode::fmNearest : GPU::FilterMode::fmLinear;
+                sd.magFilter     = gltfMagFilterToGpu(gs.magFilter);
+                sd.minFilter     = gltfMinFilterToGpu(gs.minFilter);
                 sd.lodMinClamp   = 0.0;
                 sd.lodMaxClamp   = 1000.0;
-                sd.maxAnisotropy = 1.0;
+                sd.maxAnisotropy = 8.0;
                 gpuSamplers[(size_t)gt.sampler] = device->createSampler(sd);
             }
             outSamp = gpuSamplers[(size_t)gt.sampler];
@@ -5990,14 +6725,14 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
 
     // --- Upload material uniform data ---
     {
-        float slot[82];
+        float slot[93];
         buildMaterialSlotFromGltf(material,
                                   (float)viewMode,
                                   environmentIntensity,
                                   iblEnabled ? 1.f : 0.f,
                                   slot);
         materialUniformBuffer->upload((uint64_t)uniformSlot * kMaterialUniformStride,
-                                      (uint64_t)(82 * sizeof(float)), slot);
+                                      (uint64_t)(93 * sizeof(float)), slot);
     }
 
     // --- Create bind groups ---
@@ -6065,14 +6800,14 @@ void Renderer::reuploadMaterialSlot(uint32_t uniformSlot,
                                     const systems::leal::gltf::Material& material,
                                     const systems::leal::gltf::GLTF& /*asset*/) {
     if (!materialUniformBuffer) return;
-    float slot[82];
+    float slot[93];
     buildMaterialSlotFromGltf(material,
                               (float)viewMode,
                               environmentIntensity,
                               iblEnabled ? 1.f : 0.f,
                               slot);
     materialUniformBuffer->upload((uint64_t)uniformSlot * kMaterialUniformStride,
-                                  (uint64_t)(82 * sizeof(float)), slot);
+                                  (uint64_t)(93 * sizeof(float)), slot);
 }
 
 
@@ -6551,9 +7286,11 @@ void Renderer::render(const RenderScene& scene,
             renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
         }
 
-        // Transparent draws (already sorted by caller).
+        // Transparent draws (already sorted by caller). Same encoder as the
+        // opaque loop above — do NOT reset lastBoundVertexBuffers here, or the
+        // next setVertexBuffer() call becomes redundant from Metal's point of
+        // view (see lastBoundVertexBuffers's doc comment).
         currentPipelineVariant = 0;
-        lastBoundVertexBuffers.fill({});
         for (auto &draw : scene.transparent) {
             renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
         }
@@ -6774,6 +7511,27 @@ void Renderer::renderPrimitive(
         setVertexBufferIfChanged(rpe, VERTEX_SLOT_WEIGHTS, vb[VERTEX_SLOT_WEIGHTS], 0);
     } else if (fallbackWeightBuffer) {
         setVertexBufferIfChanged(rpe, VERTEX_SLOT_WEIGHTS, fallbackWeightBuffer, 0);
+    }
+    // uploadMesh()/GpuMesh standalone meshes don't carry COLOR_0/TEXCOORD_1
+    // or morph target data (vertexBuffers is a fixed 6-slot array covering
+    // only POSITION/NORMAL/UV/TANGENT/JOINTS/WEIGHTS); bind the same white/
+    // zero fallbacks the primary GLTF-driven path uses so the shader reads
+    // spec-correct defaults instead of unbound/garbage buffers.
+    if (fallbackColor0Buffer) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_COLOR0, fallbackColor0Buffer, 0);
+    }
+    if (fallbackTexCoord1Buffer) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD1, fallbackTexCoord1Buffer, 0);
+    }
+    // bind the zero-weight default so the shader's blend loop is a no-op
+    // (buffer 21 is a non-pointer `constant` reference — Metal requires
+    // something valid bound there regardless of whether it's used).
+    if (defaultMorphInfoBuffer) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_INFO, defaultMorphInfoBuffer, 0);
+    }
+    if (fallbackTangentBuffer) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_POSITION, fallbackTangentBuffer, 0);
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_NORMAL, fallbackTangentBuffer, 0);
     }
 
     // --- 7. Draw ---

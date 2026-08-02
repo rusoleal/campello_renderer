@@ -13,3 +13,6 @@ shaders/metal/*.metallib
 shaders/metal/default_metallib.h
 shaders/vulkan/*.spv
 shaders/directx/*.dxil
+
+# Written to the working directory by test/main.cpp's image-save test.
+/test_image.tga

@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`campello_renderer` (v0.7.0) is a C++20 shared library that provides a 3D rendering layer on top of custom dependencies:
-- **campello_gpu** (v0.13.1) — low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
-- **gltf** (v0.4.2) — GLTF/GLB asset loader
+`campello_renderer` (v0.8.0) is a C++20 shared library that provides a 3D rendering layer on top of custom dependencies:
+- **campello_gpu** (v0.21.1) — low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
+- **gltf** (v0.5.0) — GLTF/GLB asset loader
 - **campello_image** (v0.5.0) — image decoding (PNG, JPEG, WebP, HDR, OpenEXR)
 
 The library is consumed as a CMake dependency and targets Android, macOS, iOS, Windows, and Linux. macOS is the primary development/test platform.
@@ -65,7 +65,8 @@ Defined in `inc/campello_renderer/campello_renderer.hpp`, implemented in `src/ca
 - `createDefaultPipelines(colorFormat)` — compile built-in pipeline variants (flat + textured); must be called before `render()`.
 - `render()` — render to the device's swapchain (Android / device-owns-surface platforms).
 - `render(colorView)` — render to an external color target (e.g., MTKView drawable on macOS).
-- `update(double dt)` — reserved for animation; currently a no-op.
+- `update(double dt)` — advances playing animations (`GltfAnimator`), applying TRS/morph-weight/material-pointer channels; pass the real elapsed time since the last call, not a fixed timestep (a hardcoded 1/60 here previously caused animations to run in slow motion on any frame slower than 16.7ms — see the macOS example's `drawInMTKView:`).
+- `playAnimation` / `pauseAnimation` / `stopAnimation` / `setAnimationTime` / `getAnimationCount` / `getAnimationName` / `getAnimationDuration` — animation playback controls, delegated to `GltfAnimator`.
 - `setCameraMatrices(view16, proj16)` / `clearCameraOverride()` — override GLTF camera with externally supplied column-major float[16] matrices.
 - `getBoundsRadius()` — approximate bounding radius of the current scene.
 - `getGpuBuffer/Texture/BindGroup(index)` and count accessors.
@@ -79,14 +80,30 @@ Defined in `inc/campello_renderer/campello_renderer.hpp`, implemented in `src/ca
 | 1 | NORMAL | float3 |
 | 2 | TEXCOORD_0 | float2 |
 | 3 | TANGENT | float4 |
+| 4 | JOINTS_0 | uint4 |
+| 5 | WEIGHTS_0 | float4 |
+| 6 | COLOR_0 (normalized to float4 on upload) | float4 |
+| 7 | TEXCOORD_1 | float2 |
 | 16 | MVP matrix (per-instance) | float4×4 |
 | 17 | MaterialUniforms (baseColorFactor) | float4 |
+| 18 | CameraPosition | float3 |
+| 19 | Instance transform (EXT_mesh_gpu_instancing) | float4×4 |
+| 20 | Joint matrix palette (per-skin) | float4×4[] |
+| 21 | MorphInfo (targetCount, hasNormal, vertexCount, weights[8]) | raw struct |
+| 22 | Morph target POSITION deltas, indexed via `[[vertex_id]]` | float3[] |
+| 23 | Morph target NORMAL deltas, indexed via `[[vertex_id]]` | float3[] |
+
+Slots 21–23 are raw `device const T*` buffers, not part of the `[[stage_in]]` vertex descriptor (target count varies per primitive) — bound directly in `renderPrimitive()`/`drawDrawCall()`, always with a valid (possibly zero-weight) fallback since `MorphInfo` is a non-pointer `constant` reference in the shader and Metal requires something bound there regardless of use.
 
 ### Resource Lifecycle
 
 GPU resources (`gpuBuffers`, `gpuTextures`, `gpuSamplers`, `gpuBindGroups`) are allocated in `setScene()`. The default sampler, default texture (1×1 white), bind group layout, and default bind group are lazy-initialized on the first `setScene()` call and reused across asset swaps.
 
 Images are decoded from GLTF buffer views via `campello_image::Image::fromMemory()`. `data:uri` images are not yet supported (TODO).
+
+Sparse accessors (`accessor.sparse`) are resolved for vertex attributes (including morph target deltas and COLOR_0) via the shared `resolveAccessorBytes()` helper in `src/campello_renderer.cpp`, which reads the base bufferView data (or an implicit zero base if absent) and overlays the sparse indices/values on top. Sparse `primitive.indices` accessors are not handled (rare in practice; the existing UNSIGNED_BYTE index-widening logic doesn't call the sparse resolver).
+
+Morph targets (`mesh.primitives[].targets`) are supported for POSITION and NORMAL (not TANGENT). Weight precedence is `node.weights` > `mesh.weights` > the `GltfAnimator`'s `"weights"` animation channel override, resolved per-node each frame in `updateMorphWeights()`.
 
 ### Pipeline Variants
 
@@ -124,7 +141,7 @@ Tests cover: version string, construction, `setAsset`/`getAsset`, `setScene`, `s
 
 ## Versioning
 
-Version is defined in `CMakeLists.txt` (`project(campello_renderer VERSION 0.7.0)`) and propagated to `campello_renderer_config.h` via `configure_file`.
+Version is defined in `CMakeLists.txt` (`project(campello_renderer VERSION 0.8.0)`) and propagated to `campello_renderer_config.h` via `configure_file`.
 
 **When upgrading the package version, update the version string in ALL of these locations:**
 1. `CMakeLists.txt` — `project(campello_renderer VERSION x.x.x)`
