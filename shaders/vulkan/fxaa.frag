@@ -11,7 +11,12 @@ layout(set = 0, binding = 2) uniform FxaaUniforms {
     vec2 _pad;
 } u;
 
-layout(location = 0) in vec2 fragUV;
+// No vertex-supplied UV — sampling below uses gl_FragCoord directly, same as
+// downsample.frag. fxaa.vert (the shared fullscreen-triangle vertex shader for
+// both pipelines) never outputs one; declaring an unused `in` here left the
+// SPIR-V interface at location 0 mismatched (vec2 input, no matching vertex
+// output), which vkCreateGraphicsPipelines()'s SPIR-V interface validation
+// rejects (VUID-RuntimeSpirv-OpEntryPoint-08743).
 layout(location = 0) out vec4 outColor;
 
 float fxaaLuma(vec3 rgb) {

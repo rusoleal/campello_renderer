@@ -1,5 +1,7 @@
 #include <campello_renderer/campello_renderer.hpp>
 #include "campello_renderer_config.h"
+#include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <campello_gpu/constants/buffer_usage.hpp>
 #include <campello_gpu/constants/compare_op.hpp>
@@ -11,6 +13,7 @@
 #include <campello_gpu/constants/shader_stage.hpp>
 #include <campello_gpu/descriptors/begin_render_pass_descriptor.hpp>
 #include <campello_gpu/descriptors/render_pipeline_descriptor.hpp>
+#include <campello_gpu/descriptors/pipeline_layout_descriptor.hpp>
 #include <campello_gpu/descriptors/sampler_descriptor.hpp>
 #include <campello_gpu/descriptors/bind_group_layout_descriptor.hpp>
 #include <campello_gpu/descriptors/bind_group_descriptor.hpp>
@@ -22,7 +25,7 @@
 
 #if defined(__APPLE__)
 #include "shaders/metal_default.h"
-#elif defined(ANDROID)
+#elif defined(ANDROID) || defined(__linux__)
 #include "shaders/vulkan_default.h"
 #elif defined(_WIN32)
 #include "shaders/directx_default.h"
@@ -786,6 +789,274 @@ void Renderer::ensureFallbackBuffer(std::shared_ptr<systems::leal::campello_gpu:
     buf = device->createBuffer(requiredBytes, GPU::BufferUsage::vertex, zeros.data());
 }
 
+void Renderer::ensureBindGroupLayout() {
+    namespace GPU = systems::leal::campello_gpu;
+    if (bindGroupLayout) return;
+
+    GPU::BindGroupLayoutDescriptor bglDesc{};
+
+    // Binding 0: baseColorTexture
+    GPU::EntryObject texEntry0{};
+    texEntry0.binding    = 0;
+    texEntry0.visibility = GPU::ShaderStage::fragment;
+    texEntry0.type       = GPU::EntryObjectType::texture;
+    texEntry0.data.texture.multisampled = false;
+    texEntry0.data.texture.sampleType   = GPU::EntryObjectTextureType::ttFloat;
+    texEntry0.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntry0);
+
+    // Binding 1: baseColorSampler
+    GPU::EntryObject sampEntry0{};
+    sampEntry0.binding    = 1;
+    sampEntry0.visibility = GPU::ShaderStage::fragment;
+    sampEntry0.type       = GPU::EntryObjectType::sampler;
+    sampEntry0.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+    bglDesc.entries.push_back(sampEntry0);
+
+    // Binding 2: metallicRoughnessTexture
+    GPU::EntryObject texEntry1{};
+    texEntry1.binding    = 2;
+    texEntry1.visibility = GPU::ShaderStage::fragment;
+    texEntry1.type       = GPU::EntryObjectType::texture;
+    texEntry1.data.texture.multisampled = false;
+    texEntry1.data.texture.sampleType   = GPU::EntryObjectTextureType::ttFloat;
+    texEntry1.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntry1);
+
+    // Binding 3: metallicRoughnessSampler
+    GPU::EntryObject sampEntry1{};
+    sampEntry1.binding    = 3;
+    sampEntry1.visibility = GPU::ShaderStage::fragment;
+    sampEntry1.type       = GPU::EntryObjectType::sampler;
+    sampEntry1.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+    bglDesc.entries.push_back(sampEntry1);
+
+    // Binding 4: normalTexture
+    GPU::EntryObject texEntry2{};
+    texEntry2.binding    = 4;
+    texEntry2.visibility = GPU::ShaderStage::fragment;
+    texEntry2.type       = GPU::EntryObjectType::texture;
+    texEntry2.data.texture.multisampled = false;
+    texEntry2.data.texture.sampleType   = GPU::EntryObjectTextureType::ttFloat;
+    texEntry2.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntry2);
+
+    // Binding 5: normalSampler
+    GPU::EntryObject sampEntry2{};
+    sampEntry2.binding    = 5;
+    sampEntry2.visibility = GPU::ShaderStage::fragment;
+    sampEntry2.type       = GPU::EntryObjectType::sampler;
+    sampEntry2.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+    bglDesc.entries.push_back(sampEntry2);
+
+    // Binding 6: emissiveTexture
+    GPU::EntryObject texEntry3{};
+    texEntry3.binding    = 6;
+    texEntry3.visibility = GPU::ShaderStage::fragment;
+    texEntry3.type       = GPU::EntryObjectType::texture;
+    texEntry3.data.texture.multisampled = false;
+    texEntry3.data.texture.sampleType   = GPU::EntryObjectTextureType::ttFloat;
+    texEntry3.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntry3);
+
+    // Binding 7: emissiveSampler
+    GPU::EntryObject sampEntry3{};
+    sampEntry3.binding    = 7;
+    sampEntry3.visibility = GPU::ShaderStage::fragment;
+    sampEntry3.type       = GPU::EntryObjectType::sampler;
+    sampEntry3.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+    bglDesc.entries.push_back(sampEntry3);
+
+    // Binding 8: occlusionTexture
+    GPU::EntryObject texEntry4{};
+    texEntry4.binding    = 8;
+    texEntry4.visibility = GPU::ShaderStage::fragment;
+    texEntry4.type       = GPU::EntryObjectType::texture;
+    texEntry4.data.texture.multisampled = false;
+    texEntry4.data.texture.sampleType   = GPU::EntryObjectTextureType::ttFloat;
+    texEntry4.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntry4);
+
+    // Binding 9: occlusionSampler
+    GPU::EntryObject sampEntry4{};
+    sampEntry4.binding    = 9;
+    sampEntry4.visibility = GPU::ShaderStage::fragment;
+    sampEntry4.type       = GPU::EntryObjectType::sampler;
+    sampEntry4.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+    bglDesc.entries.push_back(sampEntry4);
+
+    // Binding 10: lightsUniformBuffer (KHR_lights_punctual)
+    GPU::EntryObject lightsEntry{};
+    lightsEntry.binding    = 10;
+    lightsEntry.visibility = GPU::ShaderStage::fragment;
+    lightsEntry.type       = GPU::EntryObjectType::buffer;
+    lightsEntry.data.buffer.hasDinamicOffaset = false;
+    lightsEntry.data.buffer.minBindingSize    = 272; // 16-byte header + 4 lights * 64 bytes
+    lightsEntry.data.buffer.type              = GPU::EntryObjectBufferType::uniform;
+    bglDesc.entries.push_back(lightsEntry);
+
+    // Binding 11: specularTexture (KHR_materials_specular — A channel = specular factor)
+    GPU::EntryObject texEntry5{};
+    texEntry5.binding    = 11;
+    texEntry5.visibility = GPU::ShaderStage::fragment;
+    texEntry5.type       = GPU::EntryObjectType::texture;
+    texEntry5.data.texture.multisampled  = false;
+    texEntry5.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntry5.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntry5);
+
+    // Binding 12: specularSampler
+    GPU::EntryObject sampEntry5{};
+    sampEntry5.binding    = 12;
+    sampEntry5.visibility = GPU::ShaderStage::fragment;
+    sampEntry5.type       = GPU::EntryObjectType::sampler;
+    sampEntry5.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+    bglDesc.entries.push_back(sampEntry5);
+
+    // Binding 13: specularColorTexture (KHR_materials_specular — RGB = F0 color tint, sRGB)
+    GPU::EntryObject texEntry6{};
+    texEntry6.binding    = 13;
+    texEntry6.visibility = GPU::ShaderStage::fragment;
+    texEntry6.type       = GPU::EntryObjectType::texture;
+    texEntry6.data.texture.multisampled  = false;
+    texEntry6.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntry6.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntry6);
+
+    // Binding 14: specularColorSampler
+    GPU::EntryObject sampEntry6{};
+    sampEntry6.binding    = 14;
+    sampEntry6.visibility = GPU::ShaderStage::fragment;
+    sampEntry6.type       = GPU::EntryObjectType::sampler;
+    sampEntry6.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+    bglDesc.entries.push_back(sampEntry6);
+
+    // Binding 15: sheenColorTexture (KHR_materials_sheen — RGB sRGB = sheen color)
+    // Note: sampler reused from baseColorSampler (binding 1) in the shader — Metal only
+    // allows 16 sampler slots (0–15) and all are already claimed.
+    GPU::EntryObject texEntry7{};
+    texEntry7.binding    = 15;
+    texEntry7.visibility = GPU::ShaderStage::fragment;
+    texEntry7.type       = GPU::EntryObjectType::texture;
+    texEntry7.data.texture.multisampled  = false;
+    texEntry7.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntry7.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntry7);
+
+    // Binding 16: sheenRoughnessTexture (KHR_materials_sheen — R = roughness factor)
+    GPU::EntryObject texEntry8{};
+    texEntry8.binding    = 16;
+    texEntry8.visibility = GPU::ShaderStage::fragment;
+    texEntry8.type       = GPU::EntryObjectType::texture;
+    texEntry8.data.texture.multisampled  = false;
+    texEntry8.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntry8.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntry8);
+
+    // Binding 17: clearcoatTexture (KHR_materials_clearcoat — R = intensity)
+    GPU::EntryObject texEntry9{};
+    texEntry9.binding    = 17;
+    texEntry9.visibility = GPU::ShaderStage::fragment;
+    texEntry9.type       = GPU::EntryObjectType::texture;
+    texEntry9.data.texture.multisampled  = false;
+    texEntry9.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntry9.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntry9);
+
+    // Binding 18: clearcoatRoughnessTexture (KHR_materials_clearcoat — G = roughness)
+    GPU::EntryObject texEntry10{};
+    texEntry10.binding    = 18;
+    texEntry10.visibility = GPU::ShaderStage::fragment;
+    texEntry10.type       = GPU::EntryObjectType::texture;
+    texEntry10.data.texture.multisampled  = false;
+    texEntry10.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntry10.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntry10);
+
+    // Binding 19: clearcoatNormalTexture (KHR_materials_clearcoat — tangent-space normal)
+    GPU::EntryObject texEntry11{};
+    texEntry11.binding    = 19;
+    texEntry11.visibility = GPU::ShaderStage::fragment;
+    texEntry11.type       = GPU::EntryObjectType::texture;
+    texEntry11.data.texture.multisampled  = false;
+    texEntry11.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntry11.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntry11);
+
+    // Binding 20: transmissionTexture (KHR_materials_transmission — R=transmission factor)
+    // Reuses baseColorSampler (Metal has 16 sampler limit)
+    GPU::EntryObject texEntry12{};
+    texEntry12.binding    = 20;
+    texEntry12.visibility = GPU::ShaderStage::fragment;
+    texEntry12.type       = GPU::EntryObjectType::texture;
+    texEntry12.data.texture.multisampled  = false;
+    texEntry12.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntry12.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntry12);
+
+    // Binding 21: environmentMap (cube texture for IBL / skybox)
+    GPU::EntryObject texEntryEnv{};
+    texEntryEnv.binding    = 21;
+    texEntryEnv.visibility = GPU::ShaderStage::fragment;
+    texEntryEnv.type       = GPU::EntryObjectType::texture;
+    texEntryEnv.data.texture.multisampled  = false;
+    texEntryEnv.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntryEnv.data.texture.viewDimension = GPU::TextureType::ttCube;
+    bglDesc.entries.push_back(texEntryEnv);
+
+    // Binding 22: sceneColorTexture (screen-space refraction source)
+    GPU::EntryObject texEntrySc{};
+    texEntrySc.binding    = 22;
+    texEntrySc.visibility = GPU::ShaderStage::fragment;
+    texEntrySc.type       = GPU::EntryObjectType::texture;
+    texEntrySc.data.texture.multisampled  = false;
+    texEntrySc.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntrySc.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntrySc);
+
+    // Binding 23: thicknessTexture (KHR_materials_volume — R = thickness factor)
+    GPU::EntryObject texEntryTh{};
+    texEntryTh.binding    = 23;
+    texEntryTh.visibility = GPU::ShaderStage::fragment;
+    texEntryTh.type       = GPU::EntryObjectType::texture;
+    texEntryTh.data.texture.multisampled  = false;
+    texEntryTh.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntryTh.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntryTh);
+
+    // Binding 24: iridescenceTexture (KHR_materials_iridescence — R = iridescence factor)
+    GPU::EntryObject texEntryIrid{};
+    texEntryIrid.binding    = 24;
+    texEntryIrid.visibility = GPU::ShaderStage::fragment;
+    texEntryIrid.type       = GPU::EntryObjectType::texture;
+    texEntryIrid.data.texture.multisampled  = false;
+    texEntryIrid.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntryIrid.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntryIrid);
+
+    // Binding 25: iridescenceThicknessTexture (KHR_materials_iridescence — G = thickness)
+    GPU::EntryObject texEntryIridTh{};
+    texEntryIridTh.binding    = 25;
+    texEntryIridTh.visibility = GPU::ShaderStage::fragment;
+    texEntryIridTh.type       = GPU::EntryObjectType::texture;
+    texEntryIridTh.data.texture.multisampled  = false;
+    texEntryIridTh.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntryIridTh.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntryIridTh);
+
+    // Binding 26: anisotropicTexture (KHR_materials_anisotropy — R = strength, G = rotation)
+    GPU::EntryObject texEntryAniso{};
+    texEntryAniso.binding    = 26;
+    texEntryAniso.visibility = GPU::ShaderStage::fragment;
+    texEntryAniso.type       = GPU::EntryObjectType::texture;
+    texEntryAniso.data.texture.multisampled  = false;
+    texEntryAniso.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntryAniso.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntryAniso);
+
+    bindGroupLayout = device->createBindGroupLayout(bglDesc);
+}
+
 void Renderer::setScene(uint32_t index) {
     if (asset == nullptr) return;
     if (device == nullptr) return;
@@ -1245,270 +1516,7 @@ void Renderer::setScene(uint32_t index) {
     // ------------------------------------------------------------------
     // Lazy-initialize shared texture resources (once per device lifetime).
     // ------------------------------------------------------------------
-    if (!bindGroupLayout) {
-        GPU::BindGroupLayoutDescriptor bglDesc{};
-
-        // Binding 0: baseColorTexture
-        GPU::EntryObject texEntry0{};
-        texEntry0.binding    = 0;
-        texEntry0.visibility = GPU::ShaderStage::fragment;
-        texEntry0.type       = GPU::EntryObjectType::texture;
-        texEntry0.data.texture.multisampled = false;
-        texEntry0.data.texture.sampleType   = GPU::EntryObjectTextureType::ttFloat;
-        texEntry0.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntry0);
-
-        // Binding 1: baseColorSampler
-        GPU::EntryObject sampEntry0{};
-        sampEntry0.binding    = 1;
-        sampEntry0.visibility = GPU::ShaderStage::fragment;
-        sampEntry0.type       = GPU::EntryObjectType::sampler;
-        sampEntry0.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
-        bglDesc.entries.push_back(sampEntry0);
-
-        // Binding 2: metallicRoughnessTexture
-        GPU::EntryObject texEntry1{};
-        texEntry1.binding    = 2;
-        texEntry1.visibility = GPU::ShaderStage::fragment;
-        texEntry1.type       = GPU::EntryObjectType::texture;
-        texEntry1.data.texture.multisampled = false;
-        texEntry1.data.texture.sampleType   = GPU::EntryObjectTextureType::ttFloat;
-        texEntry1.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntry1);
-
-        // Binding 3: metallicRoughnessSampler
-        GPU::EntryObject sampEntry1{};
-        sampEntry1.binding    = 3;
-        sampEntry1.visibility = GPU::ShaderStage::fragment;
-        sampEntry1.type       = GPU::EntryObjectType::sampler;
-        sampEntry1.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
-        bglDesc.entries.push_back(sampEntry1);
-
-        // Binding 4: normalTexture
-        GPU::EntryObject texEntry2{};
-        texEntry2.binding    = 4;
-        texEntry2.visibility = GPU::ShaderStage::fragment;
-        texEntry2.type       = GPU::EntryObjectType::texture;
-        texEntry2.data.texture.multisampled = false;
-        texEntry2.data.texture.sampleType   = GPU::EntryObjectTextureType::ttFloat;
-        texEntry2.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntry2);
-
-        // Binding 5: normalSampler
-        GPU::EntryObject sampEntry2{};
-        sampEntry2.binding    = 5;
-        sampEntry2.visibility = GPU::ShaderStage::fragment;
-        sampEntry2.type       = GPU::EntryObjectType::sampler;
-        sampEntry2.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
-        bglDesc.entries.push_back(sampEntry2);
-
-        // Binding 6: emissiveTexture
-        GPU::EntryObject texEntry3{};
-        texEntry3.binding    = 6;
-        texEntry3.visibility = GPU::ShaderStage::fragment;
-        texEntry3.type       = GPU::EntryObjectType::texture;
-        texEntry3.data.texture.multisampled = false;
-        texEntry3.data.texture.sampleType   = GPU::EntryObjectTextureType::ttFloat;
-        texEntry3.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntry3);
-
-        // Binding 7: emissiveSampler
-        GPU::EntryObject sampEntry3{};
-        sampEntry3.binding    = 7;
-        sampEntry3.visibility = GPU::ShaderStage::fragment;
-        sampEntry3.type       = GPU::EntryObjectType::sampler;
-        sampEntry3.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
-        bglDesc.entries.push_back(sampEntry3);
-
-        // Binding 8: occlusionTexture
-        GPU::EntryObject texEntry4{};
-        texEntry4.binding    = 8;
-        texEntry4.visibility = GPU::ShaderStage::fragment;
-        texEntry4.type       = GPU::EntryObjectType::texture;
-        texEntry4.data.texture.multisampled = false;
-        texEntry4.data.texture.sampleType   = GPU::EntryObjectTextureType::ttFloat;
-        texEntry4.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntry4);
-
-        // Binding 9: occlusionSampler
-        GPU::EntryObject sampEntry4{};
-        sampEntry4.binding    = 9;
-        sampEntry4.visibility = GPU::ShaderStage::fragment;
-        sampEntry4.type       = GPU::EntryObjectType::sampler;
-        sampEntry4.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
-        bglDesc.entries.push_back(sampEntry4);
-
-        // Binding 10: lightsUniformBuffer (KHR_lights_punctual)
-        GPU::EntryObject lightsEntry{};
-        lightsEntry.binding    = 10;
-        lightsEntry.visibility = GPU::ShaderStage::fragment;
-        lightsEntry.type       = GPU::EntryObjectType::buffer;
-        lightsEntry.data.buffer.hasDinamicOffaset = false;
-        lightsEntry.data.buffer.minBindingSize    = 272; // 16-byte header + 4 lights * 64 bytes
-        lightsEntry.data.buffer.type              = GPU::EntryObjectBufferType::uniform;
-        bglDesc.entries.push_back(lightsEntry);
-
-        // Binding 11: specularTexture (KHR_materials_specular — A channel = specular factor)
-        GPU::EntryObject texEntry5{};
-        texEntry5.binding    = 11;
-        texEntry5.visibility = GPU::ShaderStage::fragment;
-        texEntry5.type       = GPU::EntryObjectType::texture;
-        texEntry5.data.texture.multisampled  = false;
-        texEntry5.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntry5.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntry5);
-
-        // Binding 12: specularSampler
-        GPU::EntryObject sampEntry5{};
-        sampEntry5.binding    = 12;
-        sampEntry5.visibility = GPU::ShaderStage::fragment;
-        sampEntry5.type       = GPU::EntryObjectType::sampler;
-        sampEntry5.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
-        bglDesc.entries.push_back(sampEntry5);
-
-        // Binding 13: specularColorTexture (KHR_materials_specular — RGB = F0 color tint, sRGB)
-        GPU::EntryObject texEntry6{};
-        texEntry6.binding    = 13;
-        texEntry6.visibility = GPU::ShaderStage::fragment;
-        texEntry6.type       = GPU::EntryObjectType::texture;
-        texEntry6.data.texture.multisampled  = false;
-        texEntry6.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntry6.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntry6);
-
-        // Binding 14: specularColorSampler
-        GPU::EntryObject sampEntry6{};
-        sampEntry6.binding    = 14;
-        sampEntry6.visibility = GPU::ShaderStage::fragment;
-        sampEntry6.type       = GPU::EntryObjectType::sampler;
-        sampEntry6.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
-        bglDesc.entries.push_back(sampEntry6);
-
-        // Binding 15: sheenColorTexture (KHR_materials_sheen — RGB sRGB = sheen color)
-        // Note: sampler reused from baseColorSampler (binding 1) in the shader — Metal only
-        // allows 16 sampler slots (0–15) and all are already claimed.
-        GPU::EntryObject texEntry7{};
-        texEntry7.binding    = 15;
-        texEntry7.visibility = GPU::ShaderStage::fragment;
-        texEntry7.type       = GPU::EntryObjectType::texture;
-        texEntry7.data.texture.multisampled  = false;
-        texEntry7.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntry7.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntry7);
-
-        // Binding 16: sheenRoughnessTexture (KHR_materials_sheen — R = roughness factor)
-        GPU::EntryObject texEntry8{};
-        texEntry8.binding    = 16;
-        texEntry8.visibility = GPU::ShaderStage::fragment;
-        texEntry8.type       = GPU::EntryObjectType::texture;
-        texEntry8.data.texture.multisampled  = false;
-        texEntry8.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntry8.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntry8);
-
-        // Binding 17: clearcoatTexture (KHR_materials_clearcoat — R = intensity)
-        GPU::EntryObject texEntry9{};
-        texEntry9.binding    = 17;
-        texEntry9.visibility = GPU::ShaderStage::fragment;
-        texEntry9.type       = GPU::EntryObjectType::texture;
-        texEntry9.data.texture.multisampled  = false;
-        texEntry9.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntry9.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntry9);
-
-        // Binding 18: clearcoatRoughnessTexture (KHR_materials_clearcoat — G = roughness)
-        GPU::EntryObject texEntry10{};
-        texEntry10.binding    = 18;
-        texEntry10.visibility = GPU::ShaderStage::fragment;
-        texEntry10.type       = GPU::EntryObjectType::texture;
-        texEntry10.data.texture.multisampled  = false;
-        texEntry10.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntry10.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntry10);
-
-        // Binding 19: clearcoatNormalTexture (KHR_materials_clearcoat — tangent-space normal)
-        GPU::EntryObject texEntry11{};
-        texEntry11.binding    = 19;
-        texEntry11.visibility = GPU::ShaderStage::fragment;
-        texEntry11.type       = GPU::EntryObjectType::texture;
-        texEntry11.data.texture.multisampled  = false;
-        texEntry11.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntry11.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntry11);
-
-        // Binding 20: transmissionTexture (KHR_materials_transmission — R=transmission factor)
-        // Reuses baseColorSampler (Metal has 16 sampler limit)
-        GPU::EntryObject texEntry12{};
-        texEntry12.binding    = 20;
-        texEntry12.visibility = GPU::ShaderStage::fragment;
-        texEntry12.type       = GPU::EntryObjectType::texture;
-        texEntry12.data.texture.multisampled  = false;
-        texEntry12.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntry12.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntry12);
-
-        // Binding 21: environmentMap (cube texture for IBL / skybox)
-        GPU::EntryObject texEntryEnv{};
-        texEntryEnv.binding    = 21;
-        texEntryEnv.visibility = GPU::ShaderStage::fragment;
-        texEntryEnv.type       = GPU::EntryObjectType::texture;
-        texEntryEnv.data.texture.multisampled  = false;
-        texEntryEnv.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntryEnv.data.texture.viewDimension = GPU::TextureType::ttCube;
-        bglDesc.entries.push_back(texEntryEnv);
-
-        // Binding 22: sceneColorTexture (screen-space refraction source)
-        GPU::EntryObject texEntrySc{};
-        texEntrySc.binding    = 22;
-        texEntrySc.visibility = GPU::ShaderStage::fragment;
-        texEntrySc.type       = GPU::EntryObjectType::texture;
-        texEntrySc.data.texture.multisampled  = false;
-        texEntrySc.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntrySc.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntrySc);
-
-        // Binding 23: thicknessTexture (KHR_materials_volume — R = thickness factor)
-        GPU::EntryObject texEntryTh{};
-        texEntryTh.binding    = 23;
-        texEntryTh.visibility = GPU::ShaderStage::fragment;
-        texEntryTh.type       = GPU::EntryObjectType::texture;
-        texEntryTh.data.texture.multisampled  = false;
-        texEntryTh.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntryTh.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntryTh);
-
-        // Binding 24: iridescenceTexture (KHR_materials_iridescence — R = iridescence factor)
-        GPU::EntryObject texEntryIrid{};
-        texEntryIrid.binding    = 24;
-        texEntryIrid.visibility = GPU::ShaderStage::fragment;
-        texEntryIrid.type       = GPU::EntryObjectType::texture;
-        texEntryIrid.data.texture.multisampled  = false;
-        texEntryIrid.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntryIrid.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntryIrid);
-
-        // Binding 25: iridescenceThicknessTexture (KHR_materials_iridescence — G = thickness)
-        GPU::EntryObject texEntryIridTh{};
-        texEntryIridTh.binding    = 25;
-        texEntryIridTh.visibility = GPU::ShaderStage::fragment;
-        texEntryIridTh.type       = GPU::EntryObjectType::texture;
-        texEntryIridTh.data.texture.multisampled  = false;
-        texEntryIridTh.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntryIridTh.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntryIridTh);
-
-        // Binding 26: anisotropicTexture (KHR_materials_anisotropy — R = strength, G = rotation)
-        GPU::EntryObject texEntryAniso{};
-        texEntryAniso.binding    = 26;
-        texEntryAniso.visibility = GPU::ShaderStage::fragment;
-        texEntryAniso.type       = GPU::EntryObjectType::texture;
-        texEntryAniso.data.texture.multisampled  = false;
-        texEntryAniso.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        texEntryAniso.data.texture.viewDimension = GPU::TextureType::tt2d;
-        bglDesc.entries.push_back(texEntryAniso);
-
-        bindGroupLayout = device->createBindGroupLayout(bglDesc);
-    }
+    ensureBindGroupLayout();
 
     if (!defaultSampler) {
         GPU::SamplerDescriptor sd{};
@@ -1768,7 +1776,14 @@ void Renderer::setScene(uint32_t index) {
             // Buffer(17): material uniforms — static after scene load.
             {17, GPU::BufferBinding{materialUniformBuffer, 0, kMaterialUniformStride}},
         };
-        defaultBindGroup = device->createBindGroup(bgDesc);
+        // persistent=true: cached and reused across the asset's whole lifetime
+        // (many frame-in-flight cycles), unlike per-frame bind groups that are
+        // deliberately rebuilt every render() call — see createBindGroup()'s
+        // persistent parameter doc comment. Without it, the per-frame pool this
+        // would otherwise allocate from gets wholesale vkResetDescriptorPool'd
+        // every kMaxFramesInFlight frames, silently invalidating the descriptor
+        // set out from under every later frame still trying to bind it.
+        defaultBindGroup = device->createBindGroup(bgDesc, /*persistent=*/true);
 
         // Flat-variant bind group: only material buffer, no textures/samplers.
         GPU::BindGroupDescriptor flatBgDesc{};
@@ -1776,7 +1791,7 @@ void Renderer::setScene(uint32_t index) {
         flatBgDesc.entries = {
             {17, GPU::BufferBinding{materialUniformBuffer, 0, kMaterialUniformStride}},
         };
-        defaultFlatBindGroup = device->createBindGroup(flatBgDesc);
+        defaultFlatBindGroup = device->createBindGroup(flatBgDesc, /*persistent=*/true);
     }
 
     // Per-frame bind groups for lights (10), camera matrices (18),
@@ -2090,7 +2105,8 @@ void Renderer::setScene(uint32_t index) {
                                         (uint64_t)(m + 1) * kMaterialUniformStride,
                                         kMaterialUniformStride}},
             };
-            materialBindGroups[m] = device->createBindGroup(bgDesc);
+            // persistent=true — see defaultBindGroup's creation above for why.
+            materialBindGroups[m] = device->createBindGroup(bgDesc, /*persistent=*/true);
 
             // Flat-variant bind group: only material buffer, no textures/samplers.
             GPU::BindGroupDescriptor flatBgDesc{};
@@ -2100,7 +2116,7 @@ void Renderer::setScene(uint32_t index) {
                                         (uint64_t)(m + 1) * kMaterialUniformStride,
                                         kMaterialUniformStride}},
             };
-            flatMaterialBindGroups[m] = device->createBindGroup(flatBgDesc);
+            flatMaterialBindGroups[m] = device->createBindGroup(flatBgDesc, /*persistent=*/true);
         }
     }
 
@@ -3106,7 +3122,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         pipelineDownsample = device->createRenderPipeline(dsDesc);
     }
 
-#elif defined(ANDROID)
+#elif defined(ANDROID) || defined(__linux__)
     using namespace systems::leal::campello_renderer::shaders;
 
     // Load separate vertex and fragment SPIR-V modules.
@@ -3116,14 +3132,28 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 
     GPU::RenderPipelineDescriptor desc{};
 
+    // The fragment shader declares `layout(set = 0, binding = 0/1)` for
+    // baseColorTexture/baseColorSampler — an explicit VkPipelineLayout is
+    // required or campello_gpu's Device::createRenderPipeline() falls back to
+    // an empty one (zero descriptor set layouts), which crashes the Intel Mesa
+    // ANV driver inside vkCreateGraphicsPipelines (no validation error raised
+    // first) rather than failing gracefully. renderPrimitive() also always
+    // binds set 1 (frameBindGroup, for lights/camera) regardless of which
+    // pipeline is active, so both set slots must be present even though this
+    // minimal default shader only reads from set 0. Reuses the same shared
+    // bindGroupLayout renderPrimitive() already creates frameBindGroup from
+    // (see ensureBindGroupLayout()'s doc comment) so the two agree on layout.
+    // May run before setScene() has lazily created it (createDefaultPipelines()
+    // is documented to run before setAsset()), hence the explicit call here.
+    ensureBindGroupLayout();
+    GPU::PipelineLayoutDescriptor plDesc{};
+    plDesc.bindGroupLayouts = { bindGroupLayout, bindGroupLayout };
+    vulkanDefaultPipelineLayout = device->createPipelineLayout(plDesc);
+    desc.layout = vulkanDefaultPipelineLayout;
+
     // --- Vertex stage ---
     // Slots 0–3: per-vertex attributes (POSITION, NORMAL, TEXCOORD_0, TANGENT).
     // Slot 16:   per-instance MVP mat4 (locations 16–19 in GLSL).
-    //
-    // NOTE: campello_gpu Vulkan backend currently hardcodes
-    // vertexBindingDescriptionCount = 0, so the vertex input descriptors below
-    // are passed to the API but not yet applied. The pipeline will work correctly
-    // once that upstream gap is resolved.
     desc.vertex.module     = vertModule;
     desc.vertex.entryPoint = "main";
 
@@ -3247,6 +3277,17 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     // --- Rasterization ---
     desc.topology  = GPU::PrimitiveTopology::triangleList;
     desc.cullMode  = GPU::CullMode::back;
+    // ccw matches Metal's setting (base.frontFace above) and is confirmed correct
+    // by OffscreenRenderTest.MeshRendersNonClearPixels/OffCenterTriangleRenders:
+    // a glTF-authored CCW (front-facing) triangle renders (survives culling) at
+    // both on-axis and off-axis camera positions under this setting. Don't be
+    // misled by OffscreenRenderTest.BackfaceCullingRespectsWinding's own result —
+    // that test uses two primitives with opposite winding sharing one mesh, and
+    // exposed a separate, narrower bug where the presence of a CW-wound sibling
+    // primitive somehow causes an otherwise-correctly-classified CCW primitive to
+    // also get culled; flipping this setting to "fix" that test broke the
+    // realistic single-primitive/consistent-winding case instead — see that
+    // test's own comments for the follow-up needed on the actual bug.
     desc.frontFace = GPU::FrontFace::ccw;
 
     // Vulkan: assign same pipeline to both variants until separate SPIR-V
@@ -3254,16 +3295,25 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     pipelineTextured = device->createRenderPipeline(desc);
     pipelineFlat     = pipelineTextured;
     pipelineDebug    = pipelineFlat;  // TODO: compile debug SPIR-V variant
-    
-    // Double-sided variants (TODO: proper pipeline creation when Vulkan backend is fixed)
-    pipelineFlatDoubleSided     = pipelineFlat;
-    pipelineTexturedDoubleSided = pipelineTextured;
-    
-    // Alpha-blend variants (TODO: proper blend state when Vulkan backend supports it)
+
+    // Double-sided variant: a real, separate VkPipeline (not aliased to the
+    // single-sided one above) with cullMode=none — glTF materials marked
+    // doubleSided need both faces rendered without culling (thin geometry
+    // like straps, leaves, cloth), and aliasing to the single-sided pipeline
+    // here silently culled one side of exactly that geometry.
+    desc.cullMode = GPU::CullMode::none;
+    pipelineTexturedDoubleSided = device->createRenderPipeline(desc);
+    pipelineFlatDoubleSided     = pipelineTexturedDoubleSided;
+
+    // Alpha-blend variants (TODO: proper blend state when Vulkan backend supports it).
+    // The double-sided+blend ones alias to the real double-sided pipeline above,
+    // not the single-sided one — culling is still correct even though blending
+    // itself isn't implemented yet, matching this same partial-implementation
+    // pattern the non-double-sided blend variants below already use.
     pipelineFlatBlend             = pipelineFlat;
     pipelineTexturedBlend         = pipelineTextured;
-    pipelineFlatBlendDoubleSided  = pipelineFlat;
-    pipelineTexturedBlendDoubleSided = pipelineTextured;
+    pipelineFlatBlendDoubleSided  = pipelineFlatDoubleSided;
+    pipelineTexturedBlendDoubleSided = pipelineTexturedDoubleSided;
 
     // --- FXAA post-process pipeline (Vulkan) ---
     {
@@ -3306,7 +3356,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 
             fxaaDesc.topology = GPU::PrimitiveTopology::triangleList;
             fxaaDesc.cullMode = GPU::CullMode::none;
-            fxaaDesc.frontFace = GPU::FrontFace::ccw;
+            fxaaDesc.frontFace = GPU::FrontFace::ccw; // no-op (cullMode=none)
 
             GPU::FragmentDescriptor fxaaFrag{};
             fxaaFrag.module = fxaaFragModule;
@@ -3316,6 +3366,13 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             fxaaCs.writeMask = GPU::ColorWrite::all;
             fxaaFrag.targets.push_back(fxaaCs);
             fxaaDesc.fragment = fxaaFrag;
+
+            // See createDefaultPipelines()'s Vulkan default-pipeline comment above for
+            // why an explicit layout matching the shader's descriptor set is required.
+            GPU::PipelineLayoutDescriptor fxaaPlDesc{};
+            fxaaPlDesc.bindGroupLayouts = { fxaaBindGroupLayout };
+            vulkanFxaaPipelineLayout = device->createPipelineLayout(fxaaPlDesc);
+            fxaaDesc.layout = vulkanFxaaPipelineLayout;
 
             pipelineFxaa = device->createRenderPipeline(fxaaDesc);
         }
@@ -3353,7 +3410,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 
             dsDesc.topology = GPU::PrimitiveTopology::triangleList;
             dsDesc.cullMode = GPU::CullMode::none;
-            dsDesc.frontFace = GPU::FrontFace::ccw;
+            dsDesc.frontFace = GPU::FrontFace::ccw; // no-op (cullMode=none)
 
             GPU::FragmentDescriptor dsFrag{};
             dsFrag.module = dsFragModule;
@@ -3363,6 +3420,13 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             dsCs.writeMask = GPU::ColorWrite::all;
             dsFrag.targets.push_back(dsCs);
             dsDesc.fragment = dsFrag;
+
+            // See createDefaultPipelines()'s Vulkan default-pipeline comment above for
+            // why an explicit layout matching the shader's descriptor set is required.
+            GPU::PipelineLayoutDescriptor dsPlDesc{};
+            dsPlDesc.bindGroupLayouts = { downsampleBindGroupLayout };
+            vulkanDownsamplePipelineLayout = device->createPipelineLayout(dsPlDesc);
+            dsDesc.layout = vulkanDownsamplePipelineLayout;
 
             pipelineDownsample = device->createRenderPipeline(dsDesc);
         }
@@ -4091,8 +4155,6 @@ void Renderer::computeNodeTransform(
                 nodeTransforms[baseIdx + 16 + col * 4 + row] = worldVal;
             }
         }
-        
-        // (matrix debug removed)
     }
     for (auto childIndex : node.children) {
         computeNodeTransform(childIndex, world);
@@ -4130,24 +4192,38 @@ void Renderer::computeSceneBounds(
 // ---------------------------------------------------------------------------
 
 void Renderer::render() {
-    renderToTarget(device->getSwapchainTextureView());
+    // Device::getSwapchainTextureView() is an unimplemented Vulkan stub (always
+    // returns nullptr — see its own doc comment) — acquiring the swapchain image
+    // is instead handled inside campello_gpu's beginRenderPass() itself, taken
+    // when a render pass's color attachment has no explicit view. Passing
+    // colorView=nullptr with useDeviceSwapchain=true routes every color
+    // attachment below that would otherwise target `colorView` (there's always
+    // at least one — the final present target, even under FXAA/SSAA where
+    // earlier passes target an offscreen intermediate) through that path
+    // instead of the plain "no colorView, nothing to render to" early return.
+    renderToTarget(nullptr, /*useDeviceSwapchain=*/true);
 }
 
 void Renderer::render(std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView) {
-    renderToTarget(colorView);
+    renderToTarget(colorView, /*useDeviceSwapchain=*/false);
 }
 
 void Renderer::renderToTarget(
-    std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView)
+    std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView,
+    bool useDeviceSwapchain)
 {
     auto frameStart = std::chrono::steady_clock::now();
 
-    if (!asset || (!pipelineFlat && !pipelineTextured && !pipelineDebug &&
-                   !pipelineFlatDoubleSided && !pipelineTexturedDoubleSided &&
-                   !pipelineFlatBlend && !pipelineTexturedBlend &&
-                   !pipelineFlatBlendDoubleSided && !pipelineTexturedBlendDoubleSided)) return;
-    if (!asset->scenes || sceneIndex >= asset->scenes->size()) return;
-    if (!colorView) return;
+    namespace GPU = systems::leal::campello_gpu;
+
+    bool hasAnyPipeline = pipelineFlat || pipelineTextured || pipelineDebug ||
+                          pipelineFlatDoubleSided || pipelineTexturedDoubleSided ||
+                          pipelineFlatBlend || pipelineTexturedBlend ||
+                          pipelineFlatBlendDoubleSided || pipelineTexturedBlendDoubleSided;
+    if (!hasAnyPipeline) return;
+    if (!useDeviceSwapchain && !colorView) return;
+
+    bool hasRenderableScene = asset && asset->scenes && sceneIndex < asset->scenes->size();
 
     // ------------------------------------------------------------------
     // Frame-in-flight synchronization.
@@ -4156,6 +4232,32 @@ void Renderer::renderToTarget(
     auto &frame = frameResources[currentFrameIndex];
     if (frame.fence) {
         frame.fence->wait();
+    }
+
+    if (!hasRenderableScene) {
+        // No asset loaded yet (or an invalid scene index) — still clear+present so
+        // a windowed swapchain target shows the configured clear color instead of
+        // staying blank/un-presented. Unlike an MTKView (which clears itself via
+        // its own clearColor property even when this call no-ops entirely),
+        // nothing else paints the swapchain image here.
+        auto encoder = device->createCommandEncoder();
+        if (!encoder) return;
+        GPU::ColorAttachment ca{};
+        ca.view          = useDeviceSwapchain ? nullptr : colorView;
+        ca.clearValue[0] = clearColor[0];
+        ca.clearValue[1] = clearColor[1];
+        ca.clearValue[2] = clearColor[2];
+        ca.clearValue[3] = clearColor[3];
+        ca.loadOp        = GPU::LoadOp::clear;
+        ca.storeOp       = GPU::StoreOp::store;
+        ca.depthSlice    = 0;
+        GPU::BeginRenderPassDescriptor desc{};
+        desc.colorAttachments.push_back(ca);
+        auto rpe = encoder->beginRenderPass(desc);
+        if (rpe) rpe->end();
+        device->submit(encoder->finish(), frame.fence);
+        currentFrameIndex = (currentFrameIndex + 1) % kMaxFramesInFlight;
+        return;
     }
 
     // Update aliases so existing code references the current frame's buffers.
@@ -4167,7 +4269,6 @@ void Renderer::renderToTarget(
     auto encoder = device->createCommandEncoder();
     if (!encoder) return;
 
-    namespace GPU = systems::leal::campello_gpu;
     namespace VM  = systems::leal::vector_math;
     using M4 = VM::Matrix4<double>;
 
@@ -5301,8 +5402,25 @@ void Renderer::renderPrimitive(
     // Index 1: frame-varying buffers — lights (10) and camera position (18).
     // Only bind what the active shader variant actually references to avoid
     // Metal debug-layer "unused binding" assertions.
+    //
+    // On Vulkan/Android there's only one compiled fragment shader so far
+    // (pipelineFlat aliases pipelineTextured — see createDefaultPipelines()'s
+    // Vulkan branch), and it unconditionally samples baseColorTexture/
+    // baseColorSampler at set 0 bindings 0/1. defaultFlatBindGroup /
+    // flatMaterialBindGroups (below) deliberately omit those bindings for
+    // Metal's real flat variant, so using them here for a Vulkan "flat" draw
+    // leaves the shader's texture/sampler reads pointing at an empty
+    // descriptor slot — sampling comes back zero, and since the fragment
+    // shader does `texColor * fragBaseColor`, the whole draw goes black
+    // regardless of fragBaseColor. Detect the shared-pipeline case directly
+    // (pipelineFlat.get() == pipelineTextured.get(), false wherever Metal's
+    // separately-compiled flat variant is in use) rather than special-casing
+    // by platform macro.
+    bool sharesFlatAndTexturedPipeline =
+        pipelineFlat && pipelineFlat.get() == pipelineTextured.get();
     bool needsTextures = (wantedVariant == 2 || wantedVariant == 5 ||
-                          wantedVariant == 7 || wantedVariant == 9);
+                          wantedVariant == 7 || wantedVariant == 9) ||
+                          sharesFlatAndTexturedPipeline;
     if (needsTextures) {
         std::shared_ptr<systems::leal::campello_gpu::BindGroup> bg = defaultBindGroup;
         if (matIdx >= 0 && (size_t)matIdx < materialBindGroups.size() && materialBindGroups[matIdx]) {
@@ -6768,7 +6886,11 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                                 (uint64_t)uniformSlot * kMaterialUniformStride,
                                 kMaterialUniformStride}},
     };
-    auto bindGroup = device->createBindGroup(bgDesc);
+    // persistent=true — cached on the GpuMaterial for the material's whole
+    // lifetime, not rebuilt per frame; see defaultBindGroup's creation in
+    // setScene() for why that matters (per-frame descriptor pool resets
+    // otherwise invalidate it out from under later frames).
+    auto bindGroup = device->createBindGroup(bgDesc, /*persistent=*/true);
 
     GPU::BindGroupDescriptor flatBgDesc{};
     flatBgDesc.layout  = bindGroupLayout;
@@ -6777,7 +6899,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                                 (uint64_t)uniformSlot * kMaterialUniformStride,
                                 kMaterialUniformStride}},
     };
-    auto flatBindGroup = device->createBindGroup(flatBgDesc);
+    auto flatBindGroup = device->createBindGroup(flatBgDesc, /*persistent=*/true);
 
     auto mat = std::make_unique<GpuMaterial>();
     mat->bindGroup     = bindGroup;

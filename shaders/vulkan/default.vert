@@ -13,10 +13,6 @@
 //   location 21  uvTransformRow0 vec4 — KHR_texture_transform row 0 [a, b, tx, 0]
 //   location 22  uvTransformRow1 vec4 — KHR_texture_transform row 1 [c, d, ty, 0]
 //
-// Note: campello_gpu Vulkan backend does not yet implement vertex input
-// descriptors (VkVertexInputBindingDescription / VkVertexInputAttributeDescription
-// are hardcoded to 0). This shader is correct GLSL and will function once that
-// upstream gap is resolved.
 
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
@@ -39,14 +35,20 @@ layout(location = 2) out vec4 fragBaseColor;
 layout(location = 3) out vec3 fragMaterialParams;
 
 void main() {
-    // The MVP is stored row-major in campello_renderer (Matrix4<double> serialised
-    // as float[16] with data[row*4+col]). Vulkan/GLSL mat4 is column-major, so
-    // the loaded layout is the transpose of the intended matrix.
-    // A row-vector multiply (pos * mvp) recovers the correct transform:
-    //   vec4 * mat4  →  result[j] = dot(pos, mvp column j)
-    //   With mvp = M^T  →  result = M * pos_col  (correct clip-space position).
-    gl_Position   = vec4(position, 1.0) * mvp;
-    gl_Position.y = -gl_Position.y; // Vulkan NDC has Y pointing down; flip to match GLTF/OpenGL convention
+    // Renderer::computeNodeTransform() transposes the source row-major
+    // (vector_math) matrix to column-major before upload — the same layout
+    // for every backend, Metal included (see its "to column-major (Metal)
+    // format" comment there) — so the buffer already holds M in the
+    // column-major layout GLSL's mat4 expects. A standard column-vector
+    // multiply is therefore correct; a compensating pos*mvp row-vector
+    // multiply here would silently apply M^T instead of M.
+    gl_Position   = mvp * vec4(position, 1.0);
+    // Vulkan's clip-space Y points down; unlike Metal (whose native Y-down NDC
+    // is absorbed transparently by drawable presentation), campello_gpu's
+    // Vulkan backend does no compensating viewport flip anywhere (no negative-
+    // height VkViewport trick), so it has to happen here or the whole frame
+    // renders upside down.
+    gl_Position.y = -gl_Position.y;
 
     // Apply KHR_texture_transform only when the flag (uvTransformRow0.w > 0.5) is set.
     if (uvTransformRow0.w > 0.5) {

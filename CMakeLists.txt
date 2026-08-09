@@ -106,6 +106,13 @@ if(IOS)
     endif()
 endif()
 
+if(UNIX AND NOT APPLE AND NOT ANDROID)
+    option(CAMPELLO_RENDERER_BUILD_LINUX_EXAMPLE "Build Linux example" OFF)
+    if(CAMPELLO_RENDERER_BUILD_LINUX_EXAMPLE)
+        add_subdirectory(examples/linux)
+    endif()
+endif()
+
 option(CAMPELLO_RENDERER_ECS_SUPPORT "Install ecs.hpp (requires campello_core at compile time)" ON)
 
 option(CAMPELLO_RENDERER_BUILD_TEST "Build unit tests" OFF)

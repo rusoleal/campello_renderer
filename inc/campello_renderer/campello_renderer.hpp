@@ -284,6 +284,18 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineDownsample;
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> downsampleBindGroupLayout;
 
+        // Vulkan-only: explicit PipelineLayouts for pipelineTextured/pipelineFxaa/
+        // pipelineDownsample (see createDefaultPipelines()'s Vulkan branch). Must
+        // outlive the RenderPipelines built from them — Vulkan's PipelineLayout
+        // destructor calls vkDestroyPipelineLayout(), and vkCmdBindDescriptorSets()
+        // at draw time still needs that handle valid (a VkPipeline itself doesn't,
+        // once built, but the encoder's later bind calls do) — a local variable
+        // that only lived for the createRenderPipeline() call left every draw
+        // after the first referencing an already-destroyed VkPipelineLayout.
+        std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanDefaultPipelineLayout;
+        std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanFxaaPipelineLayout;
+        std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanDownsamplePipelineLayout;
+
         // Environment map / IBL
         std::shared_ptr<systems::leal::campello_gpu::Texture>          environmentMap;
         std::shared_ptr<systems::leal::campello_gpu::TextureView>      environmentMapView;
@@ -572,8 +584,12 @@ namespace systems::leal::campello_renderer {
         void uploadJointMatrices();
 
         // Core render implementation — shared by both render() overloads.
+        // useDeviceSwapchain: true for render()'s no-arg overload — colorView is
+        // null and every color attachment that would otherwise target it targets
+        // the device's own swapchain instead (see render()'s doc comment for why).
         void renderToTarget(
-            std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView);
+            std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView,
+            bool useDeviceSwapchain = false);
 
         // Upload Draco-decompressed primitive data to GPU buffers.
         void uploadDracoBuffers(std::shared_ptr<systems::leal::gltf::RuntimeInfo> &info);
@@ -732,6 +748,17 @@ namespace systems::leal::campello_renderer {
 
     private:
         void ensureSceneColorTexture();
+
+        // Lazily creates the shared material BindGroupLayout (26 entries: base
+        // color/metallic-roughness/normal/emissive/occlusion/specular/sheen/
+        // clearcoat/transmission/volume/iridescence/anisotropy textures+samplers,
+        // the punctual-lights UBO, and the screen-space-refraction scene color
+        // texture). Idempotent — a no-op once bindGroupLayout exists. Normally
+        // first triggered by setScene(), but createDefaultPipelines()'s Vulkan
+        // branch also needs it (to build the pipeline's descriptor set layout)
+        // and — per the documented call order (createDefaultPipelines() before
+        // setAsset()) — may run before setScene() ever has.
+        void ensureBindGroupLayout();
 
         // Grows (or lazily creates) a zero-filled fallback vertex buffer so it can
         // cover at least `requiredBytes`. These buffers stand in for missing
