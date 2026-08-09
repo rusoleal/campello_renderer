@@ -257,6 +257,12 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout>  bindGroupLayout;
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        defaultBindGroup;
 
+        // Vulkan-only PBR bind group layouts — see ensureVulkanPbrBindGroupLayouts().
+        // GpuMaterial::bindGroup/flatBindGroup and frameBindGroup[] are built
+        // against these instead of the shared bindGroupLayout on Vulkan builds.
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout>  vulkanMaterialBindGroupLayout;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout>  vulkanFrameBindGroupLayout;
+
         // Built-in pipeline variants created by createDefaultPipelines().
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlat;
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTextured;
@@ -333,6 +339,9 @@ namespace systems::leal::campello_renderer {
         // and a fallback zero-UV buffer for primitives without TEXCOORD_0.
         std::shared_ptr<systems::leal::campello_gpu::Buffer> fallbackUVBuffer;
         std::shared_ptr<systems::leal::campello_gpu::Buffer> fallbackTangentBuffer;
+        // Fallback for primitives without NORMAL, filled with a unit vector
+        // (0,0,1) rather than zero — the Vulkan shader normalize()s it.
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> fallbackNormalBuffer;
         // Fallback for primitives without TEXCOORD_1 (zero UV — harmless since
         // it's only sampled by textures that explicitly opt into texCoord=1).
         std::shared_ptr<systems::leal::campello_gpu::Buffer> fallbackTexCoord1Buffer;
@@ -759,6 +768,20 @@ namespace systems::leal::campello_renderer {
         // and — per the documented call order (createDefaultPipelines() before
         // setAsset()) — may run before setScene() ever has.
         void ensureBindGroupLayout();
+
+        // Vulkan-only: lazily creates vulkanMaterialBindGroupLayout (set 0: 24
+        // texture/sampler entries + a MaterialUniforms UBO) and
+        // vulkanFrameBindGroupLayout (set 1: LightsUniform + CameraUniforms UBOs,
+        // environmentMap cube texture + sampler, sceneColorTexture + sampler).
+        // Separate from the shared bindGroupLayout Metal also uses — the shared
+        // layout has binding-number collisions (17/18 are declared as textures
+        // there but need to also carry MaterialUniforms/CameraUniforms buffers,
+        // which is legal on Metal's independent texture/buffer argument-index
+        // spaces but not on Vulkan's single-descriptor-type-per-binding model;
+        // campello_gpu's Device::createBindGroup() silently drops the mismatched
+        // buffer writes rather than erroring, so this was a silent no-op, not a
+        // crash). Idempotent — a no-op once vulkanMaterialBindGroupLayout exists.
+        void ensureVulkanPbrBindGroupLayouts();
 
         // Grows (or lazily creates) a zero-filled fallback vertex buffer so it can
         // cover at least `requiredBytes`. These buffers stand in for missing
