@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <functional>
 
 #if defined(__APPLE__)
 #include <campello_gpu/device.hpp>
@@ -2362,6 +2363,132 @@ static const char *kGltfBackFacingDoubleSidedTriangle = R"({
     ],
     "buffers": [{"uri": "data:application/octet-stream;base64,AAAAvwAAAL8AAAAAAAAAPwAAAL8AAAAAAAAAAAAAAD8AAAAAAAACAAEA", "byteLength": 42}]
 })";
+
+// A single camera-facing triangle (same shape as kGltfTriangleWithData) with
+// an explicit NORMAL accessor (all three vertices facing +Z, straight at the
+// default camera at (0,0,5)) and a material whose metallicFactor/
+// roughnessFactor are template placeholders — %f/%f, substituted by the
+// PBR regression tests below. Needed because the Vulkan default fragment
+// shader used to ignore metallic-roughness entirely (see
+// shaders/vulkan/default.frag's port from Metal's fragmentMain_textured);
+// these tests exist to catch that regressing again. Material is
+// deliberately doubleSided (cullMode=none) to sidestep the still-unresolved
+// single-primitive-near-origin culling issue tracked by
+// DISABLED_MeshRendersNonClearPixels and friends — orthogonal to what these
+// tests actually check (metallic/IBL response), not a workaround for it.
+static const char *kGltfLitTriangleTemplate = R"({
+    "asset": {"version": "2.0"},
+    "scene": 0,
+    "scenes": [{"nodes": [0]}],
+    "nodes": [{"mesh": 0}],
+    "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 2, "material": 0}]}],
+    "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": %f, "roughnessFactor": %f},
+         "doubleSided": true}
+    ],
+    "accessors": [
+        {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+         "max": [0.5, 0.5, 0], "min": [-0.5, -0.5, 0]},
+        {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"},
+        {"bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR"}
+    ],
+    "bufferViews": [
+        {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 36, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 72, "byteLength": 6}
+    ],
+    "buffers": [{"uri": "data:application/octet-stream;base64,AAAAvwAAAL8AAAAAAAAAPwAAAL8AAAAAAAAAAAAAAD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAABAAIA", "byteLength": 78}]
+})";
+
+// Renders kGltfLitTriangleTemplate with the given metallic/roughness factors
+// (and IBL on/off) and returns the readback pixels, for the two PBR
+// regression tests below to compare against each other.
+static std::vector<uint8_t> RenderLitTriangle(
+    std::unique_ptr<systems::leal::campello_renderer::Renderer> &renderer,
+    std::function<std::shared_ptr<systems::leal::campello_gpu::Texture>(uint32_t, uint32_t)> makeOffscreenTexture,
+    std::function<std::vector<uint8_t>(std::shared_ptr<systems::leal::campello_gpu::Texture>)> readBackPixels,
+    float metallicFactor, float roughnessFactor, bool iblEnabled) {
+    char json[2048];
+    snprintf(json, sizeof(json), kGltfLitTriangleTemplate, metallicFactor, roughnessFactor);
+    auto asset = GLTF::loadGLTF(std::string(json), kNoOpLoader);
+    if (!asset) return {};
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setIBLEnabled(iblEnabled);
+
+    auto tex = makeOffscreenTexture(64, 64);
+    if (!tex) return {};
+    auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+    if (!view) return {};
+    renderer->render(view);
+    return readBackPixels(tex);
+}
+
+TEST_F(OffscreenRenderTest, MetallicFactorAffectsRenderedColor) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+
+    // Matte dielectric (metallic=0, rough=1) vs a near-mirror metal
+    // (metallic=1, rough=0.05), same baseColorFactor and lighting — the only
+    // difference is whether the shader actually reads metallic/roughness at
+    // all. The old Vulkan placeholder shader ignored both entirely, so this
+    // pair would have rendered pixel-identical under that bug.
+    auto matte = RenderLitTriangle(renderer,
+        [this](uint32_t w, uint32_t h) { return makeOffscreenTexture(w, h); },
+        [this](std::shared_ptr<systems::leal::campello_gpu::Texture> t) { return readBackPixels(t); },
+        0.0f, 1.0f, /*iblEnabled=*/true);
+    ASSERT_EQ(matte.size(), 64u * 64u * 4u);
+
+    renderer = std::make_unique<systems::leal::campello_renderer::Renderer>(device);
+    auto metal = RenderLitTriangle(renderer,
+        [this](uint32_t w, uint32_t h) { return makeOffscreenTexture(w, h); },
+        [this](std::shared_ptr<systems::leal::campello_gpu::Texture> t) { return readBackPixels(t); },
+        1.0f, 0.05f, /*iblEnabled=*/true);
+    ASSERT_EQ(metal.size(), 64u * 64u * 4u);
+
+    // Compare the triangle's center pixel — same geometry/camera/lighting,
+    // so any RGB difference must come from metallic/roughness actually
+    // reaching the shader.
+    size_t idx = (32 * 64 + 32) * 4;
+    bool differs = matte[idx + 0] != metal[idx + 0] ||
+                   matte[idx + 1] != metal[idx + 1] ||
+                   matte[idx + 2] != metal[idx + 2];
+    EXPECT_TRUE(differs) << "Matte and near-mirror-metal materials rendered identically "
+                             "(matte=" << (int)matte[idx] << "," << (int)matte[idx+1] << "," << (int)matte[idx+2]
+                          << " metal=" << (int)metal[idx] << "," << (int)metal[idx+1] << "," << (int)metal[idx+2]
+                          << ") — metallicFactor/roughnessFactor may not be reaching the shader.";
+}
+
+TEST_F(OffscreenRenderTest, IBLEnabledChangesRenderedColorForMetallicSurface) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+
+    // Same near-mirror-metal material, IBL on vs off — a metal's specular
+    // response should be dominated by its environment reflection, so
+    // disabling IBL (with punctual lighting unchanged) must change the
+    // rendered color if IBL is actually contributing anything.
+    auto iblOn = RenderLitTriangle(renderer,
+        [this](uint32_t w, uint32_t h) { return makeOffscreenTexture(w, h); },
+        [this](std::shared_ptr<systems::leal::campello_gpu::Texture> t) { return readBackPixels(t); },
+        1.0f, 0.05f, /*iblEnabled=*/true);
+    ASSERT_EQ(iblOn.size(), 64u * 64u * 4u);
+
+    renderer = std::make_unique<systems::leal::campello_renderer::Renderer>(device);
+    auto iblOff = RenderLitTriangle(renderer,
+        [this](uint32_t w, uint32_t h) { return makeOffscreenTexture(w, h); },
+        [this](std::shared_ptr<systems::leal::campello_gpu::Texture> t) { return readBackPixels(t); },
+        1.0f, 0.05f, /*iblEnabled=*/false);
+    ASSERT_EQ(iblOff.size(), 64u * 64u * 4u);
+
+    size_t idx = (32 * 64 + 32) * 4;
+    bool differs = iblOn[idx + 0] != iblOff[idx + 0] ||
+                   iblOn[idx + 1] != iblOff[idx + 1] ||
+                   iblOn[idx + 2] != iblOff[idx + 2];
+    EXPECT_TRUE(differs) << "Metallic surface rendered identically with IBL on vs off "
+                             "(on=" << (int)iblOn[idx] << "," << (int)iblOn[idx+1] << "," << (int)iblOn[idx+2]
+                          << " off=" << (int)iblOff[idx] << "," << (int)iblOff[idx+1] << "," << (int)iblOff[idx+2]
+                          << ") — the environment cubemap may not be reaching the shader.";
+}
 
 TEST_F(OffscreenRenderTest, DoubleSidedMaterialRendersBackFace) {
     if (!device) GTEST_SKIP() << "No GPU device available";
