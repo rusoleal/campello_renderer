@@ -4,7 +4,10 @@
 //   - Creates a GLFW window (Wayland) and a campello_gpu Device that owns its swapchain.
 //   - Loads a GLTF/GLB file dropped onto the window (or passed as argv[1]) and delegates
 //     to Renderer; dropping an HDR/EXR/PNG/JPEG/WebP file loads it as an environment map.
-//   - Calls Renderer::render() each frame, targeting the device's own swapchain.
+//   - Renders on demand (interaction, resize, load, or a playing animation)
+//     rather than continuously, targeting the device's own swapchain — see
+//     App::needsRedraw and main()'s glfwWaitEvents()/glfwWaitEventsTimeout()
+//     usage, mirroring the macOS example's _needsRedraw pattern.
 //   - Handles mouse drag/scroll for orbit/pan/zoom camera control.
 //   - Mirrors examples/macos/ViewController.mm + AppDelegate.mm's feature set; the macOS
 //     menu bar's Cmd+<key> actions become Ctrl+<key> here (there's no native menu bar
@@ -30,7 +33,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <thread>
 #include <cstdio>
 #include <fstream>
 #include <future>
@@ -154,11 +156,30 @@ struct App {
 
     std::chrono::steady_clock::time_point lastTick;
 
+    // On-demand rendering (mirrors examples/macos/ViewController.mm's
+    // _needsRedraw + anyAnimationPlaying pattern): starts true so the first
+    // frame renders, then only redraws in response to an actual change
+    // (interaction, resize, load, or a playing animation) instead of every
+    // loop iteration — see main()'s glfwWaitEvents()/glfwWaitEventsTimeout()
+    // usage, which additionally lets the process sleep with ~0% CPU while
+    // truly idle instead of polling on a fixed timer.
+    bool needsRedraw = true;
+    // Rate-limits actual render() calls to ~60 Hz even when many input events
+    // arrive back-to-back (e.g. a fast mouse firing hundreds of drag-move
+    // events/sec) — campello_gpu's 3-deep frame-in-flight ring assumes
+    // submissions roughly track vsync; hammering it faster previously tripped
+    // command-buffer/query-pool-still-in-use validation errors and crashes
+    // (see the old fixed-cadence loop this replaced). needsRedraw stays set
+    // when a frame is skipped for this reason, so the next eligible tick
+    // still draws.
+    std::chrono::steady_clock::time_point lastRenderTime;
+
     bool init();
     void loadModel(const std::string &path);
     void loadEnvironmentMapFile(const std::string &path);
     void frame();
     void printHelp() const;
+    bool isAnyAnimationPlaying() const;
 };
 
 // ---------------------------------------------------------------------------
@@ -172,6 +193,7 @@ static void framebufferSizeCallback(GLFWwindow *window, int width, int height) {
     app->renderer->resize((uint32_t)width, (uint32_t)height);
     app->fbWidth  = width;
     app->fbHeight = height;
+    app->needsRedraw = true;
 }
 
 static void dropCallback(GLFWwindow *window, int count, const char **paths) {
@@ -207,6 +229,7 @@ static void mouseButtonCallback(GLFWwindow *window, int button, int action, int 
 static void cursorPosCallback(GLFWwindow *window, double x, double y) {
     auto *app = static_cast<App *>(glfwGetWindowUserPointer(window));
     if (!app || (!app->leftDown && !app->rightDown)) return;
+    app->needsRedraw = true;
 
     float dx = (float)(x - app->lastMouseX);
     // GLFW's cursor Y grows downward; examples/macos/Camera.hpp's orbit/pan signs were
@@ -232,12 +255,17 @@ static void scrollCallback(GLFWwindow *window, double /*xoffset*/, double yoffse
     auto *app = static_cast<App *>(glfwGetWindowUserPointer(window));
     if (!app) return;
     app->camera.zoom((float)yoffset);
+    app->needsRedraw = true;
 }
 
 static void keyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int mods) {
     if (action != GLFW_PRESS) return;
     auto *app = static_cast<App *>(glfwGetWindowUserPointer(window));
     if (!app || !app->renderer) return;
+    // Most hotkeys change something visible (view mode, lighting, background,
+    // FXAA/SSAA...); over-triggering on Escape/Ctrl+Q (which quit instead) is
+    // harmless since the window is closing anyway.
+    app->needsRedraw = true;
 
     if (key == GLFW_KEY_ESCAPE) {
         glfwSetWindowShouldClose(window, GLFW_TRUE);
@@ -436,6 +464,7 @@ void App::loadModel(const std::string &path) {
 
     renderer->setAsset(asset);
     camera.fitBounds(renderer->getBoundsRadius());
+    needsRedraw = true;
 
     uint32_t animCount = renderer->getAnimationCount();
     printf("Animations found: %u\n", animCount);
@@ -456,19 +485,47 @@ void App::loadEnvironmentMapFile(const std::string &path) {
         renderer->setSkyboxEnabled(true);
         renderer->setIBLEnabled(true);
         printf("Environment map loaded: %s\n", path.c_str());
+        needsRedraw = true;
     } else {
         fprintf(stderr, "campello_renderer_linux: failed to load environment map %s\n", path.c_str());
     }
 }
 
+bool App::isAnyAnimationPlaying() const {
+    if (!renderer) return false;
+    uint32_t count = renderer->getAnimationCount();
+    for (uint32_t i = 0; i < count; ++i) {
+        if (renderer->isAnimationPlaying(i)) return true;
+    }
+    return false;
+}
+
 void App::frame() {
-    if (!pendingModelPath.empty() && --pendingModelDelayFrames == 0) {
-        std::string path = pendingModelPath;
-        pendingModelPath.clear();
-        loadModel(path);
+    // Keep ticking (via main()'s WaitEventsTimeout) until the delayed load
+    // fires, even though nothing is visibly changing yet — see
+    // pendingModelPath's doc comment.
+    if (!pendingModelPath.empty()) {
+        needsRedraw = true;
+        if (--pendingModelDelayFrames == 0) {
+            std::string path = pendingModelPath;
+            pendingModelPath.clear();
+            loadModel(path);
+        }
     }
 
+    bool animating = isAnyAnimationPlaying();
+    if (!needsRedraw && !animating) return;
+
+    // Rate-limit: see lastRenderTime's doc comment. Animating frames always
+    // draw (main()'s WaitEventsTimeout(1/60) already paces those); only
+    // interaction-driven redraws get throttled here.
     auto now = std::chrono::steady_clock::now();
+    static const auto kTargetFrameTime = std::chrono::duration<double>(1.0 / 60.0);
+    if (!animating && (now - lastRenderTime) < kTargetFrameTime) return;
+
+    needsRedraw = false;
+    lastRenderTime = now;
+
     double dt = std::chrono::duration<double>(now - lastTick).count();
     lastTick = now;
     if (dt < 0.0) dt = 0.0;
@@ -512,21 +569,24 @@ int main(int argc, char **argv) {
         app.pendingModelDelayFrames = 120; // ~2s at the 60fps cap below
     }
 
-    // Cap to ~60 FPS. campello_gpu's Vulkan present doesn't actually block on
-    // vsync here (observed submitting several thousand frames/sec unthrottled),
-    // and hammering the 3-deep frame-in-flight ring that much faster than the
-    // GPU retires it is what was tripping command-buffer/query-pool-still-in-use
-    // validation errors (and an eventual crash) — this keeps CPU submission rate
-    // sane regardless of whether campello_gpu's own pacing gets fixed later.
-    const auto targetFrameTime = std::chrono::duration<double>(1.0 / 60.0);
+    // On-demand event loop: render this frame (a no-op unless something
+    // actually needs it — see App::needsRedraw's doc comment), then sleep
+    // until there's a reason to wake up again instead of polling on a fixed
+    // timer. glfwWaitEvents() blocks with ~0% CPU until an actual input/
+    // window event arrives; glfwWaitEventsTimeout(1/60s) is used instead
+    // whenever something needs regular ticks regardless of input (a playing
+    // animation, or the delayed argv[1] load counting down) so those still
+    // advance smoothly. This is what actually avoids draining battery on a
+    // static scene — App::frame()'s own needsRedraw check alone would still
+    // leave the process waking up 60x/sec on a timer even while skipping the
+    // GPU work each time.
     while (!glfwWindowShouldClose(app.window)) {
-        auto frameStart = std::chrono::steady_clock::now();
-        glfwPollEvents();
         app.frame();
-        auto elapsed = std::chrono::steady_clock::now() - frameStart;
-        auto remaining = targetFrameTime - elapsed;
-        if (remaining > std::chrono::steady_clock::duration::zero()) {
-            std::this_thread::sleep_for(remaining);
+        bool needsTicking = !app.pendingModelPath.empty() || app.isAnyAnimationPlaying();
+        if (needsTicking) {
+            glfwWaitEventsTimeout(1.0 / 60.0);
+        } else {
+            glfwWaitEvents();
         }
     }
 
