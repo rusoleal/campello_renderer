@@ -2531,6 +2531,10 @@ TEST_F(OffscreenRenderTest, ECSPathRendersToOffscreen) {
     renderer->resize(64, 64);
     renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
     renderer->setClearColor(0.0f, 0.0f, 1.0f, 1.0f); // blue clear
+    // skyboxEnabled defaults to true and would otherwise paint over the clear
+    // color with the default environment cubemap — this test is isolating
+    // the ECS draw-call path's clear/draw behavior, not skybox visibility.
+    renderer->setSkyboxEnabled(false);
 
     // Upload mesh and material manually.
     ASSERT_TRUE(asset->meshes && !asset->meshes->empty());
