@@ -701,11 +701,43 @@ Renderer::Renderer(std::shared_ptr<systems::leal::campello_gpu::Device> device) 
     animator = std::make_unique<GltfAnimator>();
 }
 
+// See setAsset()'s waitForIdle() comment for the failure mode this prevents:
+// without draining the GPU first, the member destructors that run right
+// after this body (frameResources' buffers/textures/fences, opaqueSceneTexture,
+// sceneColorTexture, bind groups...) free objects a still-in-flight command
+// buffer may reference. Device::~Device() also calls vkDeviceWaitIdle(), but
+// callers commonly reset() the Renderer before the Device (surface-teardown
+// ordering on Linux/Wayland requires it — see the example app), so that
+// device-level wait runs too late to protect these resources on its own.
+Renderer::~Renderer() {
+    if (device) device->waitForIdle();
+}
+
 // ---------------------------------------------------------------------------
 // Asset / scene / camera
 // ---------------------------------------------------------------------------
 
 void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
+    // Replacing the active asset drops the shared_ptrs to every GPU buffer,
+    // texture, and bind group the previous asset owned (below, and via
+    // setScene() -> allocateGpuResources()), which destroys the underlying
+    // Vulkan objects as soon as their refcount hits zero. render()/
+    // renderToTarget() submits are async by design (frame.fence is only
+    // waited at the top of the *next* renderToTarget() call for that same
+    // frame slot, and callers like the Linux example render on demand, so
+    // many wall-clock frames can pass between waits) -- so without this,
+    // a command buffer still executing on the GPU can reference a buffer or
+    // texture that gets freed out from under it here. That's a GPU-timeline
+    // use-after-free: it doesn't fail where it happens, it corrupts driver/
+    // validation-layer state and shows up later as an unrelated-looking
+    // crash (observed: VUID-vkDestroyQueryPool-queryPool-00793 /
+    // VUID-vkFreeCommandBuffers-pCommandBuffers-00047 "in use" errors on a
+    // completely different command buffer, then a segfault) when an asset
+    // is loaded/reloaded while a frame is in flight, e.g. drag-and-drop.
+    // Draining the GPU here is only a few extra milliseconds on an already
+    // multi-millisecond asset-load path.
+    if (device) device->waitForIdle();
+
     this->asset = asset;
     activeVariant = -1;
     if (asset == nullptr) {
@@ -714,6 +746,7 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         transformBuffer       = nullptr;
         materialUniformBuffer = nullptr;
         boundsRadius          = 1.0f;
+        boundsCenter          = systems::leal::vector_math::Vector3<double>(0.0, 0.0, 0.0);
         gpuSamplers.clear();
         materialBindGroups.clear();
         flatMaterialBindGroups.clear();
@@ -1054,6 +1087,30 @@ void Renderer::ensureBindGroupLayout() {
     texEntryAniso.data.texture.viewDimension = GPU::TextureType::tt2d;
     bglDesc.entries.push_back(texEntryAniso);
 
+    // Binding 27: irradianceEnvironmentMap (cube — Lambertian-convolved diffuse
+    // IBL; see Renderer::bakeIblResources()). Samples reuse baseColorSampler
+    // (binding 1) at the call site, same as the other >=15 textures above —
+    // Metal allows only 16 sampler slots (0-15), already exhausted.
+    GPU::EntryObject texEntryIrr{};
+    texEntryIrr.binding    = 27;
+    texEntryIrr.visibility = GPU::ShaderStage::fragment;
+    texEntryIrr.type       = GPU::EntryObjectType::texture;
+    texEntryIrr.data.texture.multisampled  = false;
+    texEntryIrr.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntryIrr.data.texture.viewDimension = GPU::TextureType::ttCube;
+    bglDesc.entries.push_back(texEntryIrr);
+
+    // Binding 28: brdfLutTexture (2D — Karis split-sum LUT indexed by
+    // (NdotV, roughness); see Renderer::bakeIblResources()).
+    GPU::EntryObject texEntryLut{};
+    texEntryLut.binding    = 28;
+    texEntryLut.visibility = GPU::ShaderStage::fragment;
+    texEntryLut.type       = GPU::EntryObjectType::texture;
+    texEntryLut.data.texture.multisampled  = false;
+    texEntryLut.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+    texEntryLut.data.texture.viewDimension = GPU::TextureType::tt2d;
+    bglDesc.entries.push_back(texEntryLut);
+
     bindGroupLayout = device->createBindGroupLayout(bglDesc);
 }
 
@@ -1128,12 +1185,169 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
         GPU::BindGroupLayoutDescriptor frameDesc{};
         addBuf(frameDesc, 0, 272);                          // LightsUniform
         addBuf(frameDesc, 1, 160);                          // CameraUniforms
-        addTex(frameDesc, 2, GPU::TextureType::ttCube);     // environmentMap
+        addTex(frameDesc, 2, GPU::TextureType::ttCube);     // environmentMap (prefiltered specular — see bakeIblResources())
         addSamp(frameDesc, 3);                              // environmentSampler
         addTex(frameDesc, 4);                               // sceneColorTexture
         addSamp(frameDesc, 5);                              // sceneColorSampler
+        addTex(frameDesc, 6, GPU::TextureType::ttCube);     // irradianceEnvironmentMap (diffuse IBL — bakeIblResources())
+        addTex(frameDesc, 7);                               // brdfLutTexture (2D, IBL specular Fresnel — bakeIblResources())
+        addSamp(frameDesc, 8);                              // brdfLutSampler (reuses fxaaSampler, clamp-to-edge)
         vulkanFrameBindGroupLayout = device->createBindGroupLayout(frameDesc);
     }
+}
+
+// Bakes the three IBL precompute resources the glTF-Sample-Renderer reference
+// uses for image-based lighting — see shaders/vulkan/ibl_bake.frag's header
+// comment for what each mode computes. Called wherever environmentMap is
+// (re)assigned (setEnvironmentMap / loadEnvironmentMap /
+// convertEquirectangularImageToCubemap). Vulkan-only for now; a no-op on
+// other backends until the Metal port lands.
+void Renderer::bakeIblResources() {
+#if defined(ANDROID) || defined(__linux__) || defined(__APPLE__)
+    namespace GPU = systems::leal::campello_gpu;
+#if defined(ANDROID) || defined(__linux__)
+    if (!device || !environmentMap || !environmentSampler || !pipelineIblBake ||
+        !iblBakeBindGroupLayout || !vulkanIblBakePipelineLayout) {
+        return;
+    }
+#else
+    if (!device || !environmentMap || !environmentSampler || !pipelineIblBake ||
+        !iblBakeBindGroupLayout) {
+        return;
+    }
+#endif
+
+    if (!iblBakeUniformBuffer) {
+        iblBakeUniformBuffer = device->createBuffer(16, GPU::BufferUsage::uniform);
+        if (!iblBakeUniformBuffer) return;
+    }
+
+    struct IblBakeUboData {
+        int32_t mode;       // 0 = BRDF LUT, 1 = GGX prefilter, 2 = irradiance convolution
+        int32_t faceIndex;  // 0..5, used for mode 1/2
+        float   roughness;  // used for mode 1
+        float   outputSize; // resolution (texels, square) of the current render target
+    };
+
+    // Runs one bake draw into `targetView`. This whole function runs once per
+    // environment load (not per-frame), so a full submit+wait per draw (safe
+    // reuse of the single shared iblBakeUniformBuffer across draws, no manual
+    // sync needed) is an acceptable cost for baking correctness/simplicity
+    // over throughput — a handful of small submissions, not a hot path.
+    auto bakeDraw = [&](const IblBakeUboData &data,
+                         const std::shared_ptr<GPU::TextureView> &targetView) {
+        if (!targetView) return;
+        iblBakeUniformBuffer->upload(0, sizeof(data), const_cast<IblBakeUboData*>(&data));
+
+        GPU::BindGroupDescriptor bgDesc{};
+        bgDesc.layout = iblBakeBindGroupLayout;
+#if defined(__APPLE__)
+        // Metal: texture/buffer/sampler occupy independent per-type argument
+        // spaces, so binding 0 as both a buffer and a texture (see
+        // iblBakeFragment's [[buffer(0)]]/[[texture(0)]]) is valid — same
+        // same-number-different-type convention already used throughout
+        // ensureBindGroupLayout() (e.g. binding 17 is both clearcoatTexture
+        // and the MaterialUniforms buffer).
+        bgDesc.entries = {
+            {0, GPU::BufferBinding{iblBakeUniformBuffer, 0, 16}},
+            {0, environmentMap},
+            {1, environmentSampler},
+        };
+#else
+        bgDesc.entries = {
+            {0, GPU::BufferBinding{iblBakeUniformBuffer, 0, 16}},
+            {1, environmentMap},
+            {2, environmentSampler},
+        };
+#endif
+        auto bindGroup = device->createBindGroup(bgDesc);
+        if (!bindGroup) return;
+
+        auto encoder = device->createCommandEncoder();
+        if (!encoder) return;
+
+        GPU::ColorAttachment ca{};
+        ca.clearValue[0] = 0.0f; ca.clearValue[1] = 0.0f;
+        ca.clearValue[2] = 0.0f; ca.clearValue[3] = 1.0f;
+        ca.depthSlice = 0;
+        ca.loadOp  = GPU::LoadOp::clear;
+        ca.storeOp = GPU::StoreOp::store;
+        ca.view = targetView;
+
+        GPU::BeginRenderPassDescriptor rpDesc{};
+        rpDesc.colorAttachments = { ca };
+        auto rpe = encoder->beginRenderPass(rpDesc);
+        if (rpe) {
+            rpe->setViewport(0.0f, 0.0f, data.outputSize, data.outputSize, 0.0f, 1.0f);
+            rpe->setPipeline(pipelineIblBake);
+            rpe->setBindGroup(0, bindGroup);
+            rpe->draw(3);
+            rpe->end();
+        }
+        auto fence = device->createFence();
+        device->submit(encoder->finish(), fence);
+        if (fence) fence->wait();
+    };
+
+    // 1) BRDF LUT — environment-independent (Karis split-sum integral over
+    // (NdotV, roughness) only); bake once and cache forever.
+    if (!brdfLutTexture) {
+        const uint32_t kBrdfLutSize = 128;
+        brdfLutTexture = device->createTexture(
+            GPU::TextureType::tt2d, GPU::PixelFormat::rgba16float,
+            kBrdfLutSize, kBrdfLutSize, 1, 1, 1,
+            (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                uint32_t(GPU::TextureUsage::textureBinding)));
+        if (brdfLutTexture) {
+            auto view = brdfLutTexture->createView(
+                GPU::PixelFormat::rgba16float, 1, GPU::Aspect::all, 0, 0, GPU::TextureType::tt2d, 1);
+            bakeDraw({0, 0, 0.0f, (float)kBrdfLutSize}, view);
+        }
+    }
+
+    // 2) GGX-prefiltered specular cubemap — derived from the current
+    // environmentMap's sharp (mip 0) faces; rebaked every time the
+    // environment changes. Standardized to rgba16float regardless of
+    // environmentMap's own format (varies by loader).
+    uint32_t envSize = environmentMap->getWidth();
+    if (envSize > 0) {
+        uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2((double)envSize));
+        prefilteredEnvironmentMap = device->createTexture(
+            GPU::TextureType::ttCube, GPU::PixelFormat::rgba16float,
+            envSize, envSize, 1, mipLevels, 1,
+            (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                uint32_t(GPU::TextureUsage::textureBinding)));
+        if (prefilteredEnvironmentMap) {
+            for (uint32_t mip = 0; mip < mipLevels; ++mip) {
+                uint32_t mipSize = std::max(1u, envSize >> mip);
+                float roughness = (mipLevels > 1) ? (float)mip / (float)(mipLevels - 1) : 0.0f;
+                for (int32_t face = 0; face < 6; ++face) {
+                    auto view = prefilteredEnvironmentMap->createView(
+                        GPU::PixelFormat::rgba16float, 1, GPU::Aspect::all, face, mip, GPU::TextureType::tt2d, 1);
+                    bakeDraw({1, face, roughness, (float)mipSize}, view);
+                }
+            }
+        }
+    }
+
+    // 3) Lambertian diffuse irradiance cubemap — small, single mip; cheap
+    // enough to rebake in full every time the environment changes.
+    {
+        const uint32_t kIrradianceSize = 32;
+        irradianceEnvironmentMap = device->createTexture(
+            GPU::TextureType::ttCube, GPU::PixelFormat::rgba16float,
+            kIrradianceSize, kIrradianceSize, 1, 1, 1,
+            (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                uint32_t(GPU::TextureUsage::textureBinding)));
+        if (irradianceEnvironmentMap) {
+            for (int32_t face = 0; face < 6; ++face) {
+                auto view = irradianceEnvironmentMap->createView(
+                    GPU::PixelFormat::rgba16float, 1, GPU::Aspect::all, face, 0, GPU::TextureType::tt2d, 1);
+                bakeDraw({2, face, 0.0f, (float)kIrradianceSize}, view);
+            }
+        }
+    }
+#endif
 }
 
 void Renderer::setScene(uint32_t index) {
@@ -1499,7 +1713,8 @@ void Renderer::setScene(uint32_t index) {
                             GPU::TextureType::tt2d, fmt,
                             img->getWidth(), img->getHeight(), 1, mipLevels, 1,
                             (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
-                                                (uint32_t)GPU::TextureUsage::copyDst));
+                                                (uint32_t)GPU::TextureUsage::copyDst |
+                                                (uint32_t)GPU::TextureUsage::copySrc));
                         if (texture != nullptr) {
                             texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
                             gpuTextures[a] = texture;
@@ -1520,7 +1735,8 @@ void Renderer::setScene(uint32_t index) {
                                 GPU::TextureType::tt2d, fmt,
                                 img->getWidth(), img->getHeight(), 1, mipLevels, 1,
                                 (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
-                                                    (uint32_t)GPU::TextureUsage::copyDst));
+                                                    (uint32_t)GPU::TextureUsage::copyDst |
+                                                    (uint32_t)GPU::TextureUsage::copySrc));
                             if (texture != nullptr) {
                                 texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
                                 gpuTextures[a] = texture;
@@ -1543,7 +1759,8 @@ void Renderer::setScene(uint32_t index) {
                             GPU::TextureType::tt2d, fmt,
                             img->getWidth(), img->getHeight(), 1, mipLevels, 1,
                             (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
-                                                (uint32_t)GPU::TextureUsage::copyDst));
+                                                (uint32_t)GPU::TextureUsage::copyDst |
+                                                (uint32_t)GPU::TextureUsage::copySrc));
                         if (texture != nullptr) {
                             texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
                             gpuTextures[a] = texture;
@@ -1630,7 +1847,9 @@ void Renderer::setScene(uint32_t index) {
         uint8_t white[4] = {255, 255, 255, 255};
         defaultTexture = device->createTexture(
             GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm_srgb,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (defaultTexture) defaultTexture->upload(0, 4, white);
     }
 
@@ -1639,7 +1858,9 @@ void Renderer::setScene(uint32_t index) {
         uint8_t metalRough[4] = {0, 255, 255, 255}; // R=0, G=1.0 (roughness), B=1.0 (metallic), A=1.0
         defaultMetallicRoughnessTexture = device->createTexture(
             GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (defaultMetallicRoughnessTexture) defaultMetallicRoughnessTexture->upload(0, 4, metalRough);
     }
 
@@ -1648,7 +1869,9 @@ void Renderer::setScene(uint32_t index) {
         uint8_t normal[4] = {128, 128, 255, 255}; // RGB=(0.5,0.5,1.0), A=1.0
         defaultNormalTexture = device->createTexture(
             GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (defaultNormalTexture) defaultNormalTexture->upload(0, 4, normal);
     }
 
@@ -1657,7 +1880,9 @@ void Renderer::setScene(uint32_t index) {
         uint8_t black[4] = {0, 0, 0, 255}; // RGB=(0,0,0), A=1.0
         defaultEmissiveTexture = device->createTexture(
             GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm_srgb,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (defaultEmissiveTexture) defaultEmissiveTexture->upload(0, 4, black);
     }
 
@@ -1666,7 +1891,9 @@ void Renderer::setScene(uint32_t index) {
         uint8_t white[4] = {255, 255, 255, 255}; // RGB=(1,1,1), A=1.0
         defaultOcclusionTexture = device->createTexture(
             GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (defaultOcclusionTexture) defaultOcclusionTexture->upload(0, 4, white);
     }
 
@@ -1675,7 +1902,9 @@ void Renderer::setScene(uint32_t index) {
         uint8_t white[4] = {255, 255, 255, 255};
         defaultSpecularTexture = device->createTexture(
             GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (defaultSpecularTexture) defaultSpecularTexture->upload(0, 4, white);
     }
 
@@ -1684,7 +1913,9 @@ void Renderer::setScene(uint32_t index) {
         uint8_t white[4] = {255, 255, 255, 255};
         defaultSpecularColorTexture = device->createTexture(
             GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm_srgb,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (defaultSpecularColorTexture) defaultSpecularColorTexture->upload(0, 4, white);
     }
 
@@ -1693,7 +1924,9 @@ void Renderer::setScene(uint32_t index) {
         uint8_t black[4] = {0, 0, 0, 255};
         defaultSheenColorTexture = device->createTexture(
             GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm_srgb,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (defaultSheenColorTexture) defaultSheenColorTexture->upload(0, 4, black);
     }
 
@@ -1702,7 +1935,9 @@ void Renderer::setScene(uint32_t index) {
         uint8_t white[4] = {255, 255, 255, 255};
         defaultSheenRoughnessTexture = device->createTexture(
             GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (defaultSheenRoughnessTexture) defaultSheenRoughnessTexture->upload(0, 4, white);
     }
 
@@ -1711,7 +1946,9 @@ void Renderer::setScene(uint32_t index) {
         uint8_t white[4] = {255, 255, 255, 255};
         defaultClearcoatTexture = device->createTexture(
             GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (defaultClearcoatTexture) defaultClearcoatTexture->upload(0, 4, white);
     }
 
@@ -1720,7 +1957,9 @@ void Renderer::setScene(uint32_t index) {
         uint8_t white[4] = {255, 255, 255, 255};
         defaultClearcoatRoughnessTexture = device->createTexture(
             GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (defaultClearcoatRoughnessTexture) defaultClearcoatRoughnessTexture->upload(0, 4, white);
     }
 
@@ -1729,7 +1968,9 @@ void Renderer::setScene(uint32_t index) {
         uint8_t flatNormal[4] = {128, 128, 255, 255};
         defaultClearcoatNormalTexture = device->createTexture(
             GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (defaultClearcoatNormalTexture) defaultClearcoatNormalTexture->upload(0, 4, flatNormal);
     }
 
@@ -1778,6 +2019,17 @@ void Renderer::setScene(uint32_t index) {
         esd.magFilter    = GPU::FilterMode::fmLinear;
         esd.minFilter    = GPU::FilterMode::fmLinear;
         environmentSampler = device->createSampler(esd);
+    }
+
+    // Bake the IBL precompute resources (BRDF LUT / prefiltered specular /
+    // diffuse irradiance) for this lazily-created default environment. Must
+    // run after environmentSampler above is created (bakeIblResources()
+    // requires it) and only once — environmentMap is non-null on every
+    // subsequent setScene() call, so the guard above won't re-enter this
+    // block; setEnvironmentMap() is what triggers rebakes for later,
+    // explicitly-loaded environments.
+    if (!brdfLutTexture && !prefilteredEnvironmentMap) {
+        bakeIblResources();
     }
 
     // Default instance matrix: identity matrix for non-instanced rendering.
@@ -1893,7 +2145,10 @@ void Renderer::setScene(uint32_t index) {
             {17, defaultClearcoatTexture},
             {18, defaultClearcoatRoughnessTexture},
             {19, defaultClearcoatNormalTexture},
-            {21, environmentMap},
+            // Environment/irradiance/BRDF-LUT bindings (21/27/28) now live in
+            // the per-frame bind group instead — see setEnvironmentMap()'s
+            // doc comment for why a per-material bind group can't refresh
+            // them when the environment changes after scene load.
             // Buffer(17): material uniforms — static after scene load.
             {17, GPU::BufferBinding{materialUniformBuffer, 0, kMaterialUniformStride}},
         };
@@ -1930,10 +2185,13 @@ void Renderer::setScene(uint32_t index) {
             bgDesc.entries = {
                 {0, GPU::BufferBinding{frameResources[f].lightsUniformBuffer, 0, 272}},
                 {1, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, 160}},
-                {2, environmentMap},
+                {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
                 {3, environmentSampler},
                 {4, defaultTexture},
                 {5, fxaaSampler},
+                {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
+                {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
+                {8, fxaaSampler},
             };
             frameBindGroup[f] = device->createBindGroup(bgDesc);
         }
@@ -1980,7 +2238,8 @@ void Renderer::setScene(uint32_t index) {
                 auto texture = device->createTexture(
                     GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
                     proceduralBakeSize, proceduralBakeSize, 1, 1, 1,
-                    GPU::TextureUsage::textureBinding);
+                    (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                        (uint32_t)GPU::TextureUsage::copyDst));
                 if (texture) {
                     texture->upload(0, pixels.size(), pixels.data());
                     proceduralBakedTextures[key] = texture;
@@ -2267,11 +2526,13 @@ void Renderer::setScene(uint32_t index) {
                 {18, clearcoatRoughnessTex},
                 {19, clearcoatNormalTex},
                 {20, transmissionTex},
-                {21, environmentMap},
                 {23, thicknessTex},
                 {24, iridescenceTex},
                 {25, iridescenceThicknessTex},
                 {26, anisotropicTex},
+                // Environment/irradiance/BRDF-LUT bindings (21/27/28) now
+                // live in the per-frame bind group instead — see
+                // setEnvironmentMap()'s doc comment.
                 // Buffer(17): material uniforms at the per-material offset.
                 {17, GPU::BufferBinding{materialUniformBuffer,
                                         (uint64_t)(m + 1) * kMaterialUniformStride,
@@ -2474,6 +2735,25 @@ void Renderer::setScene(uint32_t index) {
                     transformBounds(nodeLocalBounds[nodeIdx], instanceMatrix));
             }
             nodeLocalBounds[nodeIdx] = instancedBounds;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Compute the scene's world-space mesh bounding-box center, for callers
+    // that want to point a camera at the asset's actual visual center
+    // (mirroring the glTF Sample Viewer's default) rather than assuming it's
+    // at the origin — see getBoundsCenter(). Needs nodeLocalBounds, so this
+    // must run after the population/instancing blocks above.
+    // ------------------------------------------------------------------
+    boundsCenter = systems::leal::vector_math::Vector3<double>(0.0, 0.0, 0.0);
+    if (scene0.nodes) {
+        namespace VM = systems::leal::vector_math;
+        Bounds sceneAABB;
+        for (auto rootIdx : *scene0.nodes) {
+            sceneAABB = mergeBounds(sceneAABB, computeSceneAABB(rootIdx, VM::Matrix4<double>::identity()));
+        }
+        if (sceneAABB.valid) {
+            boundsCenter = (sceneAABB.min + sceneAABB.max) * 0.5;
         }
     }
 
@@ -3314,6 +3594,65 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         pipelineDownsample = device->createRenderPipeline(dsDesc);
     }
 
+    // --- IBL precompute pipeline (Metal) — see bakeIblResources() ---
+    // Bakes the BRDF LUT / GGX-prefiltered specular cubemap / diffuse
+    // irradiance cubemap the reference glTF-Sample-Renderer uses for IBL,
+    // none of which this renderer previously computed (see shaders/metal/
+    // default.metal's iblBakeFragment doc comment). Reuses skyboxVertex for
+    // the vertex stage — same fullscreen-triangle-from-vertex_id trick as
+    // FXAA/downsample above, just already defined for the skybox pass.
+    {
+        if (!iblBakeBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor iglDesc{};
+            GPU::EntryObject iBuf{};
+            iBuf.binding = 0;
+            iBuf.visibility = GPU::ShaderStage::fragment;
+            iBuf.type = GPU::EntryObjectType::buffer;
+            iBuf.data.buffer.hasDinamicOffaset = false;
+            iBuf.data.buffer.minBindingSize = 16;
+            iBuf.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+            iglDesc.entries.push_back(iBuf);
+
+            GPU::EntryObject iTex{};
+            iTex.binding = 0;
+            iTex.visibility = GPU::ShaderStage::fragment;
+            iTex.type = GPU::EntryObjectType::texture;
+            iTex.data.texture.multisampled = false;
+            iTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            iTex.data.texture.viewDimension = GPU::TextureType::ttCube;
+            iglDesc.entries.push_back(iTex);
+
+            GPU::EntryObject iSamp{};
+            iSamp.binding = 1;
+            iSamp.visibility = GPU::ShaderStage::fragment;
+            iSamp.type = GPU::EntryObjectType::sampler;
+            iSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            iglDesc.entries.push_back(iSamp);
+
+            iblBakeBindGroupLayout = device->createBindGroupLayout(iglDesc);
+        }
+
+        GPU::RenderPipelineDescriptor iblDesc{};
+        iblDesc.vertex.module = shaderModule;
+        iblDesc.vertex.entryPoint = "skyboxVertex";
+        // No vertex buffers — fullscreen triangle from vertex_id.
+
+        iblDesc.topology = GPU::PrimitiveTopology::triangleList;
+        iblDesc.cullMode = GPU::CullMode::none;
+        iblDesc.frontFace = GPU::FrontFace::ccw;
+
+        GPU::FragmentDescriptor iblFrag{};
+        iblFrag.module = shaderModule;
+        iblFrag.entryPoint = "iblBakeFragment";
+        GPU::ColorState iblCs{};
+        iblCs.format = GPU::PixelFormat::rgba16float;
+        iblCs.writeMask = GPU::ColorWrite::all;
+        iblFrag.targets.push_back(iblCs);
+        iblDesc.fragment = iblFrag;
+
+        pipelineIblBake = device->createRenderPipeline(iblDesc);
+    }
+
 #elif defined(ANDROID) || defined(__linux__)
     using namespace systems::leal::campello_renderer::shaders;
 
@@ -3630,6 +3969,153 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         }
     }
 
+    // --- IBL precompute pipeline (Vulkan) — see bakeIblResources() ---
+    // Bakes the BRDF LUT / GGX-prefiltered specular cubemap / diffuse
+    // irradiance cubemap the reference glTF-Sample-Renderer uses for IBL,
+    // none of which this renderer previously computed (see shaders/vulkan/
+    // ibl_bake.frag's header comment). All three outputs are standardized to
+    // rgba16float regardless of the source environmentMap's own format
+    // (which varies: rgba8unorm/rgba16float/rgba32float depending on loader)
+    // so a single fixed-format pipeline covers all three bake modes.
+    {
+        if (!iblBakeBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor iglDesc{};
+            GPU::EntryObject iBuf{};
+            iBuf.binding = 0;
+            iBuf.visibility = GPU::ShaderStage::fragment;
+            iBuf.type = GPU::EntryObjectType::buffer;
+            iBuf.data.buffer.hasDinamicOffaset = false;
+            iBuf.data.buffer.minBindingSize = 16;
+            iBuf.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+            iglDesc.entries.push_back(iBuf);
+
+            GPU::EntryObject iTex{};
+            iTex.binding = 1;
+            iTex.visibility = GPU::ShaderStage::fragment;
+            iTex.type = GPU::EntryObjectType::texture;
+            iTex.data.texture.multisampled = false;
+            iTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            iTex.data.texture.viewDimension = GPU::TextureType::ttCube;
+            iglDesc.entries.push_back(iTex);
+
+            GPU::EntryObject iSamp{};
+            iSamp.binding = 2;
+            iSamp.visibility = GPU::ShaderStage::fragment;
+            iSamp.type = GPU::EntryObjectType::sampler;
+            iSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            iglDesc.entries.push_back(iSamp);
+
+            iblBakeBindGroupLayout = device->createBindGroupLayout(iglDesc);
+        }
+
+        auto iblVertModule = device->createShaderModule(kDefaultVulkanFxaaVertShader, kDefaultVulkanFxaaVertShaderSize);
+        auto iblFragModule = device->createShaderModule(kDefaultVulkanIblBakeFragShader, kDefaultVulkanIblBakeFragShaderSize);
+        if (iblVertModule && iblFragModule) {
+            GPU::RenderPipelineDescriptor iblDesc{};
+            iblDesc.vertex.module = iblVertModule;
+            iblDesc.vertex.entryPoint = "main";
+
+            iblDesc.topology = GPU::PrimitiveTopology::triangleList;
+            iblDesc.cullMode = GPU::CullMode::none;
+            iblDesc.frontFace = GPU::FrontFace::ccw; // no-op (cullMode=none)
+
+            GPU::FragmentDescriptor iblFrag{};
+            iblFrag.module = iblFragModule;
+            iblFrag.entryPoint = "main";
+            GPU::ColorState iblCs{};
+            iblCs.format = GPU::PixelFormat::rgba16float;
+            iblCs.writeMask = GPU::ColorWrite::all;
+            iblFrag.targets.push_back(iblCs);
+            iblDesc.fragment = iblFrag;
+
+            GPU::PipelineLayoutDescriptor iblPlDesc{};
+            iblPlDesc.bindGroupLayouts = { iblBakeBindGroupLayout };
+            vulkanIblBakePipelineLayout = device->createPipelineLayout(iblPlDesc);
+            iblDesc.layout = vulkanIblBakePipelineLayout;
+
+            pipelineIblBake = device->createRenderPipeline(iblDesc);
+        }
+    }
+
+    // --- Skybox pipeline (Vulkan) — fullscreen triangle that samples an
+    // environment cubemap. Previously Metal-only; drawSkybox() (used by both
+    // render() paths) already gates entirely on pipelineSkybox/
+    // skyboxBindGroupLayout/skyboxUniformBuffer being non-null and is
+    // otherwise fully backend-agnostic, so creating these here is the only
+    // piece needed to light up Vulkan's skybox. See shaders/vulkan/
+    // skybox.frag's header comment for the NDC-reconstruction convention.
+    {
+        if (!skyboxBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor sbglDesc{};
+            GPU::EntryObject sbTex{};
+            sbTex.binding = 0;
+            sbTex.visibility = GPU::ShaderStage::fragment;
+            sbTex.type = GPU::EntryObjectType::texture;
+            sbTex.data.texture.multisampled = false;
+            sbTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            sbTex.data.texture.viewDimension = GPU::TextureType::ttCube;
+            sbglDesc.entries.push_back(sbTex);
+
+            GPU::EntryObject sbSamp{};
+            sbSamp.binding = 1;
+            sbSamp.visibility = GPU::ShaderStage::fragment;
+            sbSamp.type = GPU::EntryObjectType::sampler;
+            sbSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            sbglDesc.entries.push_back(sbSamp);
+
+            GPU::EntryObject sbBuf{};
+            sbBuf.binding = 2;
+            sbBuf.visibility = GPU::ShaderStage::fragment;
+            sbBuf.type = GPU::EntryObjectType::buffer;
+            sbBuf.data.buffer.hasDinamicOffaset = false;
+            sbBuf.data.buffer.minBindingSize = 96;
+            sbBuf.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+            sbglDesc.entries.push_back(sbBuf);
+
+            skyboxBindGroupLayout = device->createBindGroupLayout(sbglDesc);
+        }
+
+        auto skyboxVertModule = device->createShaderModule(kDefaultVulkanFxaaVertShader, kDefaultVulkanFxaaVertShaderSize);
+        auto skyboxFragModule = device->createShaderModule(kDefaultVulkanSkyboxFragShader, kDefaultVulkanSkyboxFragShaderSize);
+        if (skyboxVertModule && skyboxFragModule) {
+            GPU::RenderPipelineDescriptor skyDesc{};
+            skyDesc.vertex.module = skyboxVertModule;
+            skyDesc.vertex.entryPoint = "main";
+            // No vertex buffers — fullscreen triangle from gl_VertexIndex.
+
+            GPU::DepthStencilDescriptor skyDs{};
+            skyDs.format = GPU::PixelFormat::depth32float;
+            skyDs.depthWriteEnabled = false; // Don't write depth
+            skyDs.depthCompare = GPU::CompareOp::lessEqual;
+            skyDs.depthBias = 0.0;
+            skyDs.depthBiasClamp = 0.0;
+            skyDs.depthBiasSlopeScale = 0.0;
+            skyDs.stencilReadMask = 0xFFFFFFFF;
+            skyDs.stencilWriteMask = 0xFFFFFFFF;
+            skyDesc.depthStencil = skyDs;
+
+            skyDesc.topology = GPU::PrimitiveTopology::triangleList;
+            skyDesc.cullMode = GPU::CullMode::none;
+            skyDesc.frontFace = GPU::FrontFace::ccw;
+
+            GPU::FragmentDescriptor skyFrag{};
+            skyFrag.module = skyboxFragModule;
+            skyFrag.entryPoint = "main";
+            GPU::ColorState skyCs{};
+            skyCs.format = colorFormat;
+            skyCs.writeMask = GPU::ColorWrite::all;
+            skyFrag.targets.push_back(skyCs);
+            skyDesc.fragment = skyFrag;
+
+            GPU::PipelineLayoutDescriptor skyPlDesc{};
+            skyPlDesc.bindGroupLayouts = { skyboxBindGroupLayout };
+            vulkanSkyboxPipelineLayout = device->createPipelineLayout(skyPlDesc);
+            skyDesc.layout = vulkanSkyboxPipelineLayout;
+
+            pipelineSkybox = device->createRenderPipeline(skyDesc);
+        }
+    }
+
 #elif defined(_WIN32)
     using namespace systems::leal::campello_renderer::shaders;
 
@@ -3922,8 +4408,10 @@ void Renderer::resize(uint32_t width, uint32_t height) {
     if (width == 0 || height == 0) {
         depthTexture = nullptr;
         depthView    = nullptr;
-        sceneColorTexture = nullptr;
-        sceneColorView    = nullptr;
+        for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
+            sceneColorTexture[f] = nullptr;
+            sceneColorView[f]    = nullptr;
+        }
         std::cout << "[Renderer::resize] zero size, cleared depth" << std::endl;
         return;
     }
@@ -4029,6 +4517,24 @@ Renderer::Bounds Renderer::transformBounds(
         }
     }
     return out;
+}
+
+Renderer::Bounds Renderer::computeSceneAABB(
+    uint64_t nodeIndex,
+    const systems::leal::vector_math::Matrix4<double> &parentWorld) const
+{
+    if (!asset || !asset->nodes || nodeIndex >= asset->nodes->size()) return {};
+    auto &node  = (*asset->nodes)[nodeIndex];
+    auto  world = parentWorld * nodeLocalMatrix(node);
+
+    Bounds result;
+    if (nodeIndex < nodeLocalBounds.size() && nodeLocalBounds[nodeIndex].valid) {
+        result = transformBounds(nodeLocalBounds[nodeIndex], world);
+    }
+    for (auto childIndex : node.children) {
+        result = mergeBounds(result, computeSceneAABB(childIndex, world));
+    }
+    return result;
 }
 
 Renderer::Bounds Renderer::computePrimitiveBounds(
@@ -4428,6 +4934,21 @@ void Renderer::renderToTarget(
     // Wait until the GPU has finished with the frame slot we're about to overwrite.
     // ------------------------------------------------------------------
     auto &frame = frameResources[currentFrameIndex];
+    // frame.fence is otherwise only created lazily inside setScene() — so it's
+    // still null here on every render() call before the first asset/scene is
+    // set (e.g. the "no renderable scene" clear+present path below). Passing
+    // a null fence into device->submit() means campello_gpu has nothing to
+    // retain the submitted CommandBuffer with, so it gets destroyed the
+    // instant submit() returns -- before the GPU has necessarily finished
+    // with it. That's a genuine use-after-free on the GPU timeline: it
+    // doesn't fail at the call site, it corrupts the command pool, which
+    // then surfaces later as validation errors on an unrelated command
+    // buffer/query pool and a segfault (observed when an asset finishes
+    // loading a couple of frames after startup). Ensure the fence exists
+    // before it's ever handed to submit().
+    if (!frame.fence && device) {
+        frame.fence = device->createFence();
+    }
     if (frame.fence) {
         frame.fence->wait();
     }
@@ -4853,8 +5374,8 @@ void Renderer::renderToTarget(
     // Lazily create scene color texture if FXAA / SSAA was enabled after resize().
     ensureSceneColorTexture();
 
-    bool useSsaa = ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout && sceneColorView;
-    bool useFxaa = fxaaEnabled && !useSsaa && pipelineFxaa && fxaaBindGroupLayout && sceneColorView;
+    bool useSsaa = ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout && sceneColorView[currentFrameIndex];
+    bool useFxaa = fxaaEnabled && !useSsaa && pipelineFxaa && fxaaBindGroupLayout && sceneColorView[currentFrameIndex];
     bool useIntermediate = useSsaa || useFxaa;
 
     // Detect whether any transparent draw uses transmission — if so, we need
@@ -4879,17 +5400,19 @@ void Renderer::renderToTarget(
         uint32_t texH = (uint32_t)((float)renderHeight * ssaaScale);
         if (texW < 1) texW = 1;
         if (texH < 1) texH = 1;
-        if (!opaqueSceneTexture || opaqueSceneTexture->getWidth() != texW ||
-            opaqueSceneTexture->getHeight() != texH) {
+        if (!opaqueSceneTexture[currentFrameIndex] || opaqueSceneTexture[currentFrameIndex]->getWidth() != texW ||
+            opaqueSceneTexture[currentFrameIndex]->getHeight() != texH) {
             uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2(std::max(texW, texH)));
-            opaqueSceneTexture = device->createTexture(
+            opaqueSceneTexture[currentFrameIndex] = device->createTexture(
                 GPU::TextureType::tt2d, cachedColorFormat,
                 texW, texH, 1, mipLevels, 1,
                 (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
-                                    uint32_t(GPU::TextureUsage::textureBinding)));
-            if (opaqueSceneTexture) {
-                opaqueSceneView = opaqueSceneTexture->createView(
-                    cachedColorFormat, 1, GPU::Aspect::all, 0, 0, GPU::TextureType::tt2d);
+                                    uint32_t(GPU::TextureUsage::textureBinding) |
+                                    uint32_t(GPU::TextureUsage::copySrc) |
+                                    uint32_t(GPU::TextureUsage::copyDst)));
+            if (opaqueSceneTexture[currentFrameIndex]) {
+                opaqueSceneView[currentFrameIndex] = opaqueSceneTexture[currentFrameIndex]->createView(
+                    cachedColorFormat, 1, GPU::Aspect::all, 0, 0, GPU::TextureType::tt2d, 1);
             }
         }
     }
@@ -4901,28 +5424,39 @@ void Renderer::renderToTarget(
 #if defined(ANDROID) || defined(__linux__)
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
-        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture ? sceneColorTexture : defaultTexture;
+        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
             {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
-            {2, environmentMap},
+            {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
             {3, environmentSampler},
             {4, scTex},
             {5, fxaaSampler},
+            {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
+            {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
+            {8, fxaaSampler},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
 #else
     if (bindGroupLayout && frameBindGroup[currentFrameIndex]) {
-        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture ? sceneColorTexture : defaultTexture;
+        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = bindGroupLayout;
         bgDesc.entries = {
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
             {22, scTex},
+            // Environment-related bindings live in the per-frame bind group
+            // (not the per-material one) so a mid-session setEnvironmentMap()
+            // is picked up automatically by this unconditional per-frame
+            // rebuild — see setEnvironmentMap()'s doc comment for why the
+            // per-material bind groups can't do this on their own.
+            {21, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
+            {27, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
+            {28, brdfLutTexture ? brdfLutTexture : defaultTexture},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
@@ -4938,7 +5472,26 @@ void Renderer::renderToTarget(
                     {1, environmentSampler},
                     {2, GPU::BufferBinding{skyboxUniformBuffer[currentFrameIndex], 0, 96}},
                 };
-                skyboxBindGroup[currentFrameIndex] = device->createBindGroup(sbDesc);
+                // persistent=true: unlike frameBindGroup/fxaaBindGroup (rebuilt
+                // every render() call), skyboxBindGroup is cached and reused
+                // across many frames (see the `if (!skyboxBindGroup[...])`
+                // guard above) -- it's only ever invalidated explicitly by
+                // setEnvironmentMap(). A non-persistent bind group is
+                // allocated from the per-frame-ring descriptor pool, which
+                // beginFrameRing() unconditionally resets every
+                // kFramesInFlight (3) command-encoder creations regardless of
+                // whether anything is still holding onto sets it handed out.
+                // Caching one of those past its own pool's next reset left it
+                // pointing at a descriptor set the driver had already
+                // recycled -- VUID-vkCmdBindDescriptorSets-pDescriptorSets-
+                // parameter ("Invalid VkDescriptorSet") followed by a
+                // segfault, reproducible after a few seconds of continuous
+                // rendering (e.g. dragging to orbit the camera) once the
+                // ring caught up. persistent=true allocates from
+                // persistentDescriptorPool instead, which is never reset —
+                // only freed explicitly via BindGroup's own destructor,
+                // matching this bind group's actual (long) lifetime.
+                skyboxBindGroup[currentFrameIndex] = device->createBindGroup(sbDesc, /*persistent=*/true);
             }
             if (skyboxBindGroup[currentFrameIndex]) {
                 rpe->setPipeline(pipelineSkybox);
@@ -5035,13 +5588,13 @@ void Renderer::renderToTarget(
         }
     };
 
-    if (needsScreenSpaceRefraction && opaqueSceneView) {
+    if (needsScreenSpaceRefraction && opaqueSceneView[currentFrameIndex]) {
         // --------------------------------------------------------------
         // Pass 1: Opaque + skybox → opaqueSceneTexture
         // --------------------------------------------------------------
         {
             GPU::ColorAttachment opaqueCa{};
-            opaqueCa.view          = opaqueSceneView;
+            opaqueCa.view          = opaqueSceneView[currentFrameIndex];
             opaqueCa.clearValue[0] = clearColor[0];
             opaqueCa.clearValue[1] = clearColor[1];
             opaqueCa.clearValue[2] = clearColor[2];
@@ -5065,8 +5618,8 @@ void Renderer::renderToTarget(
 
         // Generate mipmaps for the opaque scene texture so transmissive materials
         // can sample roughness-blurred scene color using LOD selection.
-        if (opaqueSceneTexture) {
-            encoder->generateMipmaps(opaqueSceneTexture);
+        if (opaqueSceneTexture[currentFrameIndex]) {
+            encoder->generateMipmaps(opaqueSceneTexture[currentFrameIndex]);
         }
 
         // --------------------------------------------------------------
@@ -5075,21 +5628,38 @@ void Renderer::renderToTarget(
         // --------------------------------------------------------------
         std::shared_ptr<GPU::TextureView> transparentTargetView;
         if (useIntermediate) {
-            transparentTargetView = sceneColorView;
+            transparentTargetView = sceneColorView[currentFrameIndex];
         } else {
             transparentTargetView = colorView;
         }
 
-        if (transparentTargetView) {
+        // transparentTargetView is legitimately null here when targeting the
+        // device's own swapchain without FXAA/SSAA (useIntermediate false,
+        // colorView null by convention — see the single-pass branch below and
+        // the "no renderable scene" clear+present path, which both pass a
+        // null view straight through for campello_gpu to resolve to the
+        // current swapchain image). Gating this pass on transparentTargetView's
+        // truthiness treated that valid null as "nothing to render to" and
+        // skipped it entirely — so the opaque body never reached the swapchain
+        // image at all, leaving only the transparent/transmissive draws from
+        // Pass 3 (which does target it, unconditionally) visible, drawn over
+        // whatever stale content that swapchain image already held from a
+        // previous frame or even a previously loaded asset.
+        bool hasValidTarget = useIntermediate ? (transparentTargetView != nullptr)
+                                               : (useDeviceSwapchain || transparentTargetView != nullptr);
+        if (hasValidTarget) {
             // Create/update copy bind group for this frame.
             if (!copyBindGroup[currentFrameIndex] && downsampleBindGroupLayout) {
                 GPU::BindGroupDescriptor cDesc{};
                 cDesc.layout = downsampleBindGroupLayout;
                 cDesc.entries = {
-                    {0, opaqueSceneTexture},
+                    {0, opaqueSceneTexture[currentFrameIndex]},
                     {1, fxaaSampler},
                 };
-                copyBindGroup[currentFrameIndex] = device->createBindGroup(cDesc);
+                // persistent=true — see skyboxBindGroup's creation site for
+                // why a cached-and-reused-across-frames bind group must not
+                // be allocated from the per-frame-ring descriptor pool.
+                copyBindGroup[currentFrameIndex] = device->createBindGroup(cDesc, /*persistent=*/true);
             }
 
             GPU::ColorAttachment copyCa{};
@@ -5124,28 +5694,36 @@ void Renderer::renderToTarget(
         // transmissive materials can sample it without conflicting with
         // the color attachment (which is sceneColorView or colorView).
 #if defined(ANDROID) || defined(__linux__)
-        if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture &&
+        if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture[currentFrameIndex] &&
             environmentMap && environmentSampler && fxaaSampler) {
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout = vulkanFrameBindGroupLayout;
             bgDesc.entries = {
                 {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
                 {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
-                {2, environmentMap},
+                {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
                 {3, environmentSampler},
-                {4, opaqueSceneTexture},
+                {4, opaqueSceneTexture[currentFrameIndex]},
                 {5, fxaaSampler},
+                {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
+                {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
+                {8, fxaaSampler},
             };
             frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
         }
 #else
-        if (bindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture) {
+        if (bindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture[currentFrameIndex]) {
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout = bindGroupLayout;
             bgDesc.entries = {
                 {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
                 {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
-                {22, opaqueSceneTexture},
+                {22, opaqueSceneTexture[currentFrameIndex]},
+                // See the other frame-bind-group construction site's comment
+                // on why environment bindings live here, not per-material.
+                {21, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
+                {27, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
+                {28, brdfLutTexture ? brdfLutTexture : defaultTexture},
             };
             frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
         }
@@ -5178,7 +5756,7 @@ void Renderer::renderToTarget(
         // Single-pass path (no transmission materials).
         // --------------------------------------------------------------
         GPU::ColorAttachment ca{};
-        ca.view          = useIntermediate ? sceneColorView : colorView;
+        ca.view          = useIntermediate ? sceneColorView[currentFrameIndex] : colorView;
         ca.clearValue[0] = clearColor[0];
         ca.clearValue[1] = clearColor[1];
         ca.clearValue[2] = clearColor[2];
@@ -5209,10 +5787,13 @@ void Renderer::renderToTarget(
             GPU::BindGroupDescriptor dDesc{};
             dDesc.layout = downsampleBindGroupLayout;
             dDesc.entries = {
-                {0, sceneColorTexture},
+                {0, sceneColorTexture[currentFrameIndex]},
                 {1, fxaaSampler},
             };
-            downsampleBindGroup[currentFrameIndex] = device->createBindGroup(dDesc);
+            // persistent=true — see skyboxBindGroup's creation site for why a
+            // cached-and-reused-across-frames bind group must not be
+            // allocated from the per-frame-ring descriptor pool.
+            downsampleBindGroup[currentFrameIndex] = device->createBindGroup(dDesc, /*persistent=*/true);
         }
 
         GPU::ColorAttachment dsCa{};
@@ -5258,11 +5839,14 @@ void Renderer::renderToTarget(
             GPU::BindGroupDescriptor fDesc{};
             fDesc.layout = fxaaBindGroupLayout;
             fDesc.entries = {
-                {0, sceneColorTexture},
+                {0, sceneColorTexture[currentFrameIndex]},
                 {1, fxaaSampler},
                 {2, GPU::BufferBinding{fxaaUniformBuffer[currentFrameIndex], 0, 16}},
             };
-            fxaaBindGroup[currentFrameIndex] = device->createBindGroup(fDesc);
+            // persistent=true — see skyboxBindGroup's creation site for why a
+            // cached-and-reused-across-frames bind group must not be
+            // allocated from the per-frame-ring descriptor pool.
+            fxaaBindGroup[currentFrameIndex] = device->createBindGroup(fDesc, /*persistent=*/true);
         }
 
         GPU::ColorAttachment fxaaCa{};
@@ -5971,6 +6555,12 @@ float Renderer::getBoundsRadius() const {
     return boundsRadius;
 }
 
+void Renderer::getBoundsCenter(float *outX, float *outY, float *outZ) const {
+    if (outX) *outX = (float)boundsCenter.x();
+    if (outY) *outY = (float)boundsCenter.y();
+    if (outZ) *outZ = (float)boundsCenter.z();
+}
+
 // ---------------------------------------------------------------------------
 // Scene presentation controls
 // ---------------------------------------------------------------------------
@@ -6012,8 +6602,23 @@ bool Renderer::isDefaultLightEnabled() const {
 void Renderer::setEnvironmentMap(std::shared_ptr<systems::leal::campello_gpu::Texture> cubemap) {
     environmentMap = cubemap;
     for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
+        // skyboxBindGroup is created once and cached (drawSkybox only builds it
+        // when null), so it genuinely needs invalidating here to pick up the
+        // new texture. frameBindGroup is NOT cached the same way — the
+        // per-frame render path unconditionally rebuilds it every render()
+        // call (it carries per-frame lights/camera data too), gated on it
+        // already being non-null from setScene()'s one-time creation. Nulling
+        // it here doesn't "force a refresh" the way it does for skyboxBindGroup
+        // — there's no code path that recreates it from null outside
+        // setScene(), so doing this left every subsequent frame's draw calls
+        // with no set-1 bind group at all (a hard crash the very first time
+        // setEnvironmentMap() was called after setAsset()). The already-
+        // unconditional per-frame rebuild picks up prefilteredEnvironmentMap/
+        // irradianceEnvironmentMap/brdfLutTexture on the very next render()
+        // call without any invalidation needed.
         skyboxBindGroup[f] = nullptr; // Force recreation with new texture
     }
+    bakeIblResources();
 }
 
 std::shared_ptr<systems::leal::campello_gpu::Texture>
@@ -6058,7 +6663,8 @@ Renderer::loadEnvironmentMap(
         GPU::TextureType::ttCube, fmt,
         w, h, 1, mipLevels, 1,
         (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
-                            uint32_t(GPU::TextureUsage::copyDst)));
+                            uint32_t(GPU::TextureUsage::copyDst) |
+                            uint32_t(GPU::TextureUsage::copySrc)));
     if (!tex) return nullptr;
 
     size_t bytesPerFace = faces[0]->getDataSize();
@@ -6270,7 +6876,8 @@ Renderer::convertEquirectangularImageToCubemap(
         GPU::TextureType::ttCube, fmt,
         fsize, fsize, 1, mipLevels, 1,
         (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
-                            uint32_t(GPU::TextureUsage::copyDst)));
+                            uint32_t(GPU::TextureUsage::copyDst) |
+                            uint32_t(GPU::TextureUsage::copySrc)));
     if (!tex) return nullptr;
 
     // Allocate one face buffer.
@@ -6369,13 +6976,22 @@ Renderer::createBuiltinDefaultEnvironmentMap()
     auto img = Img::Image::fromMemory(kDefaultEnvironmentHdr, kDefaultEnvironmentHdrSize);
     if (!img) return nullptr;
 
-    // This HDRI is calibrated in absolute real-world radiance units (Poly
-    // Haven), where a clear sky away from the sun disc is genuinely quite
-    // dim — well under 1.0 — even though the sun itself peaks past 300,000.
-    // At intensityScale=1 that reads as a dim/muted environment for typical
-    // (non-sun-facing) reflections; empirically 6x reads as a well-exposed
-    // "vibrant" sky without blowing out the already very bright sun.
-    constexpr float kBuiltinEnvironmentExposure = 6.0f;
+    // "Cannon Exterior" — the Khronos glTF-Sample-Viewer's own default
+    // environment (see build_default_environment.sh's attribution comment),
+    // used here so campello_renderer's out-of-the-box IBL look and
+    // brightness are directly comparable to the reference viewer's default,
+    // rather than a much higher-dynamic-range sky/sun HDRI (previously
+    // "Kiara 5 Noon") that's a fundamentally harsher/brighter lighting
+    // scenario regardless of exposure scale. This HDRI is calibrated in
+    // absolute real-world radiance units; a hand-tuned exposure boost used to
+    // sit here (empirically tuned against the old, broken IBL path — raw-
+    // sample diffuse with an extra *0.3 fudge, box-filtered "prefiltered"
+    // specular — which under-delivered environment energy into the final
+    // image). Now that IBL diffuse/specular are physically correct (cosine-
+    // weighted convolution, GGX prefiltering, energy-conserving multi-
+    // scatter Fresnel), trust the HDRI's native radiometric values instead,
+    // matching how the reference renderer treats its own environments.
+    constexpr float kBuiltinEnvironmentExposure = 1.0f;
 
     // 512px per face — roughly matches the 1024x512 equirect source's own
     // detail without upsampling past it.
@@ -6410,8 +7026,10 @@ void Renderer::setFxaaEnabled(bool enabled) {
     fxaaEnabled = enabled;
     ensureSceneColorTexture();
     if (!fxaaEnabled && ssaaScale <= 1.0f) {
-        sceneColorTexture = nullptr;
-        sceneColorView    = nullptr;
+        for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
+            sceneColorTexture[f] = nullptr;
+            sceneColorView[f]    = nullptr;
+        }
     }
 }
 
@@ -6423,8 +7041,10 @@ void Renderer::setSsaaScale(float scale) {
     ssaaScale = scale;
     ensureSceneColorTexture();
     if (ssaaScale <= 1.0f && !fxaaEnabled) {
-        sceneColorTexture = nullptr;
-        sceneColorView    = nullptr;
+        for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
+            sceneColorTexture[f] = nullptr;
+            sceneColorView[f]    = nullptr;
+        }
     }
 }
 
@@ -6453,17 +7073,17 @@ void Renderer::ensureSceneColorTexture() {
     if (texW < 1) texW = 1;
     if (texH < 1) texH = 1;
 
-    if (sceneColorTexture && sceneColorTexture->getWidth() == texW && sceneColorTexture->getHeight() == texH) {
+    if (sceneColorTexture[currentFrameIndex] && sceneColorTexture[currentFrameIndex]->getWidth() == texW && sceneColorTexture[currentFrameIndex]->getHeight() == texH) {
         return; // Already correct size.
     }
 
-    sceneColorTexture = device->createTexture(
+    sceneColorTexture[currentFrameIndex] = device->createTexture(
         GPU::TextureType::tt2d,
         cachedColorFormat,
         texW, texH, 1, 1, 1,
         (TU)(uint32_t(TU::renderTarget) | uint32_t(TU::textureBinding)));
-    if (sceneColorTexture) {
-        sceneColorView = sceneColorTexture->createView(
+    if (sceneColorTexture[currentFrameIndex]) {
+        sceneColorView[currentFrameIndex] = sceneColorTexture[currentFrameIndex]->createView(
             cachedColorFormat, 1, GPU::Aspect::all, 0, 0, GPU::TextureType::tt2d);
     }
 }
@@ -6865,7 +7485,9 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
         uint8_t white[4] = {255, 255, 255, 255};
         defaultTexture = device->createTexture(
             GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm_srgb,
-            1, 1, 1, 1, 1, GPU::TextureUsage::textureBinding);
+            1, 1, 1, 1, 1,
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (defaultTexture) defaultTexture->upload(0, 4, white);
     }
     // (Other default textures are lazily created in setScene; skip here for brevity.)
@@ -6912,7 +7534,8 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
         auto texture = device->createTexture(
             GPU::TextureType::tt2d, fmt,
             img->getWidth(), img->getHeight(), 1, 1, 1,
-            GPU::TextureUsage::textureBinding);
+            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                (uint32_t)GPU::TextureUsage::copyDst));
         if (texture) {
             texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
         }
@@ -7144,11 +7767,12 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
         {18, clearcoatRoughnessTex},
         {19, clearcoatNormalTex},
         {20, transmissionTex},
-        {21, environmentMap ? environmentMap : defaultTexture},
         {23, thicknessTex},
         {24, iridescenceTex},
         {25, iridescenceThicknessTex},
         {26, anisotropicTex},
+        // Environment/irradiance/BRDF-LUT bindings (21/27/28) now live in the
+        // per-frame bind group instead — see setEnvironmentMap()'s doc comment.
         {17, GPU::BufferBinding{materialUniformBuffer,
                                 (uint64_t)uniformSlot * kMaterialUniformStride,
                                 kMaterialUniformStride}},
@@ -7217,6 +7841,11 @@ void Renderer::render(const RenderScene& scene,
 
     // Frame-in-flight synchronization.
     auto &frame = frameResources[currentFrameIndex];
+    // See the equivalent guard in renderToTarget() for why frame.fence must
+    // exist before it's ever passed to device->submit() below.
+    if (!frame.fence && device) {
+        frame.fence = device->createFence();
+    }
     if (frame.fence) frame.fence->wait();
 
     transformBuffer      = frame.transformBuffer;
@@ -7261,28 +7890,39 @@ void Renderer::render(const RenderScene& scene,
 #if defined(ANDROID) || defined(__linux__)
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
-        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture ? sceneColorTexture : defaultTexture;
+        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
             {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
-            {2, environmentMap},
+            {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
             {3, environmentSampler},
             {4, scTex},
             {5, fxaaSampler},
+            {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
+            {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
+            {8, fxaaSampler},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
 #else
     if (bindGroupLayout && frameBindGroup[currentFrameIndex]) {
-        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture ? sceneColorTexture : defaultTexture;
+        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = bindGroupLayout;
         bgDesc.entries = {
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
             {22, scTex},
+            // Environment-related bindings live in the per-frame bind group
+            // (not the per-material one) so a mid-session setEnvironmentMap()
+            // is picked up automatically by this unconditional per-frame
+            // rebuild — see setEnvironmentMap()'s doc comment for why the
+            // per-material bind groups can't do this on their own.
+            {21, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
+            {27, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
+            {28, brdfLutTexture ? brdfLutTexture : defaultTexture},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
@@ -7367,36 +8007,47 @@ void Renderer::render(const RenderScene& scene,
     // ------------------------------------------------------------------
     ensureSceneColorTexture();
 
-    bool useSsaa = ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout && sceneColorView;
-    bool useFxaa = fxaaEnabled && !useSsaa && pipelineFxaa && fxaaBindGroupLayout && sceneColorView;
+    bool useSsaa = ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout && sceneColorView[currentFrameIndex];
+    bool useFxaa = fxaaEnabled && !useSsaa && pipelineFxaa && fxaaBindGroupLayout && sceneColorView[currentFrameIndex];
     bool useIntermediate = useSsaa || useFxaa;
 
     // Update per-frame bind group (lights + camera + placeholder texture).
 #if defined(ANDROID) || defined(__linux__)
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
-        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture ? sceneColorTexture : defaultTexture;
+        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
             {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
-            {2, environmentMap},
+            {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
             {3, environmentSampler},
             {4, scTex},
             {5, fxaaSampler},
+            {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
+            {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
+            {8, fxaaSampler},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
 #else
     if (bindGroupLayout && frameBindGroup[currentFrameIndex]) {
-        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture ? sceneColorTexture : defaultTexture;
+        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = bindGroupLayout;
         bgDesc.entries = {
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
             {22, scTex},
+            // Environment-related bindings live in the per-frame bind group
+            // (not the per-material one) so a mid-session setEnvironmentMap()
+            // is picked up automatically by this unconditional per-frame
+            // rebuild — see setEnvironmentMap()'s doc comment for why the
+            // per-material bind groups can't do this on their own.
+            {21, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
+            {27, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
+            {28, brdfLutTexture ? brdfLutTexture : defaultTexture},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
@@ -7482,7 +8133,26 @@ void Renderer::render(const RenderScene& scene,
                     {1, environmentSampler},
                     {2, GPU::BufferBinding{skyboxUniformBuffer[currentFrameIndex], 0, 96}},
                 };
-                skyboxBindGroup[currentFrameIndex] = device->createBindGroup(sbDesc);
+                // persistent=true: unlike frameBindGroup/fxaaBindGroup (rebuilt
+                // every render() call), skyboxBindGroup is cached and reused
+                // across many frames (see the `if (!skyboxBindGroup[...])`
+                // guard above) -- it's only ever invalidated explicitly by
+                // setEnvironmentMap(). A non-persistent bind group is
+                // allocated from the per-frame-ring descriptor pool, which
+                // beginFrameRing() unconditionally resets every
+                // kFramesInFlight (3) command-encoder creations regardless of
+                // whether anything is still holding onto sets it handed out.
+                // Caching one of those past its own pool's next reset left it
+                // pointing at a descriptor set the driver had already
+                // recycled -- VUID-vkCmdBindDescriptorSets-pDescriptorSets-
+                // parameter ("Invalid VkDescriptorSet") followed by a
+                // segfault, reproducible after a few seconds of continuous
+                // rendering (e.g. dragging to orbit the camera) once the
+                // ring caught up. persistent=true allocates from
+                // persistentDescriptorPool instead, which is never reset —
+                // only freed explicitly via BindGroup's own destructor,
+                // matching this bind group's actual (long) lifetime.
+                skyboxBindGroup[currentFrameIndex] = device->createBindGroup(sbDesc, /*persistent=*/true);
             }
             if (skyboxBindGroup[currentFrameIndex]) {
                 rpe->setPipeline(pipelineSkybox);
@@ -7502,24 +8172,26 @@ void Renderer::render(const RenderScene& scene,
         uint32_t texH = (uint32_t)((float)renderHeight * ssaaScale);
         if (texW < 1) texW = 1;
         if (texH < 1) texH = 1;
-        if (!opaqueSceneTexture || opaqueSceneTexture->getWidth() != texW ||
-            opaqueSceneTexture->getHeight() != texH) {
+        if (!opaqueSceneTexture[currentFrameIndex] || opaqueSceneTexture[currentFrameIndex]->getWidth() != texW ||
+            opaqueSceneTexture[currentFrameIndex]->getHeight() != texH) {
             uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2(std::max(texW, texH)));
-            opaqueSceneTexture = device->createTexture(
+            opaqueSceneTexture[currentFrameIndex] = device->createTexture(
                 GPU::TextureType::tt2d, cachedColorFormat,
                 texW, texH, 1, mipLevels, 1,
                 (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
-                                    uint32_t(GPU::TextureUsage::textureBinding)));
-            if (opaqueSceneTexture) {
-                opaqueSceneView = opaqueSceneTexture->createView(
-                    cachedColorFormat, 1, GPU::Aspect::all, 0, 0, GPU::TextureType::tt2d);
+                                    uint32_t(GPU::TextureUsage::textureBinding) |
+                                    uint32_t(GPU::TextureUsage::copySrc) |
+                                    uint32_t(GPU::TextureUsage::copyDst)));
+            if (opaqueSceneTexture[currentFrameIndex]) {
+                opaqueSceneView[currentFrameIndex] = opaqueSceneTexture[currentFrameIndex]->createView(
+                    cachedColorFormat, 1, GPU::Aspect::all, 0, 0, GPU::TextureType::tt2d, 1);
             }
         }
 
         // Pass 1: Opaque + skybox → opaqueSceneTexture.
-        if (opaqueSceneView) {
+        if (opaqueSceneView[currentFrameIndex]) {
             GPU::ColorAttachment opaqueCa{};
-            opaqueCa.view          = opaqueSceneView;
+            opaqueCa.view          = opaqueSceneView[currentFrameIndex];
             opaqueCa.clearValue[0] = clearColor[0];
             opaqueCa.clearValue[1] = clearColor[1];
             opaqueCa.clearValue[2] = clearColor[2];
@@ -7560,15 +8232,15 @@ void Renderer::render(const RenderScene& scene,
                 opaqueRpe->end();
             }
 
-            if (opaqueSceneTexture) {
-                encoder->generateMipmaps(opaqueSceneTexture);
+            if (opaqueSceneTexture[currentFrameIndex]) {
+                encoder->generateMipmaps(opaqueSceneTexture[currentFrameIndex]);
             }
         }
 
         // Pass 2: Copy opaque result to the target that transparent will blend over.
         std::shared_ptr<GPU::TextureView> transparentTargetView;
         if (useIntermediate) {
-            transparentTargetView = sceneColorView;
+            transparentTargetView = sceneColorView[currentFrameIndex];
         } else {
             transparentTargetView = colorView;
         }
@@ -7578,10 +8250,13 @@ void Renderer::render(const RenderScene& scene,
                 GPU::BindGroupDescriptor cDesc{};
                 cDesc.layout = downsampleBindGroupLayout;
                 cDesc.entries = {
-                    {0, opaqueSceneTexture},
+                    {0, opaqueSceneTexture[currentFrameIndex]},
                     {1, fxaaSampler},
                 };
-                copyBindGroup[currentFrameIndex] = device->createBindGroup(cDesc);
+                // persistent=true — see skyboxBindGroup's creation site for
+                // why a cached-and-reused-across-frames bind group must not
+                // be allocated from the per-frame-ring descriptor pool.
+                copyBindGroup[currentFrameIndex] = device->createBindGroup(cDesc, /*persistent=*/true);
             }
 
             GPU::ColorAttachment copyCa{};
@@ -7614,28 +8289,36 @@ void Renderer::render(const RenderScene& scene,
 
         // Switch binding 22 to the mipmapped opaque scene texture for transmission.
 #if defined(ANDROID) || defined(__linux__)
-        if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture &&
+        if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture[currentFrameIndex] &&
             environmentMap && environmentSampler && fxaaSampler) {
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout = vulkanFrameBindGroupLayout;
             bgDesc.entries = {
                 {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
                 {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
-                {2, environmentMap},
+                {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
                 {3, environmentSampler},
-                {4, opaqueSceneTexture},
+                {4, opaqueSceneTexture[currentFrameIndex]},
                 {5, fxaaSampler},
+                {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
+                {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
+                {8, fxaaSampler},
             };
             frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
         }
 #else
-        if (bindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture) {
+        if (bindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture[currentFrameIndex]) {
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout = bindGroupLayout;
             bgDesc.entries = {
                 {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
                 {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
-                {22, opaqueSceneTexture},
+                {22, opaqueSceneTexture[currentFrameIndex]},
+                // See the other frame-bind-group construction site's comment
+                // on why environment bindings live here, not per-material.
+                {21, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
+                {27, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
+                {28, brdfLutTexture ? brdfLutTexture : defaultTexture},
             };
             frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
         }
@@ -7690,7 +8373,7 @@ void Renderer::render(const RenderScene& scene,
         // ------------------------------------------------------------------
         GPU::BeginRenderPassDescriptor desc{};
         GPU::ColorAttachment ca{};
-        ca.view = useIntermediate ? sceneColorView : colorView;
+        ca.view = useIntermediate ? sceneColorView[currentFrameIndex] : colorView;
         ca.clearValue[0] = clearColor[0];
         ca.clearValue[1] = clearColor[1];
         ca.clearValue[2] = clearColor[2];
@@ -7749,10 +8432,13 @@ void Renderer::render(const RenderScene& scene,
             GPU::BindGroupDescriptor dDesc{};
             dDesc.layout = downsampleBindGroupLayout;
             dDesc.entries = {
-                {0, sceneColorTexture},
+                {0, sceneColorTexture[currentFrameIndex]},
                 {1, fxaaSampler},
             };
-            downsampleBindGroup[currentFrameIndex] = device->createBindGroup(dDesc);
+            // persistent=true — see skyboxBindGroup's creation site for why a
+            // cached-and-reused-across-frames bind group must not be
+            // allocated from the per-frame-ring descriptor pool.
+            downsampleBindGroup[currentFrameIndex] = device->createBindGroup(dDesc, /*persistent=*/true);
         }
 
         GPU::ColorAttachment dsCa{};
@@ -7801,11 +8487,14 @@ void Renderer::render(const RenderScene& scene,
             GPU::BindGroupDescriptor fDesc{};
             fDesc.layout = fxaaBindGroupLayout;
             fDesc.entries = {
-                {0, sceneColorTexture},
+                {0, sceneColorTexture[currentFrameIndex]},
                 {1, fxaaSampler},
                 {2, GPU::BufferBinding{fxaaUniformBuffer[currentFrameIndex], 0, 16}},
             };
-            fxaaBindGroup[currentFrameIndex] = device->createBindGroup(fDesc);
+            // persistent=true — see skyboxBindGroup's creation site for why a
+            // cached-and-reused-across-frames bind group must not be
+            // allocated from the per-frame-ring descriptor pool.
+            fxaaBindGroup[currentFrameIndex] = device->createBindGroup(fDesc, /*persistent=*/true);
         }
 
         GPU::ColorAttachment fxaaCa{};

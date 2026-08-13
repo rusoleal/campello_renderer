@@ -126,7 +126,7 @@ static const char *kGltfWithBasisuTexture = R"({
 // ---------------------------------------------------------------------------
 
 TEST(VersionTest, ReturnsExpectedVersion) {
-    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.8.0");
+    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.9.0");
 }
 
 TEST(VersionTest, VersionIsNonEmpty) {
@@ -2044,6 +2044,10 @@ TEST_F(OffscreenRenderTest, ClearColorIsApplied) {
     renderer->resize(64, 64);
     renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
     renderer->setClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+    // skyboxEnabled defaults to true and would otherwise paint over the clear
+    // color with the default environment cubemap — this test is isolating
+    // the clear-color mechanism itself, not skybox visibility.
+    renderer->setSkyboxEnabled(false);
 
     auto tex = makeOffscreenTexture(64, 64);
     ASSERT_NE(tex, nullptr);

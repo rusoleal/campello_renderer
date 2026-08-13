@@ -290,6 +290,12 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineDownsample;
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> downsampleBindGroupLayout;
 
+        // IBL precompute pipeline (Vulkan) — fullscreen triangle that bakes the
+        // BRDF LUT / GGX-prefiltered specular cubemap / diffuse irradiance
+        // cubemap from the current environmentMap. See bakeIblResources().
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineIblBake;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> iblBakeBindGroupLayout;
+
         // Vulkan-only: explicit PipelineLayouts for pipelineTextured/pipelineFxaa/
         // pipelineDownsample (see createDefaultPipelines()'s Vulkan branch). Must
         // outlive the RenderPipelines built from them — Vulkan's PipelineLayout
@@ -301,17 +307,33 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanDefaultPipelineLayout;
         std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanFxaaPipelineLayout;
         std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanDownsamplePipelineLayout;
+        std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanIblBakePipelineLayout;
+        std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanSkyboxPipelineLayout;
 
         // Environment map / IBL
         std::shared_ptr<systems::leal::campello_gpu::Texture>          environmentMap;
         std::shared_ptr<systems::leal::campello_gpu::TextureView>      environmentMapView;
         std::shared_ptr<systems::leal::campello_gpu::Sampler>          environmentSampler;
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        environmentBindGroup;
-        bool skyboxEnabled = false;
+        bool skyboxEnabled = true;
         bool iblEnabled = true;
         float environmentIntensity = 1.0f;
         bool fxaaEnabled = false;
         float ssaaScale = 1.0f;
+
+        // IBL precompute outputs (Vulkan) — see bakeIblResources(). Sampled by
+        // the PBR fragment shader in place of a raw environmentMap sample
+        // (frame bind group bindings 6/7/8), falling back to environmentMap
+        // itself (diffuse) or being skipped (LUT) until the first bake runs.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> prefilteredEnvironmentMap;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> irradianceEnvironmentMap;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> brdfLutTexture;
+        std::shared_ptr<systems::leal::campello_gpu::Buffer>  iblBakeUniformBuffer;
+
+        // Runs the three IBL precompute bakes above against the current
+        // environmentMap. Called wherever environmentMap is (re)assigned
+        // (Vulkan only for now — see checkpoint 2 of the PBR-parity plan).
+        void bakeIblResources();
 
         // Active shading / inspection mode.
         ViewMode viewMode = ViewMode::normal;
@@ -357,16 +379,25 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        skyboxBindGroup[kMaxFramesInFlight];
 
         // FXAA / SSAA resources — intermediate scene texture + per-frame bind groups.
-        std::shared_ptr<systems::leal::campello_gpu::Texture>          sceneColorTexture;
-        std::shared_ptr<systems::leal::campello_gpu::TextureView>      sceneColorView;
+        // sceneColorTexture/View are per-frame-in-flight (not single instances): the
+        // opaque/transparent passes render into this texture every render() call, and
+        // with kMaxFramesInFlight overlapping frames on the GPU timeline, a single
+        // shared texture would let frame N's write race frame N-1/N-2's still-in-flight
+        // read of the same image — visible as corrupted/torn output on any animated
+        // scene using FXAA/SSAA (the content differs frame to frame, so the race
+        // becomes visible; a static scene would race too but reads the same content).
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          sceneColorTexture[kMaxFramesInFlight];
+        std::shared_ptr<systems::leal::campello_gpu::TextureView>      sceneColorView[kMaxFramesInFlight];
         std::shared_ptr<systems::leal::campello_gpu::Sampler>          fxaaSampler;
         std::shared_ptr<systems::leal::campello_gpu::Buffer>           fxaaUniformBuffer[kMaxFramesInFlight];
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        fxaaBindGroup[kMaxFramesInFlight];
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        downsampleBindGroup[kMaxFramesInFlight];
 
-        // Screen-space refraction resources.
-        std::shared_ptr<systems::leal::campello_gpu::Texture>          opaqueSceneTexture;
-        std::shared_ptr<systems::leal::campello_gpu::TextureView>      opaqueSceneView;
+        // Screen-space refraction resources — per-frame-in-flight for the same reason
+        // as sceneColorTexture above: the opaque pass writes this every render() call
+        // and the transparent pass reads it back for KHR_materials_transmission.
+        std::shared_ptr<systems::leal::campello_gpu::Texture>          opaqueSceneTexture[kMaxFramesInFlight];
+        std::shared_ptr<systems::leal::campello_gpu::TextureView>      opaqueSceneView[kMaxFramesInFlight];
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        copyBindGroup[kMaxFramesInFlight];
         struct FrameResources {
             std::shared_ptr<systems::leal::campello_gpu::Buffer> transformBuffer;
@@ -449,6 +480,21 @@ namespace systems::leal::campello_renderer {
             systems::leal::vector_math::Vector3<double> min;
             systems::leal::vector_math::Vector3<double> max;
         };
+
+        // World-space center of the current scene's mesh geometry bounding box
+        // (computed in setScene(), once nodeLocalBounds is populated — see
+        // computeSceneAABB()). Defaults to the origin for an empty/boundless scene.
+        systems::leal::vector_math::Vector3<double> boundsCenter =
+            systems::leal::vector_math::Vector3<double>(0.0, 0.0, 0.0);
+
+        // Recursively computes nodeIndex's subtree world-space AABB from
+        // nodeLocalBounds (resting pose — no animation applied), for the
+        // one-time post-load bounds-center calculation. Distinct from
+        // nodeWorldBounds/computeNodeTransform(), which refresh per-frame
+        // during render() and require a render to have already happened.
+        Bounds computeSceneAABB(
+            uint64_t nodeIndex,
+            const systems::leal::vector_math::Matrix4<double> &parentWorld) const;
 
         // Cached local-space bounds per primitive and per-node bounds used by
         // visibility systems. World bounds are refreshed during transform updates.
@@ -605,6 +651,11 @@ namespace systems::leal::campello_renderer {
 
     public:
         Renderer(std::shared_ptr<systems::leal::campello_gpu::Device> device);
+        // Waits for every in-flight frame's GPU work to finish before the
+        // implicit member destructors below release the buffers/textures/bind
+        // groups those submissions reference — see the definition for why this
+        // can't rely on Device's own vkDeviceWaitIdle instead.
+        ~Renderer();
 
         void setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset);
         std::shared_ptr<systems::leal::gltf::GLTF> getAsset();
@@ -667,6 +718,13 @@ namespace systems::leal::campello_renderer {
         // Returns the approximate bounding radius of the current scene,
         // computed from node world-space positions in setScene().
         float getBoundsRadius() const;
+
+        // Returns the world-space center of the current scene's mesh geometry
+        // bounding box, computed in setScene() — mirrors the glTF Sample
+        // Viewer's default of pointing the camera at the scene's actual visual
+        // center rather than assuming it's at the origin. (0,0,0) for an
+        // empty/boundless scene.
+        void getBoundsCenter(float *outX, float *outY, float *outZ) const;
 
         void setViewMode(ViewMode mode);
         ViewMode getViewMode() const;

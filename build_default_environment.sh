@@ -8,11 +8,18 @@ OUT_HEADER="$SCRIPT_DIR/src/environments/default_environment.h"
 # ---------------------------------------------------------------------------
 # Embed resources/environments/default_environment.hdr as a byte array header.
 #
-# Source: "Kiara 5 Noon" by Greg Zaal, https://polyhaven.com/a/kiara_5_noon
+# Source: "Cannon Exterior" by Greg Zaal — the Khronos glTF-Sample-Viewer's
+# own default environment (KhronosGroup/glTF-Sample-Environments, path
+# Cannon_Exterior.hdr on the low_resolution_hdrs branch; see that repo's
+# Cannon_Exterior.hdr.license). Deliberately matches the reference viewer's
+# default so campello_renderer's out-of-the-box look and IBL brightness are
+# directly comparable to it, instead of the previous "Kiara 5 Noon" sky/sun
+# HDRI (much higher dynamic range/more directional light — a fundamentally
+# different, harsher lighting scenario, not just a different exposure).
 # License: CC0 1.0 (public domain, no attribution required).
-# 1k (1024x512) Radiance HDR — real (non-tonemapped) linear radiance data, so
-# sky/sun highlights exceed 1.0 and reflective/metallic/iridescent materials
-# get real specular punch instead of being capped by an LDR source image.
+# 1024x512 equirectangular Radiance HDR — real (non-tonemapped) linear
+# radiance data, so reflective/metallic materials still get real specular
+# response rather than being capped by an LDR source image.
 # ---------------------------------------------------------------------------
 python3 - "$SRC_IMAGE" "$OUT_HEADER" <<'PYEOF'
 import sys
@@ -34,10 +41,11 @@ header = f"""#pragma once
 // Rebuild with: ./build_default_environment.sh
 //
 // Embedded source: resources/environments/default_environment.hdr
-// "Kiara 5 Noon" by Greg Zaal (https://polyhaven.com/a/kiara_5_noon), CC0 1.0.
+// "Cannon Exterior" by Greg Zaal — the Khronos glTF-Sample-Viewer's own
+// default environment (KhronosGroup/glTF-Sample-Environments), CC0 1.0.
 // 1024x512 equirectangular Radiance HDR ({size} bytes) — real linear
-// radiance data (sky/sun exceed 1.0), used as the built-in default IBL
-// environment map when the caller hasn't set one.
+// radiance data, used as the built-in default IBL environment map when the
+// caller hasn't set one.
 
 namespace systems::leal::campello_renderer::environments {{
 

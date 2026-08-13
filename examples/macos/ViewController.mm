@@ -311,7 +311,11 @@ static bool ViewModeForKey(NSString *key, rend::ViewMode &outMode) {
     NSLog(@"campello_renderer_macos: loaded %@", url.lastPathComponent);
 
     _renderer->setAsset(asset);
-    _camera.fitBounds(_renderer->getBoundsRadius());
+    float cx, cy, cz;
+    _renderer->getBoundsCenter(&cx, &cy, &cz);
+    NSLog(@"Bounds: radius=%.3f center=(%.3f, %.3f, %.3f)",
+          _renderer->getBoundsRadius(), cx, cy, cz);
+    _camera.fitBounds(_renderer->getBoundsRadius(), simd_make_float3(cx, cy, cz));
 
     uint32_t animCount = _renderer->getAnimationCount();
     NSLog(@"Animations found: %u", animCount);

@@ -123,6 +123,13 @@ layout(set = 1, binding = 2) uniform textureCube environmentMap;
 layout(set = 1, binding = 3) uniform sampler     environmentSampler;
 layout(set = 1, binding = 4) uniform texture2D   sceneColorTexture;
 layout(set = 1, binding = 5) uniform sampler     sceneColorSampler;
+// IBL precompute resources — see Renderer::bakeIblResources() /
+// shaders/vulkan/ibl_bake.frag. environmentMap above (binding 2) is now the
+// GGX-prefiltered specular cubemap (bakeIblResources() rebinds it there);
+// irradianceMap is the separate Lambertian-convolved diffuse cubemap.
+layout(set = 1, binding = 6) uniform textureCube irradianceMap;
+layout(set = 1, binding = 7) uniform texture2D   brdfLutTexture;
+layout(set = 1, binding = 8) uniform sampler     brdfLutSampler;
 
 // --- Per-material textures/samplers (set 0) -------------------------------------
 layout(set = 0, binding = 0)  uniform texture2D baseColorTexture;
@@ -311,6 +318,57 @@ float V_Neubelt(float NdotV, float NdotL) {
     return clamp(1.0 / (4.0 * (NdotL + NdotV - NdotL * NdotV)), 0.0, 1.0);
 }
 
+// Roughness-aware IBL Fresnel with single-scattering (FssEss) + multi-scattering
+// (FmsEms) energy compensation — glTF-Sample-Renderer's getIBLGGXFresnel
+// (ibl.glsl), from Fdez-Aguera's "A Multiple-Scattering Microfacet Model for
+// Real-Time Image-based Lighting" (https://bruop.github.io/ibl/#single_scattering_results).
+// Replaces the plain pow(1-NdotV,5) Schlick this used to use for IBL specular,
+// which had no roughness dependence at all (rough dielectrics kept a bright
+// grazing rim they shouldn't, and rough metals lost energy with no
+// compensation).
+vec3 iblGGXFresnel(float NdotV, float roughness, vec3 F0) {
+    vec2 fAB = texture(sampler2D(brdfLutTexture, brdfLutSampler), clamp(vec2(NdotV, roughness), 0.0, 1.0)).rg;
+    vec3 Fr = max(vec3(1.0 - roughness), F0) - F0;
+    vec3 kS = F0 + Fr * pow(clamp(1.0 - NdotV, 0.0, 1.0), 5.0);
+    vec3 FssEss = kS * fAB.x + fAB.y;
+
+    float Ems = 1.0 - (fAB.x + fAB.y);
+    vec3 Favg = F0 + (vec3(1.0) - F0) / 21.0;
+    vec3 FmsEms = Ems * FssEss * Favg / (vec3(1.0) - Favg * Ems);
+
+    return FssEss + FmsEms;
+}
+
+// Khronos PBR Neutral tone mapping — the glTF-Sample-Renderer's actual current
+// default (see GltfState.ToneMaps.KHR_PBR_NEUTRAL), not the plain Reinhard this
+// replaces. Ported verbatim from the reference's tonemapping.glsl.
+vec3 toneMapKhronosPbrNeutral(vec3 color) {
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation = 0.15;
+
+    float x = min(color.r, min(color.g, color.b));
+    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    color -= offset;
+
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression) return color;
+
+    float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    color *= newPeak / peak;
+
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return mix(color, vec3(newPeak), g);
+}
+
+// The swapchain target is plain (non-sRGB-tagged) unorm — see
+// Device::getSwapchainPixelFormat() picking VK_FORMAT_B8G8R8A8_UNORM — so, as in
+// the reference's own toneMap() wrapper, linear-to-sRGB encoding must happen here
+// rather than relying on the hardware to do it on write.
+vec3 linearToSRGBFast(vec3 color) {
+    return pow(color, vec3(1.0 / 2.2));
+}
+
 void main() {
     vec2 uv0 = fragTexcoord0;
     if (mat.uvTransformRow0.w > 0.5) {
@@ -463,9 +521,16 @@ void main() {
     vec3 iblSpecular  = vec3(0.0);
     vec3 iblClearcoat = vec3(0.0);
     if (mat.iblEnabled > 0.5) {
-        vec3 envDiffuse = texture(samplerCube(environmentMap, environmentSampler), N).rgb;
-        iblDiffuse = baseColor.rgb * (1.0 - metallic) * envDiffuse * mat.environmentIntensity * 0.3;
+        // Lambertian-convolved diffuse irradiance (bakeIblResources() mode 2) —
+        // not a raw environmentMap sample, so no hand-tuned brightness fudge
+        // factor is needed the way the old raw-sample approximation required.
+        vec3 envDiffuse = texture(samplerCube(irradianceMap, environmentSampler), N).rgb;
+        iblDiffuse = baseColor.rgb * (1.0 - metallic) * envDiffuse * mat.environmentIntensity;
 
+        // environmentMap here is the GGX-prefiltered specular cubemap
+        // (bakeIblResources() mode 1) — same roughness*envMaxLod mip selection
+        // as before, but each mip now actually holds that roughness's GGX
+        // lobe instead of a box-filtered downsample.
         float envMaxLod = max(float(textureQueryLevels(samplerCube(environmentMap, environmentSampler))) - 1.0, 0.0);
 
         vec3 R = reflect(-viewDir, N);
@@ -477,8 +542,7 @@ void main() {
             vec3 iridF0 = EvalIridescence(1.0, mat.iridescenceIor, NdotV, iridescenceThickness, F0);
             F0 = mix(F0, iridF0, iridescenceFactor);
         }
-        float fresnel = pow(1.0 - NdotV, 5.0);
-        vec3 F = F0 + (vec3(1.0) - F0) * fresnel;
+        vec3 F = iblGGXFresnel(NdotV, roughness, F0);
         iblSpecular = envSpecular * F * mat.environmentIntensity;
 
         if (ccFactor > 0.0) {
@@ -605,10 +669,10 @@ void main() {
 
         float NdotL      = max(dot(N, lightDir), 0.0);
         vec3  lightColor = light.color.xyz * light.color.w * attenuation * spotFactor;
-        totalDiffuse += baseColor.rgb * NdotL * (1.0 - metallic) * lightColor;
 
         vec3  halfDir = normalize(lightDir + viewDir);
         float NdotH   = max(dot(N, halfDir), 0.0);
+        float VdotH   = max(dot(viewDir, halfDir), 0.0);
 
         float f0_scalarL = (mat.ior - 1.0) / (mat.ior + 1.0);
         f0_scalarL *= f0_scalarL;
@@ -622,6 +686,12 @@ void main() {
             vec3 iridF0 = EvalIridescence(1.0, mat.iridescenceIor, NdotV, iridescenceThickness, F0);
             F0 = mix(F0, iridF0, iridescenceFactor);
         }
+        // Schlick Fresnel at this light's half-vector angle (F90 = 1, per the
+        // reference's F_Schlick default) — used both to weight specular's
+        // grazing-angle brightening and, via energy conservation, to reduce the
+        // diffuse response by the same amount (glTF-Sample-Renderer pbr.frag:
+        // l_dielectric_brdf = mix(l_diffuse, l_specular, dielectric_fresnel)).
+        vec3 fresnel = F0 + (vec3(1.0) - F0) * pow(clamp(1.0 - VdotH, 0.0, 1.0), 5.0);
 
         float D, V;
         if (anisoStrength > 0.001) {
@@ -639,13 +709,22 @@ void main() {
             D = D_GGX(roughness, NdotH);
         }
         V = V_SmithGGX(NdotL, NdotV, roughness);
-        totalSpecular += F0 * D * V * NdotL * lightColor;
+
+        // BRDF_lambertian(baseColor) = baseColor / PI (glTF-Sample-Renderer brdf.glsl).
+        vec3 lDiffuse  = (baseColor.rgb / PI) * NdotL * lightColor;
+        vec3 lSpecular = fresnel * D * V * NdotL * lightColor;
+
+        // Metals have no diffuse response at all; dielectrics split energy
+        // between diffuse and specular by the Fresnel reflectance instead of
+        // adding both unconditionally (which double-counts energy at grazing
+        // angles).
+        totalDiffuse  += lDiffuse * (vec3(1.0) - fresnel) * (1.0 - metallic);
+        totalSpecular += lSpecular;
 
         float sheenD = D_Charlie(sheenRoughness, NdotH);
         float sheenV = V_Neubelt(NdotV, max(NdotL, 0.0001));
         totalSheen += sheenColor * sheenD * sheenV * NdotL * lightColor;
 
-        float VdotH   = max(dot(viewDir, halfDir), 0.0);
         float ccNdotH = max(dot(ccN, halfDir), 0.0);
         float ccNdotL = max(dot(ccN, lightDir), 0.0);
         float cc_D    = D_GGX(ccRoughness, ccNdotH);
@@ -655,7 +734,10 @@ void main() {
     }
 
     // --- Final composition ---
-    vec3 ambientColor = baseColor.rgb * 0.25 * occlusion;
+    // The flat ambient-color hack is only a stand-in for real indirect
+    // lighting when IBL is off; with IBL on, iblDiffuse already supplies the
+    // ambient term and this would otherwise double-count it.
+    vec3 ambientColor = (mat.iblEnabled > 0.5) ? vec3(0.0) : baseColor.rgb * 0.25 * occlusion;
     vec3 diffuse      = totalDiffuse;
     iblDiffuse  *= occlusion;
     iblSpecular *= occlusion;
@@ -670,8 +752,8 @@ void main() {
                        + emissive + transmitted * transmittance) * ccAmbientAtten
                       + totalClearcoat + iblClearcoat;
 
-    // Reinhard tone mapping.
-    finalColor = finalColor / (vec3(1.0) + finalColor);
+    finalColor = toneMapKhronosPbrNeutral(finalColor);
+    finalColor = linearToSRGBFast(finalColor);
 
     outColor = vec4(finalColor, baseColor.a);
 }

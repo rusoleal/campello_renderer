@@ -205,6 +205,38 @@ inline float2 selectUV(float2 uv0, float2 uv1, float packedMask, uint bit) {
     return (uint(packedMask) & bit) != 0 ? uv1 : uv0;
 }
 
+// Khronos PBR Neutral tone mapping — the glTF-Sample-Renderer's actual current
+// default (see GltfState.ToneMaps.KHR_PBR_NEUTRAL), not the plain Reinhard this
+// replaces. Ported verbatim from the reference's tonemapping.glsl. Shared by
+// fragmentMain_flat, fragmentMain_textured, and skyboxFragment so all three
+// output paths agree on the same final color transform.
+inline float3 toneMapKhronosPbrNeutral(float3 color) {
+    const float startCompression = 0.8f - 0.04f;
+    const float desaturation = 0.15f;
+
+    float x = min(color.r, min(color.g, color.b));
+    float offset = x < 0.08f ? x - 6.25f * x * x : 0.04f;
+    color -= offset;
+
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression) return color;
+
+    float d = 1.0f - startCompression;
+    float newPeak = 1.0f - d * d / (peak + d - startCompression);
+    color *= newPeak / peak;
+
+    float g = 1.0f - 1.0f / (desaturation * (peak - newPeak) + 1.0f);
+    return mix(color, float3(newPeak), g);
+}
+
+// The swapchain target is plain (non-sRGB-tagged) unorm (bgra8unorm — see
+// examples/macos/ViewController.mm's colorPixelFormat), so, as in the
+// reference's own toneMap() wrapper, linear-to-sRGB encoding must happen here
+// rather than relying on the hardware to do it on write.
+inline float3 linearToSRGBFast(float3 color) {
+    return pow(color, float3(1.0f / 2.2f));
+}
+
 struct CameraUniforms {
     float4   cameraPos;
     float4x4 viewMatrix;
@@ -499,7 +531,11 @@ fragment float4 fragmentMain_flat(
     float3 diffuse = baseColor.rgb * NdotL * 0.8;
     float3 ambientColor = baseColor.rgb * ambient;
 
-    return float4(ambientColor + diffuse + mat.emissiveFactor.xyz, baseColor.a);
+    float3 finalColor = ambientColor + diffuse + mat.emissiveFactor.xyz;
+    finalColor = toneMapKhronosPbrNeutral(finalColor);
+    finalColor = linearToSRGBFast(finalColor);
+
+    return float4(finalColor, baseColor.a);
 }
 
 // ---------------------------------------------------------------------------
@@ -690,6 +726,28 @@ float V_Neubelt(float NdotV, float NdotL) {
     return clamp(1.0f / (4.0f * (NdotL + NdotV - NdotL * NdotV)), 0.0f, 1.0f);
 }
 
+// Roughness-aware IBL Fresnel with single-scattering (FssEss) + multi-scattering
+// (FmsEms) energy compensation — glTF-Sample-Renderer's getIBLGGXFresnel
+// (ibl.glsl), from Fdez-Aguera's "A Multiple-Scattering Microfacet Model for
+// Real-Time Image-based Lighting" (https://bruop.github.io/ibl/#single_scattering_results).
+// Replaces the plain pow(1-NdotV,5) Schlick this used to use for IBL specular,
+// which had no roughness dependence at all (rough dielectrics kept a bright
+// grazing rim they shouldn't, and rough metals lost energy with no
+// compensation).
+float3 iblGGXFresnel(float NdotV, float roughness, float3 F0,
+                      texture2d<float> brdfLut, sampler brdfLutSamp) {
+    float2 fAB = brdfLut.sample(brdfLutSamp, clamp(float2(NdotV, roughness), 0.0f, 1.0f)).rg;
+    float3 Fr = max(float3(1.0f - roughness), F0) - F0;
+    float3 kS = F0 + Fr * pow(clamp(1.0f - NdotV, 0.0f, 1.0f), 5.0f);
+    float3 FssEss = kS * fAB.x + fAB.y;
+
+    float Ems = 1.0f - (fAB.x + fAB.y);
+    float3 Favg = F0 + (float3(1.0f) - F0) / 21.0f;
+    float3 FmsEms = Ems * FssEss * Favg / (float3(1.0f) - Favg * Ems);
+
+    return FssEss + FmsEms;
+}
+
 fragment float4 fragmentMain_textured(
     VertexOut        in                        [[stage_in]],
     constant MaterialUniforms &mat             [[buffer(17)]],
@@ -720,7 +778,9 @@ fragment float4 fragmentMain_textured(
     texture2d<float> thicknessTexture          [[texture(23)]],
     texture2d<float> iridescenceTexture        [[texture(24)]],
     texture2d<float> iridescenceThicknessTexture [[texture(25)]],
-    texture2d<float> anisotropicTexture          [[texture(26)]])
+    texture2d<float> anisotropicTexture          [[texture(26)]],
+    texturecube<float> irradianceEnvironmentMap  [[texture(27)]],
+    texture2d<float> brdfLutTexture              [[texture(28)]])
 {
     // uv is the shared TEXCOORD_0-based fallback every other texture below
     // reads unless it opts into texCoord=1 via its own selectUV() call.
@@ -932,18 +992,23 @@ fragment float4 fragmentMain_textured(
     float3 iblSpecular = float3(0.0);
     float3 iblClearcoat = float3(0.0);
     if (mat.iblEnabled > 0.5) {
-        // Diffuse: sample irradiance using normal direction.
-        float3 envDiffuse = environmentMap.sample(baseColorSampler, N).rgb;
-        iblDiffuse = baseColor.rgb * (1.0 - metallic) * envDiffuse * mat.environmentIntensity * 0.3;
+        // Diffuse: Lambertian-convolved irradiance cubemap (bakeIblResources()
+        // mode 2) — not a raw environmentMap sample, so no hand-tuned
+        // brightness fudge factor is needed the way the old raw-sample
+        // approximation required.
+        float3 envDiffuse = irradianceEnvironmentMap.sample(baseColorSampler, N).rgb;
+        iblDiffuse = baseColor.rgb * (1.0 - metallic) * envDiffuse * mat.environmentIntensity;
 
         // Roughness-based LOD so rough surfaces reflect a blurred (lower mip)
         // environment instead of always sampling the sharpest level.
+        // environmentMap here is the GGX-prefiltered specular cubemap
+        // (bakeIblResources() mode 1) — each mip actually holds that
+        // roughness's GGX lobe instead of a box-filtered downsample.
         float envMaxLod = max(float(environmentMap.get_num_mip_levels()) - 1.0, 0.0);
 
         // Specular: sample using reflection direction, blurred by roughness.
         float3 R = reflect(-viewDir, N);
         float3 envSpecular = environmentMap.sample(baseColorSampler, R, level(roughness * envMaxLod)).rgb;
-        // Simple Fresnel approximation for IBL specular.
         float f0_scalar = (mat.ior - 1.0) / (mat.ior + 1.0);
         f0_scalar *= f0_scalar;
         float3 F0 = mix(float3(f0_scalar) * mat.specularColorFactor.xyz, baseColor.rgb, metallic);
@@ -952,8 +1017,7 @@ fragment float4 fragmentMain_textured(
             float3 iridF0 = EvalIridescence(1.0, mat.iridescenceIor, NdotV, iridescenceThickness, F0);
             F0 = mix(F0, iridF0, iridescenceFactor);
         }
-        float fresnel = pow(1.0 - NdotV, 5.0);
-        float3 F = F0 + (float3(1.0) - F0) * fresnel;
+        float3 F = iblGGXFresnel(NdotV, roughness, F0, brdfLutTexture, baseColorSampler);
         iblSpecular = envSpecular * F * mat.environmentIntensity;
 
         // IBL clearcoat: sample environment with clearcoat normal and Fresnel,
@@ -1145,10 +1209,10 @@ fragment float4 fragmentMain_textured(
 
         float  NdotL      = max(dot(N, lightDir), 0.0);
         float3 lightColor = light.color.xyz * light.color.w * attenuation * spotFactor;
-        totalDiffuse += baseColor.rgb * NdotL * (1.0 - metallic) * lightColor;
 
         float3 halfDir = normalize(lightDir + viewDir);
         float  NdotH   = max(dot(N, halfDir), 0.0);
+        float  VdotH   = max(dot(viewDir, halfDir), 0.0f);
 
         // KHR_materials_specular F0.
         float f0_scalar = (mat.ior - 1.0) / (mat.ior + 1.0);
@@ -1173,6 +1237,12 @@ fragment float4 fragmentMain_textured(
             float3 iridF0 = EvalIridescence(1.0, mat.iridescenceIor, NdotV, iridescenceThickness, F0);
             F0 = mix(F0, iridF0, iridescenceFactor);
         }
+        // Schlick Fresnel at this light's half-vector angle (F90 = 1, per the
+        // reference's F_Schlick default) — used both to weight specular's
+        // grazing-angle brightening and, via energy conservation, to reduce the
+        // diffuse response by the same amount (glTF-Sample-Renderer pbr.frag:
+        // l_dielectric_brdf = mix(l_diffuse, l_specular, dielectric_fresnel)).
+        float3 fresnel = F0 + (float3(1.0) - F0) * pow(clamp(1.0 - VdotH, 0.0f, 1.0f), 5.0f);
 
         // GGX microfacet BRDF (isotropic or anisotropic).
         float D, V;
@@ -1191,7 +1261,17 @@ fragment float4 fragmentMain_textured(
             D = D_GGX(roughness, NdotH);
         }
         V = V_SmithGGX(NdotL, NdotV, roughness);
-        totalSpecular += F0 * D * V * NdotL * lightColor;
+
+        // BRDF_lambertian(baseColor) = baseColor / PI (glTF-Sample-Renderer brdf.glsl).
+        float3 lDiffuse  = (baseColor.rgb / M_PI_F) * NdotL * lightColor;
+        float3 lSpecular = fresnel * D * V * NdotL * lightColor;
+
+        // Metals have no diffuse response at all; dielectrics split energy
+        // between diffuse and specular by the Fresnel reflectance instead of
+        // adding both unconditionally (which double-counts energy at grazing
+        // angles).
+        totalDiffuse  += lDiffuse * (float3(1.0) - fresnel) * (1.0 - metallic);
+        totalSpecular += lSpecular;
 
         // KHR_materials_sheen.
         float sheenD = D_Charlie(sheenRoughness, NdotH);
@@ -1199,7 +1279,6 @@ fragment float4 fragmentMain_textured(
         totalSheen += sheenColor * sheenD * sheenV * NdotL * lightColor;
 
         // KHR_materials_clearcoat.
-        float VdotH   = max(dot(viewDir, halfDir), 0.0f);
         float ccNdotH = max(dot(ccN, halfDir), 0.0f);
         float ccNdotL = max(dot(ccN, lightDir), 0.0f);
         float cc_D    = D_GGX(ccRoughness, ccNdotH);
@@ -1214,7 +1293,11 @@ fragment float4 fragmentMain_textured(
     // the direct-light loop above and must stay untouched by it; ambientColor
     // (our no-IBL placeholder) and the real IBL diffuse/specular terms are
     // the indirect ones and are what occlusion is meant to darken.
-    float3 ambientColor = baseColor.rgb * 0.25 * occlusion;
+    //
+    // The flat ambient-color hack is only a stand-in for real indirect
+    // lighting when IBL is off; with IBL on, iblDiffuse already supplies the
+    // ambient term and this would otherwise double-count it.
+    float3 ambientColor = (mat.iblEnabled > 0.5) ? float3(0.0) : baseColor.rgb * 0.25 * occlusion;
     float3 diffuse      = totalDiffuse;
     iblDiffuse  *= occlusion;
     iblSpecular *= occlusion;
@@ -1234,8 +1317,8 @@ fragment float4 fragmentMain_textured(
                          + emissive + transmitted * transmittance) * ccAmbientAtten
                         + totalClearcoat + iblClearcoat;
 
-    // Reinhard tone mapping.
-    finalColor = finalColor / (float3(1.0) + finalColor);
+    finalColor = toneMapKhronosPbrNeutral(finalColor);
+    finalColor = linearToSRGBFast(finalColor);
 
     return float4(finalColor, baseColor.a);
 }
@@ -1277,16 +1360,216 @@ fragment float4 skyboxFragment(SkyboxOut in [[stage_in]],
     float3 worldDir = normalize(worldFar.xyz / worldFar.w - u.cameraPos.xyz);
     float3 color = envMap.sample(envSampler, worldDir).rgb;
 
-    // Match the Reinhard tonemapping every material's fragment shader applies
-    // (see fragmentMain_textured/_flat) before writing to the 8-bit swapchain.
-    // The environment is genuine HDR (sky/sun routinely exceed 1.0, more so
-    // now that the built-in default is baked with a 6x exposure correction —
-    // see createBuiltinDefaultEnvironmentMap), so returning it raw here hard
-    // -clips to solid white/saturated colors at the output format instead of
-    // compressing smoothly like every reflection of the same environment does.
-    color = color / (float3(1.0) + color);
+    // Match the tonemapping + sRGB encoding every material's fragment shader
+    // applies (see fragmentMain_textured/_flat) before writing to the 8-bit
+    // swapchain. The environment is genuine HDR (sky/sun routinely exceed 1.0,
+    // more so now that the built-in default is baked with a 6x exposure
+    // correction — see createBuiltinDefaultEnvironmentMap), so returning it
+    // raw here hard-clips to solid white/saturated colors at the output
+    // format instead of compressing smoothly like every reflection of the
+    // same environment does.
+    color = toneMapKhronosPbrNeutral(color);
+    color = linearToSRGBFast(color);
 
     return float4(color, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// IBL precompute shader — bakes the three environment-independent/derived
+// resources the glTF-Sample-Renderer reference uses for physically correct
+// image-based lighting, none of which this renderer previously computed.
+// Direct MSL port of shaders/vulkan/ibl_bake.frag — see that file's header
+// comment for the full mode/algorithm description. Reuses skyboxVertex's
+// fullscreen triangle (SkyboxOut) for the vertex stage — see
+// Renderer::bakeIblResources() for the per-(mode,face,mip) draw orchestration.
+// ---------------------------------------------------------------------------
+struct IblBakeUniforms {
+    int32_t mode;       // 0 = BRDF LUT, 1 = GGX prefilter, 2 = irradiance convolution
+    int32_t faceIndex;  // 0..5, used for mode 1/2
+    float   roughness;  // used for mode 1
+    float   outputSize; // resolution (texels, square) of the current render target
+};
+
+// Direction for cubemap face `face` at signed uv in [-1,1] — must match the
+// CPU-side convention in Renderer::convertEquirectangularImageToCubemap()
+// exactly (right-handed, +Z forward, face order +X,-X,+Y,-Y,+Z,-Z), so baked
+// faces stay aligned with faces uploaded via the equirect/6-file loaders.
+inline float3 iblFaceDirection(int face, float uu, float vv) {
+    float3 d;
+    if (face == 0)      d = float3( 1.0, -vv, -uu);
+    else if (face == 1) d = float3(-1.0, -vv,  uu);
+    else if (face == 2) d = float3( uu,  1.0,  vv);
+    else if (face == 3) d = float3( uu, -1.0, -vv);
+    else if (face == 4) d = float3( uu, -vv,  1.0);
+    else                 d = float3(-uu, -vv, -1.0);
+    return normalize(d);
+}
+
+inline float iblRadicalInverseVdC(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10; // / 0x100000000
+}
+
+inline float2 iblHammersley(uint i, uint n) {
+    return float2(float(i) / float(n), iblRadicalInverseVdC(i));
+}
+
+inline float3 iblImportanceSampleGGX(float2 xi, float3 N, float roughness) {
+    float a = roughness * roughness;
+
+    float phi = 2.0 * M_PI_F * xi.x;
+    float cosTheta = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+    float3 H;
+    H.x = cos(phi) * sinTheta;
+    H.y = sin(phi) * sinTheta;
+    H.z = cosTheta;
+
+    float3 up = (abs(N.z) < 0.999) ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+    float3 tangent = normalize(cross(up, N));
+    float3 bitangent = cross(N, tangent);
+
+    return normalize(tangent * H.x + bitangent * H.y + N * H.z);
+}
+
+inline float iblGeometrySchlickGGX(float NdotV, float roughness) {
+    float a = roughness;
+    float k = (a * a) / 2.0;
+    return NdotV / (NdotV * (1.0 - k) + k);
+}
+
+inline float iblGeometrySmith(float NdotV, float NdotL, float roughness) {
+    return iblGeometrySchlickGGX(NdotV, roughness) * iblGeometrySchlickGGX(NdotL, roughness);
+}
+
+// Karis split-sum BRDF LUT integration — the standard closed-form approximation
+// (UE4 2013 course notes) also used, in spirit, by the reference's own offline
+// ibl_sampler.js LUT bake (sampled here at (NdotV, roughness) instead of stored
+// as a shipped asset, since this renderer has no offline asset pipeline).
+inline float2 iblIntegrateBRDF(float NdotV, float roughness) {
+    float3 V = float3(sqrt(max(1.0 - NdotV * NdotV, 0.0)), 0.0, NdotV);
+    float3 N = float3(0.0, 0.0, 1.0);
+
+    float A = 0.0;
+    float B = 0.0;
+    const uint SAMPLE_COUNT = 256u;
+    for (uint i = 0u; i < SAMPLE_COUNT; ++i) {
+        float2 xi = iblHammersley(i, SAMPLE_COUNT);
+        float3 H = iblImportanceSampleGGX(xi, N, roughness);
+        float3 L = normalize(2.0 * dot(V, H) * H - V);
+
+        float NdotL = max(L.z, 0.0);
+        float NdotH = max(H.z, 0.0);
+        float VdotH = max(dot(V, H), 0.0);
+
+        if (NdotL > 0.0) {
+            float G = iblGeometrySmith(NdotV, NdotL, roughness);
+            float G_Vis = (G * VdotH) / max(NdotH * NdotV, 0.0001);
+            float Fc = pow(1.0 - VdotH, 5.0);
+
+            A += (1.0 - Fc) * G_Vis;
+            B += Fc * G_Vis;
+        }
+    }
+    return float2(A, B) / float(SAMPLE_COUNT);
+}
+
+// GGX-importance-sampled prefiltered specular radiance for direction N at the
+// given roughness — Karis's split-sum "pre-filtered environment map" half.
+inline float3 iblPrefilterEnvironment(float3 N, float roughness, texturecube<float> srcEnvMap, sampler srcEnvSampler) {
+    // At roughness ~0 the GGX lobe collapses to a delta function (H = N for
+    // every sample regardless of xi — see iblImportanceSampleGGX's cosTheta
+    // formula), so importance sampling has already converged to the exact
+    // answer: a single direct sample. Skipping the loop here removes the
+    // single most expensive mip (mip 0, the source's full resolution) from
+    // the bake entirely, which is what makes raising SAMPLE_COUNT below
+    // affordable for the mips that actually need it.
+    if (roughness < 0.01) {
+        return srcEnvMap.sample(srcEnvSampler, N, level(0.0)).rgb;
+    }
+
+    float3 V = N;
+    float3 prefilteredColor = float3(0.0);
+    float totalWeight = 0.0;
+    // 64 samples produced visible Monte-Carlo fireflies/noise wherever a
+    // material's local roughness landed on a mid mip level reflecting a
+    // bright part of the environment (the built-in default env is baked with
+    // a 6x exposure boost, so its highlights are well above 1.0) — this is a
+    // one-time bake, not a per-frame cost, so a much higher sample count is
+    // affordable, especially with the roughness~0 fast path above removing
+    // the largest/most expensive mip from needing it at all.
+    const uint SAMPLE_COUNT = 512u;
+    for (uint i = 0u; i < SAMPLE_COUNT; ++i) {
+        float2 xi = iblHammersley(i, SAMPLE_COUNT);
+        float3 H = iblImportanceSampleGGX(xi, N, roughness);
+        float3 L = normalize(2.0 * dot(V, H) * H - V);
+        float NdotL = max(dot(N, L), 0.0);
+        if (NdotL > 0.0) {
+            prefilteredColor += srcEnvMap.sample(srcEnvSampler, L, level(0.0)).rgb * NdotL;
+            totalWeight += NdotL;
+        }
+    }
+    return prefilteredColor / max(totalWeight, 0.0001);
+}
+
+// Cosine-weighted hemisphere convolution of the source environment around
+// normal N — the Lambertian diffuse irradiance integral the reference bakes
+// offline into u_LambertianEnvSampler (ibl_sampler.js), computed here on GPU.
+//
+// Cosine-weighted importance sampling via Hammersley (same technique as
+// iblPrefilterEnvironment/iblIntegrateBRDF above) rather than a structured
+// (phi,theta) grid walked with two nested float-indexed loops — the Vulkan
+// port of the original nested-float-loop version produced visibly speckled/
+// incoherent output on Intel Mesa ANV despite being mathematically standard;
+// porting the same fix here for consistency even though it's unverified on
+// Metal. A single uint-indexed loop matching this file's other two integrals
+// sidesteps whatever miscompiled. With cosine-weighted sampling the pdf
+// (cosTheta/PI) exactly cancels the integrand's own cosTheta factor, leaving
+// a plain PI * average(L).
+inline float3 iblConvolveIrradiance(float3 N, texturecube<float> srcEnvMap, sampler srcEnvSampler) {
+    float3 up = (abs(N.z) < 0.999) ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+    float3 tangent = normalize(cross(up, N));
+    float3 bitangent = cross(N, tangent);
+
+    float3 irradiance = float3(0.0);
+    const uint SAMPLE_COUNT = 16384u;
+    for (uint i = 0u; i < SAMPLE_COUNT; ++i) {
+        float2 xi = iblHammersley(i, SAMPLE_COUNT);
+        float phi = 2.0 * M_PI_F * xi.x;
+        float cosTheta = sqrt(1.0 - xi.y);
+        float sinTheta = sqrt(xi.y);
+        float3 localDir = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+        float3 sampleDir = localDir.x * tangent + localDir.y * bitangent + localDir.z * N;
+        irradiance += srcEnvMap.sample(srcEnvSampler, sampleDir, level(0.0)).rgb;
+    }
+    return M_PI_F * irradiance / float(SAMPLE_COUNT);
+}
+
+fragment float4 iblBakeFragment(
+    SkyboxOut                  in           [[stage_in]],
+    constant IblBakeUniforms  &u            [[buffer(0)]],
+    texturecube<float>         srcEnvMap    [[texture(0)]],
+    sampler                    srcEnvSampler [[sampler(1)]])
+{
+    if (u.mode == 0) {
+        float2 uv = in.position.xy / u.outputSize;
+        float2 ab = iblIntegrateBRDF(clamp(uv.x, 0.001, 1.0), clamp(uv.y, 0.001, 1.0));
+        return float4(ab, 0.0, 1.0);
+    }
+
+    float2 ndc = (in.position.xy / u.outputSize) * 2.0 - 1.0;
+    float3 dir = iblFaceDirection(u.faceIndex, ndc.x, ndc.y);
+
+    if (u.mode == 1) {
+        return float4(iblPrefilterEnvironment(dir, u.roughness, srcEnvMap, srcEnvSampler), 1.0);
+    } else {
+        return float4(iblConvolveIrradiance(dir, srcEnvMap, srcEnvSampler), 1.0);
+    }
 }
 
 // ---------------------------------------------------------------------------

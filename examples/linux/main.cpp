@@ -463,7 +463,11 @@ void App::loadModel(const std::string &path) {
     printf("campello_renderer_linux: loaded %s\n", path.c_str());
 
     renderer->setAsset(asset);
-    camera.fitBounds(renderer->getBoundsRadius());
+    float cx, cy, cz;
+    renderer->getBoundsCenter(&cx, &cy, &cz);
+    printf("Bounds: radius=%.3f center=(%.3f, %.3f, %.3f)\n",
+           renderer->getBoundsRadius(), cx, cy, cz);
+    camera.fitBounds(renderer->getBoundsRadius(), Vec3{cx, cy, cz});
     needsRedraw = true;
 
     uint32_t animCount = renderer->getAnimationCount();

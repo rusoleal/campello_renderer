@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.9.0] - 2026-08-13
+
+### Added
+- **Vulkan IBL precompute pipeline** (`Renderer::bakeIblResources()`) — bakes the BRDF LUT, a GGX-prefiltered specular cubemap, and a Lambertian diffuse irradiance cubemap from the current environment map via a new fullscreen-triangle shader (`shaders/vulkan/ibl_bake.frag`), matching the reference glTF-Sample-Renderer's IBL approach that was already implemented for Metal. The PBR fragment shader now samples these baked resources (frame bind group bindings 6/7/8) instead of the raw environment map, falling back to it when a bake hasn't run yet.
+- **Vulkan skybox rendering** — new `shaders/vulkan/skybox.frag` plus `pipelineSkybox` wiring; `drawSkybox()` was already shared by both render paths and only needed the Vulkan pipeline to light up.
+- `Renderer::getBoundsCenter()` — world-space center of the current scene's geometry bounding box (via new `computeSceneAABB()`), so camera code can orbit the scene's actual visual center instead of assuming the origin. Wired into the Linux and macOS example apps' `Camera::fitBounds()`.
+- `Renderer::~Renderer()` — explicit destructor that waits for all in-flight GPU frames to finish before member buffers/textures/bind groups are released.
+
+### Changed
+- `skyboxEnabled` now defaults to `true` (previously `false`).
+- Default embedded environment map replaced with "Cannon Exterior" by Greg Zaal — the Khronos glTF-Sample-Viewer's own default HDRI — instead of "Kiara 5 Noon", so out-of-the-box IBL brightness is directly comparable to the reference viewer.
+- `sceneColorTexture`/`sceneColorView` (FXAA/SSAA) and `opaqueSceneTexture`/`opaqueSceneView` (screen-space refraction) are now per-frame-in-flight arrays instead of single shared instances, fixing a race where one frame's write could stomp another still-in-flight frame's read of the same texture — visible as corrupted/torn output on animated scenes using FXAA/SSAA or `KHR_materials_transmission`.
+- Upgraded `campello_gpu` dependency from v0.21.1 to v0.23.0.
+
+### Fixed
+- `OffscreenRenderTest.ClearColorIsApplied` now explicitly disables the skybox, since `skyboxEnabled` defaulting to `true` would otherwise paint over the clear color under test.
+
 ## [0.8.0] - 2026-08-02
 
 ### Added

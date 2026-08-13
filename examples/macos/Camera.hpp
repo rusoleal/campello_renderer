@@ -89,8 +89,11 @@ struct Camera {
         target = target - r * (dx * scale) + u * (dy * scale);
     }
 
-    // Reset to fit a bounding sphere of the given radius at the origin.
-    void fitBounds(float boundsRadius) {
+    // Reset to fit a bounding sphere of the given radius centered at `center`
+    // — mirrors the glTF Sample Viewer's default of orbiting the scene's
+    // actual visual center rather than assuming it's at the origin.
+    void fitBounds(float boundsRadius, simd_float3 center = simd_make_float3(0.0f, 0.0f, 0.0f)) {
+        target = center;
         radius = boundsRadius * 2.5f;
         nearZ  = boundsRadius * 0.01f;
         farZ   = boundsRadius * 100.0f;
