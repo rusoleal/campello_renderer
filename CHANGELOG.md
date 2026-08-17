@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.10.0] - 2026-08-17
+
+### Added
+- **Full glTF PBR pipeline ported to DirectX 12 (Windows)** — metallic-roughness Cook-Torrance GGX BRDF, image-based lighting (GGX-prefiltered specular + Lambertian diffuse irradiance + BRDF LUT), normal mapping, punctual lights (`KHR_lights_punctual`), and `KHR_materials_specular`/`anisotropy`/`iridescence`/`clearcoat`/`sheen`/`transmission`, matching the existing Metal/Vulkan feature set. Windows rendering (previously non-functional — DXIL binaries weren't compiled) now fully works, including resize.
+- **DirectX combined per-(material, frame-in-flight) bind group scheme** (`Renderer::ensureDirectXPbrBindGroupLayout()` / `buildDirectXCombinedBindGroup()` / `rebuildDirectXCombinedBindGroups()`) — works around a `campello_gpu` D3D12 root-signature bug where a second `setBindGroup()` call landed on the wrong descriptor table, by combining all per-material and per-frame PBR resources (textures, samplers, lights, camera, environment/IBL, scene-color) into one bind group per (material, frame-in-flight) pair instead of Vulkan/Metal's material+frame split.
+- New Windows example app (`examples/windows/`, GLFW-based) — drag-and-drop glTF/HDR loading, orbit camera, animation playback, and the same view-mode/hotkey set as the macOS/Linux examples. Enabled via `-DCAMPELLO_RENDERER_BUILD_WINDOWS_EXAMPLE=ON`.
+- `build_directx_shaders.ps1` — compiles `shaders/directx/default.hlsl` to DXIL via `dxc.exe` and regenerates the embedded `src/shaders/directx_default.h` header, mirroring `build_metal_shaders.sh` / `build_vulkan_shaders.sh`.
+- `WINDOWS_EXPORT_ALL_SYMBOLS` enabled for the Windows DLL build — without it, MSVC's linker built the `.dll` but never emitted the companion import `.lib`, failing every consumer (tests, example apps) at link time with `LNK1104`.
+
+### Changed
+- Upgraded `campello_gpu` dependency from v0.23.0 to v0.23.1 (Windows/DirectX descriptor-heap contiguity, DSV/sampler-heap leaks, swapchain resize, and cube-texture fixes).
+- `dependencies/campello_gpu.cmake` no longer supports a local-checkout override — always fetches from GitHub via `FetchContent`, removing a footgun where a developer's local `campello_gpu` checkout could silently diverge from the pinned released version.
+
+### Fixed
+- **Mirrored default camera** — `render(view)`'s and the ECS `render_system()`'s built-in fallback camera (used whenever no glTF/ECS camera exists) rendered a left-right-mirrored image and incorrectly backface-culled single-sided, CCW-front geometry near the origin. Root cause: `vector_math::Matrix4::lookAt()` builds its right/up axes with a cross-product argument order that's mirrored relative to what `Matrix4::perspective()`'s +Z-forward convention expects — confirmed empirically (geometry translated to world +X rendered on the left half of the frame instead of the right). Same root cause as the long-disabled `DISABLED_MeshRendersNonClearPixels` and sibling Vulkan tests. Worked around locally with a corrected `buildDefaultCameraView()` helper in both `campello_renderer.cpp` and `ecs.hpp`, scoped narrowly to the default-camera fallback only — real cameras (glTF-embedded, ECS `Transform`-driven, both of which use `Matrix4::inverted()` instead) are unaffected. The underlying bug lives upstream in the shared `vector_math` dependency.
+- **DirectX offscreen-render test crashes** — `BasicOffscreenRenderDoesNotCrash` / `MultipleConsecutiveRenders` / `ResizeOffscreenTarget` / `DifferentPixelFormatBGRA8` released their local render-target texture before the GPU finished executing the render into it (`render()`'s `submit()` is async and doesn't block), which D3D12's debug layer treats as fatal resource corruption. Fixed by adding `device->waitForIdle()` before the texture goes out of scope, matching the pattern `readBackPixels()` already used.
+- **`ECSPathRendersToOffscreen` backface culling** — same root cause as the mirrored-camera fix above; the test now builds its own corrected view matrix since it exercises the public ECS `render(scene, view)` API as an external caller would, supplying its own camera.
+
 ## [0.9.0] - 2026-08-13
 
 ### Added

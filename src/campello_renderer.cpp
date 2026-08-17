@@ -690,6 +690,54 @@ static bool uploadTextureDataWithMips(
     return true;
 }
 
+// vector_math::Matrix4::lookAt() builds its right/up axes as
+// cross(up, forward)/cross(forward, right), which — combined with
+// Matrix4::perspective()'s +Z-forward view-space convention (verified: for a
+// point at distance s in front of the camera, perspective() needs
+// view-space.z == +s, not -s, for the perspective divide/depth mapping to be
+// non-degenerate) — produces a view matrix whose right axis points the WRONG
+// way (confirmed empirically: an object translated to world +X rendered on
+// the LEFT half of a 64x64 offscreen target, and single-sided glTF-authored
+// (CCW-front) geometry near the origin was incorrectly backface-culled under
+// cullMode=back/frontFace=ccw — see OffscreenRenderTest.ECSPathRendersToOffscreen
+// in test/main.cpp). This is the same root cause as the long-standing,
+// disabled Vulkan tests DISABLED_MeshRendersNonClearPixels and friends, which
+// go through this exact same default-camera fallback.
+//
+// A prior attempt to fix this by flipping frontFace globally (cw instead of
+// ccw) was tried and reverted — it broke real, multi-primitive assets like
+// DamagedHelmet.glb, which use an embedded glTF camera (Matrix4::inverted() on
+// the camera node's world transform, not lookAt()) and were already correct.
+// This local, corrected lookAt only replaces the *default/fallback* camera
+// path (used when no glTF camera exists), so it can't affect anything that
+// goes through a real camera node.
+//
+// The actual bug lives in the shared, separately-versioned vector_math
+// dependency (Matrix4::lookAt()) and should ideally be fixed upstream — any
+// caller of vector_math::Matrix4::lookAt() paired with Matrix4::perspective()
+// hits the same mirroring. This is a local, campello_renderer-only
+// workaround for the one place this library builds its own default camera.
+systems::leal::vector_math::Matrix4<double> buildDefaultCameraView(
+    const systems::leal::vector_math::Vector3<double> &eye,
+    const systems::leal::vector_math::Vector3<double> &target,
+    const systems::leal::vector_math::Vector3<double> &up) {
+    namespace VM = systems::leal::vector_math;
+    auto zAxis = target - eye;
+    zAxis.normalize();
+    auto xAxis = VM::Vector3<double>::cross(zAxis, up); // swapped vs. Matrix4::lookAt()
+    xAxis.normalize();
+    auto yAxis = VM::Vector3<double>::cross(xAxis, zAxis); // swapped vs. Matrix4::lookAt()
+
+    auto result = VM::Matrix4<double>::identity();
+    result.data[0] = xAxis.data[0]; result.data[1] = xAxis.data[1]; result.data[2] = xAxis.data[2];
+    result.data[4] = yAxis.data[0]; result.data[5] = yAxis.data[1]; result.data[6] = yAxis.data[2];
+    result.data[8] = zAxis.data[0]; result.data[9] = zAxis.data[1]; result.data[10] = zAxis.data[2];
+    result.data[3]  = -VM::Vector3<double>::dot(xAxis, eye);
+    result.data[7]  = -VM::Vector3<double>::dot(yAxis, eye);
+    result.data[11] = -VM::Vector3<double>::dot(zAxis, eye);
+    return result;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -1196,6 +1244,174 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
     }
 }
 
+// DirectX-only: a single combined bind group layout carrying every per-material AND
+// per-frame PBR resource together — see the doc comment on
+// Renderer::directxPbrBindGroupLayout (campello_renderer.hpp) for why this differs
+// from Vulkan's material+frame split. Binding numbers 0-24 reuse the exact numbers
+// shaders/vulkan/default.frag's material set uses; frame resources are offset to
+// start at 30 purely so they can never collide with the material range even though
+// campello_gpu's D3D12 backend would tolerate it (independent t#/s#/b# namespaces,
+// like Metal) — see ensureDirectXPbrBindGroupLayout()'s call site for confirmation
+// this was verified against the vendored campello_gpu D3D12 backend source.
+void Renderer::ensureDirectXPbrBindGroupLayout() {
+    namespace GPU = systems::leal::campello_gpu;
+    if (directxPbrBindGroupLayout) return;
+
+    auto addTex = [](GPU::BindGroupLayoutDescriptor &desc, uint32_t binding,
+                      GPU::TextureType dim = GPU::TextureType::tt2d) {
+        GPU::EntryObject e{};
+        e.binding    = binding;
+        e.visibility = GPU::ShaderStage::fragment;
+        e.type       = GPU::EntryObjectType::texture;
+        e.data.texture.multisampled  = false;
+        e.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
+        e.data.texture.viewDimension = dim;
+        desc.entries.push_back(e);
+    };
+    auto addSamp = [](GPU::BindGroupLayoutDescriptor &desc, uint32_t binding) {
+        GPU::EntryObject e{};
+        e.binding    = binding;
+        e.visibility = GPU::ShaderStage::fragment;
+        e.type       = GPU::EntryObjectType::sampler;
+        e.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+        desc.entries.push_back(e);
+    };
+    auto addBuf = [](GPU::BindGroupLayoutDescriptor &desc, uint32_t binding, uint32_t size) {
+        GPU::EntryObject e{};
+        e.binding    = binding;
+        e.visibility = GPU::ShaderStage::fragment;
+        e.type       = GPU::EntryObjectType::buffer;
+        e.data.buffer.hasDinamicOffaset = false;
+        e.data.buffer.minBindingSize    = size;
+        e.data.buffer.type              = GPU::EntryObjectBufferType::uniform;
+        desc.entries.push_back(e);
+    };
+
+    GPU::BindGroupLayoutDescriptor desc{};
+    // --- Per-material textures/samplers + MaterialUniforms ---
+    addTex(desc, 0);  addSamp(desc, 1);   // baseColor
+    addTex(desc, 2);  addSamp(desc, 3);   // metallicRoughness
+    addTex(desc, 4);  addSamp(desc, 5);   // normal
+    addTex(desc, 6);  addSamp(desc, 7);   // emissive
+    addTex(desc, 8);  addSamp(desc, 9);   // occlusion
+    addTex(desc, 10); addSamp(desc, 11);  // specular
+    addTex(desc, 12); addSamp(desc, 13);  // specularColor
+    addTex(desc, 14);                     // sheenColor (reuses sampler 1)
+    addTex(desc, 15);                     // sheenRoughness (reuses sampler 1)
+    addTex(desc, 16);                     // clearcoat (reuses sampler 1)
+    addTex(desc, 17);                     // clearcoatRoughness (reuses sampler 1)
+    addTex(desc, 18);                     // clearcoatNormal (reuses sampler 1)
+    addTex(desc, 19);                     // transmission (reuses sampler 1)
+    addTex(desc, 20);                     // thickness (reuses sampler 1)
+    addTex(desc, 21);                     // iridescence (reuses sampler 1)
+    addTex(desc, 22);                     // iridescenceThickness (reuses sampler 1)
+    addTex(desc, 23);                     // anisotropic (reuses sampler 1)
+    addBuf(desc, 24, kMaterialUniformStride);
+
+    // --- Per-frame lights/camera/environment/scene-color (offset to avoid any
+    // chance of overlap with the material range above within the same
+    // RegisterSpace(0) root signature) ---
+    addBuf(desc, 30, 272);                          // LightsUniform
+    addBuf(desc, 31, 160);                          // CameraUniforms
+    addTex(desc, 32, GPU::TextureType::ttCube);     // environmentMap (prefiltered specular)
+    addSamp(desc, 33);                              // environmentSampler
+    addTex(desc, 34);                               // sceneColorTexture / opaqueSceneTexture
+    addSamp(desc, 35);                              // sceneColorSampler
+    addTex(desc, 36, GPU::TextureType::ttCube);     // irradianceEnvironmentMap
+    addTex(desc, 37);                               // brdfLutTexture
+    addSamp(desc, 38);                              // brdfLutSampler
+
+    directxPbrBindGroupLayout = device->createBindGroupLayout(desc);
+}
+
+// DirectX-only: builds one combined bind group (see ensureDirectXPbrBindGroupLayout())
+// for a specific material's cached texture assignments, bound against frameIndex's
+// lights/camera buffers and the caller-supplied scene-color/opaque-scene texture.
+std::shared_ptr<systems::leal::campello_gpu::BindGroup> Renderer::buildDirectXCombinedBindGroup(
+    const DirectXMaterialResources& res, uint32_t frameIndex,
+    const std::shared_ptr<systems::leal::campello_gpu::Texture>& sceneColorOrOpaque) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!directxPbrBindGroupLayout || !materialUniformBuffer) return nullptr;
+    auto& fr = frameResources[frameIndex];
+    if (!fr.lightsUniformBuffer || !fr.cameraPositionBuffer) return nullptr;
+
+    std::shared_ptr<GPU::Texture> envSpecular = prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap;
+    std::shared_ptr<GPU::Texture> envIrradiance = irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap;
+    std::shared_ptr<GPU::Texture> lut = brdfLutTexture ? brdfLutTexture : defaultTexture;
+    std::shared_ptr<GPU::Texture> scTex = sceneColorOrOpaque ? sceneColorOrOpaque : defaultTexture;
+    if (!envSpecular || !envIrradiance || !environmentSampler) return nullptr;
+
+    GPU::BindGroupDescriptor bgDesc{};
+    bgDesc.layout = directxPbrBindGroupLayout;
+    bgDesc.entries = {
+        {0,  res.baseColorTex},        {1,  res.baseColorSamp},
+        {2,  res.mrTex},               {3,  res.mrSamp},
+        {4,  res.normalTex},           {5,  res.normalSamp},
+        {6,  res.emissiveTex},         {7,  res.emissiveSamp},
+        {8,  res.occlusionTex},        {9,  res.occlusionSamp},
+        {10, res.specularTex},         {11, res.specularSamp},
+        {12, res.specularColorTex},    {13, res.specularColorSamp},
+        {14, res.sheenColorTex},
+        {15, res.sheenRoughnessTex},
+        {16, res.clearcoatTex},
+        {17, res.clearcoatRoughnessTex},
+        {18, res.clearcoatNormalTex},
+        {19, res.transmissionTex},
+        {20, res.thicknessTex},
+        {21, res.iridescenceTex},
+        {22, res.iridescenceThicknessTex},
+        {23, res.anisotropicTex},
+        {24, GPU::BufferBinding{materialUniformBuffer, res.materialBufferOffset, kMaterialUniformStride}},
+        {30, GPU::BufferBinding{fr.lightsUniformBuffer, 0, 272}},
+        {31, GPU::BufferBinding{fr.cameraPositionBuffer, 0, 160}},
+        {32, envSpecular},
+        {33, environmentSampler},
+        {34, scTex},
+        {35, environmentSampler},
+        {36, envIrradiance},
+        {37, lut},
+        {38, environmentSampler},
+    };
+    return device->createBindGroup(bgDesc);
+}
+
+// DirectX-only: rebuilds every combined bind group (default + all glTF materials +
+// all ECS GpuMaterials) for one frame-in-flight slot. Called once per material at
+// scene/material load (with a defaultTexture placeholder for the scene-color entry,
+// mirroring frameBindGroup[]'s "safe placeholder" comment on Vulkan/Metal) and again
+// every render() call once the real scene-color/opaque-scene texture for this frame
+// is known — see the two call sites in render()/renderToTarget(). This means DirectX
+// pays for materials-many createBindGroup() calls per relevant render pass where
+// Vulkan/Metal pay for exactly one (rebuilding only frameBindGroup[currentFrameIndex])
+// — an accepted cost of the single-combined-bind-group workaround described on
+// Renderer::directxPbrBindGroupLayout; scenes are not expected to have enough
+// materials for this to be a practical bottleneck.
+void Renderer::rebuildDirectXCombinedBindGroups(uint32_t frameIndex,
+    const std::shared_ptr<systems::leal::campello_gpu::Texture>& sceneColorOrOpaque) {
+    if (!directxPbrBindGroupLayout || frameIndex >= kMaxFramesInFlight) return;
+
+    directxDefaultBindGroup[frameIndex] = buildDirectXCombinedBindGroup(
+        directxDefaultResources, frameIndex, sceneColorOrOpaque);
+
+    for (size_t m = 0; m < directxMaterialResources.size(); ++m) {
+        if (m >= directxMaterialBindGroups.size()) break;
+        directxMaterialBindGroups[m][frameIndex] = buildDirectXCombinedBindGroup(
+            directxMaterialResources[m], frameIndex, sceneColorOrOpaque);
+    }
+
+    for (auto& matPtr : materialPool) {
+        if (!matPtr) continue;
+        // ECS GpuMaterials store their DirectXMaterialResources via uniformSlot's
+        // offset and the same texture pointers already cached on directxBindGroup's
+        // sibling fields — see uploadMesh()'s material-creation call site, which
+        // populates directxEcsMaterialResources keyed by GpuMaterial pointer.
+        auto it = directxEcsMaterialResources.find(matPtr.get());
+        if (it == directxEcsMaterialResources.end()) continue;
+        matPtr->directxBindGroup[frameIndex] = buildDirectXCombinedBindGroup(
+            it->second, frameIndex, sceneColorOrOpaque);
+    }
+}
+
 // Bakes the three IBL precompute resources the glTF-Sample-Renderer reference
 // uses for image-based lighting — see shaders/vulkan/ibl_bake.frag's header
 // comment for what each mode computes. Called wherever environmentMap is
@@ -1203,11 +1419,16 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
 // convertEquirectangularImageToCubemap). Vulkan-only for now; a no-op on
 // other backends until the Metal port lands.
 void Renderer::bakeIblResources() {
-#if defined(ANDROID) || defined(__linux__) || defined(__APPLE__)
+#if defined(ANDROID) || defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
     namespace GPU = systems::leal::campello_gpu;
 #if defined(ANDROID) || defined(__linux__)
     if (!device || !environmentMap || !environmentSampler || !pipelineIblBake ||
         !iblBakeBindGroupLayout || !vulkanIblBakePipelineLayout) {
+        return;
+    }
+#elif defined(_WIN32)
+    if (!device || !environmentMap || !environmentSampler || !pipelineIblBake ||
+        !iblBakeBindGroupLayout || !directxIblBakePipelineLayout) {
         return;
     }
 #else
@@ -1241,13 +1462,14 @@ void Renderer::bakeIblResources() {
 
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = iblBakeBindGroupLayout;
-#if defined(__APPLE__)
-        // Metal: texture/buffer/sampler occupy independent per-type argument
-        // spaces, so binding 0 as both a buffer and a texture (see
-        // iblBakeFragment's [[buffer(0)]]/[[texture(0)]]) is valid — same
-        // same-number-different-type convention already used throughout
-        // ensureBindGroupLayout() (e.g. binding 17 is both clearcoatTexture
-        // and the MaterialUniforms buffer).
+#if defined(__APPLE__) || defined(_WIN32)
+        // Metal and D3D12 both give texture/buffer/sampler independent per-type
+        // argument/register spaces, so binding 0 as both a buffer and a texture
+        // (see iblBakePixel's register(b0)/register(t0) in shaders/directx/
+        // default.hlsl, or iblBakeFragment's [[buffer(0)]]/[[texture(0)]] on
+        // Metal) is valid — same same-number-different-type convention already
+        // used throughout ensureBindGroupLayout() (e.g. binding 17 is both
+        // clearcoatTexture and the MaterialUniforms buffer).
         bgDesc.entries = {
             {0, GPU::BufferBinding{iblBakeUniformBuffer, 0, 16}},
             {0, environmentMap},
@@ -1279,6 +1501,7 @@ void Renderer::bakeIblResources() {
         auto rpe = encoder->beginRenderPass(rpDesc);
         if (rpe) {
             rpe->setViewport(0.0f, 0.0f, data.outputSize, data.outputSize, 0.0f, 1.0f);
+            rpe->setScissorRect(0.0f, 0.0f, data.outputSize, data.outputSize);
             rpe->setPipeline(pipelineIblBake);
             rpe->setBindGroup(0, bindGroup);
             rpe->draw(3);
@@ -1714,7 +1937,22 @@ void Renderer::setScene(uint32_t index) {
                             img->getWidth(), img->getHeight(), 1, mipLevels, 1,
                             (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                                 (uint32_t)GPU::TextureUsage::copyDst |
-                                                (uint32_t)GPU::TextureUsage::copySrc));
+                                                (uint32_t)GPU::TextureUsage::copySrc |
+                                                // Required for mipLevels > 1: CommandEncoder::
+                                                // generateMipmaps() downsamples by drawing into
+                                                // each mip as a render target (D3D12 has no
+                                                // built-in blit-based mip generation the way
+                                                // Metal/Vulkan do) — creating a
+                                                // D3D12_RENDER_TARGET_VIEW for a resource that
+                                                // wasn't allocated with
+                                                // D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET is
+                                                // severe enough D3D12 misuse that the debug
+                                                // layer fails the device outright (observed as
+                                                // DXGI_ERROR_DEVICE_HUNG, not a normal TDR —
+                                                // confirmed via cdb.exe: the device was still
+                                                // healthy 2.5s after the frame's own Present()
+                                                // returned, ruling out a real GPU hang).
+                                                (mipLevels > 1 ? (uint32_t)GPU::TextureUsage::renderTarget : 0u)));
                         if (texture != nullptr) {
                             texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
                             gpuTextures[a] = texture;
@@ -1736,7 +1974,10 @@ void Renderer::setScene(uint32_t index) {
                                 img->getWidth(), img->getHeight(), 1, mipLevels, 1,
                                 (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                                     (uint32_t)GPU::TextureUsage::copyDst |
-                                                    (uint32_t)GPU::TextureUsage::copySrc));
+                                                    (uint32_t)GPU::TextureUsage::copySrc |
+                                                    // See the identical fix's comment on the
+                                                    // data:uri texture-creation site above.
+                                                    (mipLevels > 1 ? (uint32_t)GPU::TextureUsage::renderTarget : 0u)));
                             if (texture != nullptr) {
                                 texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
                                 gpuTextures[a] = texture;
@@ -1760,7 +2001,10 @@ void Renderer::setScene(uint32_t index) {
                             img->getWidth(), img->getHeight(), 1, mipLevels, 1,
                             (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                                 (uint32_t)GPU::TextureUsage::copyDst |
-                                                (uint32_t)GPU::TextureUsage::copySrc));
+                                                (uint32_t)GPU::TextureUsage::copySrc |
+                                                // See the identical fix's comment on the
+                                                // data:uri texture-creation site above.
+                                                (mipLevels > 1 ? (uint32_t)GPU::TextureUsage::renderTarget : 0u)));
                         if (texture != nullptr) {
                             texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
                             gpuTextures[a] = texture;
@@ -2018,6 +2262,24 @@ void Renderer::setScene(uint32_t index) {
         esd.addressModeW = GPU::WrapMode::clampToEdge;
         esd.magFilter    = GPU::FilterMode::fmLinear;
         esd.minFilter    = GPU::FilterMode::fmLinear;
+        // lodMinClamp/lodMaxClamp have no default member initializer (see
+        // SamplerDescriptor's doc comment) — every other createSampler()
+        // call site in this file sets them explicitly except this one,
+        // which left them zero-initialized. D3D12 clamps even explicit-LOD
+        // SampleLevel() calls to the sampler's [MinLOD, MaxLOD] range, so a
+        // MaxLOD of 0.0 silently forced every SampleLevel() using this
+        // sampler — the prefiltered-environment IBL specular reflection AND
+        // KHR_materials_transmission's roughness-based background blur,
+        // both of which explicitly select a mip via SampleLevel(...,
+        // roughness-derived lod) — to mip 0 regardless of the requested
+        // LOD, on DirectX specifically (Vulkan/Metal apparently don't
+        // enforce this clamp as strictly for explicit-LOD sampling, which
+        // is why the same zero-initialized descriptor "worked" there).
+        // Confirmed via a user report: transmission showed correct
+        // Fresnel/refraction behavior but zero roughness-based blur.
+        esd.lodMinClamp  = 0.0;
+        esd.lodMaxClamp  = 1000.0;
+        esd.maxAnisotropy = 1.0;
         environmentSampler = device->createSampler(esd);
     }
 
@@ -2114,6 +2376,53 @@ void Renderer::setScene(uint32_t index) {
         // reuse the same fully-populated bind group for both.
         defaultFlatBindGroup = defaultBindGroup;
     }
+#elif defined(_WIN32)
+    ensureDirectXPbrBindGroupLayout();
+    if (directxPbrBindGroupLayout && defaultTexture && defaultSampler &&
+        defaultMetallicRoughnessTexture && defaultNormalTexture &&
+        defaultEmissiveTexture && defaultOcclusionTexture &&
+        defaultSpecularTexture && defaultSpecularColorTexture &&
+        defaultSheenColorTexture && defaultSheenRoughnessTexture &&
+        defaultClearcoatTexture && defaultClearcoatRoughnessTexture &&
+        defaultClearcoatNormalTexture &&
+        materialUniformBuffer) {
+        directxDefaultResources = DirectXMaterialResources{};
+        directxDefaultResources.baseColorTex          = defaultTexture;
+        directxDefaultResources.baseColorSamp         = defaultSampler;
+        directxDefaultResources.mrTex                 = defaultMetallicRoughnessTexture;
+        directxDefaultResources.mrSamp                = defaultSampler;
+        directxDefaultResources.normalTex             = defaultNormalTexture;
+        directxDefaultResources.normalSamp            = defaultSampler;
+        directxDefaultResources.emissiveTex           = defaultEmissiveTexture;
+        directxDefaultResources.emissiveSamp          = defaultSampler;
+        directxDefaultResources.occlusionTex          = defaultOcclusionTexture;
+        directxDefaultResources.occlusionSamp         = defaultSampler;
+        directxDefaultResources.specularTex           = defaultSpecularTexture;
+        directxDefaultResources.specularSamp          = defaultSampler;
+        directxDefaultResources.specularColorTex      = defaultSpecularColorTexture;
+        directxDefaultResources.specularColorSamp     = defaultSampler;
+        directxDefaultResources.sheenColorTex         = defaultSheenColorTexture;
+        directxDefaultResources.sheenRoughnessTex     = defaultSheenRoughnessTexture;
+        directxDefaultResources.clearcoatTex          = defaultClearcoatTexture;
+        directxDefaultResources.clearcoatRoughnessTex = defaultClearcoatRoughnessTexture;
+        directxDefaultResources.clearcoatNormalTex    = defaultClearcoatNormalTexture;
+        directxDefaultResources.transmissionTex       = defaultTexture; // no dedicated default, white is a no-op
+        directxDefaultResources.thicknessTex          = defaultTexture;
+        directxDefaultResources.iridescenceTex        = defaultTexture;
+        directxDefaultResources.iridescenceThicknessTex = defaultTexture;
+        directxDefaultResources.anisotropicTex        = defaultTexture;
+        directxDefaultResources.materialBufferOffset  = 0;
+        // Real scene-color/opaque-scene texture is not known yet at scene load —
+        // rebuildDirectXCombinedBindGroups() replaces this placeholder every
+        // render() call (see its own doc comment).
+        for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
+            directxDefaultBindGroup[f] = buildDirectXCombinedBindGroup(directxDefaultResources, f, defaultTexture);
+        }
+        // No separate flat shader on DirectX (pipelineFlat aliases pipelineTextured,
+        // matching Vulkan) — reuse the same fully-populated bind groups for both.
+        defaultBindGroup = directxDefaultBindGroup[0];
+        defaultFlatBindGroup = defaultBindGroup;
+    }
 #else
     if (!defaultBindGroup && bindGroupLayout && defaultTexture && defaultSampler &&
         defaultMetallicRoughnessTexture && defaultNormalTexture &&
@@ -2195,6 +2504,12 @@ void Renderer::setScene(uint32_t index) {
             };
             frameBindGroup[f] = device->createBindGroup(bgDesc);
         }
+#elif defined(_WIN32)
+        // No separate frameBindGroup[] on DirectX — lights/camera/environment are
+        // folded into each material's combined bind group instead (see
+        // ensureDirectXPbrBindGroupLayout()'s doc comment). directxDefaultBindGroup[f]
+        // was already built above; per-material combined bind groups are built in
+        // their own loop below once their textures are known.
 #else
         if (!frameBindGroup[f] && bindGroupLayout &&
             frameResources[f].lightsUniformBuffer &&
@@ -2302,8 +2617,12 @@ void Renderer::setScene(uint32_t index) {
     // ------------------------------------------------------------------
     materialBindGroups.clear();
     flatMaterialBindGroups.clear();
+    directxMaterialResources.clear();
+    directxMaterialBindGroups.clear();
     if (asset->materials && bindGroupLayout) {
         materialBindGroups.resize(asset->materials->size());
+        directxMaterialResources.resize(asset->materials->size());
+        directxMaterialBindGroups.resize(asset->materials->size());
         flatMaterialBindGroups.resize(asset->materials->size());
         for (size_t m = 0; m < asset->materials->size(); ++m) {
             auto &mat = (*asset->materials)[m];
@@ -2501,6 +2820,36 @@ void Renderer::setScene(uint32_t index) {
             };
             materialBindGroups[m] = device->createBindGroup(bgDesc, /*persistent=*/true);
             // No separate flat shader on Vulkan — reuse the same bind group.
+            flatMaterialBindGroups[m] = materialBindGroups[m];
+#elif defined(_WIN32)
+            ensureDirectXPbrBindGroupLayout();
+            DirectXMaterialResources& res = directxMaterialResources[m];
+            res = DirectXMaterialResources{};
+            res.baseColorTex          = baseColorTex;          res.baseColorSamp     = baseColorSamp;
+            res.mrTex                 = mrTex;                 res.mrSamp            = mrSamp;
+            res.normalTex             = normalTex;              res.normalSamp        = normalSamp;
+            res.emissiveTex           = emissiveTex;            res.emissiveSamp      = emissiveSamp;
+            res.occlusionTex          = occlusionTex;           res.occlusionSamp     = occlusionSamp;
+            res.specularTex           = specularTex;            res.specularSamp      = specularSamp;
+            res.specularColorTex      = specularColorTex;       res.specularColorSamp = specularColorSamp;
+            res.sheenColorTex         = sheenColorTex;
+            res.sheenRoughnessTex     = sheenRoughnessTex;
+            res.clearcoatTex          = clearcoatTex;
+            res.clearcoatRoughnessTex = clearcoatRoughnessTex;
+            res.clearcoatNormalTex    = clearcoatNormalTex;
+            res.transmissionTex       = transmissionTex;
+            res.thicknessTex          = thicknessTex;
+            res.iridescenceTex        = iridescenceTex;
+            res.iridescenceThicknessTex = iridescenceThicknessTex;
+            res.anisotropicTex        = anisotropicTex;
+            res.materialBufferOffset  = (uint64_t)(m + 1) * kMaterialUniformStride;
+            // Real scene-color/opaque-scene texture is filled in by
+            // rebuildDirectXCombinedBindGroups() every render() call.
+            for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
+                directxMaterialBindGroups[m][f] = buildDirectXCombinedBindGroup(res, f, defaultTexture);
+            }
+            // No separate flat shader on DirectX — reuse the same bind groups.
+            materialBindGroups[m] = directxMaterialBindGroups[m][0];
             flatMaterialBindGroups[m] = materialBindGroups[m];
 #else
             GPU::BindGroupDescriptor bgDesc{};
@@ -4119,8 +4468,9 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 #elif defined(_WIN32)
     using namespace systems::leal::campello_renderer::shaders;
 
-    // DXIL binaries not yet compiled — pipelines remain null.
-    // See shaders/directx/default.hlsl and src/shaders/directx_default.h.
+    // DXIL binaries not yet compiled — pipelines remain null. See
+    // shaders/directx/default.hlsl, build_directx_shaders.ps1, and
+    // src/shaders/directx_default.h.
     if (kDefaultDirectXVertShaderSize == 0 || kDefaultDirectXPixelShaderSize == 0)
         return;
 
@@ -4128,7 +4478,20 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     auto pixelModule = device->createShaderModule(kDefaultDirectXPixelShader, kDefaultDirectXPixelShaderSize);
     if (!vertModule || !pixelModule) return;
 
+    // set 0 = combined per-material + per-frame PBR resources — see
+    // ensureDirectXPbrBindGroupLayout()'s doc comment for why DirectX uses one
+    // combined bind group instead of Vulkan/Metal's material+frame split. An
+    // explicit PipelineLayout is required here for the same reason Vulkan's
+    // branch documents on its own vulkanDefaultPipelineLayout: an empty
+    // fallback root signature fails resource binding rather than erroring at
+    // creation time.
+    ensureDirectXPbrBindGroupLayout();
+    GPU::PipelineLayoutDescriptor plDesc{};
+    plDesc.bindGroupLayouts = { directxPbrBindGroupLayout };
+    directxPbrPipelineLayout = device->createPipelineLayout(plDesc);
+
     GPU::RenderPipelineDescriptor desc{};
+    desc.layout = directxPbrPipelineLayout;
 
     // --- Vertex stage ---
     // campello_gpu DirectX backend maps attrs to SemanticName="TEXCOORD",
@@ -4167,58 +4530,65 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         GPU::ComponentType::ctFloat, GPU::AccessorType::acVec4,
         16.0, GPU::StepMode::vertex, VERTEX_SLOT_TANGENT));
 
-    // Slots 4–15: empty placeholder layouts to align slot index with buffer index.
-    for (int i = 4; i < (int)VERTEX_SLOT_MVP; i++) {
+    // Slots 4–5 (JOINTS_0/WEIGHTS_0 — skinning): unused placeholders, matching
+    // Vulkan's pipeline (skinning isn't wired on either backend yet).
+    for (int i = 4; i <= (int)VERTEX_SLOT_WEIGHTS; i++) {
+        GPU::VertexLayout empty{};
+        empty.arrayStride = 0;
+        empty.stepMode    = GPU::StepMode::vertex;
+        desc.vertex.buffers.push_back(empty);
+    }
+    // Slot 6 — COLOR_0  float4  TEXCOORD6
+    desc.vertex.buffers.push_back(makeLayout(
+        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec4,
+        16.0, GPU::StepMode::vertex, VERTEX_SLOT_COLOR0));
+    // Slot 7 — TEXCOORD_1 float2  TEXCOORD7
+    desc.vertex.buffers.push_back(makeLayout(
+        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec2,
+        8.0, GPU::StepMode::vertex, VERTEX_SLOT_TEXCOORD1));
+    // Slots 8–15: remaining unused placeholders.
+    for (int i = 8; i < (int)VERTEX_SLOT_MVP; i++) {
         GPU::VertexLayout empty{};
         empty.arrayStride = 0;
         empty.stepMode    = GPU::StepMode::vertex;
         desc.vertex.buffers.push_back(empty);
     }
 
-    // Slot 16 — MVP mat4 split into 4 float4 rows, per-instance (TEXCOORD16–19).
+    // Slot 16 — per-node NodeTransforms{mvp, model}, per-instance, 128 bytes
+    // (MVP columns at locations 16-19, MODEL columns at locations 24-27) — the
+    // same buffer/layout every backend shares; see default.vert's comment.
     {
         GPU::VertexLayout mvpLayout{};
-        mvpLayout.arrayStride = 64; // sizeof(float4x4)
+        mvpLayout.arrayStride = 128; // sizeof(NodeTransforms) = 2 * sizeof(float4x4)
         mvpLayout.stepMode    = GPU::StepMode::instance;
-        for (uint32_t row = 0; row < 4; row++) {
+        for (uint32_t col = 0; col < 4; col++) {
             GPU::VertexAttribute attr{};
             attr.componentType  = GPU::ComponentType::ctFloat;
             attr.accessorType   = GPU::AccessorType::acVec4;
-            attr.offset         = row * 16; // 4 floats * 4 bytes per row
-            attr.shaderLocation = VERTEX_SLOT_MVP + row; // TEXCOORD16–19
+            attr.offset         = col * 16;
+            attr.shaderLocation = VERTEX_SLOT_MVP + col; // TEXCOORD16-19
+            mvpLayout.attributes.push_back(attr);
+        }
+        for (uint32_t col = 0; col < 4; col++) {
+            GPU::VertexAttribute attr{};
+            attr.componentType  = GPU::ComponentType::ctFloat;
+            attr.accessorType   = GPU::AccessorType::acVec4;
+            attr.offset         = 64 + col * 16;
+            attr.shaderLocation = 24 + col; // TEXCOORD24-27
             mvpLayout.attributes.push_back(attr);
         }
         desc.vertex.buffers.push_back(mvpLayout);
     }
 
-    // Slot 17 — MaterialUniforms per-instance (stride = 256 bytes, TEXCOORD20–22).
+    // Slot 17 — unused: MaterialUniforms is now a real cbuffer (register b24 in
+    // the combined bind group) instead of a vertex-attribute-smuggled struct.
+    // Empty placeholder to keep the vector index aligned with the buffer slot
+    // number, matching slots 4-15 above.
     {
-        GPU::VertexLayout matLayout{};
-        matLayout.arrayStride = kMaterialUniformStride;
-        matLayout.stepMode    = GPU::StepMode::instance;
-
-        GPU::VertexAttribute bcAttr{};
-        bcAttr.componentType  = GPU::ComponentType::ctFloat;
-        bcAttr.accessorType   = GPU::AccessorType::acVec4;
-        bcAttr.offset         = 0;
-        bcAttr.shaderLocation = 20; // TEXCOORD20 — baseColorFactor
-        matLayout.attributes.push_back(bcAttr);
-
-        GPU::VertexAttribute r0Attr{};
-        r0Attr.componentType  = GPU::ComponentType::ctFloat;
-        r0Attr.accessorType   = GPU::AccessorType::acVec4;
-        r0Attr.offset         = 16;
-        r0Attr.shaderLocation = 21; // TEXCOORD21 — uvTransformRow0
-        matLayout.attributes.push_back(r0Attr);
-
-        GPU::VertexAttribute r1Attr{};
-        r1Attr.componentType  = GPU::ComponentType::ctFloat;
-        r1Attr.accessorType   = GPU::AccessorType::acVec4;
-        r1Attr.offset         = 32;
-        r1Attr.shaderLocation = 22; // TEXCOORD22 — uvTransformRow1
-        matLayout.attributes.push_back(r1Attr);
-
-        desc.vertex.buffers.push_back(matLayout);
+        GPU::VertexLayout empty{};
+        empty.arrayStride = 0;
+        empty.stepMode    = GPU::StepMode::vertex;
+        desc.vertex.buffers.push_back(empty);
     }
 
     // --- Fragment stage ---
@@ -4248,24 +4618,28 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     desc.cullMode  = GPU::CullMode::back;
     desc.frontFace = GPU::FrontFace::ccw;
 
-    // DirectX: assign same pipeline to both variants (flat TODO).
+    // DirectX: assign same pipeline to both variants until a separate flat
+    // HLSL fragment entry point is compiled (flat variant TODO — matches
+    // Vulkan's current partial-implementation state).
     pipelineTextured = device->createRenderPipeline(desc);
     pipelineFlat     = pipelineTextured;
     pipelineDebug    = pipelineFlat;  // TODO: compile debug DXIL variant
-    
-    // Double-sided variants (TODO: proper pipeline creation when DXIL shaders are ready)
-    pipelineFlatDoubleSided     = pipelineFlat;
-    pipelineTexturedDoubleSided = pipelineTextured;
-    
-    // Alpha-blend variants (TODO: proper blend state when DXIL shaders are ready)
+
+    // Double-sided variant: a real, separate pipeline (not aliased to the
+    // single-sided one above) with cullMode=none — see Vulkan's identical
+    // fix/comment for why aliasing here silently culled doubleSided geometry.
+    desc.cullMode = GPU::CullMode::none;
+    pipelineTexturedDoubleSided = device->createRenderPipeline(desc);
+    pipelineFlatDoubleSided     = pipelineTexturedDoubleSided;
+
+    // Alpha-blend variants (TODO: proper blend state when DirectX backend
+    // supports it — matches Vulkan's current partial-implementation state).
     pipelineFlatBlend             = pipelineFlat;
     pipelineTexturedBlend         = pipelineTextured;
-    pipelineFlatBlendDoubleSided  = pipelineFlat;
-    pipelineTexturedBlendDoubleSided = pipelineTextured;
+    pipelineFlatBlendDoubleSided  = pipelineFlatDoubleSided;
+    pipelineTexturedBlendDoubleSided = pipelineTexturedDoubleSided;
 
     // --- FXAA post-process pipeline (DirectX) ---
-    // NOTE: DXIL binaries are currently empty placeholders; FXAA will only work
-    // after shaders are compiled on Windows. See shaders/directx/default.hlsl.
     {
         if (!fxaaBindGroupLayout) {
             GPU::BindGroupLayoutDescriptor fglDesc{};
@@ -4278,15 +4652,26 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             fTex.data.texture.viewDimension = GPU::TextureType::tt2d;
             fglDesc.entries.push_back(fTex);
 
+            // Binding 0 for both the sampler and the buffer below (as well as
+            // the texture above) — D3D12 gives textures/samplers/buffers
+            // independent register namespaces (t0/s0/b0), unlike Vulkan,
+            // which is why this differs from this file's Vulkan/Metal
+            // branches' 0/1/2 numbering for the same conceptual layout — see
+            // shaders/directx/default.hlsl's fxaaPixel, which declares
+            // exactly these registers. Mismatched numbers here previously
+            // produced a real "Root Signature doesn't match Pixel Shader"
+            // D3D12 debug-layer error at PSO creation (harmless-looking, but
+            // implicated in a DXGI_ERROR_DEVICE_HUNG reproduced when tracing
+            // this down with cdb.exe).
             GPU::EntryObject fSamp{};
-            fSamp.binding = 1;
+            fSamp.binding = 0;
             fSamp.visibility = GPU::ShaderStage::fragment;
             fSamp.type = GPU::EntryObjectType::sampler;
             fSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
             fglDesc.entries.push_back(fSamp);
 
             GPU::EntryObject fBuf{};
-            fBuf.binding = 2;
+            fBuf.binding = 0;
             fBuf.visibility = GPU::ShaderStage::fragment;
             fBuf.type = GPU::EntryObjectType::buffer;
             fBuf.data.buffer.hasDinamicOffaset = false;
@@ -4318,14 +4703,17 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
                 fxaaFrag.targets.push_back(fxaaCs);
                 fxaaDesc.fragment = fxaaFrag;
 
+                GPU::PipelineLayoutDescriptor fxaaPlDesc{};
+                fxaaPlDesc.bindGroupLayouts = { fxaaBindGroupLayout };
+                directxFxaaPipelineLayout = device->createPipelineLayout(fxaaPlDesc);
+                fxaaDesc.layout = directxFxaaPipelineLayout;
+
                 pipelineFxaa = device->createRenderPipeline(fxaaDesc);
             }
         }
     }
 
     // --- Downsample pipeline (DirectX) ---
-    // NOTE: DXIL binaries are currently empty placeholders; downsample will only work
-    // after shaders are compiled on Windows. See shaders/directx/default.hlsl.
     {
         if (!downsampleBindGroupLayout) {
             GPU::BindGroupLayoutDescriptor dglDesc{};
@@ -4338,8 +4726,10 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             dTex.data.texture.viewDimension = GPU::TextureType::tt2d;
             dglDesc.entries.push_back(dTex);
 
+            // Binding 0, not 1 — see the identical fix/comment on fSamp above
+            // in this file's DirectX FXAA pipeline block.
             GPU::EntryObject dSamp{};
-            dSamp.binding = 1;
+            dSamp.binding = 0;
             dSamp.visibility = GPU::ShaderStage::fragment;
             dSamp.type = GPU::EntryObjectType::sampler;
             dSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
@@ -4369,7 +4759,159 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
                 dsFrag.targets.push_back(dsCs);
                 dsDesc.fragment = dsFrag;
 
+                GPU::PipelineLayoutDescriptor dsPlDesc{};
+                dsPlDesc.bindGroupLayouts = { downsampleBindGroupLayout };
+                directxDownsamplePipelineLayout = device->createPipelineLayout(dsPlDesc);
+                dsDesc.layout = directxDownsamplePipelineLayout;
+
                 pipelineDownsample = device->createRenderPipeline(dsDesc);
+            }
+        }
+    }
+
+    // --- IBL precompute pipeline (DirectX) — see bakeIblResources() and
+    // shaders/directx/default.hlsl's iblBakePixel. Reuses fxaaVertex for the
+    // vertex stage, matching Vulkan's reuse of its own fullscreen-triangle
+    // vertex shader. Binding scheme (0=buffer, 0=texture, 1=sampler) matches
+    // Metal's, not Vulkan's — see bakeIblResources()'s own comment for why
+    // that's valid on D3D12 (independent t#/s#/b# register namespaces).
+    {
+        if (!iblBakeBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor iglDesc{};
+            GPU::EntryObject iBuf{};
+            iBuf.binding = 0;
+            iBuf.visibility = GPU::ShaderStage::fragment;
+            iBuf.type = GPU::EntryObjectType::buffer;
+            iBuf.data.buffer.hasDinamicOffaset = false;
+            iBuf.data.buffer.minBindingSize = 16;
+            iBuf.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+            iglDesc.entries.push_back(iBuf);
+
+            GPU::EntryObject iTex{};
+            iTex.binding = 0;
+            iTex.visibility = GPU::ShaderStage::fragment;
+            iTex.type = GPU::EntryObjectType::texture;
+            iTex.data.texture.multisampled = false;
+            iTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            iTex.data.texture.viewDimension = GPU::TextureType::ttCube;
+            iglDesc.entries.push_back(iTex);
+
+            GPU::EntryObject iSamp{};
+            iSamp.binding = 1;
+            iSamp.visibility = GPU::ShaderStage::fragment;
+            iSamp.type = GPU::EntryObjectType::sampler;
+            iSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            iglDesc.entries.push_back(iSamp);
+
+            iblBakeBindGroupLayout = device->createBindGroupLayout(iglDesc);
+        }
+
+        if (kDefaultDirectXFxaaVertShaderSize > 0 && kDefaultDirectXIblBakePixelShaderSize > 0) {
+            auto iblVertModule = device->createShaderModule(kDefaultDirectXFxaaVertShader, kDefaultDirectXFxaaVertShaderSize);
+            auto iblPixelModule = device->createShaderModule(kDefaultDirectXIblBakePixelShader, kDefaultDirectXIblBakePixelShaderSize);
+            if (iblVertModule && iblPixelModule) {
+                GPU::RenderPipelineDescriptor iblDesc{};
+                iblDesc.vertex.module = iblVertModule;
+                iblDesc.vertex.entryPoint = "fxaaVertex";
+
+                iblDesc.topology = GPU::PrimitiveTopology::triangleList;
+                iblDesc.cullMode = GPU::CullMode::none;
+                iblDesc.frontFace = GPU::FrontFace::ccw;
+
+                GPU::FragmentDescriptor iblFrag{};
+                iblFrag.module = iblPixelModule;
+                iblFrag.entryPoint = "iblBakePixel";
+                GPU::ColorState iblCs{};
+                iblCs.format = GPU::PixelFormat::rgba16float;
+                iblCs.writeMask = GPU::ColorWrite::all;
+                iblFrag.targets.push_back(iblCs);
+                iblDesc.fragment = iblFrag;
+
+                GPU::PipelineLayoutDescriptor iblPlDesc{};
+                iblPlDesc.bindGroupLayouts = { iblBakeBindGroupLayout };
+                directxIblBakePipelineLayout = device->createPipelineLayout(iblPlDesc);
+                iblDesc.layout = directxIblBakePipelineLayout;
+
+                pipelineIblBake = device->createRenderPipeline(iblDesc);
+            }
+        }
+    }
+
+    // --- Skybox pipeline (DirectX) — fullscreen triangle that samples an
+    // environment cubemap; drawSkybox() (shared by both render() paths)
+    // already gates entirely on pipelineSkybox/skyboxBindGroupLayout/
+    // skyboxUniformBuffer being non-null. See shaders/directx/default.hlsl's
+    // skyboxPixel header comment for the NDC-reconstruction convention.
+    {
+        if (!skyboxBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor sbglDesc{};
+            GPU::EntryObject sbTex{};
+            sbTex.binding = 0;
+            sbTex.visibility = GPU::ShaderStage::fragment;
+            sbTex.type = GPU::EntryObjectType::texture;
+            sbTex.data.texture.multisampled = false;
+            sbTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            sbTex.data.texture.viewDimension = GPU::TextureType::ttCube;
+            sbglDesc.entries.push_back(sbTex);
+
+            GPU::EntryObject sbSamp{};
+            sbSamp.binding = 1;
+            sbSamp.visibility = GPU::ShaderStage::fragment;
+            sbSamp.type = GPU::EntryObjectType::sampler;
+            sbSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            sbglDesc.entries.push_back(sbSamp);
+
+            GPU::EntryObject sbBuf{};
+            sbBuf.binding = 2;
+            sbBuf.visibility = GPU::ShaderStage::fragment;
+            sbBuf.type = GPU::EntryObjectType::buffer;
+            sbBuf.data.buffer.hasDinamicOffaset = false;
+            sbBuf.data.buffer.minBindingSize = 96;
+            sbBuf.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+            sbglDesc.entries.push_back(sbBuf);
+
+            skyboxBindGroupLayout = device->createBindGroupLayout(sbglDesc);
+        }
+
+        if (kDefaultDirectXFxaaVertShaderSize > 0 && kDefaultDirectXSkyboxPixelShaderSize > 0) {
+            auto skyboxVertModule = device->createShaderModule(kDefaultDirectXFxaaVertShader, kDefaultDirectXFxaaVertShaderSize);
+            auto skyboxPixelModule = device->createShaderModule(kDefaultDirectXSkyboxPixelShader, kDefaultDirectXSkyboxPixelShaderSize);
+            if (skyboxVertModule && skyboxPixelModule) {
+                GPU::RenderPipelineDescriptor skyDesc{};
+                skyDesc.vertex.module = skyboxVertModule;
+                skyDesc.vertex.entryPoint = "fxaaVertex";
+                // No vertex buffers — fullscreen triangle from SV_VertexID.
+
+                GPU::DepthStencilDescriptor skyDs{};
+                skyDs.format = GPU::PixelFormat::depth32float;
+                skyDs.depthWriteEnabled = false; // Don't write depth
+                skyDs.depthCompare = GPU::CompareOp::lessEqual;
+                skyDs.depthBias = 0.0;
+                skyDs.depthBiasClamp = 0.0;
+                skyDs.depthBiasSlopeScale = 0.0;
+                skyDs.stencilReadMask = 0xFFFFFFFF;
+                skyDs.stencilWriteMask = 0xFFFFFFFF;
+                skyDesc.depthStencil = skyDs;
+
+                skyDesc.topology = GPU::PrimitiveTopology::triangleList;
+                skyDesc.cullMode = GPU::CullMode::none;
+                skyDesc.frontFace = GPU::FrontFace::ccw;
+
+                GPU::FragmentDescriptor skyFrag{};
+                skyFrag.module = skyboxPixelModule;
+                skyFrag.entryPoint = "skyboxPixel";
+                GPU::ColorState skyCs{};
+                skyCs.format = colorFormat;
+                skyCs.writeMask = GPU::ColorWrite::all;
+                skyFrag.targets.push_back(skyCs);
+                skyDesc.fragment = skyFrag;
+
+                GPU::PipelineLayoutDescriptor skyPlDesc{};
+                skyPlDesc.bindGroupLayouts = { skyboxBindGroupLayout };
+                directxSkyboxPipelineLayout = device->createPipelineLayout(skyPlDesc);
+                skyDesc.layout = directxSkyboxPipelineLayout;
+
+                pipelineSkybox = device->createRenderPipeline(skyDesc);
             }
         }
     }
@@ -5005,7 +5547,9 @@ void Renderer::renderToTarget(
             ? static_cast<double>(renderWidth) / renderHeight
             : 1.0;
 
-        view = M4::lookAt(
+        // See buildDefaultCameraView()'s doc comment for why this doesn't use
+        // vector_math::Matrix4::lookAt() directly.
+        view = buildDefaultCameraView(
             VM::Vector3<double>(0.0, 0.0, 5.0),
             VM::Vector3<double>(0.0, 0.0, 0.0),
             VM::Vector3<double>(0.0, 1.0, 0.0));
@@ -5440,6 +5984,11 @@ void Renderer::renderToTarget(
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
+#elif defined(_WIN32)
+    {
+        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
+        rebuildDirectXCombinedBindGroups(currentFrameIndex, scTex);
+    }
 #else
     if (bindGroupLayout && frameBindGroup[currentFrameIndex]) {
         std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
@@ -5710,6 +6259,10 @@ void Renderer::renderToTarget(
                 {8, fxaaSampler},
             };
             frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
+        }
+#elif defined(_WIN32)
+        if (opaqueSceneTexture[currentFrameIndex]) {
+            rebuildDirectXCombinedBindGroups(currentFrameIndex, opaqueSceneTexture[currentFrameIndex]);
         }
 #else
         if (bindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture[currentFrameIndex]) {
@@ -6238,6 +6791,20 @@ void Renderer::renderPrimitive(
     bool needsTextures = (wantedVariant == 2 || wantedVariant == 5 ||
                           wantedVariant == 7 || wantedVariant == 9) ||
                           sharesFlatAndTexturedPipeline;
+#if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
+    // DirectX: a single combined bind group already carries lights/camera/
+    // environment alongside the material — no separate setBindGroup(1, ...)
+    // call (and no textured-vs-flat split, matching pipelineFlat aliasing
+    // pipelineTextured above) — see ensureDirectXPbrBindGroupLayout()'s doc
+    // comment.
+    (void)needsTextures;
+    std::shared_ptr<systems::leal::campello_gpu::BindGroup> bg = directxDefaultBindGroup[currentFrameIndex];
+    if (matIdx >= 0 && (size_t)matIdx < directxMaterialBindGroups.size() &&
+        directxMaterialBindGroups[matIdx][currentFrameIndex]) {
+        bg = directxMaterialBindGroups[matIdx][currentFrameIndex];
+    }
+    if (bg) rpe->setBindGroup(0, bg);
+#else
     if (needsTextures) {
         std::shared_ptr<systems::leal::campello_gpu::BindGroup> bg = defaultBindGroup;
         if (matIdx >= 0 && (size_t)matIdx < materialBindGroups.size() && materialBindGroups[matIdx]) {
@@ -6257,7 +6824,8 @@ void Renderer::renderPrimitive(
         }
         if (bg) rpe->setBindGroup(0, bg);
     }
-    
+#endif
+
     // --- 5. Bind transform matrices for this node ---
     // Buffer contains: MVP (64 bytes) + Model (64 bytes) = 128 bytes per node.
     if (transformBuffer) {
@@ -7743,6 +8311,31 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     auto bindGroup = device->createBindGroup(bgDesc, /*persistent=*/true);
     // No separate flat shader on Vulkan — reuse the same bind group.
     auto flatBindGroup = bindGroup;
+#elif defined(_WIN32)
+    ensureDirectXPbrBindGroupLayout();
+    DirectXMaterialResources dxRes{};
+    dxRes.baseColorTex          = baseColorTex;          dxRes.baseColorSamp     = baseColorSamp;
+    dxRes.mrTex                 = mrTex;                 dxRes.mrSamp            = mrSamp;
+    dxRes.normalTex             = normalTex;              dxRes.normalSamp        = normalSamp;
+    dxRes.emissiveTex           = emissiveTex;            dxRes.emissiveSamp      = emissiveSamp;
+    dxRes.occlusionTex          = occlusionTex;           dxRes.occlusionSamp     = occlusionSamp;
+    dxRes.specularTex           = specularTex;            dxRes.specularSamp      = specularSamp;
+    dxRes.specularColorTex      = specularColorTex;       dxRes.specularColorSamp = specularColorSamp;
+    dxRes.sheenColorTex         = sheenColorTex;
+    dxRes.sheenRoughnessTex     = sheenRoughnessTex;
+    dxRes.clearcoatTex          = clearcoatTex;
+    dxRes.clearcoatRoughnessTex = clearcoatRoughnessTex;
+    dxRes.clearcoatNormalTex    = clearcoatNormalTex;
+    dxRes.transmissionTex       = transmissionTex;
+    dxRes.thicknessTex          = thicknessTex;
+    dxRes.iridescenceTex        = iridescenceTex;
+    dxRes.iridescenceThicknessTex = iridescenceThicknessTex;
+    dxRes.anisotropicTex        = anisotropicTex;
+    dxRes.materialBufferOffset  = (uint64_t)uniformSlot * kMaterialUniformStride;
+    // mat->bindGroup/flatBindGroup are unused on DirectX (drawDrawCall() reads
+    // mat->directxBindGroup[frameIndex] instead — see the assignment below).
+    std::shared_ptr<GPU::BindGroup> bindGroup;
+    std::shared_ptr<GPU::BindGroup> flatBindGroup;
 #else
     GPU::BindGroupDescriptor bgDesc{};
     bgDesc.layout  = bindGroupLayout;
@@ -7801,6 +8394,15 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     mat->alphaBlend    = (material.alphaMode == systems::leal::gltf::AlphaMode::blend);
     mat->alphaMask     = (material.alphaMode == systems::leal::gltf::AlphaMode::mask);
     mat->transmission  = (material.khrMaterialsTransmission && material.khrMaterialsTransmission->transmissionFactor > 0.0f);
+
+#if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
+    // Real scene-color/opaque-scene texture is filled in by
+    // rebuildDirectXCombinedBindGroups() every render(RenderScene, ...) call.
+    for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
+        mat->directxBindGroup[f] = buildDirectXCombinedBindGroup(dxRes, f, defaultTexture);
+    }
+    directxEcsMaterialResources[mat.get()] = dxRes;
+#endif
 
     GpuMaterial* result = mat.get();
     if (materialIndex >= 0) {
@@ -7905,6 +8507,11 @@ void Renderer::render(const RenderScene& scene,
             {8, fxaaSampler},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
+    }
+#elif defined(_WIN32)
+    {
+        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
+        rebuildDirectXCombinedBindGroups(currentFrameIndex, scTex);
     }
 #else
     if (bindGroupLayout && frameBindGroup[currentFrameIndex]) {
@@ -8577,6 +9184,15 @@ void Renderer::renderPrimitive(
     // --- 2. Bind bind groups ---
     bool needsTextures = (wantedVariant == 2 || wantedVariant == 5 ||
                           wantedVariant == 7 || wantedVariant == 9);
+#if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
+    // DirectX: single combined bind group — see renderPrimitive()'s identical
+    // branch / ensureDirectXPbrBindGroupLayout()'s doc comment.
+    (void)needsTextures;
+    auto bg = draw.material->directxBindGroup[currentFrameIndex]
+        ? draw.material->directxBindGroup[currentFrameIndex]
+        : directxDefaultBindGroup[currentFrameIndex];
+    if (bg) rpe->setBindGroup(0, bg);
+#else
     if (needsTextures) {
         auto bg = draw.material->bindGroup ? draw.material->bindGroup : defaultBindGroup;
         if (bg) rpe->setBindGroup(0, bg);
@@ -8587,6 +9203,7 @@ void Renderer::renderPrimitive(
         auto bg = draw.material->flatBindGroup ? draw.material->flatBindGroup : defaultFlatBindGroup;
         if (bg) rpe->setBindGroup(0, bg);
     }
+#endif
 
     // --- 3. Bind transform ---
     if (transformBuffer) {

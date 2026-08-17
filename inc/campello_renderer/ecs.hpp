@@ -80,6 +80,38 @@ struct SpotLight {
 };
 
 // ------------------------------------------------------------------
+// Helper: default camera view when no ECS Camera exists.
+//
+// Does not use vector_math::Matrix4::lookAt() directly — that function's
+// right/up axes are built as cross(up, forward)/cross(forward, right), which
+// is mirrored relative to what Matrix4::perspective()'s +Z-forward
+// convention expects, and produces a backwards (mirrored, wrong-winding)
+// camera. See campello_renderer.cpp's buildDefaultCameraView() (same fix,
+// duplicated here since this is a separate, header-only translation unit)
+// for the full explanation and the empirical verification behind it.
+// ------------------------------------------------------------------
+inline systems::leal::vector_math::Matrix4<double> buildDefaultCameraView(
+    const systems::leal::vector_math::Vector3<double> &eye,
+    const systems::leal::vector_math::Vector3<double> &target,
+    const systems::leal::vector_math::Vector3<double> &up) {
+    namespace VM = systems::leal::vector_math;
+    auto zAxis = target - eye;
+    zAxis.normalize();
+    auto xAxis = VM::Vector3<double>::cross(zAxis, up);
+    xAxis.normalize();
+    auto yAxis = VM::Vector3<double>::cross(xAxis, zAxis);
+
+    auto result = VM::Matrix4<double>::identity();
+    result.data[0] = xAxis.data[0]; result.data[1] = xAxis.data[1]; result.data[2] = xAxis.data[2];
+    result.data[4] = yAxis.data[0]; result.data[5] = yAxis.data[1]; result.data[6] = yAxis.data[2];
+    result.data[8] = zAxis.data[0]; result.data[9] = zAxis.data[1]; result.data[10] = zAxis.data[2];
+    result.data[3]  = -VM::Vector3<double>::dot(xAxis, eye);
+    result.data[7]  = -VM::Vector3<double>::dot(yAxis, eye);
+    result.data[11] = -VM::Vector3<double>::dot(zAxis, eye);
+    return result;
+}
+
+// ------------------------------------------------------------------
 // Helper: build CameraData from ECS Transform + Camera
 // ------------------------------------------------------------------
 inline CameraData buildCameraData(const Transform& transform, const Camera& camera,
@@ -366,8 +398,9 @@ inline void render_system(
         break; // pick first camera
     }
     if (!cameraFound) {
-        // Default camera if none exists.
-        scene.camera.view = systems::leal::vector_math::Matrix4<double>::lookAt(
+        // Default camera if none exists. See buildDefaultCameraView()'s doc
+        // comment for why this doesn't use Matrix4::lookAt() directly.
+        scene.camera.view = buildDefaultCameraView(
             {0.0, 0.0, 5.0}, {0.0, 0.0, 0.0}, {0.0, 1.0, 0.0});
         scene.camera.projection = systems::leal::vector_math::Matrix4<double>::perspective(
             60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 1000.0);

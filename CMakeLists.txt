@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project(campello_renderer VERSION 0.9.0)
+project(campello_renderer VERSION 0.10.0)
 
 configure_file(src/campello_renderer_config.h.in campello_renderer_config.h)
 
@@ -36,6 +36,14 @@ add_library(${PROJECT_NAME} SHARED
 
 # Enable Unity Build for faster compilation
 set_target_properties(${PROJECT_NAME} PROPERTIES UNITY_BUILD ON)
+
+# Windows: none of this library's symbols carry __declspec(dllexport), so
+# without this MSVC's linker builds the .dll but never emits the companion
+# import .lib, which fails every consumer (test target, example apps) at
+# link time with LNK1104 — see CHANGELOG.md's "Windows CI build-only" entry.
+if(WIN32)
+    set_target_properties(${PROJECT_NAME} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
 
 # ---------------------------------------------------------------------------
 # Metal shader compilation (Apple platforms only)
@@ -110,6 +118,13 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
     option(CAMPELLO_RENDERER_BUILD_LINUX_EXAMPLE "Build Linux example" OFF)
     if(CAMPELLO_RENDERER_BUILD_LINUX_EXAMPLE)
         add_subdirectory(examples/linux)
+    endif()
+endif()
+
+if(WIN32)
+    option(CAMPELLO_RENDERER_BUILD_WINDOWS_EXAMPLE "Build Windows example" OFF)
+    if(CAMPELLO_RENDERER_BUILD_WINDOWS_EXAMPLE)
+        add_subdirectory(examples/windows)
     endif()
 endif()
 
