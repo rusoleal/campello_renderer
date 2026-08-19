@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.1] - 2026-08-19
+
+### Changed
+- Upgraded `vector_math` dependency from v0.3.5 (transitively pinned by `gltf` v0.5.0) to v0.6.0 — added an explicit `dependencies/vector_math.cmake`, declared and included before `gltf.cmake`, so this project's own `FetchContent_Declare` wins over `gltf`'s older transitive pin (both guard on `if(TARGET vector_math)`).
+- Removed the local `buildDefaultCameraView()` workaround from both `campello_renderer.cpp` and `ecs.hpp` (added in 0.10.0), and reverted `OffscreenRenderTest.ECSPathRendersToOffscreen` to call `vector_math::Matrix4::lookAt()` directly — the underlying mirrored-camera bug is now fixed upstream in `vector_math` v0.6.0, so the local compensation is no longer needed.
+
 ## [0.10.0] - 2026-08-17
 
 ### Added

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project(campello_renderer VERSION 0.10.0)
+project(campello_renderer VERSION 0.10.1)
 
 configure_file(src/campello_renderer_config.h.in campello_renderer_config.h)
 
@@ -9,6 +9,12 @@ set(CMAKE_CXX_STANDARD 20)
 include_directories(inc)
 
 message(STATUS ${PROJECT_NAME})
+
+include(${PROJECT_SOURCE_DIR}/dependencies/vector_math.cmake)
+set(DEPENDENCIES
+    ${DEPENDENCIES}
+    vector_math
+)
 
 include(${PROJECT_SOURCE_DIR}/dependencies/campello_gpu.cmake)
 set(DEPENDENCIES

@@ -690,54 +690,6 @@ static bool uploadTextureDataWithMips(
     return true;
 }
 
-// vector_math::Matrix4::lookAt() builds its right/up axes as
-// cross(up, forward)/cross(forward, right), which — combined with
-// Matrix4::perspective()'s +Z-forward view-space convention (verified: for a
-// point at distance s in front of the camera, perspective() needs
-// view-space.z == +s, not -s, for the perspective divide/depth mapping to be
-// non-degenerate) — produces a view matrix whose right axis points the WRONG
-// way (confirmed empirically: an object translated to world +X rendered on
-// the LEFT half of a 64x64 offscreen target, and single-sided glTF-authored
-// (CCW-front) geometry near the origin was incorrectly backface-culled under
-// cullMode=back/frontFace=ccw — see OffscreenRenderTest.ECSPathRendersToOffscreen
-// in test/main.cpp). This is the same root cause as the long-standing,
-// disabled Vulkan tests DISABLED_MeshRendersNonClearPixels and friends, which
-// go through this exact same default-camera fallback.
-//
-// A prior attempt to fix this by flipping frontFace globally (cw instead of
-// ccw) was tried and reverted — it broke real, multi-primitive assets like
-// DamagedHelmet.glb, which use an embedded glTF camera (Matrix4::inverted() on
-// the camera node's world transform, not lookAt()) and were already correct.
-// This local, corrected lookAt only replaces the *default/fallback* camera
-// path (used when no glTF camera exists), so it can't affect anything that
-// goes through a real camera node.
-//
-// The actual bug lives in the shared, separately-versioned vector_math
-// dependency (Matrix4::lookAt()) and should ideally be fixed upstream — any
-// caller of vector_math::Matrix4::lookAt() paired with Matrix4::perspective()
-// hits the same mirroring. This is a local, campello_renderer-only
-// workaround for the one place this library builds its own default camera.
-systems::leal::vector_math::Matrix4<double> buildDefaultCameraView(
-    const systems::leal::vector_math::Vector3<double> &eye,
-    const systems::leal::vector_math::Vector3<double> &target,
-    const systems::leal::vector_math::Vector3<double> &up) {
-    namespace VM = systems::leal::vector_math;
-    auto zAxis = target - eye;
-    zAxis.normalize();
-    auto xAxis = VM::Vector3<double>::cross(zAxis, up); // swapped vs. Matrix4::lookAt()
-    xAxis.normalize();
-    auto yAxis = VM::Vector3<double>::cross(xAxis, zAxis); // swapped vs. Matrix4::lookAt()
-
-    auto result = VM::Matrix4<double>::identity();
-    result.data[0] = xAxis.data[0]; result.data[1] = xAxis.data[1]; result.data[2] = xAxis.data[2];
-    result.data[4] = yAxis.data[0]; result.data[5] = yAxis.data[1]; result.data[6] = yAxis.data[2];
-    result.data[8] = zAxis.data[0]; result.data[9] = zAxis.data[1]; result.data[10] = zAxis.data[2];
-    result.data[3]  = -VM::Vector3<double>::dot(xAxis, eye);
-    result.data[7]  = -VM::Vector3<double>::dot(yAxis, eye);
-    result.data[11] = -VM::Vector3<double>::dot(zAxis, eye);
-    return result;
-}
-
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -5547,9 +5499,7 @@ void Renderer::renderToTarget(
             ? static_cast<double>(renderWidth) / renderHeight
             : 1.0;
 
-        // See buildDefaultCameraView()'s doc comment for why this doesn't use
-        // vector_math::Matrix4::lookAt() directly.
-        view = buildDefaultCameraView(
+        view = M4::lookAt(
             VM::Vector3<double>(0.0, 0.0, 5.0),
             VM::Vector3<double>(0.0, 0.0, 0.0),
             VM::Vector3<double>(0.0, 1.0, 0.0));

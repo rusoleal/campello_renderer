@@ -126,7 +126,7 @@ static const char *kGltfWithBasisuTexture = R"({
 // ---------------------------------------------------------------------------
 
 TEST(VersionTest, ReturnsExpectedVersion) {
-    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.10.0");
+    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.10.1");
 }
 
 TEST(VersionTest, VersionIsNonEmpty) {
@@ -2571,34 +2571,10 @@ TEST_F(OffscreenRenderTest, ECSPathRendersToOffscreen) {
 
     namespace VM = systems::leal::vector_math;
     RenderScene scene;
-    // Deliberately NOT VM::Matrix4<double>::lookAt(): that function's right/up
-    // axes are built as cross(up, forward)/cross(forward, right), which is
-    // mirrored relative to what Matrix4::perspective()'s +Z-forward
-    // convention expects — confirmed empirically (an object translated to
-    // world +X rendered on the LEFT half of the offscreen target instead of
-    // the right) — and this exact triangle, single-sided (cullMode=back,
-    // frontFace=ccw) and CCW-front per glTF authoring, was being incorrectly
-    // backface-culled as a result. Same root cause as the disabled Vulkan
-    // tests DISABLED_MeshRendersNonClearPixels and friends, which go through
-    // campello_renderer's equivalent default-camera fallback. See
-    // buildDefaultCameraView() in campello_renderer.cpp for the renderer's
-    // own internal fix; this test constructs the corrected view matrix
-    // directly since it's exercising the public ECS render(scene, view) API
-    // as an external caller would, supplying its own camera.
-    {
-        VM::Vector3<double> eye(0.0, 0.0, 5.0), target(0.0, 0.0, 0.0), up(0.0, 1.0, 0.0);
-        auto zAxis = target - eye; zAxis.normalize();
-        auto xAxis = VM::Vector3<double>::cross(zAxis, up); xAxis.normalize(); // swapped vs. lookAt()
-        auto yAxis = VM::Vector3<double>::cross(xAxis, zAxis);                 // swapped vs. lookAt()
-        VM::Matrix4<double> v = VM::Matrix4<double>::identity();
-        v.data[0]=xAxis.data[0]; v.data[1]=xAxis.data[1]; v.data[2]=xAxis.data[2];
-        v.data[4]=yAxis.data[0]; v.data[5]=yAxis.data[1]; v.data[6]=yAxis.data[2];
-        v.data[8]=zAxis.data[0]; v.data[9]=zAxis.data[1]; v.data[10]=zAxis.data[2];
-        v.data[3]  = -VM::Vector3<double>::dot(xAxis, eye);
-        v.data[7]  = -VM::Vector3<double>::dot(yAxis, eye);
-        v.data[11] = -VM::Vector3<double>::dot(zAxis, eye);
-        scene.camera.view = v;
-    }
+    scene.camera.view = VM::Matrix4<double>::lookAt(
+        VM::Vector3<double>(0.0, 0.0, 5.0),
+        VM::Vector3<double>(0.0, 0.0, 0.0),
+        VM::Vector3<double>(0.0, 1.0, 0.0));
     scene.camera.projection = VM::Matrix4<double>::perspective(
         60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 1000.0);
     scene.camera.position = VM::Vector3<double>(0.0, 0.0, 5.0);
