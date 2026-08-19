@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.10.2] - 2026-08-19
+
+### Changed
+- Upgraded `gltf` dependency from v0.5.0 to v0.5.1 (upgrades its own `vector_math` pin to v0.6.0, the same version this project's `dependencies/vector_math.cmake` already pins directly — no functional change for `campello_renderer` itself, since our explicit pin already won over `gltf`'s transitive one, but keeps both declarations in agreement).
+
 ## [0.10.1] - 2026-08-19
 
 ### Changed
