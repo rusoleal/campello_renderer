@@ -151,4 +151,22 @@ if(CAMPELLO_RENDERER_BUILD_TEST)
         gtest
     )
     add_test(NAME ${PROJECT_NAME}_test COMMAND ${PROJECT_NAME}_test)
+
+    # Windows: cmake --build only updates DLLs inside their own target output
+    # directories (_deps/extern_campello_gpu-build/<config>/, etc.) — nothing
+    # puts a fresh copy next to campello_renderer_test.exe itself, so running
+    # (or ctest-ing) it fails with STATUS_DLL_NOT_FOUND. Mirrors the identical
+    # POST_BUILD copy step in examples/windows/CMakeLists.txt.
+    if(WIN32)
+        foreach(dep_target ${PROJECT_NAME} campello_gpu gltf campello_image)
+            if(TARGET ${dep_target})
+                add_custom_command(TARGET ${PROJECT_NAME}_test POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        $<TARGET_FILE:${dep_target}>
+                        $<TARGET_FILE_DIR:${PROJECT_NAME}_test>
+                    COMMENT "Copying ${dep_target} DLL next to ${PROJECT_NAME}_test.exe"
+                )
+            endif()
+        endforeach()
+    endif()
 endif()

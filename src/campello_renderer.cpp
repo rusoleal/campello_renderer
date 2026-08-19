@@ -4913,6 +4913,16 @@ void Renderer::resize(uint32_t width, uint32_t height) {
     namespace GPU = systems::leal::campello_gpu;
     using TU = GPU::TextureUsage;
 
+    // Reassigning depthTexture/sceneColorTexture below drops the shared_ptr to
+    // whatever the previous size's textures were, destroying them as soon as
+    // their refcount hits zero. render()'s submit() is async and doesn't
+    // block, so without this, a resize() called shortly after render() (e.g.
+    // a live window resize) can release a depth/scene-color texture the GPU
+    // is still executing against — D3D12's debug layer treats that as fatal
+    // resource corruption. Same reasoning as setAsset()'s identical
+    // waitForIdle() call and Renderer::~Renderer()'s doc comment.
+    if (device) device->waitForIdle();
+
     depthTexture = device->createTexture(
         GPU::TextureType::tt2d,
         GPU::PixelFormat::depth32float,
