@@ -1,17 +1,6 @@
 # Changelog
 
-## [0.10.2] - 2026-08-19
-
-### Changed
-- Upgraded `gltf` dependency from v0.5.0 to v0.5.1 (upgrades its own `vector_math` pin to v0.6.0, the same version this project's `dependencies/vector_math.cmake` already pins directly — no functional change for `campello_renderer` itself, since our explicit pin already won over `gltf`'s transitive one, but keeps both declarations in agreement).
-
-## [0.10.1] - 2026-08-19
-
-### Changed
-- Upgraded `vector_math` dependency from v0.3.5 (transitively pinned by `gltf` v0.5.0) to v0.6.0 — added an explicit `dependencies/vector_math.cmake`, declared and included before `gltf.cmake`, so this project's own `FetchContent_Declare` wins over `gltf`'s older transitive pin (both guard on `if(TARGET vector_math)`).
-- Removed the local `buildDefaultCameraView()` workaround from both `campello_renderer.cpp` and `ecs.hpp` (added in 0.10.0), and reverted `OffscreenRenderTest.ECSPathRendersToOffscreen` to call `vector_math::Matrix4::lookAt()` directly — the underlying mirrored-camera bug is now fixed upstream in `vector_math` v0.6.0, so the local compensation is no longer needed.
-
-## [0.10.0] - 2026-08-17
+## [0.10.0] - 2026-08-19
 
 ### Added
 - **Full glTF PBR pipeline ported to DirectX 12 (Windows)** — metallic-roughness Cook-Torrance GGX BRDF, image-based lighting (GGX-prefiltered specular + Lambertian diffuse irradiance + BRDF LUT), normal mapping, punctual lights (`KHR_lights_punctual`), and `KHR_materials_specular`/`anisotropy`/`iridescence`/`clearcoat`/`sheen`/`transmission`, matching the existing Metal/Vulkan feature set. Windows rendering (previously non-functional — DXIL binaries weren't compiled) now fully works, including resize.
@@ -23,11 +12,11 @@
 ### Changed
 - Upgraded `campello_gpu` dependency from v0.23.0 to v0.23.1 (Windows/DirectX descriptor-heap contiguity, DSV/sampler-heap leaks, swapchain resize, and cube-texture fixes).
 - `dependencies/campello_gpu.cmake` no longer supports a local-checkout override — always fetches from GitHub via `FetchContent`, removing a footgun where a developer's local `campello_gpu` checkout could silently diverge from the pinned released version.
+- Upgraded `gltf` dependency from v0.5.0 to v0.5.1, and added an explicit `dependencies/vector_math.cmake` (declared before `gltf.cmake`) pinning `vector_math` v0.6.0 directly — both now agree, instead of relying on `gltf`'s older transitive pin (previously v0.3.5).
 
 ### Fixed
-- **Mirrored default camera** — `render(view)`'s and the ECS `render_system()`'s built-in fallback camera (used whenever no glTF/ECS camera exists) rendered a left-right-mirrored image and incorrectly backface-culled single-sided, CCW-front geometry near the origin. Root cause: `vector_math::Matrix4::lookAt()` builds its right/up axes with a cross-product argument order that's mirrored relative to what `Matrix4::perspective()`'s +Z-forward convention expects — confirmed empirically (geometry translated to world +X rendered on the left half of the frame instead of the right). Same root cause as the long-disabled `DISABLED_MeshRendersNonClearPixels` and sibling Vulkan tests. Worked around locally with a corrected `buildDefaultCameraView()` helper in both `campello_renderer.cpp` and `ecs.hpp`, scoped narrowly to the default-camera fallback only — real cameras (glTF-embedded, ECS `Transform`-driven, both of which use `Matrix4::inverted()` instead) are unaffected. The underlying bug lives upstream in the shared `vector_math` dependency.
+- **Mirrored default camera** — `render(view)`'s and the ECS `render_system()`'s built-in fallback camera (used whenever no glTF/ECS camera exists) rendered a left-right-mirrored image and incorrectly backface-culled single-sided, CCW-front geometry near the origin (including `OffscreenRenderTest.ECSPathRendersToOffscreen`, which builds its own camera the same way as an external ECS caller would). Root cause: `vector_math::Matrix4::lookAt()` built its right/up axes with a cross-product argument order that's mirrored relative to what `Matrix4::perspective()`'s +Z-forward convention expects — confirmed empirically (geometry translated to world +X rendered on the left half of the frame instead of the right). Same root cause as the long-disabled `DISABLED_MeshRendersNonClearPixels` and sibling Vulkan tests. Fixed upstream in `vector_math` v0.6.0 (see that project's changelog) and picked up here via the `vector_math` upgrade above; real cameras (glTF-embedded, ECS `Transform`-driven, both of which use `Matrix4::inverted()` instead of `lookAt()`) were never affected.
 - **DirectX offscreen-render test crashes** — `BasicOffscreenRenderDoesNotCrash` / `MultipleConsecutiveRenders` / `ResizeOffscreenTarget` / `DifferentPixelFormatBGRA8` released their local render-target texture before the GPU finished executing the render into it (`render()`'s `submit()` is async and doesn't block), which D3D12's debug layer treats as fatal resource corruption. Fixed by adding `device->waitForIdle()` before the texture goes out of scope, matching the pattern `readBackPixels()` already used.
-- **`ECSPathRendersToOffscreen` backface culling** — same root cause as the mirrored-camera fix above; the test now builds its own corrected view matrix since it exercises the public ECS `render(scene, view)` API as an external caller would, supplying its own camera.
 
 ## [0.9.0] - 2026-08-13
 
