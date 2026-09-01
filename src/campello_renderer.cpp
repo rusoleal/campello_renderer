@@ -8021,12 +8021,62 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     // (Other default textures are lazily created in setScene; skip here for brevity.)
 
     // --- Upload referenced textures ---
-    auto ensureTexture = [&](int64_t imageIndex, bool srgb) -> std::shared_ptr<GPU::Texture> {
+    // isBasisu: whether *some* texture referencing this image index does so
+    // via KHR_texture_basisu (checked by getTextureAndSampler below, which
+    // is the only caller and always knows this at the point it resolves
+    // imgIdx) -- an image can only sensibly be one or the other, so this
+    // is safe to trust per-call rather than re-deriving it here.
+    auto ensureTexture = [&](int64_t imageIndex, bool srgb, bool isBasisu) -> std::shared_ptr<GPU::Texture> {
         if (imageIndex < 0 || !asset.images) return nullptr;
         if ((size_t)imageIndex >= gpuTextures.size()) gpuTextures.resize(imageIndex + 1);
         if (gpuTextures[(size_t)imageIndex]) return gpuTextures[(size_t)imageIndex];
 
         auto& image = (*asset.images)[(size_t)imageIndex];
+
+        if (isBasisu) {
+            // ------------------------------------------------------------
+            // KHR_texture_basisu path — same TextureData-based GPU-
+            // compressed decode+upload as the scene-wide loader above;
+            // this lazy per-material path previously always fell through
+            // to the plain campello_image::Image branch below, which
+            // can't parse KTX2/.basis bytes at all.
+            // ------------------------------------------------------------
+            std::shared_ptr<systems::leal::campello_image::TextureData> texData;
+            auto basisTargetFormat = chooseBasisTargetFormat(device);
+            if (!image.data.empty()) {
+                texData = systems::leal::campello_image::TextureData::fromMemory(
+                    image.data.data(), image.data.size(), basisTargetFormat);
+            } else if (image.bufferView != -1 && asset.bufferViews && asset.buffers) {
+                auto& bufferView = (*asset.bufferViews)[image.bufferView];
+                auto& buffer     = (*asset.buffers)[bufferView.buffer];
+                if (!buffer.data.empty()) {
+                    const uint8_t* src = buffer.data.data() + bufferView.byteOffset;
+                    texData = systems::leal::campello_image::TextureData::fromMemory(
+                        src, bufferView.byteLength, basisTargetFormat);
+                }
+            } else if (!image.uri.empty()) {
+                std::string imagePath = image.uri;
+                if (!assetBasePath.empty() && imagePath.find(":") == std::string::npos && imagePath.front() != '/') {
+                    imagePath = assetBasePath + imagePath;
+                }
+                texData = systems::leal::campello_image::TextureData::fromFile(imagePath.c_str(), basisTargetFormat);
+            }
+            if (!texData) return nullptr;
+
+            auto fmt = textureDataFormatToPixelFormat(texData->getFormat(), srgb);
+            auto texture = device->createTexture(
+                GPU::TextureType::tt2d, fmt,
+                texData->getWidth(), texData->getHeight(), 1,
+                texData->getMipLevelCount(), 1,
+                (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                    (uint32_t)GPU::TextureUsage::copyDst));
+            if (texture && !uploadTextureDataWithMips(device, texture, *texData)) {
+                texture = nullptr;
+            }
+            gpuTextures[(size_t)imageIndex] = texture;
+            return texture;
+        }
+
         std::shared_ptr<systems::leal::campello_image::Image> img;
         if (!image.data.empty()) {
             img = systems::leal::campello_image::Image::fromMemory(
@@ -8079,9 +8129,11 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
         size_t texIdx = (size_t)texInfo->index;
         if (texIdx >= asset.textures->size()) return;
         auto& gt = (*asset.textures)[texIdx];
-        int64_t imgIdx = (gt.ext_texture_webp >= 0) ? gt.ext_texture_webp : gt.source;
+        bool isBasisu = gt.khr_texture_basisu >= 0;
+        int64_t imgIdx = isBasisu ? gt.khr_texture_basisu
+                        : (gt.ext_texture_webp >= 0) ? gt.ext_texture_webp : gt.source;
         if (imgIdx >= 0) {
-            outTex = ensureTexture(imgIdx, srgb);
+            outTex = ensureTexture(imgIdx, srgb, isBasisu);
         }
         if (gt.sampler >= 0 && asset.samplers &&
             (size_t)gt.sampler < asset.samplers->size()) {

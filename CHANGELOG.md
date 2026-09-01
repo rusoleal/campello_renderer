@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.11.0] - 2026-09-01
+
+### Fixed
+- **`Renderer::uploadMaterial()` never handled `KHR_texture_basisu`** — the lazy per-material texture path (used by `MeshAssetCache` and any other caller resolving one material at a time, as opposed to the scene-wide upload loop in `setScene()`) always fell through to the plain `campello_image::Image::fromMemory()` branch, which cannot parse KTX2/`.basis` bytes at all; any material referencing a `KHR_texture_basisu` texture silently failed to upload. `ensureTexture()` now takes an `isBasisu` flag and, when set, uses the same `campello_image::TextureData`-based GPU-compressed decode+upload path (`chooseBasisTargetFormat()` / `textureDataFormatToPixelFormat()` / `uploadTextureDataWithMips()`) the scene-wide loader already used, instead of duplicating it. `getTextureAndSampler()`'s image-index resolution now checks `gt.khr_texture_basisu` before falling back to `ext_texture_webp`/`source` — it previously skipped basisu entirely. Not independently visually verified against a real KTX2/basisu-textured glTF asset (none available locally); this is code-parity with the already-proven-correct scene-wide path, confirmed by a clean build, not an isolated regression test.
+
+### Changed
+- Upgraded `campello_image` dependency from `v0.5.0` to `v0.5.1` (basis_universal transcoder upgraded `1.16.4` → `v2_50`; see that project's changelog).
+- `dependencies/campello_image.cmake` no longer supports a local-checkout override — always fetches from GitHub via `FetchContent`, removing the same footgun already removed from `dependencies/campello_gpu.cmake` in 0.10.0 (a developer's local `campello_image` checkout could silently diverge from the pinned released version).
+
 ## [0.10.0] - 2026-08-19
 
 ### Added
