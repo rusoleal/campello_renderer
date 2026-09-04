@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.1] - 2026-09-04
+
+### Changed
+- Upgraded `campello_gpu` dependency from `v0.23.1` to `v0.24.1`:
+  - **MSAA support** added across the Metal, Vulkan, and DirectX backends (`RenderPipelineDescriptor.sampleCount`, `resolveTarget`) — not yet wired into `campello_renderer`'s own pipeline creation, so no behavior change here, but now available for future use.
+  - Fixed `ShaderStage` missing bitwise operators (`operator|`, `operator&`, `operator|=`) — `campello_renderer` currently only ever assigns a single `ShaderStage` value per bind group entry (never combines vertex+fragment visibility), so this doesn't change existing behavior, but unblocks doing so later.
+  - Various Metal/Vulkan/DirectX correctness fixes not otherwise exercised by this library (MSAA texture storage mode, stencil state wiring, DirectX descriptor-heap leaks/contiguity, swapchain resize) — see [campello_gpu's changelog](https://github.com/rusoleal/campello_gpu/blob/v0.24.1/CHANGELOG.md) for the full list.
+
 ## [0.11.0] - 2026-09-01
 
 ### Fixed
