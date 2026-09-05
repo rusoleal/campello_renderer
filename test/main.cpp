@@ -126,7 +126,7 @@ static const char *kGltfWithBasisuTexture = R"({
 // ---------------------------------------------------------------------------
 
 TEST(VersionTest, ReturnsExpectedVersion) {
-    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.12.0");
+    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.12.1");
 }
 
 TEST(VersionTest, VersionIsNonEmpty) {

@@ -86,6 +86,22 @@ inline CameraData buildCameraData(const Transform& transform, const Camera& came
                                     double aspect = 1.0) {
     CameraData data;
     data.view = transform.worldMatrix.inverted();
+    // Matrix4::perspective() (and Matrix4::rotateX/Y/Z(), and OrbitCamera's own
+    // hand-rolled view matrix -- see its "row2 = -forward" doc comment) all
+    // assume a view space where +Z is in front of the camera, but
+    // Transform.worldMatrix uses the standard -Z-is-forward convention (the
+    // same one buildLightData() above assumes when it negates worldMatrix's Z
+    // column to get a light's direction). A plain inverse of worldMatrix
+    // therefore produces a view matrix with the opposite Z-forward convention
+    // from what the projection matrix expects, which shows up as a negative
+    // clip-space w for points in front of the camera (should always be
+    // positive) and everything landing outside the frustum. Negate the Z row
+    // to flip to the convention Matrix4::perspective() needs, mirroring
+    // OrbitCamera's own compensation.
+    data.view.data[8]  = -data.view.data[8];
+    data.view.data[9]  = -data.view.data[9];
+    data.view.data[10] = -data.view.data[10];
+    data.view.data[11] = -data.view.data[11];
     if (camera.isOrthographic) {
         data.projection = systems::leal::vector_math::Matrix4<double>::ortho(
             camera.orthoWidth, camera.orthoHeight, camera.nearPlane, camera.farPlane);

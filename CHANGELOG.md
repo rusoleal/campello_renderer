@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.12.1] - 2026-09-05
+
+### Fixed
+- **`buildCameraData()` (`inc/campello_renderer/ecs.hpp`) produced a view matrix with the wrong Z-forward convention, breaking any consumer that rendered from a scene's own `Camera` entity.** `Transform.worldMatrix` uses the standard "-Z is forward" convention (the same one `buildLightData()` already assumes when it negates `worldMatrix`'s Z column to get a light's direction), but `buildCameraData()` computed `view = transform.worldMatrix.inverted()` as a plain matrix inverse, which carries that same -Z-forward convention into view space. `Matrix4::perspective()` (and `Matrix4::rotateX/Y/Z()`) instead assume a view space where **+Z** is in front of the camera — `OrbitCamera::getViewMatrix()` already compensates for this internally (see its own "row2 = -forward" comment), which is why edit-mode/tool-camera rendering was never affected. Any renderer using an actual `Camera` entity (e.g. an editor's Play-mode preview, or any consumer relying on `render_system()`'s built-in "first Camera entity" query) got a view matrix with the opposite convention: points in front of the camera produced a **negative** clip-space `w`, sending them outside the visible NDC range and making the entire scene disappear even though the camera, meshes, and matrices were all otherwise correct. Fixed by negating the view matrix's Z row (`data[8..11]`) in `buildCameraData()`, mirroring `OrbitCamera`'s own compensation. Verified by hand-computing clip-space coordinates for a known camera/mesh pair before and after the fix (`clip.w` flipped from -6.31 to +6.31; `ndc.z` moved from 1.016, just past the far-clip boundary, to 0.984, correctly inside `[0,1]`) and confirmed visually in a real consumer (campello_editor's Play-mode viewport).
+
 ## [0.12.0] - 2026-09-05
 
 ### Added
