@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.0] - 2026-09-05
+
+### Added
+- **`render_system()` (`inc/campello_renderer/ecs.hpp`) accepts an optional `const CameraData* cameraOverride`** — when non-null, it's used verbatim as the scene camera and the world's own `Transform`+`Camera` entity query is skipped entirely. Lets a consumer with two distinct camera needs on the same `World` — e.g. an editor viewport driven by a free-floating tool camera while editing versus the scene's own `Camera` entity once actually playing — pick per call, without maintaining a separate render path just for the edit-mode case. Passing `nullptr` (the default) preserves the exact existing entity-driven/built-in-default-fallback behavior.
+
+### Fixed
+- **`ecs.hpp` had never actually been compiled** — this header-only "optional ECS bridge" ships in the package but nothing in this repo (or, as far as could be determined, any known consumer) includes or exercises it, so three real bugs sat undetected:
+  - `animation_system()`/`material_animation_sync_system()` destructured `world.query<GltfAnimation>()` (a single-component query) into two names (`[entity, anim]`) — a single-component query only yields the component, not the entity, so this failed to compile at all. Neither loop body actually used the entity; fixed by destructuring to `[anim]`.
+  - `skinning_system()` declared `using GPU = systems::leal::campello_gpu;` — `using` aliases a *type*, not a namespace; the correct form is `namespace GPU = ...`. Fixed, which also resolved a knock-on "undeclared identifier GPU" a few lines later.
+  - `skinning_system()` called `Buffer::getSize()`, which doesn't exist on `campello_gpu::Buffer` — the real accessor is `getLength()`. Fixed.
+  - Verified via a standalone `-fsyntax-only` compile against the real `campello_core`/`campello_gpu`/`vector_math`/`gltf` headers (this repo's own build/test suite doesn't touch `ecs.hpp`, so this is the only way it's currently validated) — clean, zero errors, after the fix. No regression test added yet since no example/test in this repo currently exercises the ECS bridge at all; tracked as follow-up work for whoever adopts it.
+
 ## [0.11.2] - 2026-09-05
 
 ### Fixed

@@ -199,7 +199,7 @@ inline void animation_system(campello::core::World& world, float dt) {
     namespace VM = systems::leal::vector_math;
     using campello::core::Entity;
 
-    for (auto [entity, anim] : world.query<GltfAnimation>()) {
+    for (auto [anim] : world.query<GltfAnimation>()) {
         if (!anim.animator || !anim.asset) continue;
         anim.animator->update(dt);
 
@@ -228,9 +228,7 @@ inline void animation_system(campello::core::World& world, float dt) {
 // Must run after animation_system and before render_system.
 // ------------------------------------------------------------------
 inline void material_animation_sync_system(campello::core::World& world, Renderer& renderer) {
-    using campello::core::Entity;
-
-    for (auto [entity, anim] : world.query<GltfAnimation>()) {
+    for (auto [anim] : world.query<GltfAnimation>()) {
         if (!anim.asset || anim.modifiedMaterialIndices.empty()) continue;
         if (!anim.asset->materials) continue;
 
@@ -292,7 +290,7 @@ inline void transform_hierarchy_system(campello::core::World& world) {
 // ------------------------------------------------------------------
 inline void skinning_system(campello::core::World& world, Renderer& renderer) {
     namespace VM = systems::leal::vector_math;
-    using GPU = systems::leal::campello_gpu;
+    namespace GPU = systems::leal::campello_gpu;
     using campello::core::Entity;
 
     auto device = renderer.getDevice();
@@ -332,7 +330,7 @@ inline void skinning_system(campello::core::World& world, Renderer& renderer) {
             }
 
             uint64_t bufferSize = jointCount * 64;
-            if (!mr.jointMatrixBuffer || mr.jointMatrixBuffer->getSize() < bufferSize) {
+            if (!mr.jointMatrixBuffer || mr.jointMatrixBuffer->getLength() < bufferSize) {
                 mr.jointMatrixBuffer = device->createBuffer(bufferSize, GPU::BufferUsage::vertex);
             }
             if (mr.jointMatrixBuffer) {
@@ -346,32 +344,45 @@ inline void skinning_system(campello::core::World& world, Renderer& renderer) {
 // ------------------------------------------------------------------
 // Render system
 // ------------------------------------------------------------------
+// cameraOverride: when non-null, used verbatim as the scene camera and the
+// world's own Transform+Camera query is skipped entirely. For a consumer
+// that needs two distinct camera behaviors on the same World -- e.g. an
+// editor viewport driven by a free-floating tool camera (not a scene
+// entity) while editing, versus "whatever the scene's own Camera entity
+// sees" once the scene is actually playing -- pass an override only in
+// the former case; passing nullptr in the latter preserves the original
+// entity-driven (or built-in-default-fallback) behavior exactly.
 inline void render_system(
     campello::core::World& world,
     Renderer& renderer,
     std::shared_ptr<systems::leal::campello_gpu::TextureView> target,
     uint32_t renderWidth = 0,
-    uint32_t renderHeight = 0)
+    uint32_t renderHeight = 0,
+    const CameraData* cameraOverride = nullptr)
 {
     RenderScene scene;
 
     // 1. Camera
-    bool cameraFound = false;
-    double aspect = (renderWidth > 0 && renderHeight > 0)
-        ? static_cast<double>(renderWidth) / renderHeight
-        : 1.0;
-    for (auto [transform, camera] : world.query<Transform, Camera>()) {
-        scene.camera = buildCameraData(transform, camera, aspect);
-        cameraFound = true;
-        break; // pick first camera
-    }
-    if (!cameraFound) {
-        // Default camera if none exists.
-        scene.camera.view = systems::leal::vector_math::Matrix4<double>::lookAt(
-            {0.0, 0.0, 5.0}, {0.0, 0.0, 0.0}, {0.0, 1.0, 0.0});
-        scene.camera.projection = systems::leal::vector_math::Matrix4<double>::perspective(
-            60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 1000.0);
-        scene.camera.position = {0.0, 0.0, 5.0};
+    if (cameraOverride) {
+        scene.camera = *cameraOverride;
+    } else {
+        bool cameraFound = false;
+        double aspect = (renderWidth > 0 && renderHeight > 0)
+            ? static_cast<double>(renderWidth) / renderHeight
+            : 1.0;
+        for (auto [transform, camera] : world.query<Transform, Camera>()) {
+            scene.camera = buildCameraData(transform, camera, aspect);
+            cameraFound = true;
+            break; // pick first camera
+        }
+        if (!cameraFound) {
+            // Default camera if none exists.
+            scene.camera.view = systems::leal::vector_math::Matrix4<double>::lookAt(
+                {0.0, 0.0, 5.0}, {0.0, 0.0, 0.0}, {0.0, 1.0, 0.0});
+            scene.camera.projection = systems::leal::vector_math::Matrix4<double>::perspective(
+                60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 1000.0);
+            scene.camera.position = {0.0, 0.0, 5.0};
+        }
     }
 
     // 2. Lights
