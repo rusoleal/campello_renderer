@@ -755,5 +755,9 @@ void main() {
     finalColor = toneMapKhronosPbrNeutral(finalColor);
     finalColor = linearToSRGBFast(finalColor);
 
-    outColor = vec4(finalColor, baseColor.a);
+    // glTF spec: alphaMode OPAQUE (0) and MASK (1) must render fully opaque
+    // -- alpha is ignored (OPAQUE) or only used for the cutoff test already
+    // applied above (MASK); only BLEND (2) actually blends by baseColor.a.
+    float outAlpha = (mat.alphaMode < 1.5) ? 1.0 : baseColor.a;
+    outColor = vec4(finalColor, outAlpha);
 }

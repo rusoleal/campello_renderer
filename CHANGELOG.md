@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.11.2] - 2026-09-05
+
+### Fixed
+- **`alphaMode: OPAQUE`/`MASK` materials wrote a non-1.0 alpha into the color target** — `fragmentMain_flat`/`fragmentMain_textured` (Metal), the combined PBR fragment shader (Vulkan/GLSL), and the DirectX HLSL equivalent all returned `baseColor.a` verbatim as the framebuffer alpha, regardless of the material's `alphaMode`. Per the glTF spec, `OPAQUE` (the default) and `MASK` must render fully opaque — alpha is either ignored entirely or only relevant for the cutoff test already applied earlier in the shader. A consumer that presents this renderer's output directly to a window's opaque drawable never noticed (the OS compositor discards alpha there), but a consumer that composites the render target as a 2D texture (e.g. an editor viewport backed by an offscreen render target, displayed via an alpha-aware image widget) could see an "opaque" material's real color rendered fully or partially transparent wherever its albedo texture's alpha channel wasn't a clean 1.0 — common for authored PNG/JPEG textures with unused/garbage alpha. Fixed by forcing alpha to 1.0 for `alphaMode < 1.5` (OPAQUE/MASK) in all three shader backends; only `BLEND` (2) still uses the real `baseColor.a`.
+  - **Known gap**: the Metal (`src/shaders/metal_default.h`) and Vulkan (`src/shaders/vulkan_default.h`) embedded binaries were regenerated and are current as of this release. The DirectX embedded binary (`src/shaders/directx_default.h`) was **not** regenerated — this release only has the fixed HLSL source (`shaders/directx/default.hlsl`); no Windows/`dxc.exe` toolchain was available to rebuild it. Anyone consuming the DirectX backend should run `build_directx_shaders.ps1` on Windows and commit the regenerated header before this fix takes effect there.
+
 ## [0.11.1] - 2026-09-04
 
 ### Changed

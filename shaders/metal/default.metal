@@ -535,7 +535,16 @@ fragment float4 fragmentMain_flat(
     finalColor = toneMapKhronosPbrNeutral(finalColor);
     finalColor = linearToSRGBFast(finalColor);
 
-    return float4(finalColor, baseColor.a);
+    // glTF spec: alphaMode OPAQUE (0) and MASK (1) must render fully opaque
+    // -- alpha is ignored (OPAQUE) or only used for the cutoff test already
+    // applied above (MASK); only BLEND (2) actually blends by baseColor.a.
+    // Without this, a consumer that composites this renderer's output as a
+    // textured 2D image (rather than presenting it directly to a window,
+    // where an opaque drawable's alpha is simply discarded) can see an
+    // "opaque" material's real color show through as transparent wherever
+    // its albedo texture's alpha channel isn't a clean 1.0.
+    float outAlpha = (mat.alphaMode < 1.5) ? 1.0 : baseColor.a;
+    return float4(finalColor, outAlpha);
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,7 +1329,10 @@ fragment float4 fragmentMain_textured(
     finalColor = toneMapKhronosPbrNeutral(finalColor);
     finalColor = linearToSRGBFast(finalColor);
 
-    return float4(finalColor, baseColor.a);
+    // glTF spec: alphaMode OPAQUE (0) and MASK (1) must render fully opaque
+    // -- see fragmentMain_flat's identical fix for why this matters.
+    float outAlpha = (mat.alphaMode < 1.5) ? 1.0 : baseColor.a;
+    return float4(finalColor, outAlpha);
 }
 
 // ---------------------------------------------------------------------------
