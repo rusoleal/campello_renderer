@@ -6385,6 +6385,8 @@ void Renderer::renderToTarget(
         }
     }
 
+    if (overlayCallback) overlayCallback(encoder, colorView, currentFrameIndex);
+
     device->submit(encoder->finish(), frame.fence);
     currentFrameIndex = (currentFrameIndex + 1) % kMaxFramesInFlight;
 
@@ -6515,6 +6517,10 @@ void Renderer::updateMorphWeights(uint64_t nodeIndex) {
     } else {
         buf->upload(0, sizeof(data), data);
     }
+}
+
+void Renderer::setOverlayCallback(OverlayCallback callback) {
+    overlayCallback = std::move(callback);
 }
 
 void Renderer::setViewMode(ViewMode mode) {

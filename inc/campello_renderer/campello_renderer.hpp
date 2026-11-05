@@ -1,11 +1,13 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <array>
 #include <string>
 #include <unordered_map>
 #include <vector>
 #include <gltf/gltf.hpp>
+#include <campello_gpu/command_encoder.hpp>
 #include <campello_gpu/device.hpp>
 #include <campello_gpu/render_pass_encoder.hpp>
 #include <campello_gpu/texture.hpp>
@@ -114,6 +116,11 @@ namespace systems::leal::campello_renderer {
         uint32_t instanceCount = 0;
         double cpuFrameTimeMs = 0.0;
     };
+
+    using OverlayCallback = std::function<void(
+        const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
+        const std::shared_ptr<systems::leal::campello_gpu::TextureView>& colorView,
+        uint32_t frameIndex)>;
 
     class Renderer {
     public:
@@ -383,6 +390,7 @@ namespace systems::leal::campello_renderer {
         bool skyboxEnabled = true;
         bool iblEnabled = true;
         float environmentIntensity = 1.0f;
+        OverlayCallback overlayCallback;
         bool fxaaEnabled = false;
         float ssaaScale = 1.0f;
 
@@ -867,6 +875,13 @@ namespace systems::leal::campello_renderer {
         bool isSkyboxEnabled() const;
         bool isIBLEnabled() const;
         float getEnvironmentIntensity() const;
+
+        // Draws on top of the finished frame, for example a stats display. Called once per
+        // render() just before the frame is submitted, with the frame's encoder and color
+        // target (null means the device's swapchain) and a frame index below
+        // kMaxFramesInFlight. The callback begins and ends its own render pass, using
+        // LoadOp::load to keep the frame. Pass nullptr to remove it.
+        void setOverlayCallback(OverlayCallback callback);
 
         void setFxaaEnabled(bool enabled);
         bool isFxaaEnabled() const;

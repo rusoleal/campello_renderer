@@ -12,6 +12,8 @@ set(PACKAGE_ASSETS
 
 add_executable(campello_renderer_uwp WIN32
     main.cpp
+    Overlay.hpp
+    overlay_shaders.h
     Package.appxmanifest
     ${PACKAGE_ASSETS}
 )

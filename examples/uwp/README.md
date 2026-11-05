@@ -43,6 +43,12 @@ The package also needs a recent `Microsoft.VCLibs.140.00.Debug`. If registering 
 3. Start it from Dev Home. To get more memory, set **App type** to **Game**: the limit rises from 1 GB
    to 5 GB.
 
+## Resolution and stats
+
+The app renders at 3840x2160 on an Xbox in Game mode, and at 1920x1080 otherwise; `app.log` records which.
+The top-left corner shows the window size and frame rate. The window size is in the system's layout units,
+so it can differ from the render resolution. The frame rate is capped at 60 by vsync.
+
 ## Controls
 
 | Gamepad | Action |

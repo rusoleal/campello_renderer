@@ -15,6 +15,7 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Gaming.Input.h>
 #include <winrt/Windows.Storage.h>
+#include <winrt/Windows.System.Profile.h>
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Core.h>
 
@@ -41,6 +42,7 @@
 #include <gltf/gltf.hpp>
 
 #include "Camera.hpp"
+#include "Overlay.hpp"
 
 using namespace winrt;
 using namespace winrt::Windows::ApplicationModel::Core;
@@ -52,9 +54,6 @@ namespace gltf = systems::leal::gltf;
 
 namespace {
 
-// The swapchain stretches to fill the window, so this is the render resolution.
-constexpr uint32_t kWidth = 1920;
-constexpr uint32_t kHeight = 1080;
 constexpr float kOrbitRadiansPerSecond = 0.4f;
 constexpr float kStickRadiansPerSecond = 1.5f;
 constexpr float kStickDeadZone = 0.15f;
@@ -201,17 +200,32 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
         }
 
         renderer.reset();
+        overlay.reset();
         device.reset();
     }
 
 private:
+    // 4K only on an Xbox in Game mode, which has the memory and GPU time for it. The
+    // swapchain stretches to fill the window, so this is the render resolution.
+    void chooseResolution() {
+        const bool isXbox = winrt::Windows::System::Profile::AnalyticsInfo::VersionInfo().DeviceFamily() == L"Windows.Xbox";
+        const bool isGameMode = winrt::Windows::System::MemoryManager::AppMemoryUsageLimit() > 2048ull * 1024ull * 1024ull;
+        if (isXbox && isGameMode) {
+            width = 3840;
+            height = 2160;
+        }
+    }
+
     bool start(CoreWindow const& window) {
         const auto startTime = std::chrono::steady_clock::now();
         logLine("app memory limit: %llu MB",
                 winrt::Windows::System::MemoryManager::AppMemoryUsageLimit() / (1024ull * 1024ull));
 
         logLine("creating device");
-        device = gpu::Device::createDefaultDeviceForCoreWindow(winrt::get_unknown(window), kWidth, kHeight);
+        chooseResolution();
+        logLine("render resolution: %u x %u", width, height);
+
+        device = gpu::Device::createDefaultDeviceForCoreWindow(winrt::get_unknown(window), width, height);
         if (!device) {
             logLine("FAILED: createDefaultDeviceForCoreWindow returned null");
             return false;
@@ -220,7 +234,7 @@ private:
 
         renderer = std::make_shared<rend::Renderer>(device);
         renderer->createDefaultPipelines(device->getSwapchainPixelFormat());
-        renderer->resize(kWidth, kHeight);
+        renderer->resize(width, height);
         logLine("pipelines ready at %.2f s", secondsSince(startTime));
 
         const std::string assets =
@@ -253,7 +267,17 @@ private:
             logLine("WARNING: environment map failed to load");
         }
 
+        overlay = std::make_unique<Overlay>(device, width, height);
+        if (overlay->isReady()) {
+            renderer->setOverlayCallback([this](const auto& encoder, const auto& colorView, uint32_t frameIndex) {
+                overlay->draw(encoder, colorView, frameIndex);
+            });
+        } else {
+            logLine("WARNING: overlay failed to initialize");
+        }
+
         lastFrame = std::chrono::steady_clock::now();
+        statsStart = lastFrame;
         return true;
     }
 
@@ -310,6 +334,21 @@ private:
         return bounds.Width / bounds.Height;
     }
 
+    void updateOverlay() {
+        ++statsFrames;
+        const double elapsed = secondsSince(statsStart);
+        if (elapsed < 0.5 || !overlay) return;
+
+        const auto bounds = CoreWindow::GetForCurrentThread().Bounds();
+        char line[64];
+        snprintf(line, sizeof(line), "%uX%u %.1f FPS", static_cast<uint32_t>(bounds.Width),
+                 static_cast<uint32_t>(bounds.Height), statsFrames / elapsed);
+        overlay->setLines({line});
+
+        statsFrames = 0;
+        statsStart = std::chrono::steady_clock::now();
+    }
+
     void renderFrame() {
         const auto now = std::chrono::steady_clock::now();
         const double dt = std::min(std::chrono::duration<double>(now - lastFrame).count(), 0.25);
@@ -324,6 +363,7 @@ private:
 
         renderer->update(dt);
         renderer->setCameraMatrices(view, projection);
+        updateOverlay();
         renderer->render();
 
         // The first frame includes lazy setup, so it's timed on its own.
@@ -340,6 +380,11 @@ private:
     bool closed = false;
     std::shared_ptr<gpu::Device> device;
     std::shared_ptr<rend::Renderer> renderer;
+    std::unique_ptr<Overlay> overlay;
+    uint32_t width = 1920;
+    uint32_t height = 1080;
+    std::chrono::steady_clock::time_point statsStart;
+    unsigned statsFrames = 0;
     Camera camera;
     std::chrono::steady_clock::time_point lastFrame;
     std::chrono::steady_clock::time_point fpsStart;
