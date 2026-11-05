@@ -507,34 +507,6 @@ float4 pixelMain(PixelIn input) : SV_Target {
         transmission *= transmissionTexture.Sample(baseColorSampler, transUV).r;
     }
 
-    // Debug view modes — ported from shaders/metal/default.metal's identical
-    // three-checkpoint structure (each checkpoint fires only once the data
-    // it needs has actually been computed, avoiding paying for IBL/lighting
-    // just to show a debug view). This entire feature was previously absent
-    // from the DirectX shader (confirmed: viewMode was declared in the
-    // cbuffer but never read anywhere), so every ViewMode hotkey (0-9,
-    // q/w/e/r/t/y/u/i/o/p/z) silently did nothing on Windows — pressing e.g.
-    // '4' (roughness) just kept showing normal shading.
-    if (viewMode > 0.5) {
-        if (abs(viewMode - 1.0) < 0.5) { // VIEW_MODE_WORLD_NORMAL
-            float3 Ndbg = normalize(input.worldNormal);
-            return float4(Ndbg * 0.5 + 0.5, 1.0);
-        }
-        if (abs(viewMode - 2.0) < 0.5) { // VIEW_MODE_BASE_COLOR
-            return float4(baseColor.rgb, 1.0);
-        }
-    }
-
-    // Alpha mask.
-    if (alphaMode > 0.5 && alphaMode < 1.5 && baseColor.a < alphaCutoff) {
-        discard;
-    }
-
-    // Unlit: return base color without lighting.
-    if (unlit > 0.5) {
-        return baseColor;
-    }
-
     // Metallic-roughness.
     float2 mrUV = selectUV(uv0, input.uv1, texCoord1Mask, kUV1MetallicRoughness);
     float4 mrSample = metallicRoughnessTexture.Sample(metallicRoughnessSampler, mrUV);
@@ -610,34 +582,6 @@ float4 pixelMain(PixelIn input) : SV_Target {
             iridescenceThicknessTexture.Sample(baseColorSampler, iridThickUV).g);
     }
 
-    // Debug view modes, checkpoint 2 — see the first checkpoint's comment above.
-    if (viewMode > 0.5) {
-        if (abs(viewMode - 3.0) < 0.5) { // VIEW_MODE_METALLIC
-            return float4(metallic, metallic, metallic, 1.0);
-        }
-        if (abs(viewMode - 4.0) < 0.5) { // VIEW_MODE_ROUGHNESS
-            return float4(roughness, roughness, roughness, 1.0);
-        }
-        if (abs(viewMode - 5.0) < 0.5) { // VIEW_MODE_OCCLUSION
-            return float4(occlusion, occlusion, occlusion, 1.0);
-        }
-        if (abs(viewMode - 6.0) < 0.5) { // VIEW_MODE_EMISSIVE
-            return float4(emissive, 1.0);
-        }
-        if (abs(viewMode - 7.0) < 0.5) { // VIEW_MODE_ALPHA
-            return float4(baseColor.a, baseColor.a, baseColor.a, 1.0);
-        }
-        if (abs(viewMode - 8.0) < 0.5) { // VIEW_MODE_UV0
-            return float4(frac(uv0), 0.0, 1.0);
-        }
-        if (abs(viewMode - 9.0) < 0.5) { // VIEW_MODE_SPECULAR_FACTOR
-            return float4(specularFactorSampled, specularFactorSampled, specularFactorSampled, 1.0);
-        }
-        if (abs(viewMode - 10.0) < 0.5) { // VIEW_MODE_SPECULAR_COLOR
-            return float4(specularColorFactorSampled, 1.0);
-        }
-    }
-
     // KHR_materials_sheen.
     float3 sheenColor = sheenColorFactor.xyz;
     if (hasSheenColorTexture > 0.5) {
@@ -674,6 +618,66 @@ float4 pixelMain(PixelIn input) : SV_Target {
         float3 Nbase = normalize(input.worldNormal);
         float3 ccNsN = normalize(ccNS);
         ccN = normalize(ccNsN.x * T2 + ccNsN.y * B2 + ccNsN.z * Nbase);
+    }
+
+    // Every early return and the discard stay below the material texture samples above.
+    // With them above the samples, Xbox Series X (AMD) drew the mesh's triangle edges as light
+    // and dark lines in the lit output; an Intel GPU didn't. The likely cause is Sample()
+    // choosing wrong mips at triangle edges, since it derives the mip from neighbouring pixels.
+    // Debug view modes — ported from shaders/metal/default.metal's identical
+    // three-checkpoint structure (each checkpoint fires only once the data
+    // it needs has actually been computed, avoiding paying for IBL/lighting
+    // just to show a debug view). This entire feature was previously absent
+    // from the DirectX shader (confirmed: viewMode was declared in the
+    // cbuffer but never read anywhere), so every ViewMode hotkey (0-9,
+    // q/w/e/r/t/y/u/i/o/p/z) silently did nothing on Windows — pressing e.g.
+    // '4' (roughness) just kept showing normal shading.
+    if (viewMode > 0.5) {
+        if (abs(viewMode - 1.0) < 0.5) { // VIEW_MODE_WORLD_NORMAL
+            float3 Ndbg = normalize(input.worldNormal);
+            return float4(Ndbg * 0.5 + 0.5, 1.0);
+        }
+        if (abs(viewMode - 2.0) < 0.5) { // VIEW_MODE_BASE_COLOR
+            return float4(baseColor.rgb, 1.0);
+        }
+    }
+
+    // Alpha mask.
+    if (alphaMode > 0.5 && alphaMode < 1.5 && baseColor.a < alphaCutoff) {
+        discard;
+    }
+
+    // Unlit: return base color without lighting.
+    if (unlit > 0.5) {
+        return baseColor;
+    }
+
+    // Debug view modes, checkpoint 2 — see the first checkpoint's comment above.
+    if (viewMode > 0.5) {
+        if (abs(viewMode - 3.0) < 0.5) { // VIEW_MODE_METALLIC
+            return float4(metallic, metallic, metallic, 1.0);
+        }
+        if (abs(viewMode - 4.0) < 0.5) { // VIEW_MODE_ROUGHNESS
+            return float4(roughness, roughness, roughness, 1.0);
+        }
+        if (abs(viewMode - 5.0) < 0.5) { // VIEW_MODE_OCCLUSION
+            return float4(occlusion, occlusion, occlusion, 1.0);
+        }
+        if (abs(viewMode - 6.0) < 0.5) { // VIEW_MODE_EMISSIVE
+            return float4(emissive, 1.0);
+        }
+        if (abs(viewMode - 7.0) < 0.5) { // VIEW_MODE_ALPHA
+            return float4(baseColor.a, baseColor.a, baseColor.a, 1.0);
+        }
+        if (abs(viewMode - 8.0) < 0.5) { // VIEW_MODE_UV0
+            return float4(frac(uv0), 0.0, 1.0);
+        }
+        if (abs(viewMode - 9.0) < 0.5) { // VIEW_MODE_SPECULAR_FACTOR
+            return float4(specularFactorSampled, specularFactorSampled, specularFactorSampled, 1.0);
+        }
+        if (abs(viewMode - 10.0) < 0.5) { // VIEW_MODE_SPECULAR_COLOR
+            return float4(specularColorFactorSampled, 1.0);
+        }
     }
 
     // View direction & double-sided normal flip.
