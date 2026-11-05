@@ -8,6 +8,15 @@ set(CMAKE_CXX_STANDARD 20)
 
 include_directories(inc)
 
+# UWP differs from a desktop Windows build in ways the dependencies don't expect:
+# gltf only defines _USE_MATH_DEFINES for the "Windows" platform, tinyexr breaks
+# on the min/max macros, and the /sdl default turns fopen and deprecation
+# warnings into errors.
+if(CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    add_compile_definitions(_USE_MATH_DEFINES NOMINMAX)
+    add_compile_options(/sdl-)
+endif()
+
 message(STATUS ${PROJECT_NAME})
 
 include(${PROJECT_SOURCE_DIR}/dependencies/vector_math.cmake)
@@ -29,6 +38,11 @@ set(DEPENDENCIES
 )
 
 include(${PROJECT_SOURCE_DIR}/dependencies/campello_image.cmake)
+# campello_image has no WindowsStore branch and falls through to its linux.cmake,
+# which doesn't export symbols, so MSVC wouldn't produce an import library.
+if(CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    set_target_properties(campello_image PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
 set(DEPENDENCIES
     ${DEPENDENCIES}
     campello_image
@@ -131,6 +145,13 @@ if(WIN32)
     option(CAMPELLO_RENDERER_BUILD_WINDOWS_EXAMPLE "Build Windows example" OFF)
     if(CAMPELLO_RENDERER_BUILD_WINDOWS_EXAMPLE)
         add_subdirectory(examples/windows)
+    endif()
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    option(CAMPELLO_RENDERER_BUILD_UWP_EXAMPLE "Build UWP example (Windows PC and Xbox Developer Mode)" OFF)
+    if(CAMPELLO_RENDERER_BUILD_UWP_EXAMPLE)
+        add_subdirectory(examples/uwp)
     endif()
 endif()
 
