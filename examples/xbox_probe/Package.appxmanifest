@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  IgnorableNamespaces="uap mp">
+
+  <Identity Name="campello.xboxprobe" Publisher="CN=campello" Version="1.0.0.0" />
+
+  <mp:PhoneIdentity PhoneProductId="6e0b7c52-3a41-4f7e-9c1d-2b8a5d4e7f10" PhonePublisherId="00000000-0000-0000-0000-000000000000" />
+
+  <Properties>
+    <DisplayName>campello xbox probe</DisplayName>
+    <PublisherDisplayName>campello</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <!-- Windows.Universal, so it also runs on the Windows PC as a first smoke test. -->
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.19041.0" MaxVersionTested="10.0.22621.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="x-generate" />
+  </Resources>
+
+  <Applications>
+    <Application Id="App" Executable="$targetnametoken$.exe" EntryPoint="xbox_probe.App">
+      <uap:VisualElements
+        DisplayName="campello xbox probe"
+        Description="Probes D3D12 support for campello_renderer"
+        Square150x150Logo="Assets\Logo150.png"
+        Square44x44Logo="Assets\Logo44.png"
+        BackgroundColor="#202020">
+        <uap:SplashScreen Image="Assets\SplashScreen.png" BackgroundColor="#202020" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+</Package>

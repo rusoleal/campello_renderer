@@ -1,0 +1,10 @@
+x64/
+.vs/
+Generated Files/
+AppPackages/
+BundleArtifacts/
+*.user
+*.sln
+*.vcxproj.filters
+*.appx
+*.msix
