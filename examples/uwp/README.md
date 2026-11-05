@@ -46,8 +46,10 @@ The package also needs a recent `Microsoft.VCLibs.140.00.Debug`. If registering 
 ## Resolution and stats
 
 The app renders at 3840x2160 on an Xbox in Game mode, and at 1920x1080 otherwise; `app.log` records which.
-The top-left corner shows the window size and frame rate. The window size is in the system's layout units,
-so it can differ from the render resolution. The frame rate is capped at 60 by vsync.
+In that 4K case it also asks the console for a 4K output mode, and logs the modes the TV supports.
+
+The top-left corner shows the frame rate and the size of the output: the real HDMI mode where the app
+knows it, otherwise the window size. The frame rate is capped at 60 by vsync.
 
 ## Controls
 

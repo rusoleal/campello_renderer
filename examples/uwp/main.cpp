@@ -14,6 +14,7 @@
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Gaming.Input.h>
+#include <winrt/Windows.Graphics.Display.Core.h>
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.System.Profile.h>
 #include <winrt/Windows.System.h>
@@ -213,7 +214,61 @@ private:
         if (isXbox && isGameMode) {
             width = 3840;
             height = 2160;
+            requestUhdOutput();
         }
+    }
+
+    // A 4K swapchain alone doesn't change what's sent to the TV: the console's output
+    // stays in its current mode, usually 1080p, unless the app asks for another one.
+    void requestUhdOutput() {
+        using namespace winrt::Windows::Graphics::Display::Core;
+        try {
+            hdmi = HdmiDisplayInformation::GetForCurrentView();
+        } catch (const hresult_error& e) {
+            logLine("display: HDMI information unavailable, hr=0x%08X", static_cast<unsigned>(e.code().value));
+            return;
+        }
+        if (!hdmi) {
+            logLine("display: HDMI information unavailable");
+            return;
+        }
+
+        const auto current = hdmi.GetCurrentDisplayMode();
+        logLine("display: current mode %u x %u at %.2f Hz, %u bpp", current.ResolutionWidthInRawPixels(),
+                current.ResolutionHeightInRawPixels(), current.RefreshRate(), current.BitsPerPixel());
+
+        // Any color space: 1080p modes here are RGB, but 4K at 60 Hz is only offered as BT.709.
+        HdmiDisplayMode chosen{nullptr};
+        for (const auto& mode : hdmi.GetSupportedDisplayModes()) {
+            logLine("display: supported %u x %u at %.2f Hz, %u bpp, color space %d",
+                    mode.ResolutionWidthInRawPixels(), mode.ResolutionHeightInRawPixels(), mode.RefreshRate(),
+                    mode.BitsPerPixel(), static_cast<int>(mode.ColorSpace()));
+            if (!chosen && mode.ResolutionWidthInRawPixels() == 3840 && mode.ResolutionHeightInRawPixels() == 2160 &&
+                std::abs(mode.RefreshRate() - 60.0) < 1.0 && mode.BitsPerPixel() == current.BitsPerPixel()) {
+                chosen = mode;
+            }
+        }
+
+        if (current.ResolutionWidthInRawPixels() == 3840) return;
+        if (!chosen) {
+            logLine("display: no 3840 x 2160 mode at 60 Hz with %u bpp", current.BitsPerPixel());
+            return;
+        }
+        displayModeRequest = hdmi.RequestSetCurrentDisplayModeAsync(chosen);
+        logLine("display: requested 3840 x 2160");
+    }
+
+    // Polled from the render loop, so the result is logged from the app's own thread.
+    void logDisplayModeRequestResult() {
+        using winrt::Windows::Foundation::AsyncStatus;
+        if (!displayModeRequest || displayModeRequest.Status() == AsyncStatus::Started) return;
+        if (displayModeRequest.Status() == AsyncStatus::Completed) {
+            logLine("display: mode request finished, success=%d", displayModeRequest.GetResults() ? 1 : 0);
+        } else {
+            logLine("display: mode request failed, hr=0x%08X",
+                    static_cast<unsigned>(displayModeRequest.ErrorCode().value));
+        }
+        displayModeRequest = nullptr;
     }
 
     bool start(CoreWindow const& window) {
@@ -339,10 +394,21 @@ private:
         const double elapsed = secondsSince(statsStart);
         if (elapsed < 0.5 || !overlay) return;
 
-        const auto bounds = CoreWindow::GetForCurrentThread().Bounds();
+        // The real output mode where the app knows it. A window's bounds are in layout
+        // units, which read 1920x1080 on an Xbox even in a 4K output mode.
+        uint32_t shownWidth;
+        uint32_t shownHeight;
+        if (hdmi) {
+            const auto mode = hdmi.GetCurrentDisplayMode();
+            shownWidth = mode.ResolutionWidthInRawPixels();
+            shownHeight = mode.ResolutionHeightInRawPixels();
+        } else {
+            const auto bounds = CoreWindow::GetForCurrentThread().Bounds();
+            shownWidth = static_cast<uint32_t>(bounds.Width);
+            shownHeight = static_cast<uint32_t>(bounds.Height);
+        }
         char line[64];
-        snprintf(line, sizeof(line), "%uX%u %.1f FPS", static_cast<uint32_t>(bounds.Width),
-                 static_cast<uint32_t>(bounds.Height), statsFrames / elapsed);
+        snprintf(line, sizeof(line), "%uX%u %.1f FPS", shownWidth, shownHeight, statsFrames / elapsed);
         overlay->setLines({line});
 
         statsFrames = 0;
@@ -364,6 +430,7 @@ private:
         renderer->update(dt);
         renderer->setCameraMatrices(view, projection);
         updateOverlay();
+        logDisplayModeRequestResult();
         renderer->render();
 
         // The first frame includes lazy setup, so it's timed on its own.
@@ -381,6 +448,8 @@ private:
     std::shared_ptr<gpu::Device> device;
     std::shared_ptr<rend::Renderer> renderer;
     std::unique_ptr<Overlay> overlay;
+    winrt::Windows::Graphics::Display::Core::HdmiDisplayInformation hdmi{nullptr};
+    winrt::Windows::Foundation::IAsyncOperation<bool> displayModeRequest{nullptr};
     uint32_t width = 1920;
     uint32_t height = 1080;
     std::chrono::steady_clock::time_point statsStart;
