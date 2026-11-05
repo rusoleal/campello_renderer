@@ -6,8 +6,8 @@ result. It doesn't link `campello_gpu` or `campello_renderer`, and it isn't part
 
 ## Requirements (Windows PC)
 
-- Visual Studio with the **Universal Windows Platform development** workload and the
-  **C++ (v143) Universal Windows Platform tools** component
+- Visual Studio with the **Universal Windows Platform development** workload and its C++ UWP tools
+  (the project builds with that Visual Studio's default toolset; tested with v145 in VS 2026)
 - Windows SDK 22621 or later (Xbox UWP development requires it)
 - Developer Mode enabled in Windows settings
 

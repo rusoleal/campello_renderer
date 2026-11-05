@@ -580,7 +580,7 @@ private:
             desc.Height = size[1];
             char label[64];
             snprintf(label, sizeof(label), "CreateSwapChainForCoreWindow %ux%u", size[0], size[1]);
-            HRESULT hr = factory->CreateSwapChainForCoreWindow(queue.get(), get_unknown(window), &desc,
+            HRESULT hr = factory->CreateSwapChainForCoreWindow(queue.get(), winrt::get_unknown(window), &desc,
                                                                nullptr, swapChain1.put());
             report(label, hr);
             if (SUCCEEDED(hr)) break;
