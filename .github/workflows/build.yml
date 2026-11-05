@@ -90,6 +90,32 @@ jobs:
           if-no-files-found: ignore
 
   # =============================================================================
+  # UWP Build (Windows PC and Xbox Developer Mode)
+  # Compiles the libraries for UWP and packages examples/uwp. It can't run the app,
+  # so this catches build breaks only, not rendering problems on a console.
+  # =============================================================================
+  build-uwp:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Configure
+        shell: cmd
+        run: |
+          cmake -S . -B build/uwp -A x64 ^
+            -DCMAKE_SYSTEM_NAME=WindowsStore ^
+            -DCMAKE_SYSTEM_VERSION=10.0 ^
+            -DCMAKE_VS_WINDOWS_TARGET_PLATFORM_MIN_VERSION=10.0.19041.0 ^
+            -DCAMPELLO_RENDERER_BUILD_UWP_EXAMPLE=ON ^
+            -DCAMPELLO_RENDERER_ECS_SUPPORT=OFF
+
+      - name: Build
+        run: cmake --build build/uwp --config Release --target campello_renderer_uwp
+
+  # =============================================================================
   # macOS Build
   # =============================================================================
   build-macos:
