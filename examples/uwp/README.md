@@ -49,7 +49,8 @@ The app renders at 3840x2160 on an Xbox in Game mode, and at 1920x1080 otherwise
 In that 4K case it also asks the console for a 4K output mode, and logs the modes the TV supports.
 
 The top-left corner shows the frame rate and the size of the output: the real HDMI mode where the app
-knows it, otherwise the window size. The frame rate is capped at 60 by vsync.
+knows it, otherwise the window size. The frame rate is capped at 60 by vsync, so use the GPU time to see
+how much headroom is left: at 60 Hz, a frame has about 16.7 ms.
 
 ## Controls
 

@@ -164,6 +164,9 @@ private:
         static const std::array<uint8_t, 7> blank = {{0, 0, 0, 0, 0, 0, 0}};
         static const std::array<uint8_t, 7> dot = {{0, 0, 0, 0, 0, 0x0C, 0x0C}};
         static const std::array<uint8_t, 7> f = {{0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}};
+        static const std::array<uint8_t, 7> g = {{0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}};
+        static const std::array<uint8_t, 7> m = {{0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}};
+        static const std::array<uint8_t, 7> u = {{0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}};
         static const std::array<uint8_t, 7> p = {{0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}};
         static const std::array<uint8_t, 7> s = {{0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}};
         static const std::array<uint8_t, 7> x = {{0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11}};
@@ -172,7 +175,10 @@ private:
         switch (c) {
             case '.': return dot;
             case 'F': return f;
+            case 'G': return g;
+            case 'M': return m;
             case 'P': return p;
+            case 'U': return u;
             case 'S': return s;
             case 'X': return x;
             default:  return blank;

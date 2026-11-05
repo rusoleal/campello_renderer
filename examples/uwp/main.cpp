@@ -331,6 +331,9 @@ private:
             logLine("WARNING: overlay failed to initialize");
         }
 
+        // Leave out the one-off work above, such as the environment bake.
+        device->resetPassPerformanceStats();
+
         lastFrame = std::chrono::steady_clock::now();
         statsStart = lastFrame;
         return true;
@@ -407,8 +410,16 @@ private:
             shownWidth = static_cast<uint32_t>(bounds.Width);
             shownHeight = static_cast<uint32_t>(bounds.Height);
         }
+        // Time the GPU spent on each frame, averaged. Unlike the frame rate, vsync doesn't
+        // cap this, so it shows how much of the frame's time is really left.
+        const auto gpuStats = device->getPassPerformanceStats();
+        const double gpuMs = static_cast<double>(gpuStats.averageRenderPassTimeNs()) / 1e6;
+        device->resetPassPerformanceStats();
+        lastGpuMs = gpuMs;
+
         char line[64];
-        snprintf(line, sizeof(line), "%uX%u %.1f FPS", shownWidth, shownHeight, statsFrames / elapsed);
+        snprintf(line, sizeof(line), "%uX%u %.1f FPS GPU %.1f MS", shownWidth, shownHeight,
+                 statsFrames / elapsed, gpuMs);
         overlay->setLines({line});
 
         statsFrames = 0;
@@ -438,7 +449,7 @@ private:
             logLine("first frame submitted");
             fpsStart = std::chrono::steady_clock::now();
         } else if (frames % 300 == 0) {
-            logLine("frame %u: %.1f fps", frames, 300.0 / secondsSince(fpsStart));
+            logLine("frame %u: %.1f fps, GPU %.2f ms", frames, 300.0 / secondsSince(fpsStart), lastGpuMs);
             fpsStart = std::chrono::steady_clock::now();
         }
         ++frames;
@@ -454,6 +465,7 @@ private:
     uint32_t height = 1080;
     std::chrono::steady_clock::time_point statsStart;
     unsigned statsFrames = 0;
+    double lastGpuMs = 0.0;
     Camera camera;
     std::chrono::steady_clock::time_point lastFrame;
     std::chrono::steady_clock::time_point fpsStart;
