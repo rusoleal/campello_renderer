@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.13.0] - 2026-11-05
+
+### Added
+- **UWP support, including Xbox in Developer Mode.** The library builds with `CMAKE_SYSTEM_NAME=WindowsStore`. The new `examples/uwp` renders DamagedHelmet with an HDR environment on a Windows PC or an Xbox, with gamepad controls, logs in `LocalState`, and a 4K output mode in Game mode on Xbox. On an Xbox Series X it holds 60 fps at true 4K, at about 2 ms of GPU time per frame.
+- **`Renderer::setOverlayCallback()`** lets an app draw on top of the finished frame, in its own render pass, just before `render()` submits it. `examples/uwp` uses it to show the output size, frame rate and GPU time.
+- **`examples/xbox_probe`**, a standalone UWP app that reports what a console's D3D12 supports. It found that UWP on Xbox Series X only exposes feature level 11_0.
+
+### Fixed
+- **DirectX: triangle edges appeared as light and dark lines in lit output on Xbox Series X (AMD).** An Intel GPU didn't show this. The early returns and `discard` in `pixelMain` now come after the material texture samples, which removes the lines. The likely cause is `Sample()` choosing wrong mips at triangle edges, though that wasn't measured directly. The Metal and Vulkan shaders were not changed.
+- **DirectX: two more implicit-LOD samples in the transmission path could be affected the same way.** `thicknessTexture` is now sampled with the other material textures, and the `environmentMap` fallback uses an explicit LOD of 0. No transmissive asset was tested on Xbox.
+- **DirectX: `directx_default.h` was out of date.** It's now regenerated from the current HLSL, so the 0.11.2 fix that forces alpha to 1.0 for OPAQUE and MASK materials now takes effect on DirectX.
+
+### Changed
+- Requires `campello_gpu` 0.25.0 and `campello_image` 0.5.2.
+
 ## [0.12.1] - 2026-09-05
 
 ### Fixed

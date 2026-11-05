@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project(campello_renderer VERSION 0.12.1)
+project(campello_renderer VERSION 0.13.0)
 
 configure_file(src/campello_renderer_config.h.in campello_renderer_config.h)
 
@@ -9,11 +9,10 @@ set(CMAKE_CXX_STANDARD 20)
 include_directories(inc)
 
 # UWP differs from a desktop Windows build in ways the dependencies don't expect:
-# gltf only defines _USE_MATH_DEFINES for the "Windows" platform, tinyexr breaks
-# on the min/max macros, and the /sdl default turns fopen and deprecation
-# warnings into errors.
+# gltf only defines _USE_MATH_DEFINES for the "Windows" platform, and the /sdl
+# default turns fopen and deprecation warnings into errors.
 if(CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
-    add_compile_definitions(_USE_MATH_DEFINES NOMINMAX)
+    add_compile_definitions(_USE_MATH_DEFINES)
     add_compile_options(/sdl-)
 endif()
 
@@ -38,11 +37,6 @@ set(DEPENDENCIES
 )
 
 include(${PROJECT_SOURCE_DIR}/dependencies/campello_image.cmake)
-# campello_image has no WindowsStore branch and falls through to its linux.cmake,
-# which doesn't export symbols, so MSVC wouldn't produce an import library.
-if(CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
-    set_target_properties(campello_image PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
-endif()
 set(DEPENDENCIES
     ${DEPENDENCIES}
     campello_image

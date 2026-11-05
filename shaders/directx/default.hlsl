@@ -620,6 +620,13 @@ float4 pixelMain(PixelIn input) : SV_Target {
         ccN = normalize(ccNsN.x * T2 + ccNsN.y * B2 + ccNsN.z * Nbase);
     }
 
+    // KHR_materials_volume.
+    float thickness = thicknessFactor;
+    if (hasThicknessTexture > 0.5) {
+        float2 thickUV = selectUV(uv0, input.uv1, texCoord1Mask, kUV1Thickness);
+        thickness *= thicknessTexture.Sample(baseColorSampler, thickUV).r;
+    }
+
     // Every early return and the discard stay below the material texture samples above.
     // With them above the samples, Xbox Series X (AMD) drew the mesh's triangle edges as light
     // and dark lines in the lit output; an Intel GPU didn't. The likely cause is Sample()
@@ -734,12 +741,6 @@ float4 pixelMain(PixelIn input) : SV_Target {
         float3 Trefr = refract(-viewDir, N, eta);
         if (all(Trefr == float3(0.0, 0.0, 0.0))) Trefr = -viewDir;
 
-        float thickness = thicknessFactor;
-        if (hasThicknessTexture > 0.5) {
-            float2 thickUV = selectUV(uv0, input.uv1, texCoord1Mask, kUV1Thickness);
-            thickness *= thicknessTexture.Sample(baseColorSampler, thickUV).r;
-        }
-
         float2 sampleUV[3];
         bool uvValid[3];
         sampleUV[0] = sampleUV[1] = sampleUV[2] = float2(0.0, 0.0);
@@ -782,7 +783,8 @@ float4 pixelMain(PixelIn input) : SV_Target {
             if (uvValid[ch2]) {
                 transmitted[ch2] = sceneColorTexture.SampleLevel(sceneColorSampler, sampleUV[ch2], lod)[ch2];
             } else {
-                transmitted[ch2] = environmentMap.Sample(environmentSampler, Trefr)[ch2];
+                // Explicit LOD: this branch varies per pixel, so Sample() can't pick a mip here.
+                transmitted[ch2] = environmentMap.SampleLevel(environmentSampler, Trefr, 0.0)[ch2];
             }
         }
 

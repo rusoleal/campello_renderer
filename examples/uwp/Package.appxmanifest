@@ -5,7 +5,7 @@
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   IgnorableNamespaces="uap mp">
 
-  <Identity Name="campello.rendereruwp" Publisher="CN=campello" Version="1.0.0.3" />
+  <Identity Name="campello.rendereruwp" Publisher="CN=campello" Version="1.0.0.4" />
 
   <mp:PhoneIdentity PhoneProductId="b2f4a1d6-7c35-4e8a-9d10-3c6e5f8a2b47" PhonePublisherId="00000000-0000-0000-0000-000000000000" />
 

@@ -10,15 +10,11 @@ plus a Windows SDK. This command is for Visual Studio 2026; change `-G` for anot
 
 ```powershell
 cmake -S . -B build/uwp -G "Visual Studio 18 2026" -A x64 `
-  -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0 `
-  -DCMAKE_VS_WINDOWS_TARGET_PLATFORM_MIN_VERSION=10.0.19041.0 `
-  -DCAMPELLO_RENDERER_BUILD_UWP_EXAMPLE=ON -DCAMPELLO_RENDERER_ECS_SUPPORT=OFF `
-  -DFETCHCONTENT_SOURCE_DIR_EXTERN_CAMPELLO_GPU=<path to your campello_gpu clone>
+  -DCMAKE_SYSTEM_NAME=WindowsStore "-DCMAKE_SYSTEM_VERSION=10.0" `
+  "-DCMAKE_VS_WINDOWS_TARGET_PLATFORM_MIN_VERSION=10.0.19041.0" `
+  -DCAMPELLO_RENDERER_BUILD_UWP_EXAMPLE=ON -DCAMPELLO_RENDERER_ECS_SUPPORT=OFF
 cmake --build build/uwp --config Debug --target campello_renderer_uwp
 ```
-
-`campello_gpu` needs `createDefaultDeviceForCoreWindow()`, so point CMake at a clone that has it until
-a release includes it.
 
 The build writes an unsigned package to
 `build/uwp/examples/uwp/AppPackages/campello_renderer_uwp/campello_renderer_uwp_1.0.0.0_x64_Debug_Test/`.

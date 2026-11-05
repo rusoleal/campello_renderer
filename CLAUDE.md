@@ -132,6 +132,7 @@ Two variants are created by `createDefaultPipelines()`:
 
 - **Android**: `examples/android/` — Kotlin `MainActivity`, native layer at `app/src/main/cpp/`.
 - **macOS**: `examples/macos/` — Objective-C++ app using `ViewController.mm` and `AppDelegate.mm`. Enabled via `-DCAMPELLO_RENDERER_BUILD_MACOS_EXAMPLE=ON`.
+- **UWP (Windows PC and Xbox Developer Mode)**: `examples/uwp/`, see its README. Enabled via `-DCMAKE_SYSTEM_NAME=WindowsStore -DCAMPELLO_RENDERER_BUILD_UWP_EXAMPLE=ON`.
 
 ### Tests
 
