@@ -68,7 +68,7 @@ See `inc/campello_renderer/campello_renderer.hpp` for the full public API, and `
 ## Dependencies
 
 * [systems::leal::gltf](https://github.com/rusoleal/gltf) v0.5.1 — C++ glTF/GLB asset loader
-* [systems::leal::campello_gpu](https://github.com/rusoleal/campello_gpu) v0.23.1 — Low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX 12)
+* [systems::leal::campello_gpu](https://github.com/rusoleal/campello_gpu) v0.26.0 — Low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX 12)
 * [systems::leal::campello_image](https://github.com/rusoleal/campello_image) v0.5.0 — Image decoding (PNG, JPEG, WebP, HDR, OpenEXR) + GPU-compressed texture transcoding (Basis Universal / KTX2)
 * [systems::leal::vector_math](https://github.com/rusoleal/vector_math) v0.6.0 — Vector/matrix/quaternion math, SIMD-accelerated
 
