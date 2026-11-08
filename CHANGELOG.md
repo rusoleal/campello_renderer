@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-11-08
+
+### Fixed
+- **FXAA and SSAA broke after the first resize.** The cached FXAA, SSAA-downsample and refraction-copy bind groups were never rebuilt when `resize()` or `setSsaaScale()` recreated the textures they reference, so they kept sampling the old ones (FXAA showed nothing, SSAA an old frame). Any app whose first frame renders before its final size hit this; enabling AA only after resizing hid it. They are now dropped whenever their textures are recreated or released.
+- **SSAA never actually supersampled.** Scene passes kept the output-size viewport, scissor and depth buffer, so the scene was drawn at 1x into the corner of the scaled target, and the downsample shader divided by the scene texture's size, which happened to copy that corner back 1:1. Scene passes now use the scaled target size (`sceneTargetWidth/Height()`), the depth buffer matches it, the skybox gets it, and the downsample samples with output-normalized UVs from `fxaaVertex` (Metal, Vulkan and DirectX).
+- **Metal FXAA produced a flat frame.** It sampled with pixel positions instead of normalized UVs, so every tap clamped to an edge texel. It now uses the vertex UV (the Vulkan and DirectX FXAA were already correct).
+- Shader headers regenerated: Metal (xcrun), Vulkan (glslc) and DirectX (dxc).
+
 ## [0.13.1] - 2026-11-08
 
 ### Fixed
