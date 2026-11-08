@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- **campello_gpu v0.27.1** (was v0.26.0). On Metal, pipelines now honour `cullMode`/`frontFace`, so the opaque pipelines (`back`, `ccw`) cull back faces on macOS and iOS as they already did on Vulkan and DirectX; double-sided materials keep `none`. Also brings the 0.27.0 WebGPU work. No API changes affect campello_renderer.
+
 ## [0.13.2] - 2026-11-08
 
 ### Fixed
