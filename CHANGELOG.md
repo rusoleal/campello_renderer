@@ -2,11 +2,14 @@
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-11-08
+
 ### Fixed
 - **`render(const RenderScene&)` drew opaque meshes with the wrong transforms.** Per-draw transforms were uploaded in `scene.opaque` order, but the draws were then sorted by material and mesh, and each sorted draw read the transform at its new position. Any scene where the sort reordered draws placed meshes at other draws' transforms. Draws are now sorted before their transforms are uploaded. Found in campello_bim, whose meshes each have their own world transform.
 - **Out-of-bounds read for instanced ECS draws.** `renderPrimitive()` read `GpuMesh::vertexBuffers[VERTEX_SLOT_INSTANCE_MATRIX]` (index 19) from the 6-element per-vertex array when `instanceCount > 1`. It now uses the default instance matrix unless the array actually has that slot.
 
 ### Changed
+- **campello_gpu v0.26.0.** Brings the Metal readback fix (`Texture::download()` no longer aborts under Metal API Validation) and the emdawnwebgpu WebGPU backend; no API changes for the Metal, Vulkan or DirectX 12 paths.
 - **The public `inc/` directory is now a `PUBLIC` include directory of the `campello_renderer` target**, so consumers using `FetchContent`/`add_subdirectory` no longer need to add it by hand.
 
 ## [0.13.0] - 2026-11-05
