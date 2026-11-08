@@ -1,0 +1,35 @@
+# TEMPORARY (fix/ssaa-fxaa-resize only): regenerates the committed Vulkan and
+# DirectX shader headers with the canonical compilers (glslc, dxc), which
+# aren't available on the macOS machine that made the shader source changes.
+# Removed before merging.
+name: Regenerate shader headers (temporary)
+
+on:
+  push:
+    branches: [ fix/ssaa-fxaa-resize ]
+
+jobs:
+  vulkan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install glslc
+        run: sudo apt-get update && sudo apt-get install -y glslc
+      - name: Build Vulkan shaders
+        run: ./build_vulkan_shaders.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vulkan_default.h
+          path: src/shaders/vulkan_default.h
+
+  directx:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build DirectX shaders
+        shell: pwsh
+        run: ./build_directx_shaders.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: directx_default.h
+          path: src/shaders/directx_default.h
