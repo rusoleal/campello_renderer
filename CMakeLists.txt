@@ -106,6 +106,10 @@ endif()
 
 target_include_directories(${PROJECT_NAME} PUBLIC
                            "${PROJECT_BINARY_DIR}"
+                           # Public headers, so consumers don't have to add inc/ by hand
+                           # (the include_directories(inc) above is directory-scoped).
+                           $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/inc>
+                           $<INSTALL_INTERFACE:include>
                            )
 
 if(CAMPELLO_RENDERER_ECS_SUPPORT)

@@ -8624,7 +8624,24 @@ void Renderer::render(const RenderScene& scene,
         transformOffsets.push_back(txOffset);
         txOffset += 128;
     };
-    for (auto &draw : scene.opaque)   uploadOneTransform(draw);
+    // Opaque draws — sort by material then mesh to reduce state changes.
+    // Sorted *before* the transforms are uploaded: the draw loops below index
+    // transformOffsets by position in sortedOpaque, so the upload order must
+    // match it. (Uploading in scene.opaque order gave each draw another draw's
+    // transform whenever sorting reordered them.)
+    std::vector<systems::leal::campello_renderer::DrawCall> sortedOpaque = scene.opaque;
+    std::sort(sortedOpaque.begin(), sortedOpaque.end(),
+        [](const systems::leal::campello_renderer::DrawCall &a,
+           const systems::leal::campello_renderer::DrawCall &b) {
+            if (!a.material || !b.material) return a.material < b.material;
+            if (a.material->alphaBlend != b.material->alphaBlend)
+                return !a.material->alphaBlend;
+            if (a.material->doubleSided != b.material->doubleSided)
+                return !a.material->doubleSided;
+            if (a.material != b.material) return a.material < b.material;
+            return a.mesh < b.mesh;
+        });
+    for (auto &draw : sortedOpaque)      uploadOneTransform(draw);
     for (auto &draw : scene.transparent) uploadOneTransform(draw);
 
     // ------------------------------------------------------------------
@@ -8715,20 +8732,6 @@ void Renderer::render(const RenderScene& scene,
             break;
         }
     }
-
-    // Opaque draws — sort by material then mesh to reduce state changes.
-    std::vector<systems::leal::campello_renderer::DrawCall> sortedOpaque = scene.opaque;
-    std::sort(sortedOpaque.begin(), sortedOpaque.end(),
-        [](const systems::leal::campello_renderer::DrawCall &a,
-           const systems::leal::campello_renderer::DrawCall &b) {
-            if (!a.material || !b.material) return a.material < b.material;
-            if (a.material->alphaBlend != b.material->alphaBlend)
-                return !a.material->alphaBlend;
-            if (a.material->doubleSided != b.material->doubleSided)
-                return !a.material->doubleSided;
-            if (a.material != b.material) return a.material < b.material;
-            return a.mesh < b.mesh;
-        });
 
     auto drawSkybox = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe) {
         if (skyboxEnabled && pipelineSkybox && environmentMap) {
@@ -9229,9 +9232,17 @@ void Renderer::renderPrimitive(
     }
 
     // --- 4. Bind instance matrix ---
-    if (draw.instanceCount > 1 && draw.mesh->vertexBuffers[VERTEX_SLOT_INSTANCE_MATRIX]) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_INSTANCE_MATRIX,
-                                 draw.mesh->vertexBuffers[VERTEX_SLOT_INSTANCE_MATRIX], 0);
+    // GpuMesh::vertexBuffers only has the 6 per-vertex attribute slots
+    // (POSITION..WEIGHTS); VERTEX_SLOT_INSTANCE_MATRIX (19) is past its end, so
+    // reading it was out of bounds. Only look there if the array ever grows.
+    constexpr bool meshHasInstanceSlot =
+        VERTEX_SLOT_INSTANCE_MATRIX < std::tuple_size_v<decltype(GpuMesh::vertexBuffers)>;
+    std::shared_ptr<systems::leal::campello_gpu::Buffer> meshInstanceBuffer;
+    if constexpr (meshHasInstanceSlot) {
+        meshInstanceBuffer = draw.mesh->vertexBuffers[VERTEX_SLOT_INSTANCE_MATRIX];
+    }
+    if (draw.instanceCount > 1 && meshInstanceBuffer) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_INSTANCE_MATRIX, meshInstanceBuffer, 0);
     } else if (defaultInstanceMatrixBuffer) {
         setVertexBufferIfChanged(rpe, VERTEX_SLOT_INSTANCE_MATRIX, defaultInstanceMatrixBuffer, 0);
     }
