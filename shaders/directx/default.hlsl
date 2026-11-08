@@ -981,6 +981,7 @@ float4 pixelMain(PixelIn input) : SV_Target {
 
 struct FxaaOut {
     float4 position : SV_Position;
+    float2 uv : TEXCOORD0;  // normalized target coordinates, (0, 0) = top-left
 };
 
 FxaaOut fxaaVertex(uint vertexID : SV_VertexID)
@@ -991,6 +992,8 @@ FxaaOut fxaaVertex(uint vertexID : SV_VertexID)
     else if (vertexID == 1) pos = float2(3.0, -1.0);
     else pos = float2(-1.0, 3.0);
     output.position = float4(pos, 1.0, 1.0);
+    // D3D clip space has +Y up; texture coordinates start at the top.
+    output.uv = float2((pos.x + 1.0) * 0.5, (1.0 - pos.y) * 0.5);
     return output;
 }
 
@@ -1063,10 +1066,9 @@ SamplerState      downsampleSceneSampler : register(s0);
 
 float4 downsamplePixel(FxaaOut input) : SV_Target
 {
-    float width, height;
-    downsampleSceneTexture.GetDimensions(width, height);
-    float2 uv = input.position.xy / float2(width, height);
-    return downsampleSceneTexture.Sample(downsampleSceneSampler, uv);
+    // The scene texture is ssaaScale x the output, so use the output-normalized
+    // UV from the vertex shader, not SV_Position / scene texture size.
+    return downsampleSceneTexture.Sample(downsampleSceneSampler, input.uv);
 }
 
 // ---------------------------------------------------------------------------

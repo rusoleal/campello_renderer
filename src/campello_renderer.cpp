@@ -4906,12 +4906,10 @@ void Renderer::resize(uint32_t width, uint32_t height) {
             sceneColorTexture[f] = nullptr;
             sceneColorView[f]    = nullptr;
         }
+        invalidatePostProcessBindGroups();
         std::cout << "[Renderer::resize] zero size, cleared depth" << std::endl;
         return;
     }
-
-    namespace GPU = systems::leal::campello_gpu;
-    using TU = GPU::TextureUsage;
 
     // Reassigning depthTexture/sceneColorTexture below drops the shared_ptr to
     // whatever the previous size's textures were, destroying them as soon as
@@ -4923,12 +4921,49 @@ void Renderer::resize(uint32_t width, uint32_t height) {
     // waitForIdle() call and Renderer::~Renderer()'s doc comment.
     if (device) device->waitForIdle();
 
+    // The scene color textures of the other frame slots still have the old
+    // size; ensureSceneColorTexture() recreates each one (and its bind
+    // groups) when its slot comes round. Drop every cached bind group now.
+    invalidatePostProcessBindGroups();
+
+    // Depth at the scene target size (scaled when SSAA is on).
+    ensureDepthTexture();
+
+    // Intermediate scene color target for FXAA / SSAA.
+    ensureSceneColorTexture();
+}
+
+uint32_t Renderer::sceneTargetWidth() const {
+    if (ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout) {
+        return std::max(1u, (uint32_t)((float)renderWidth * ssaaScale));
+    }
+    return renderWidth;
+}
+
+uint32_t Renderer::sceneTargetHeight() const {
+    if (ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout) {
+        return std::max(1u, (uint32_t)((float)renderHeight * ssaaScale));
+    }
+    return renderHeight;
+}
+
+void Renderer::ensureDepthTexture() {
+    namespace GPU = systems::leal::campello_gpu;
+    using TU = GPU::TextureUsage;
+    if (!device || renderWidth == 0 || renderHeight == 0) return;
+    const uint32_t w = sceneTargetWidth();
+    const uint32_t h = sceneTargetHeight();
+    if (depthTexture && depthTexture->getWidth() == w && depthTexture->getHeight() == h) return;
+
+    // Same reasoning as resize(): don't release a depth texture the GPU may
+    // still be using.
+    device->waitForIdle();
     depthTexture = device->createTexture(
         GPU::TextureType::tt2d,
         GPU::PixelFormat::depth32float,
-        width, height, 1, 1, 1,
+        w, h, 1, 1, 1,
         (TU)(uint32_t(TU::renderTarget)));
-
+    depthView = nullptr;
     if (depthTexture) {
         depthView = depthTexture->createView(
             GPU::PixelFormat::depth32float,
@@ -4937,9 +4972,13 @@ void Renderer::resize(uint32_t width, uint32_t height) {
             0, 0,
             GPU::TextureType::tt2d);
     }
+}
 
-    // Intermediate scene color target for FXAA / SSAA.
-    ensureSceneColorTexture();
+void Renderer::invalidatePostProcessBindGroups() {
+    for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
+        fxaaBindGroup[f] = nullptr;
+        downsampleBindGroup[f] = nullptr;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5616,8 +5655,8 @@ void Renderer::renderToTarget(
                 }
             }
             // screenSize at offset 64 (float2)
-            skyboxData[16] = (float)renderWidth;
-            skyboxData[17] = (float)renderHeight;
+            skyboxData[16] = (float)sceneTargetWidth();
+            skyboxData[17] = (float)sceneTargetHeight();
             // cameraPos at offset 80 (float3, 16-byte aligned)
             skyboxData[20] = cameraWorldPos[0];
             skyboxData[21] = cameraWorldPos[1];
@@ -5907,6 +5946,7 @@ void Renderer::renderToTarget(
         if (!opaqueSceneTexture[currentFrameIndex] || opaqueSceneTexture[currentFrameIndex]->getWidth() != texW ||
             opaqueSceneTexture[currentFrameIndex]->getHeight() != texH) {
             uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2(std::max(texW, texH)));
+            copyBindGroup[currentFrameIndex] = nullptr;  // referenced the texture being replaced
             opaqueSceneTexture[currentFrameIndex] = device->createTexture(
                 GPU::TextureType::tt2d, cachedColorFormat,
                 texW, texH, 1, mipLevels, 1,
@@ -6092,8 +6132,10 @@ void Renderer::renderToTarget(
 
     auto setupViewport = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe) {
         if (renderWidth > 0 && renderHeight > 0) {
-            rpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
-            rpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+            const float sw = (float)sceneTargetWidth();
+            const float sh = (float)sceneTargetHeight();
+            rpe->setViewport(0.0f, 0.0f, sw, sh, 0.0f, 1.0f);
+            rpe->setScissorRect(0.0f, 0.0f, sw, sh);
         }
     };
 
@@ -7564,6 +7606,7 @@ void Renderer::setFxaaEnabled(bool enabled) {
             sceneColorTexture[f] = nullptr;
             sceneColorView[f]    = nullptr;
         }
+        invalidatePostProcessBindGroups();
     }
 }
 
@@ -7573,6 +7616,10 @@ bool Renderer::isFxaaEnabled() const {
 
 void Renderer::setSsaaScale(float scale) {
     ssaaScale = scale;
+    // The scene target size changed: every slot's scene color texture and
+    // cached bind groups are now the wrong size, and so is the depth buffer.
+    invalidatePostProcessBindGroups();
+    ensureDepthTexture();
     ensureSceneColorTexture();
     if (ssaaScale <= 1.0f && !fxaaEnabled) {
         for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
@@ -7611,6 +7658,10 @@ void Renderer::ensureSceneColorTexture() {
         return; // Already correct size.
     }
 
+    // This slot's cached FXAA / downsample bind groups reference the texture
+    // being replaced; drop them so they're rebuilt against the new one.
+    fxaaBindGroup[currentFrameIndex] = nullptr;
+    downsampleBindGroup[currentFrameIndex] = nullptr;
     sceneColorTexture[currentFrameIndex] = device->createTexture(
         GPU::TextureType::tt2d,
         cachedColorFormat,
@@ -8746,8 +8797,8 @@ void Renderer::render(const RenderScene& scene,
                         skyboxData[col*4 + row] = (float)invVP.data[row*4 + col];
                     }
                 }
-                skyboxData[16] = (float)renderWidth;
-                skyboxData[17] = (float)renderHeight;
+                skyboxData[16] = (float)sceneTargetWidth();
+                skyboxData[17] = (float)sceneTargetHeight();
                 skyboxData[20] = cameraWorldPos[0];
                 skyboxData[21] = cameraWorldPos[1];
                 skyboxData[22] = cameraWorldPos[2];
@@ -8803,6 +8854,7 @@ void Renderer::render(const RenderScene& scene,
         if (!opaqueSceneTexture[currentFrameIndex] || opaqueSceneTexture[currentFrameIndex]->getWidth() != texW ||
             opaqueSceneTexture[currentFrameIndex]->getHeight() != texH) {
             uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2(std::max(texW, texH)));
+            copyBindGroup[currentFrameIndex] = nullptr;  // referenced the texture being replaced
             opaqueSceneTexture[currentFrameIndex] = device->createTexture(
                 GPU::TextureType::tt2d, cachedColorFormat,
                 texW, texH, 1, mipLevels, 1,
@@ -8847,8 +8899,8 @@ void Renderer::render(const RenderScene& scene,
             auto opaqueRpe = encoder->beginRenderPass(opaqueDesc);
             if (opaqueRpe) {
                 if (renderWidth > 0 && renderHeight > 0) {
-                    opaqueRpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
-                    opaqueRpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+                    opaqueRpe->setViewport(0.0f, 0.0f, (float)sceneTargetWidth(), (float)sceneTargetHeight(), 0.0f, 1.0f);
+                    opaqueRpe->setScissorRect(0.0f, 0.0f, (float)sceneTargetWidth(), (float)sceneTargetHeight());
                 }
                 drawSkybox(opaqueRpe);
                 currentPipelineVariant = 0;
@@ -8903,8 +8955,8 @@ void Renderer::render(const RenderScene& scene,
             auto copyRpe = encoder->beginRenderPass(copyDesc);
             if (copyRpe) {
                 if (renderWidth > 0 && renderHeight > 0) {
-                    copyRpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
-                    copyRpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+                    copyRpe->setViewport(0.0f, 0.0f, (float)sceneTargetWidth(), (float)sceneTargetHeight(), 0.0f, 1.0f);
+                    copyRpe->setScissorRect(0.0f, 0.0f, (float)sceneTargetWidth(), (float)sceneTargetHeight());
                 }
                 if (pipelineDownsample && copyBindGroup[currentFrameIndex]) {
                     copyRpe->setPipeline(pipelineDownsample);
@@ -8983,8 +9035,8 @@ void Renderer::render(const RenderScene& scene,
             auto transRpe = encoder->beginRenderPass(transDesc);
             if (transRpe) {
                 if (renderWidth > 0 && renderHeight > 0) {
-                    transRpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
-                    transRpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+                    transRpe->setViewport(0.0f, 0.0f, (float)sceneTargetWidth(), (float)sceneTargetHeight(), 0.0f, 1.0f);
+                    transRpe->setScissorRect(0.0f, 0.0f, (float)sceneTargetWidth(), (float)sceneTargetHeight());
                 }
                 currentPipelineVariant = 0;
                 lastBoundVertexBuffers.fill({});
@@ -9027,8 +9079,10 @@ void Renderer::render(const RenderScene& scene,
         auto rpe = encoder->beginRenderPass(desc);
         if (!rpe) return;
         if (renderWidth > 0 && renderHeight > 0) {
-            rpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
-            rpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+            const float sw = (float)sceneTargetWidth();
+            const float sh = (float)sceneTargetHeight();
+            rpe->setViewport(0.0f, 0.0f, sw, sh, 0.0f, 1.0f);
+            rpe->setScissorRect(0.0f, 0.0f, sw, sh);
         }
 
         drawSkybox(rpe);
