@@ -203,6 +203,7 @@ jobs:
   build-android:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false  # one flaky download shouldn't cancel the other ABIs
       matrix:
         build_type: [Debug, Release]
         abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
@@ -223,6 +224,22 @@ jobs:
 
       - name: Install NDK
         run: sdkmanager "ndk;26.1.10909125" "cmake;3.22.1"
+
+      - name: Set up Gradle (caches the wrapper distribution and dependencies)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Download Gradle (with retries)
+        working-directory: examples/android
+        run: |
+          # The wrapper downloads Gradle from a GitHub release asset; on
+          # 2026-11-08 that returned 502/504/timeouts for hours and blocked the
+          # v0.13.2 release. Retry the first (uncached) download.
+          for attempt in 1 2 3 4 5; do
+            ./gradlew --version && exit 0
+            echo "Gradle download failed (attempt $attempt), retrying in 30 s"
+            sleep 30
+          done
+          exit 1
 
       - name: Build with Gradle
         working-directory: examples/android
