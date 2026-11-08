@@ -902,6 +902,20 @@ namespace systems::leal::campello_renderer {
 
     private:
         void ensureSceneColorTexture();
+        // (Re)creates the depth buffer at the scene target size (see
+        // sceneTargetWidth()). Waits for the GPU before releasing the old one.
+        void ensureDepthTexture();
+        // Drops the cached FXAA / SSAA downsample bind groups of every frame
+        // slot: they reference the scene color textures, so they must be
+        // rebuilt whenever those textures are recreated or released.
+        void invalidatePostProcessBindGroups();
+        // Size of the target the scene passes render into: the output size,
+        // or the output size times ssaaScale when SSAA is active (the scene
+        // is then rendered into a scaled intermediate texture and
+        // downsampled). Viewports, scissors, the depth buffer and the
+        // skybox's screen-size uniforms must all use this size.
+        uint32_t sceneTargetWidth() const;
+        uint32_t sceneTargetHeight() const;
 
         // Lazily creates the shared material BindGroupLayout (26 entries: base
         // color/metallic-roughness/normal/emissive/occlusion/specular/sheen/

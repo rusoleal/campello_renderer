@@ -1590,6 +1590,7 @@ fragment float4 iblBakeFragment(
 // ---------------------------------------------------------------------------
 struct FxaaOut {
     float4 position [[position]];
+    float2 uv;  // normalized target coordinates, (0, 0) = top-left
 };
 
 vertex FxaaOut fxaaVertex(uint vertexID [[vertex_id]]) {
@@ -1597,7 +1598,8 @@ vertex FxaaOut fxaaVertex(uint vertexID [[vertex_id]]) {
     if (vertexID == 0) pos = float2(-1, -1);
     else if (vertexID == 1) pos = float2(3, -1);
     else pos = float2(-1, 3);
-    return FxaaOut{float4(pos, 1.0, 1.0)};
+    // Metal clip space has +Y up; texture coordinates start at the top.
+    return FxaaOut{float4(pos, 1.0, 1.0), float2((pos.x + 1.0) * 0.5, (1.0 - pos.y) * 0.5)};
 }
 
 struct FxaaUniforms {
@@ -1614,7 +1616,10 @@ fragment float4 fxaaFragment(FxaaOut in [[stage_in]],
                              texture2d<float> sceneTex [[texture(0)]],
                              sampler sceneSampler [[sampler(1)]])
 {
-    float2 pos = in.position.xy;
+    // Normalized coordinates: sample() takes 0..1 UVs, not pixel positions
+    // (using in.position.xy here sampled far outside the texture and turned
+    // the whole frame into one clamped edge color).
+    float2 pos = in.uv;
     float2 rcpFrame = u.rcpFrame;
 
     // Sample center and 4 direct neighbours.
@@ -1674,8 +1679,9 @@ fragment float4 downsampleFragment(FxaaOut in [[stage_in]],
                                    texture2d<float> sceneTex [[texture(0)]],
                                    sampler sceneSampler [[sampler(1)]])
 {
-    float2 uv = in.position.xy / float2(sceneTex.get_width(), sceneTex.get_height());
-    return sceneTex.sample(sceneSampler, uv);
+    // The scene texture is ssaaScale x the output, so normalize by the output
+    // (via the vertex UV), not by the scene texture's own size.
+    return sceneTex.sample(sceneSampler, in.uv);
 }
 
 // ---------------------------------------------------------------------------
