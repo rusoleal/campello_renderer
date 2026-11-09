@@ -138,6 +138,14 @@ namespace systems::leal::campello_renderer {
         dispersion = 20,
     };
 
+    /// Order of opaque draws within a frame. `byState` (default) groups draws
+    /// by material and mesh to minimise state changes. `frontToBack` keeps the
+    /// pipeline classes (single/double-sided) together and draws nearer meshes
+    /// first, so early depth testing skips hidden fragments on GPUs that shade
+    /// in submission order (most desktop GPUs; tile-based Apple GPUs remove
+    /// hidden surfaces themselves).
+    enum class OpaqueOrder { byState, frontToBack };
+
     struct RenderStats {
         uint32_t opaqueDrawCount = 0;
         uint32_t transparentDrawCount = 0;
@@ -146,6 +154,10 @@ namespace systems::leal::campello_renderer {
         uint32_t visibleNodeCount = 0;
         uint32_t instanceCount = 0;
         double cpuFrameTimeMs = 0.0;
+        // GPU execution time of the most recent render() whose command buffer
+        // has completed (frames in flight: usually two or three frames old).
+        // 0 when the backend doesn't report it (Metal does).
+        double gpuFrameTimeMs = 0.0;
     };
 
     using OverlayCallback = std::function<void(
@@ -524,6 +536,9 @@ namespace systems::leal::campello_renderer {
             std::shared_ptr<systems::leal::campello_gpu::Buffer> lightsUniformBuffer;
             std::shared_ptr<systems::leal::campello_gpu::Buffer> jointMatrixBuffer;
             std::shared_ptr<systems::leal::campello_gpu::Fence>  fence;
+            // render()'s command buffer, kept to read its GPU time once the
+            // fence says it completed.
+            std::shared_ptr<systems::leal::campello_gpu::CommandBuffer> commandBuffer;
         };
         FrameResources frameResources[kMaxFramesInFlight];
         uint32_t currentFrameIndex = 0;
@@ -691,6 +706,8 @@ namespace systems::leal::campello_renderer {
         bool punctualLightsEnabled = true;
 
         RenderStats lastFrameStats;
+        double gpuFrameTimeMs = 0.0;  // latest completed render() command buffer
+        OpaqueOrder opaqueOrder = OpaqueOrder::byState;
         bool defaultLightEnabled = true;
 
         // KHR_texture_procedurals — load-time baked textures.
@@ -921,6 +938,10 @@ namespace systems::leal::campello_renderer {
         // kMaxFramesInFlight. The callback begins and ends its own render pass, using
         // LoadOp::load to keep the frame. Pass nullptr to remove it.
         void setOverlayCallback(OverlayCallback callback);
+
+        /// Order of opaque draws within a frame (see OpaqueOrder).
+        void setOpaqueOrder(OpaqueOrder order) { opaqueOrder = order; }
+        OpaqueOrder getOpaqueOrder() const { return opaqueOrder; }
 
         /// True when position-only meshes (GpuMesh::positionOnly) can be drawn:
         /// this backend's shaders have the lean pipelines and they were created

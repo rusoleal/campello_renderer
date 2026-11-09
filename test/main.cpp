@@ -2768,6 +2768,90 @@ TEST(FrustumCulling, ProjectedRadiusShrinksWithDistance) {
 // pipelines, which derive the face normal in the fragment shader: a quad
 // facing the camera must come out the same colour as the same quad with an
 // explicit normal.
+// OpaqueOrder::frontToBack only reorders draws: whatever order the scene
+// lists them in, the nearer of two overlapping quads must win, exactly as
+// with the default byState order.
+TEST_F(OffscreenRenderTest, FrontToBackOrderKeepsTheNearerSurface) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+
+    // A 1 x 1 quad in the z = 0 plane, facing +z (the camera), with bounds.
+    float positions[] = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f, -0.5f, 0.5f, 0.0f};
+    float normals[]   = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    uint32_t indices[] = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(sizeof(positions), GPU::BufferUsage::vertex, positions);
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+        device->createBuffer(sizeof(normals), GPU::BufferUsage::vertex, normals);
+    quad.indexBuffer = device->createBuffer(sizeof(indices), GPU::BufferUsage::index, indices);
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.setBoundsFromPositions(positions, 4);
+
+    namespace GLTF_NS = systems::leal::gltf;
+    const auto emissive = [&](double r, double g, double b) {
+        GLTF_NS::Material m("", nullptr, nullptr, nullptr, nullptr, VM::Vector3<double>(r, g, b),
+                            GLTF_NS::AlphaMode::opaque, 0.5, false, false, 1.0, 1.5, 0.0);
+        return renderer->uploadMaterial(m, *asset);
+    };
+    GpuMaterial* red = emissive(1.0, 0.0, 0.0);
+    GpuMaterial* blue = emissive(0.0, 0.0, 1.0);
+    ASSERT_NE(red, nullptr);
+    ASSERT_NE(blue, nullptr);
+
+    const auto translate = [](double z) {
+        auto m = VM::Matrix4<double>::identity();
+        m.data[11] = z;  // row-major, column vectors: translation in the last column
+        return m;
+    };
+    const auto renderCentre = [&](bool nearListedFirst) {
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        RenderScene scene;
+        scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                        VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                        VM::Vector3<double>(0.0, 1.0, 0.0));
+        scene.camera.projection =
+            VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+        scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+        DrawCall nearDraw;
+        nearDraw.mesh = &quad;
+        nearDraw.material = red;
+        nearDraw.worldTransform = translate(0.3);
+        DrawCall farDraw = nearDraw;
+        farDraw.material = blue;
+        farDraw.worldTransform = translate(-0.3);
+        scene.opaque = nearListedFirst ? std::vector<DrawCall>{nearDraw, farDraw}
+                                       : std::vector<DrawCall>{farDraw, nearDraw};
+        renderer->render(scene, view);
+        auto pixels = readBackPixels(tex);
+        const size_t centre = (32 * 64 + 32) * 4;
+        return std::array<int, 3>{pixels[centre], pixels[centre + 1], pixels[centre + 2]};
+    };
+
+    EXPECT_EQ(renderer->getOpaqueOrder(), OpaqueOrder::byState);
+    const auto reference = renderCentre(true);
+    EXPECT_GT(reference[0], reference[2] + 50) << "near (red) quad should be in front";
+    renderer->setOpaqueOrder(OpaqueOrder::frontToBack);
+    for (const bool nearFirst : {true, false}) {
+        const auto pixel = renderCentre(nearFirst);
+        for (int c = 0; c < 3; ++c) {
+            EXPECT_NEAR(pixel[static_cast<size_t>(c)], reference[static_cast<size_t>(c)], 2)
+                << "channel " << c << (nearFirst ? ", near listed first" : ", far listed first");
+        }
+    }
+}
+
 TEST_F(OffscreenRenderTest, PositionOnlyMeshMatchesExplicitNormals) {
     if (!device) GTEST_SKIP() << "No GPU device available";
     namespace GPU = systems::leal::campello_gpu;

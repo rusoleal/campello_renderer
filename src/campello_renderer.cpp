@@ -8591,6 +8591,13 @@ void Renderer::render(const RenderScene& scene,
         frame.fence = device->createFence();
     }
     if (frame.fence) frame.fence->wait();
+    if (frame.commandBuffer) {
+        // Completed (fence waited): its GPU time is available now.
+        if (const uint64_t ns = frame.commandBuffer->getGPUExecutionTime()) {
+            gpuFrameTimeMs = static_cast<double>(ns) / 1.0e6;
+        }
+        frame.commandBuffer.reset();
+    }
 
     transformBuffer      = frame.transformBuffer;
     cameraPositionBuffer = frame.cameraPositionBuffer;
@@ -8754,6 +8761,45 @@ void Renderer::render(const RenderScene& scene,
     // match it. (Uploading in scene.opaque order gave each draw another draw's
     // transform whenever sorting reordered them.)
     std::vector<systems::leal::campello_renderer::DrawCall> sortedOpaque = scene.opaque;
+    if (opaqueOrder == OpaqueOrder::frontToBack) {
+        // Pipeline class first (blend, double-sided), then nearest first, so
+        // early depth testing rejects hidden fragments on GPUs that shade in
+        // submission order. Distance: camera to the world-space centre of
+        // the mesh bounds (the node origin when the mesh has none).
+        const auto &eye = scene.camera.position;
+        std::vector<std::pair<double, uint32_t>> order(sortedOpaque.size());
+        for (uint32_t i = 0; i < sortedOpaque.size(); ++i) {
+            const auto &draw = sortedOpaque[i];
+            double c[3] = {0.0, 0.0, 0.0};
+            if (draw.mesh && draw.mesh->hasBounds) {
+                for (int k = 0; k < 3; ++k) {
+                    c[k] = 0.5 * ((double)draw.mesh->boundsMin[k] + (double)draw.mesh->boundsMax[k]);
+                }
+            }
+            const double *m = draw.worldTransform.data;
+            double d2 = 0.0;
+            for (int r = 0; r < 3; ++r) {
+                const double w = m[r * 4] * c[0] + m[r * 4 + 1] * c[1] + m[r * 4 + 2] * c[2] + m[r * 4 + 3];
+                const double e = r == 0 ? eye.x() : r == 1 ? eye.y() : eye.z();
+                d2 += (w - e) * (w - e);
+            }
+            order[i] = {d2, i};
+        }
+        const auto rank = [](const systems::leal::campello_renderer::DrawCall &d) {
+            return !d.material ? 0 : (d.material->alphaBlend ? 2 : 0) + (d.material->doubleSided ? 1 : 0);
+        };
+        std::sort(order.begin(), order.end(), [&](const auto &a, const auto &b) {
+            const int ra = rank(sortedOpaque[a.second]);
+            const int rb = rank(sortedOpaque[b.second]);
+            if (ra != rb) return ra < rb;
+            if (a.first != b.first) return a.first < b.first;
+            return a.second < b.second;
+        });
+        std::vector<systems::leal::campello_renderer::DrawCall> byDepth;
+        byDepth.reserve(sortedOpaque.size());
+        for (const auto &entry : order) byDepth.push_back(sortedOpaque[entry.second]);
+        sortedOpaque = std::move(byDepth);
+    } else {
     std::sort(sortedOpaque.begin(), sortedOpaque.end(),
         [](const systems::leal::campello_renderer::DrawCall &a,
            const systems::leal::campello_renderer::DrawCall &b) {
@@ -8765,6 +8811,7 @@ void Renderer::render(const RenderScene& scene,
             if (a.material != b.material) return a.material < b.material;
             return a.mesh < b.mesh;
         });
+    }
     for (auto &draw : sortedOpaque)      uploadOneTransform(draw);
     for (auto &draw : scene.transparent) uploadOneTransform(draw);
 
@@ -9278,10 +9325,12 @@ void Renderer::render(const RenderScene& scene,
         }
     }
 
-    device->submit(encoder->finish(), frame.fence);
+    frame.commandBuffer = encoder->finish();
+    device->submit(frame.commandBuffer, frame.fence);
     currentFrameIndex = (currentFrameIndex + 1) % kMaxFramesInFlight;
 
     // Stats
+    lastFrameStats.gpuFrameTimeMs = gpuFrameTimeMs;
     lastFrameStats.opaqueDrawCount = (uint32_t)scene.opaque.size();
     lastFrameStats.transparentDrawCount = (uint32_t)scene.transparent.size();
     lastFrameStats.totalDrawCount = lastFrameStats.opaqueDrawCount + lastFrameStats.transparentDrawCount;
