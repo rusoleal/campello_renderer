@@ -2850,6 +2850,78 @@ TEST_F(OffscreenRenderTest, QuantizedPositionsRenderLikeFloatPositions) {
     EXPECT_EQ(differing, 0u) << "quantized and float positions rendered differently";
 }
 
+// A camera-facing triangle with one morph target moving every vertex
+// +0.4 in x; the mesh's default weight is the template placeholder.
+static const char *kGltfMorphTriangleTemplate = R"({
+    "asset": {"version": "2.0"},
+    "scene": 0,
+    "scenes": [{"nodes": [0]}],
+    "nodes": [{"mesh": 0}],
+    "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "targets": [{"POSITION": 2}], "indices": 3, "material": 0}],
+                "weights": [%f]}],
+    "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0, "roughnessFactor": 1}, "doubleSided": true}],
+    "accessors": [
+        {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [0.5, 0.5, 0], "min": [-0.5, -0.5, 0]},
+        {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"},
+        {"bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC3", "max": [0.4, 0, 0], "min": [0.4, 0, 0]},
+        {"bufferView": 3, "componentType": 5123, "count": 3, "type": "SCALAR"}
+    ],
+    "bufferViews": [
+        {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 36, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 72, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 108, "byteLength": 6}
+    ],
+    "buffers": [{"uri": "data:application/octet-stream;base64,AAAAvwAAAL8AAAAAAAAAPwAAAL8AAAAAAAAAAAAAAD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/zczMPgAAAAAAAAAAzczMPgAAAAAAAAAAzczMPgAAAAAAAAAAAAABAAIA", "byteLength": 114}]
+})";
+
+// Morph-target deltas are uploaded tightly packed (12 bytes per vertex):
+// with weight 1 the whole triangle moves right, its right edge too (a
+// shader reading them at another stride moves only the first vertex).
+TEST_F(OffscreenRenderTest, MorphTargetMovesEveryVertex) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    const auto render = [&](double weight) -> std::vector<uint8_t> {
+        renderer = std::make_unique<systems::leal::campello_renderer::Renderer>(device);
+        char json[4096];
+        snprintf(json, sizeof(json), kGltfMorphTriangleTemplate, weight);
+        auto asset = GLTF::loadGLTF(std::string(json), kNoOpLoader);
+        if (!asset) return {};
+        renderer->setAsset(asset);
+        renderer->resize(64, 64);
+        renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+        renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        renderer->setSkyboxEnabled(false);
+        auto tex = makeOffscreenTexture(64, 64);
+        if (!tex) return {};
+        auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+        renderer->render(view);
+        return readBackPixels(tex);
+    };
+    // Leftmost and rightmost lit columns.
+    const auto extent = [](const std::vector<uint8_t>& p) {
+        int left = 64, right = -1;
+        for (int y = 0; y < 64; ++y) {
+            for (int x = 0; x < 64; ++x) {
+                const size_t i = (size_t(y) * 64 + size_t(x)) * 4;
+                if (p[i] + p[i + 1] + p[i + 2] > 30) {
+                    left = std::min(left, x);
+                    right = std::max(right, x);
+                }
+            }
+        }
+        return std::pair{left, right};
+    };
+    const auto rest = render(0.0);
+    const auto moved = render(1.0);
+    ASSERT_EQ(rest.size(), 64u * 64u * 4u);
+    ASSERT_EQ(moved.size(), rest.size());
+    const auto [restLeft, restRight] = extent(rest);
+    const auto [movedLeft, movedRight] = extent(moved);
+    ASSERT_GE(restRight, 0) << "triangle not drawn";
+    EXPECT_GT(movedLeft, restLeft + 2) << "left edge should move right";
+    EXPECT_GT(movedRight, restRight + 2) << "right edge should move right too";
+}
+
 // App shader programs (program.hpp): an element-id program compiled by
 // campello_renderer_add_shader_program() writes each quad's per-vertex id
 // (custom0) into an r32uint target through renderProgramPass().

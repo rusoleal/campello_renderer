@@ -327,8 +327,10 @@ vertex VertexOut vertexMain(
     device const float4x4    *instanceMatrices   [[buffer(19)]],
     device const float4x4    *jointMatrices      [[buffer(20)]],
     constant MorphInfo       &morph              [[buffer(21)]],
-    device const float3      *morphPositions     [[buffer(22)]],
-    device const float3      *morphNormals       [[buffer(23)]],
+    // Deltas are uploaded tightly packed (3 floats per vertex): packed_float3,
+    // not float3 (16-byte stride in device memory).
+    device const packed_float3 *morphPositions   [[buffer(22)]],
+    device const packed_float3 *morphNormals     [[buffer(23)]],
     uint                       vertexID          [[vertex_id]])
 {
     // Apply KHR_texture_transform when hasUVTransform flag (row0.w) is set.
@@ -372,9 +374,9 @@ vertex VertexOut vertexMain(
         for (uint i = 0; i < morphTargetCount; i++) {
             float w = morph.weights[i];
             if (w != 0.0) {
-                morphedPosition += w * morphPositions[i * morphVertexCount + vertexID];
+                morphedPosition += w * float3(morphPositions[i * morphVertexCount + vertexID]);
                 if (morphHasNormal) {
-                    morphedNormal += w * morphNormals[i * morphVertexCount + vertexID];
+                    morphedNormal += w * float3(morphNormals[i * morphVertexCount + vertexID]);
                 }
             }
         }

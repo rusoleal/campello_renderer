@@ -18,6 +18,9 @@
 - Design proposal: `docs/design/programmable-pipelines.md` (app-defined vertex layouts and shader programs).
 - **Size culling in `render_system()`.** With `RenderSystemOptions{minPixelRadius, viewportHeight}`, draws whose bounding sphere covers fewer pixels than that on screen are skipped (counted in `RenderSystemStats::tooSmall`). The estimate is `projectedRadiusPixels()` in `culling.hpp`; meshes without bounds and spheres reaching the camera are never "small". Found in campello_bim, whose IFC reference models have thousands of batches.
 
+### Fixed
+- **Morph targets on Metal.** The vertex shader read the morph-target deltas as `device const float3*` (16-byte stride) while they are uploaded tightly packed (12 bytes per vertex), so only the first vertex of each primitive got its delta (the rest read neighbouring components or past the end). They are now `packed_float3`. New test: a morph target moves every vertex.
+
 ### Changed
 - **One transform contract on every backend.** On Metal, the per-draw transforms are now also per-instance vertex attributes (locations 16-19 MVP, 24-27 model, in the slot after the attributes), as on Vulkan and DirectX, so one program source can serve every backend (programmable pipelines phase 5, Slang). The built-in Metal shaders keep reading `[[buffer(16)]]`; both are bound. `program_interface.metal.h` gains `CAMPELLO_TRANSFORM_ATTRIBUTES` and `CAMPELLO_MVP()`/`CAMPELLO_MODEL()`; the element-id test program uses them.
 - **Compact vertex buffer slots** (programmable pipelines phase 2). A pipeline's attributes take slots 0..n-1 in semantic order, then the per-draw transforms (Vulkan/DirectX); each cached pipeline carries a map from logical slot (`VERTEX_SLOT_*`) to physical slot, and draw code binds through it (buffers the pipeline doesn't read are no longer bound). The standard Vulkan/DirectX pipeline uses 7 vertex buffers instead of 18 (WebGPU allows 8). No shader changes; Metal is unchanged.
