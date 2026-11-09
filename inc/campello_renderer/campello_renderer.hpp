@@ -467,6 +467,14 @@ namespace systems::leal::campello_renderer {
         bool hasFlatProgram() const { return !programs.empty() && !programs[0].fragmentEntries[0].empty(); }
         // renderProgramPass() in progress (render() draws in its mode).
         const ProgramPassOptions* activeProgramPass = nullptr;
+        // Clip planes (setClipPlanes()); uploaded after the camera block.
+        std::vector<std::array<double, 4>> clipPlanes;
+        bool sectionCapsEnabled = true;
+        std::array<float, 4> sectionCapColor{0.35f, 0.35f, 0.38f, 1.0f};
+        bool clippingActive() const { return !clipPlanes.empty() && supportsClipPlanes(); }
+        void uploadClipUniforms(const std::shared_ptr<systems::leal::campello_gpu::Buffer>& buffer) const;
+        // CameraUniforms (160 bytes) + clip block (128 bytes).
+        static constexpr uint64_t kCameraUniformSize = 288;
         std::shared_ptr<systems::leal::campello_gpu::Texture> programPassDepthTexture;
         std::shared_ptr<systems::leal::campello_gpu::TextureView> programPassDepthView;
 
@@ -1044,6 +1052,19 @@ namespace systems::leal::campello_renderer {
         /// The layout of meshes with GpuMesh::layout == nullptr (glTF/PBR;
         /// joint and weight formats follow the loaded asset).
         const VertexLayout& standardVertexLayout() const { return standardLayout; }
+        /// Clip planes (world space, up to 6): fragments where n.p + d < 0 for
+        /// any plane are discarded; planes are {nx, ny, nz, d} (normalised
+        /// here). While planes are set, built-in materials draw without
+        /// back-face culling, so the inside of cut solids shows; with section
+        /// caps on, back faces of single-sided materials are painted in the
+        /// cap colour (a solid-looking cut). Empty = no clipping. Only on
+        /// backends where supportsClipPlanes() (Metal, Vulkan; not DirectX yet).
+        void setClipPlanes(const std::vector<std::array<double, 4>>& planes);
+        const std::vector<std::array<double, 4>>& getClipPlanes() const { return clipPlanes; }
+        void setSectionCaps(bool enabled, float r = 0.35f, float g = 0.35f, float b = 0.38f);
+        bool supportsClipPlanes() const;
+        static constexpr size_t kMaxClipPlanes = 6;
+
         /// Mesh pipelines created so far (cache size; for statistics and tests).
         size_t meshPipelineCount() const { return meshPipelineCache.size(); }
 

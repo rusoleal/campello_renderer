@@ -8,6 +8,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <array>
+#include <vector>
 
 namespace systems::leal::campello_renderer {
 
@@ -79,6 +81,32 @@ inline double projectedRadiusPixels(const systems::leal::vector_math::Matrix4<do
     const double depth = m.data[12] * cx + m.data[13] * cy + m.data[14] * cz + m.data[15];
     if (depth <= radius) return NEVER_SMALL;
     return radius * projYScale / depth * 0.5 * static_cast<double>(viewportHeight);
+}
+
+/// True if the mesh's bounds lie entirely on the clipped side of one of the
+/// world-space planes {nx, ny, nz, d} (Renderer::setClipPlanes(): kept where
+/// n.p + d >= 0), so every fragment would be discarded. Exact for affine
+/// world matrices: the plane is moved into the mesh's local space and tested
+/// against the box's farthest corner. Meshes without bounds are never clipped.
+inline bool isClippedAway(const std::vector<std::array<double, 4>>& planes,
+                          const systems::leal::vector_math::Matrix4<double>& world,
+                          const GpuMesh& mesh) {
+    if (!mesh.hasBounds) return false;
+    const double* w = world.data;  // row-major: p_world = M p_local + t
+    for (const auto& plane : planes) {
+        // Local plane: n_l = M^T n, d_l = n.t + d.
+        double nl[3];
+        for (int j = 0; j < 3; ++j) {
+            nl[j] = w[j] * plane[0] + w[4 + j] * plane[1] + w[8 + j] * plane[2];
+        }
+        const double dl = w[3] * plane[0] + w[7] * plane[1] + w[11] * plane[2] + plane[3];
+        double farthest = dl;
+        for (int j = 0; j < 3; ++j) {
+            farthest += nl[j] * (nl[j] >= 0.0 ? mesh.boundsMax[j] : mesh.boundsMin[j]);
+        }
+        if (farthest < 0.0) return true;
+    }
+    return false;
 }
 
 } // namespace systems::leal::campello_renderer

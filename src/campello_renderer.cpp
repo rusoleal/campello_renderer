@@ -581,6 +581,10 @@ static void buildMaterialSlotFromGltf(const systems::leal::gltf::Material& mat,
                  viewModeValue,
                  environmentIntensityValue, iblEnabledValue,
                  out);
+    // Offset 88 (_padding / _pad0 in the shaders): double-sided flag, so
+    // section caps (clip planes) only paint back faces of closed, single-
+    // sided surfaces.
+    out[22] = mat.doubleSided ? 1.f : 0.f;
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,7 +1190,7 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
     if (!vulkanFrameBindGroupLayout) {
         GPU::BindGroupLayoutDescriptor frameDesc{};
         addBuf(frameDesc, 0, 272);                          // LightsUniform
-        addBuf(frameDesc, 1, 160);                          // CameraUniforms
+        addBuf(frameDesc, 1, kCameraUniformSize);           // CameraUniforms + clip planes
         addTex(frameDesc, 2, GPU::TextureType::ttCube);     // environmentMap (prefiltered specular — see bakeIblResources())
         addSamp(frameDesc, 3);                              // environmentSampler
         addTex(frameDesc, 4);                               // sceneColorTexture
@@ -2269,10 +2273,11 @@ void Renderer::setScene(uint32_t index) {
             frameResources[f].lightsUniformBuffer->upload(0, 272, zeros);
         }
         if (!frameResources[f].cameraPositionBuffer) {
-            frameResources[f].cameraPositionBuffer = device->createBuffer(160, GPU::BufferUsage::uniform);
+            frameResources[f].cameraPositionBuffer = device->createBuffer(kCameraUniformSize, GPU::BufferUsage::uniform);
             float defaultCam[40] = {0.f};
             defaultCam[2] = 3.f;
             frameResources[f].cameraPositionBuffer->upload(0, 160, defaultCam);
+            uploadClipUniforms(frameResources[f].cameraPositionBuffer);
         }
         if (!frameResources[f].fence) {
             frameResources[f].fence = device->createFence();
@@ -2447,7 +2452,7 @@ void Renderer::setScene(uint32_t index) {
             bgDesc.layout  = vulkanFrameBindGroupLayout;
             bgDesc.entries = {
                 {0, GPU::BufferBinding{frameResources[f].lightsUniformBuffer, 0, 272}},
-                {1, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, 160}},
+                {1, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, kCameraUniformSize}},
                 {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
                 {3, environmentSampler},
                 {4, defaultTexture},
@@ -2472,7 +2477,7 @@ void Renderer::setScene(uint32_t index) {
             bgDesc.layout  = bindGroupLayout;
             bgDesc.entries = {
                 {10, GPU::BufferBinding{frameResources[f].lightsUniformBuffer, 0, 272}},
-                {18, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, 160}},
+                {18, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, kCameraUniformSize}},
                 {22, defaultTexture},
             };
             frameBindGroup[f] = device->createBindGroup(bgDesc);
@@ -3475,6 +3480,50 @@ void Renderer::prewarmMeshPipelines() {
             }
         }
     }
+}
+
+void Renderer::setClipPlanes(const std::vector<std::array<double, 4>>& planes) {
+    clipPlanes.clear();
+    for (const auto& p : planes) {
+        if (clipPlanes.size() == kMaxClipPlanes) break;
+        const double length = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+        if (length <= 0.0) continue;
+        clipPlanes.push_back({p[0] / length, p[1] / length, p[2] / length, p[3] / length});
+    }
+}
+
+void Renderer::setSectionCaps(bool enabled, float r, float g, float b) {
+    sectionCapsEnabled = enabled;
+    sectionCapColor = {r, g, b, 1.0f};
+}
+
+bool Renderer::supportsClipPlanes() const {
+#if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
+    return false;  // default.hlsl doesn't read the clip block yet
+#else
+    return meshRecipe.ready;
+#endif
+}
+
+void Renderer::uploadClipUniforms(const std::shared_ptr<systems::leal::campello_gpu::Buffer>& buffer) const {
+    // Layout after the 160-byte camera block (CameraUniforms in the shaders):
+    // uint4 clipInfo (x = plane count, y = caps on), float4 capColor,
+    // float4 clipPlanes[6] (xyz = unit normal, w = d; kept where n.p + d >= 0).
+    if (!buffer) return;
+    struct {
+        uint32_t info[4];
+        float capColor[4];
+        float planes[kMaxClipPlanes][4];
+    } block{};
+    const bool active = clippingActive();
+    block.info[0] = active ? (uint32_t)clipPlanes.size() : 0u;
+    block.info[1] = active && sectionCapsEnabled ? 1u : 0u;
+    for (int c = 0; c < 4; ++c) block.capColor[c] = sectionCapColor[(size_t)c];
+    for (size_t i = 0; i < clipPlanes.size(); ++i) {
+        for (int c = 0; c < 4; ++c) block.planes[i][c] = (float)clipPlanes[i][(size_t)c];
+    }
+    static_assert(sizeof(block) == kCameraUniformSize - 160, "clip block size");
+    buffer->upload(160, sizeof(block), &block);
 }
 
 ProgramHandle Renderer::registerProgram(const ShaderProgramDesc& desc) {
@@ -5524,6 +5573,7 @@ void Renderer::renderToTarget(
             camData[37] = (float)renderHeight;
 
             cameraPositionBuffer->upload(0, 160, camData);
+            uploadClipUniforms(cameraPositionBuffer);
         }
     }
 
@@ -5862,7 +5912,7 @@ void Renderer::renderToTarget(
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
             {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-            {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
             {3, environmentSampler},
             {4, scTex},
@@ -5885,7 +5935,7 @@ void Renderer::renderToTarget(
         bgDesc.layout = bindGroupLayout;
         bgDesc.entries = {
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-            {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
@@ -6144,7 +6194,7 @@ void Renderer::renderToTarget(
             bgDesc.layout = vulkanFrameBindGroupLayout;
             bgDesc.entries = {
                 {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-                {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+                {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
                 {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
                 {3, environmentSampler},
                 {4, opaqueSceneTexture[currentFrameIndex]},
@@ -6165,7 +6215,7 @@ void Renderer::renderToTarget(
             bgDesc.layout = bindGroupLayout;
             bgDesc.entries = {
                 {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-                {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+                {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
                 {22, opaqueSceneTexture[currentFrameIndex]},
                 // See the other frame-bind-group construction site's comment
                 // on why environment bindings live here, not per-material.
@@ -6638,9 +6688,13 @@ void Renderer::renderPrimitive(
             }
         }
     }
+    // Clip planes: the clip test is in the textured shader, and without
+    // culling the back faces seen through the cut become section caps.
+    const bool clipping = clippingActive();
     const MeshPipelineEntry* entry = debugView
         ? meshPipeline(MeshProgram::debug, *layout, false, false)
-        : meshPipeline(hasTexture ? MeshProgram::textured : MeshProgram::flat, *layout, doubleSided, useBlend);
+        : meshPipeline((hasTexture || clipping) ? MeshProgram::textured : MeshProgram::flat, *layout,
+                       doubleSided || clipping, useBlend);
     if (!entry) return;
     activeMeshSlots = &entry->slots;
     if (entry->pipeline.get() != currentPipelineObject) {
@@ -8453,6 +8507,7 @@ void Renderer::render(const RenderScene& scene,
         camData[36] = (float)renderWidth;
         camData[37] = (float)renderHeight;
         cameraPositionBuffer->upload(0, 160, camData);
+            uploadClipUniforms(cameraPositionBuffer);
     }
 
     // Update per-frame bind group (lights + camera + placeholder texture).
@@ -8464,7 +8519,7 @@ void Renderer::render(const RenderScene& scene,
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
             {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-            {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
             {3, environmentSampler},
             {4, scTex},
@@ -8487,7 +8542,7 @@ void Renderer::render(const RenderScene& scene,
         bgDesc.layout = bindGroupLayout;
         bgDesc.entries = {
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-            {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
@@ -8652,7 +8707,7 @@ void Renderer::render(const RenderScene& scene,
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
             {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-            {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
             {3, environmentSampler},
             {4, scTex},
@@ -8670,7 +8725,7 @@ void Renderer::render(const RenderScene& scene,
         bgDesc.layout = bindGroupLayout;
         bgDesc.entries = {
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-            {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
@@ -8916,7 +8971,7 @@ void Renderer::render(const RenderScene& scene,
             bgDesc.layout = vulkanFrameBindGroupLayout;
             bgDesc.entries = {
                 {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-                {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+                {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
                 {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
                 {3, environmentSampler},
                 {4, opaqueSceneTexture[currentFrameIndex]},
@@ -8933,7 +8988,7 @@ void Renderer::render(const RenderScene& scene,
             bgDesc.layout = bindGroupLayout;
             bgDesc.entries = {
                 {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-                {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+                {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
                 {22, opaqueSceneTexture[currentFrameIndex]},
                 // See the other frame-bind-group construction site's comment
                 // on why environment bindings live here, not per-material.
@@ -9200,7 +9255,8 @@ void Renderer::renderPrimitive(
     bool debugView = program == kPbrProgram && viewMode == ViewMode::worldNormal && !customLayout;
     const MeshPipelineEntry* entry = debugView
         ? meshPipeline(program, MeshProgram::debug, layout, false, false, colorFormat)
-        : meshPipeline(program, MeshProgram::textured, layout, doubleSided, useBlend, colorFormat);
+        : meshPipeline(program, MeshProgram::textured, layout, doubleSided || (program == kPbrProgram && clippingActive()),
+                       useBlend, colorFormat);
     if (!entry) return;
     activeMeshSlots = &entry->slots;
 

@@ -131,7 +131,7 @@ struct MaterialUniforms {
     float  hasEmissiveTexture;
     float  hasOcclusionTexture;
     float  occlusionStrength;
-    float  _padding;
+    float  doubleSided;           // 1 = double-sided material (no section cap)
     float4 emissiveFactor;        // xyz = emissive RGB, w unused
     float  ior;
     float  specularFactor;
@@ -243,6 +243,10 @@ struct CameraUniforms {
     float4x4 projMatrix;
     float2   screenSize;
     float2   _pad;
+    // Clip block (Renderer::uploadClipUniforms()).
+    uint4    clipInfo;       // x = plane count, y = section caps on
+    float4   capColor;
+    float4   clipPlanes[6];  // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
 };
 
 constant float VIEW_MODE_NORMAL       = 0.0;
@@ -817,7 +821,8 @@ fragment float4 fragmentMain_textured(
     texture2d<float> iridescenceThicknessTexture [[texture(25)]],
     texture2d<float> anisotropicTexture          [[texture(26)]],
     texturecube<float> irradianceEnvironmentMap  [[texture(27)]],
-    texture2d<float> brdfLutTexture              [[texture(28)]])
+    texture2d<float> brdfLutTexture              [[texture(28)]],
+    bool             frontFacing                 [[front_facing]])
 {
     // Position-only meshes (vertexLean) carry no normal: use the flat face
     // normal from screen-space derivatives of the world position, turned
@@ -834,6 +839,18 @@ fragment float4 fragmentMain_textured(
         in.worldNormal    = N;
         in.worldTangent   = T;
         in.worldBitangent = cross(N, T);
+    }
+
+    // Clip planes (Renderer::setClipPlanes()): discard the clipped side. With
+    // section caps on, back faces of single-sided surfaces (the inside of a
+    // cut solid, visible through the cut) take the cap colour.
+    for (uint i = 0; i < camera.clipInfo.x; ++i) {
+        if (dot(camera.clipPlanes[i].xyz, inRaw.worldPos) + camera.clipPlanes[i].w < 0.0) {
+            discard_fragment();
+        }
+    }
+    if (camera.clipInfo.y != 0 && !frontFacing && mat.doubleSided < 0.5) {
+        return float4(camera.capColor.rgb, 1.0);
     }
 
     // uv is the shared TEXCOORD_0-based fallback every other texture below

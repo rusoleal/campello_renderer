@@ -2943,6 +2943,124 @@ TEST_F(OffscreenRenderTest, ProgramPassWritesElementIds) {
     EXPECT_NO_THROW(renderer->render(scene, colorView));
 }
 
+TEST(ClipPlanes, IsClippedAwayTestsTheBoxInLocalSpace) {
+    namespace VM = systems::leal::vector_math;
+    GpuMesh mesh;
+    mesh.hasBounds = true;
+    mesh.boundsMin = {-1.0f, -1.0f, -1.0f};
+    mesh.boundsMax = {1.0f, 1.0f, 1.0f};
+    const auto identity = VM::Matrix4<double>::identity();
+    // Kept where n.p + d >= 0.
+    EXPECT_TRUE(isClippedAway({{1.0, 0.0, 0.0, -2.0}}, identity, mesh));   // keep x >= 2
+    EXPECT_FALSE(isClippedAway({{1.0, 0.0, 0.0, 0.0}}, identity, mesh));   // keep x >= 0: straddles
+    EXPECT_FALSE(isClippedAway({{-1.0, 0.0, 0.0, -0.999}}, identity, mesh)); // keep x <= -0.999
+    EXPECT_FALSE(isClippedAway({}, identity, mesh));
+    // Moved to x = 5: now entirely kept by "x >= 2", and clipped by "x <= 3".
+    auto moved = VM::Matrix4<double>::identity();
+    moved.data[3] = 5.0;
+    EXPECT_FALSE(isClippedAway({{1.0, 0.0, 0.0, -2.0}}, moved, mesh));
+    EXPECT_TRUE(isClippedAway({{-1.0, 0.0, 0.0, 3.0}}, moved, mesh));
+    // Any plane clipping it is enough.
+    EXPECT_TRUE(isClippedAway({{0.0, 0.0, 1.0, 10.0}, {-1.0, 0.0, 0.0, 3.0}}, moved, mesh));
+    mesh.hasBounds = false;
+    EXPECT_FALSE(isClippedAway({{1.0, 0.0, 0.0, -2.0}}, identity, mesh));
+}
+
+// Clip planes in the built-in PBR shader: the clipped half of a quad is
+// discarded; with section caps, the back face of a single-sided quad (no
+// longer culled while clipping) takes the cap colour, a double-sided one
+// doesn't.
+TEST_F(OffscreenRenderTest, ClipPlanesDiscardAndCapBackFaces) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsClipPlanes()) GTEST_SKIP() << "No clip planes on this backend";
+
+    // 1 x 1 quad at z = 0, counter-clockwise seen from +z (front) or not.
+    const auto makeQuad = [&](bool facingCamera) {
+        float positions[] = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f, -0.5f, 0.5f, 0.0f};
+        float normals[] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+        uint32_t front[] = {0, 1, 2, 0, 2, 3};
+        uint32_t back[] = {0, 2, 1, 0, 3, 2};
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(sizeof(positions), GPU::BufferUsage::vertex, positions);
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+            device->createBuffer(sizeof(normals), GPU::BufferUsage::vertex, normals);
+        mesh.indexBuffer = device->createBuffer(sizeof(front), GPU::BufferUsage::index, facingCamera ? front : back);
+        mesh.indexCount = 6;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = 4;
+        mesh.setBoundsFromPositions(positions, 4);
+        return mesh;
+    };
+    GpuMesh frontQuad = makeQuad(true);
+    GpuMesh backQuad = makeQuad(false);
+    namespace GLTF_NS = systems::leal::gltf;
+    const auto material = [&](bool doubleSided) {
+        GLTF_NS::Material m("", nullptr, nullptr, nullptr, nullptr, VM::Vector3<double>(0.0, 0.0, 0.0),
+                            GLTF_NS::AlphaMode::opaque, 0.5, doubleSided, false, 1.0, 1.5, 0.0);
+        return renderer->uploadMaterial(m, *asset);
+    };
+    GpuMaterial* singleSided = material(false);
+    GpuMaterial* doubleSided = material(true);
+    ASSERT_NE(singleSided, nullptr);
+    ASSERT_NE(doubleSided, nullptr);
+
+    const auto render = [&](GpuMesh& mesh, GpuMaterial* mat) {
+        RenderScene scene;
+        scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                        VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                        VM::Vector3<double>(0.0, 1.0, 0.0));
+        scene.camera.projection =
+            VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+        scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+        DrawCall draw;
+        draw.mesh = &mesh;
+        draw.material = mat;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        return readBackPixels(tex);
+    };
+    const auto pixel = [](const std::vector<uint8_t>& p, int x, int y) {
+        const size_t i = ((size_t)y * 64 + (size_t)x) * 4;
+        return std::array<int, 3>{p[i], p[i + 1], p[i + 2]};
+    };
+    const auto lit = [](std::array<int, 3> c) { return c[0] + c[1] + c[2] > 30; };
+
+    // The quad covers about pixels 23-41. No clipping: both halves lit.
+    auto plain = render(frontQuad, singleSided);
+    EXPECT_TRUE(lit(pixel(plain, 26, 32)));
+    EXPECT_TRUE(lit(pixel(plain, 38, 32)));
+    // Keep x >= 0: the left half is discarded.
+    renderer->setClipPlanes({{1.0, 0.0, 0.0, 0.0}});
+    auto half = render(frontQuad, singleSided);
+    EXPECT_FALSE(lit(pixel(half, 26, 32))) << "clipped side discarded";
+    EXPECT_TRUE(lit(pixel(half, 38, 32))) << "kept side drawn";
+
+    // A plane keeping everything; red caps.
+    renderer->setClipPlanes({{0.0, 0.0, 1.0, 10.0}});
+    renderer->setSectionCaps(true, 1.0f, 0.0f, 0.0f);
+    const auto cap = pixel(render(backQuad, singleSided), 32, 32);
+    EXPECT_EQ(cap, (std::array<int, 3>{255, 0, 0})) << "single-sided back face: cap colour";
+    const auto twoSided = pixel(render(backQuad, doubleSided), 32, 32);
+    EXPECT_TRUE(lit(twoSided));
+    EXPECT_NE(twoSided, (std::array<int, 3>{255, 0, 0})) << "double-sided back face is shaded, not capped";
+    // Clipping off: the single-sided back face is culled again.
+    renderer->setClipPlanes({});
+    EXPECT_FALSE(lit(pixel(render(backQuad, singleSided), 32, 32))) << "back face culled";
+}
+
 TEST(VertexLayout, DescribesFormatsAndHashesThem) {
     using CT = systems::leal::campello_gpu::ComponentType;
     const VertexLayout standard = VertexLayout::standard();

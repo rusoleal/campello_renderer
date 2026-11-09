@@ -41,7 +41,7 @@ layout(std140, set = 0, binding = 24) uniform MaterialUniforms {
     float hasEmissiveTexture;        // 76
     float hasOcclusionTexture;       // 80
     float occlusionStrength;         // 84
-    float _pad0;                     // 88
+    float doubleSided;               // 88: 1 = double-sided material (no section cap)
     float _pad1;                     // 92
     vec4  emissiveFactor;            // 96
     float ior;                       // 112
@@ -117,6 +117,10 @@ layout(std140, set = 1, binding = 1) uniform CameraUniforms {
     mat4 projMatrix;
     vec2 screenSize;
     vec2 _cpad;
+    // Clip block (Renderer::uploadClipUniforms()).
+    uvec4 clipInfo;       // x = plane count, y = section caps on
+    vec4  capColor;
+    vec4  clipPlanes[6];  // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
 } camera;
 
 layout(set = 1, binding = 2) uniform textureCube environmentMap;
@@ -391,6 +395,19 @@ void main() {
         worldNormalIn    = N;
         worldTangentIn   = T;
         worldBitangentIn = cross(N, T);
+    }
+
+    // Clip planes (Renderer::setClipPlanes()): discard the clipped side. With
+    // section caps on, back faces of single-sided surfaces (the inside of a
+    // cut solid, visible through the cut) take the cap colour.
+    for (uint i = 0u; i < camera.clipInfo.x; ++i) {
+        if (dot(camera.clipPlanes[i].xyz, worldPos) + camera.clipPlanes[i].w < 0.0) {
+            discard;
+        }
+    }
+    if (camera.clipInfo.y != 0u && !gl_FrontFacing && mat.doubleSided < 0.5) {
+        outColor = vec4(camera.capColor.rgb, 1.0);
+        return;
     }
 
     vec2 uv0 = fragTexcoord0;

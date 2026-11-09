@@ -444,10 +444,16 @@ inline void render_system(
     // 3. Draw calls (frustum-culled when the mesh has bounds)
     const auto clipFromWorld = scene.camera.projection * scene.camera.view;
     RenderSystemStats counted;
+    const bool clipping = !renderer.getClipPlanes().empty() && renderer.supportsClipPlanes();
     for (auto [transform, meshRenderer] : world.query<Transform, MeshRenderer>()) {
         if (!meshRenderer.mesh || !meshRenderer.material) continue;
         const bool skinned = meshRenderer.jointMatrixBuffer && meshRenderer.jointCount > 0;
         if (!skinned && isOutsideFrustum(clipFromWorld, transform.worldMatrix, *meshRenderer.mesh)) {
+            ++counted.culled;
+            continue;
+        }
+        // Entirely on the clipped side of a clip plane (setClipPlanes()).
+        if (!skinned && clipping && isClippedAway(renderer.getClipPlanes(), transform.worldMatrix, *meshRenderer.mesh)) {
             ++counted.culled;
             continue;
         }

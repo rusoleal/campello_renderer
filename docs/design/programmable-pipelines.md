@@ -1,6 +1,6 @@
 # Programmable pipelines: app-defined vertex layouts and shaders
 
-Status: **in progress** (2026-11-09). Phases 1 (vertex layouts, pipeline cache) and 3 (app shader programs) and most of phase 2 (compact slots, binding contract) are implemented; the rest is proposed.
+Status: **in progress** (2026-11-09). Phases 1 (vertex layouts, pipeline cache), 3 (app shader programs) and 4 (clip planes, section caps) and most of phase 2 (compact slots, binding contract) are implemented; the rest is proposed.
 
 ## Problem
 
@@ -209,9 +209,9 @@ Each phase ships on its own, keeps the existing tests and image comparisons pass
    - Interface headers per language (`inc/campello_renderer/shaders/program_interface.*`) and `campello_renderer_add_shader_program()` (CMake) to compile and embed app programs.
    - `VertexSemantic::custom0`-`3` for app vertex data; first program: element ids into `r32uint` (renderer test). campello_gpu needed a fix for integer/normalized vertex formats on Vulkan and DirectX (local branch `fix/vulkan-vertex-formats`, to release as 0.27.2).
    - Not done: BIM GPU picking (its CPU BVH picking already returns the hit point that snapping needs; ids would add 4 bytes per vertex). The built-in shaders don't include the interface headers yet (they would need regenerated binaries on every backend).
-4. **PBR features.**
-   - Clip planes, tint/override.
-   - BIM section planes and selection highlight move onto these.
+4. **PBR features.** *Clip planes done; tint deferred.*
+   - Done: `setClipPlanes()` (6 world planes in the camera block, discard in the PBR fragment shader on Metal and Vulkan), section caps (back faces of single-sided materials in a cap colour, culling off while clipping), CPU culling of draws entirely clipped (`isClippedAway()` in `render_system`). BIM uses it for horizontal sections. DirectX: needs `default.hlsl` to read the clip block (dxc).
+   - Deferred: per-draw tint/override. Materials already cover highlight and ghosting (BIM swaps materials), and colour-by-property on merged batches needs per-vertex colour (`COLOR_0`, which `GpuMesh` now carries) rather than a per-draw value; revisit with a concrete need.
 5. **Single-source shaders (optional).**
    - Slang spike on the PBR shader; if it passes the image tests, move the built-in shaders and document it for apps.
 6. **Lines and topology.**
