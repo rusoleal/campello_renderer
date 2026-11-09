@@ -7919,6 +7919,24 @@ GpuMesh* Renderer::uploadMesh(const systems::leal::gltf::Primitive& primitive,
 
     auto mesh = std::make_unique<GpuMesh>();
 
+    // Bounds for frustum culling (render_system), from the POSITION
+    // accessor's min/max (required by glTF). Float positions only: quantized
+    // ones (KHR_mesh_quantization) are dequantized by the node transform, so
+    // their raw min/max aren't shader-space positions.
+    if (auto posIt = primitive.attributes.find("POSITION");
+        posIt != primitive.attributes.end() && asset.accessors && posIt->second >= 0 &&
+        (size_t)posIt->second < asset.accessors->size()) {
+        const auto& posAcc = (*asset.accessors)[(size_t)posIt->second];
+        if (posAcc.componentType == systems::leal::gltf::ComponentType::ctFloat && posAcc.min && posAcc.max &&
+            posAcc.min->size() >= 3 && posAcc.max->size() >= 3) {
+            mesh->hasBounds = true;
+            for (size_t a = 0; a < 3; ++a) {
+                mesh->boundsMin[a] = (float)(*posAcc.min)[a];
+                mesh->boundsMax[a] = (float)(*posAcc.max)[a];
+            }
+        }
+    }
+
     // --- Index buffer ---
     if (primitive.indices >= 0 && asset.accessors) {
         auto& idxAcc = (*asset.accessors)[(size_t)primitive.indices];

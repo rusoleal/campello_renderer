@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <campello_renderer/campello_renderer.hpp>
 #include <campello_renderer/procedural_texture_baker.hpp>
+#include <campello_renderer/culling.hpp>
 #include <gltf/gltf.hpp>
 #include <future>
 #include <vector>
@@ -2637,4 +2638,106 @@ TEST_F(OffscreenRenderTest, DifferentPixelFormatBGRA8) {
 int main(int argc, char **argv) {
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
+}
+
+
+// ---------------------------------------------------------------------------
+// Frustum culling (culling.hpp): pure math, no GPU.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+namespace VMC = systems::leal::vector_math;
+using systems::leal::campello_renderer::GpuMesh;
+using systems::leal::campello_renderer::isOutsideFrustum;
+
+// Camera at (0, 0, 5) looking at the origin, 60 degree vertical FOV, square,
+// near 0.1, far 1000 (the same set-up as ECSPathRendersToOffscreen).
+VMC::Matrix4<double> testClipFromWorld() {
+    const auto view = VMC::Matrix4<double>::lookAt(
+        VMC::Vector3<double>(0.0, 0.0, 5.0), VMC::Vector3<double>(0.0, 0.0, 0.0), VMC::Vector3<double>(0.0, 1.0, 0.0));
+    const auto projection = VMC::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 1000.0);
+    return projection * view;
+}
+
+GpuMesh boxMesh(float x0, float y0, float z0, float x1, float y1, float z1) {
+    GpuMesh mesh;
+    mesh.hasBounds = true;
+    mesh.boundsMin = {x0, y0, z0};
+    mesh.boundsMax = {x1, y1, z1};
+    return mesh;
+}
+
+VMC::Matrix4<double> moved(double x, double y, double z) {
+    return VMC::Matrix4<double>::translate(VMC::Vector3<double>(x, y, z));
+}
+
+} // namespace
+
+TEST(FrustumCulling, BoxInFrontIsVisible) {
+    const auto box = boxMesh(-0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f);
+    EXPECT_FALSE(isOutsideFrustum(testClipFromWorld(), VMC::Matrix4<double>::identity(), box));
+}
+
+TEST(FrustumCulling, BoxesOutsideEachPlaneAreCulled) {
+    const auto clip = testClipFromWorld();
+    const auto box = boxMesh(-0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f);
+    EXPECT_TRUE(isOutsideFrustum(clip, moved(100.0, 0.0, 0.0), box));    // right
+    EXPECT_TRUE(isOutsideFrustum(clip, moved(-100.0, 0.0, 0.0), box));   // left
+    EXPECT_TRUE(isOutsideFrustum(clip, moved(0.0, 100.0, 0.0), box));    // top
+    EXPECT_TRUE(isOutsideFrustum(clip, moved(0.0, -100.0, 0.0), box));   // bottom
+    EXPECT_TRUE(isOutsideFrustum(clip, moved(0.0, 0.0, 20.0), box));     // behind the camera
+    EXPECT_TRUE(isOutsideFrustum(clip, moved(0.0, 0.0, -2000.0), box));  // beyond the far plane
+}
+
+TEST(FrustumCulling, BoxCrossingTheEdgeIsVisible) {
+    // At the origin (5 units away) the half-width is 5 * tan(30 deg) = 2.89:
+    // a box from x = 2 to 10 straddles the right plane.
+    EXPECT_FALSE(isOutsideFrustum(testClipFromWorld(), VMC::Matrix4<double>::identity(),
+                                  boxMesh(2.0f, -0.5f, -0.5f, 10.0f, 0.5f, 0.5f)));
+}
+
+TEST(FrustumCulling, WorldTransformIsApplied) {
+    const auto clip = testClipFromWorld();
+    // Local bounds far to the right; the world transform brings them back in.
+    const auto box = boxMesh(50.0f, -0.5f, -0.5f, 60.0f, 0.5f, 0.5f);
+    EXPECT_TRUE(isOutsideFrustum(clip, VMC::Matrix4<double>::identity(), box));
+    EXPECT_FALSE(isOutsideFrustum(clip, moved(-55.0, 0.0, 0.0), box));
+    // A half turn about Y maps local x 50..60 to world x -60..-50: still outside.
+    EXPECT_TRUE(isOutsideFrustum(clip, VMC::Matrix4<double>::rotateY(3.14159265358979323846), box));
+}
+
+TEST(FrustumCulling, MeshWithoutBoundsIsNeverCulled) {
+    GpuMesh mesh;  // hasBounds == false
+    EXPECT_FALSE(isOutsideFrustum(testClipFromWorld(), moved(1e6, 1e6, 1e6), mesh));
+}
+
+TEST(FrustumCulling, BoundsFromPositions) {
+    GpuMesh mesh;
+    const float xyz[] = {1.0f, -2.0f, 3.0f, -4.0f, 5.0f, 0.5f, 2.0f, 0.0f, -6.0f};
+    mesh.setBoundsFromPositions(xyz, 3);
+    ASSERT_TRUE(mesh.hasBounds);
+    EXPECT_FLOAT_EQ(mesh.boundsMin[0], -4.0f);
+    EXPECT_FLOAT_EQ(mesh.boundsMin[1], -2.0f);
+    EXPECT_FLOAT_EQ(mesh.boundsMin[2], -6.0f);
+    EXPECT_FLOAT_EQ(mesh.boundsMax[0], 2.0f);
+    EXPECT_FLOAT_EQ(mesh.boundsMax[1], 5.0f);
+    EXPECT_FLOAT_EQ(mesh.boundsMax[2], 3.0f);
+    GpuMesh empty;
+    empty.setBoundsFromPositions(xyz, 0);
+    EXPECT_FALSE(empty.hasBounds);
+}
+
+TEST_F(OffscreenRenderTest, UploadMeshTakesBoundsFromThePositionAccessor) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    GpuMesh* mesh = renderer->uploadMesh(asset->meshes->front().primitives.front(), *asset);
+    ASSERT_NE(mesh, nullptr);
+    ASSERT_TRUE(mesh->hasBounds);  // POSITION min [-0.5, -0.5, 0], max [0.5, 0.5, 0]
+    EXPECT_FLOAT_EQ(mesh->boundsMin[0], -0.5f);
+    EXPECT_FLOAT_EQ(mesh->boundsMin[1], -0.5f);
+    EXPECT_FLOAT_EQ(mesh->boundsMax[0], 0.5f);
+    EXPECT_FLOAT_EQ(mesh->boundsMax[1], 0.5f);
 }

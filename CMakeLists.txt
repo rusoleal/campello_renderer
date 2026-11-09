@@ -114,7 +114,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 
 if(CAMPELLO_RENDERER_ECS_SUPPORT)
     # ecs.hpp is header-only; consumers must have campello_core in their include path.
-    install(FILES inc/campello_renderer/ecs.hpp
+    install(FILES inc/campello_renderer/ecs.hpp inc/campello_renderer/culling.hpp
             DESTINATION include/campello_renderer)
 endif()
 

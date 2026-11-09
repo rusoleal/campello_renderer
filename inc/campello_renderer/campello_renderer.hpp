@@ -31,7 +31,30 @@ namespace systems::leal::campello_renderer {
             systems::leal::campello_gpu::IndexFormat::uint32;
         std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, 6> vertexBuffers; // POSITION, NORMAL, UV, TANGENT, JOINTS, WEIGHTS
         uint32_t vertexCount = 0;
-        // topology, bounds — reserved for future phases
+
+        // Local-space axis-aligned bounds of the vertex positions. When set,
+        // render_system() skips the draw if the box is entirely outside the
+        // camera frustum. Unset (the default): never culled. uploadMesh()
+        // fills them from a float POSITION accessor's min/max.
+        bool hasBounds = false;
+        std::array<float, 3> boundsMin{0.0f, 0.0f, 0.0f};
+        std::array<float, 3> boundsMax{0.0f, 0.0f, 0.0f};
+
+        /// Sets the bounds from tightly packed xyz positions.
+        void setBoundsFromPositions(const float* xyz, size_t count) {
+            hasBounds = count > 0;
+            if (!hasBounds) return;
+            boundsMin = {xyz[0], xyz[1], xyz[2]};
+            boundsMax = boundsMin;
+            for (size_t i = 1; i < count; ++i) {
+                for (size_t a = 0; a < 3; ++a) {
+                    const float v = xyz[i * 3 + a];
+                    if (v < boundsMin[a]) boundsMin[a] = v;
+                    if (v > boundsMax[a]) boundsMax[a] = v;
+                }
+            }
+        }
+        // topology — reserved for future phases
     };
 
     struct GpuMaterial {
