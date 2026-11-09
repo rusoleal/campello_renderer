@@ -215,8 +215,9 @@ Each phase ships on its own, keeps the existing tests and image comparisons pass
 5. **Single-source shaders.** *Spike done (Slang 2026.20): go for app programs; PBR move planned.* See "Slang spike findings" below.
    - Done: one transform contract on every backend (Metal also gets the transforms as per-instance attributes); `program_interface.slang`; `campello_renderer_add_shader_program(SLANG ...)` compiles one source to Metal, SPIR-V (`-fvk-invert-y`), HLSL (then dxc) and WGSL; the element-id test program is Slang and passes on Metal, with valid SPIR-V.
    - Next (PBR): one binding layout for all backends (material group + frame group, the DirectX split from phase 2), port the Metal PBR shader (the most complete) to Slang, Metal image tests pixel-identical, then retire the three hand-written copies; split PBR by feature set for WebGPU's 16-texture limit.
-6. **Lines and topology.**
-   - `GpuMesh` topology (lines, line strips) with a line program, for edges and drawing views.
+6. **Lines and topology.** *Done (1-pixel lines).*
+   - `GpuMesh::topology` in the pipeline key; a line vertex stage in the built-in program (Metal, Vulkan) with a clip-space depth offset so edges win over their faces; unlit materials give flat colours. campello_bim draws feature edges with it.
+   - Later, for drawing views: wide lines (screen-space quads expanded in the vertex shader), dashes, line weights by category.
 7. **WebGPU backend.**
    - PBR in WGSL (from Slang if phase 5 worked, hand-written otherwise), split into feature variants within 16 textures per stage.
    - Pipelines through the same cache; Emscripten build and an image test in a headless browser.

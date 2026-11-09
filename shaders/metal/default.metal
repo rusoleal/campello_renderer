@@ -474,6 +474,35 @@ vertex VertexOut vertexLean(
 }
 
 // ---------------------------------------------------------------------------
+// Line vertex shader: line meshes (GpuMesh::topology lineList/lineStrip),
+// position only. As vertexLean, plus a small clip-space depth offset towards
+// the camera so edges drawn on their own faces win the depth test (depth
+// bias doesn't apply to lines on Metal/Vulkan). The offset is in normalized
+// depth, so its world size follows depth precision (about 2 cm at 100 m
+// with a near plane at 1 m).
+// ---------------------------------------------------------------------------
+constant float kLineDepthOffset = 4.0e-6;
+
+vertex VertexOut vertexLine(
+    VertexInLean                 in             [[stage_in]],
+    device const NodeTransforms *nodeTransforms [[buffer(16)]])
+{
+    float4 localPos = float4(in.position, 1.0);
+    VertexOut out;
+    out.clipPosition   = nodeTransforms[0].mvp * localPos;
+    out.clipPosition.z -= kLineDepthOffset * out.clipPosition.w;
+    out.worldPos       = (nodeTransforms[0].model * localPos).xyz;
+    out.worldNormal    = float3(0.0);
+    out.worldTangent   = float3(0.0);
+    out.worldBitangent = float3(0.0);
+    out.texcoord0      = float2(0.0);
+    out.normalUV       = float2(0.0);
+    out.texcoord1      = float2(0.0);
+    out.color0         = float4(1.0);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Fragment variant: flat — Lambert shading with baseColorFactor only.
 // ---------------------------------------------------------------------------
 fragment float4 fragmentMain_flat(

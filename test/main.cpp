@@ -2922,6 +2922,95 @@ TEST_F(OffscreenRenderTest, MorphTargetMovesEveryVertex) {
     EXPECT_GT(movedRight, restRight + 2) << "right edge should move right too";
 }
 
+// Lines (GpuMesh::topology): an unlit green line over a lit quad in the same
+// plane is drawn along its whole length (the line stage's depth offset wins
+// the depth test) and only on its own row.
+static const char *kGltfLineMaterials = R"({
+    "asset": {"version": "2.0"},
+    "extensionsUsed": ["KHR_materials_unlit"],
+    "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0, 1, 0, 1]}, "extensions": {"KHR_materials_unlit": {}}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [1, 0, 0, 1], "metallicFactor": 0, "roughnessFactor": 1}}
+    ]
+})";
+
+TEST_F(OffscreenRenderTest, LinesDrawOnTopOfTheirFaces) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    ASSERT_TRUE(asset->materials && asset->materials->size() == 2);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsLines()) GTEST_SKIP() << "No line stage on this backend";
+    GpuMaterial* green = renderer->uploadMaterial((*asset->materials)[0], *asset);
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(green, nullptr);
+    ASSERT_NE(red, nullptr);
+
+    // A 1.2 x 1.2 quad at z = 0 and a horizontal line along its middle,
+    // both position-only.
+    float quadPositions[] = {-0.6f, -0.6f, 0.0f, 0.6f, -0.6f, 0.0f, 0.6f, 0.6f, 0.0f, -0.6f, 0.6f, 0.0f};
+    uint32_t quadIndices[] = {0, 1, 2, 0, 2, 3};
+    float linePositions[] = {-0.6f, 0.0f, 0.0f, 0.6f, 0.0f, 0.0f};
+    uint32_t lineIndices[] = {0, 1};
+    const auto makeMesh = [&](float* positions, size_t positionBytes, uint32_t* indices, uint32_t indexCount,
+                              GPU::PrimitiveTopology topology) {
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positionBytes, GPU::BufferUsage::vertex, positions);
+        mesh.indexBuffer = device->createBuffer(indexCount * sizeof(uint32_t), GPU::BufferUsage::index, indices);
+        mesh.indexCount = indexCount;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = (uint32_t)(positionBytes / 12);
+        mesh.layout = &VertexLayout::positionOnly();
+        mesh.topology = topology;
+        return mesh;
+    };
+    GpuMesh quad = makeMesh(quadPositions, sizeof(quadPositions), quadIndices, 6, GPU::PrimitiveTopology::triangleList);
+    GpuMesh line = makeMesh(linePositions, sizeof(linePositions), lineIndices, 2, GPU::PrimitiveTopology::lineList);
+
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                    VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection =
+        VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+    for (auto [mesh, material] : {std::pair{&quad, red}, std::pair{&line, green}}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    renderer->render(scene, view);
+    const auto pixels = readBackPixels(tex);
+    const auto isGreen = [&](int x, int y) {
+        const size_t i = (size_t(y) * 64 + size_t(x)) * 4;
+        return pixels[i + 1] > 200 && pixels[i] < 60 && pixels[i + 2] < 60;
+    };
+    // The line's row (it may land on row 31 or 32): green along the quad.
+    int greenOnLine = 0;
+    for (int x = 22; x <= 41; ++x) {
+        if (isGreen(x, 31) || isGreen(x, 32)) ++greenOnLine;
+    }
+    EXPECT_EQ(greenOnLine, 20) << "line hidden by its coplanar face somewhere";
+    // Away from it: the quad, not the line.
+    EXPECT_FALSE(isGreen(32, 26));
+    EXPECT_FALSE(isGreen(32, 38));
+    const size_t quadPixel = (size_t(26) * 64 + 32) * 4;
+    EXPECT_GT(pixels[quadPixel], 40) << "lit red quad";
+}
+
 // App shader programs (program.hpp): an element-id program compiled by
 // campello_renderer_add_shader_program() writes each quad's per-vertex id
 // (custom0) into an r32uint target through renderProgramPass().

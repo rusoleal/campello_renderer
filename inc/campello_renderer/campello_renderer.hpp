@@ -48,6 +48,13 @@ namespace systems::leal::campello_renderer {
         // if Renderer::supportsVertexLayout() accepts it, and must point at
         // storage that outlives the mesh (e.g. VertexLayout::positionOnly()).
         const VertexLayout* layout = nullptr;
+        // Primitive topology. Lines (lineList, lineStrip) are drawn by the
+        // built-in program with its line vertex stage (Metal, Vulkan): one
+        // pixel wide, nudged towards the camera so edges stay visible on
+        // their faces, no culling; use an unlit material for a flat colour.
+        // Clip planes apply to them too.
+        systems::leal::campello_gpu::PrimitiveTopology topology =
+            systems::leal::campello_gpu::PrimitiveTopology::triangleList;
 
         bool hasBounds = false;
         std::array<float, 3> boundsMin{0.0f, 0.0f, 0.0f};
@@ -394,6 +401,7 @@ namespace systems::leal::campello_renderer {
             uint32_t readMask = 0;  // semantics the shader reads (semanticBit())
             std::shared_ptr<systems::leal::campello_gpu::ShaderModule> module;
             std::string entryPoint;
+            bool lines = false;     // stage for line/point topologies (vs triangles)
         };
         // One registered program: its shaders (index = ProgramHandle;
         // 0 = built-in PBR, rebuilt by createDefaultPipelines(), app programs
@@ -452,11 +460,13 @@ namespace systems::leal::campello_renderer {
         bool quantizedLayoutDetected = false;
         VertexLayout standardLayout = VertexLayout::standard();
 
-        const MeshVertexStage* vertexStageFor(ProgramHandle program, const VertexLayout& layout) const;
+        const MeshVertexStage* vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines = false) const;
         // colorFormat: invalid = the recipe's (createDefaultPipelines()) format.
         const MeshPipelineEntry* meshPipeline(
             ProgramHandle program, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
-            systems::leal::campello_gpu::PixelFormat colorFormat = systems::leal::campello_gpu::PixelFormat::invalid);
+            systems::leal::campello_gpu::PixelFormat colorFormat = systems::leal::campello_gpu::PixelFormat::invalid,
+            systems::leal::campello_gpu::PrimitiveTopology topology =
+                systems::leal::campello_gpu::PrimitiveTopology::triangleList);
         const MeshPipelineEntry* meshPipeline(
             MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend) {
             return meshPipeline(kPbrProgram, variant, layout, doubleSided, blend);
@@ -1040,6 +1050,11 @@ namespace systems::leal::campello_renderer {
         /// True when meshes with this layout can be drawn by the program.
         bool supportsProgram(ProgramHandle program, const VertexLayout& layout) const {
             return meshRecipe.ready && program < programs.size() && vertexStageFor(program, layout) != nullptr;
+        }
+        /// True when line meshes (GpuMesh::topology lineList/lineStrip) with
+        /// this layout can be drawn by the built-in program (Metal, Vulkan).
+        bool supportsLines(const VertexLayout& layout = VertexLayout::positionOnly()) const {
+            return meshRecipe.ready && vertexStageFor(kPbrProgram, layout, true) != nullptr;
         }
         /// Draws the scene with one program into colorView (a texture of
         /// options.colorFormat, renderWidth x renderHeight as set by

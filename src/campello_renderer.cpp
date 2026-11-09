@@ -3346,7 +3346,7 @@ void Renderer::detectQuantizedLayout() {
 #endif
 }
 
-const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program, const VertexLayout& layout) const {
+const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines) const {
     if (program >= programs.size()) return nullptr;
     // The stage that reads the most attributes among those reading only
     // attributes the layout has (the full shader for glTF meshes, the lean
@@ -3354,6 +3354,7 @@ const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program,
     const uint32_t has = layout.semanticMask();
     const MeshVertexStage* best = nullptr;
     for (const auto& stage : programs[program].vertexStages) {
+        if (stage.lines != lines) continue;
         if ((stage.readMask & ~has) != 0) continue;
         if (!best || std::popcount(stage.readMask) > std::popcount(best->readMask)) best = &stage;
     }
@@ -3362,7 +3363,7 @@ const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program,
 
 const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     ProgramHandle programHandle, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
-    systems::leal::campello_gpu::PixelFormat colorFormat) {
+    systems::leal::campello_gpu::PixelFormat colorFormat, systems::leal::campello_gpu::PrimitiveTopology topology) {
     namespace GPU = systems::leal::campello_gpu;
     if (!meshRecipe.ready || !device || programHandle >= programs.size()) return nullptr;
     const ProgramState& program = programs[programHandle];
@@ -3373,7 +3374,10 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     if (program.fragmentEntries[(size_t)variant].empty()) return nullptr;
     if (!meshRecipe.supportsBlend || !program.supportsBlend) blend = false;
     if (colorFormat == GPU::PixelFormat::invalid) colorFormat = meshRecipe.colorTarget.format;
-    const MeshVertexStage* stage = vertexStageFor(programHandle, layout);
+    const bool lines = topology != GPU::PrimitiveTopology::triangleList &&
+                       topology != GPU::PrimitiveTopology::triangleStrip;
+    if (lines) doubleSided = true;  // no faces to cull
+    const MeshVertexStage* stage = vertexStageFor(programHandle, layout, lines);
     if (!stage) return nullptr;
 
     // Only the attributes the stage reads shape the pipeline.
@@ -3389,6 +3393,7 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     mix((uint64_t)programHandle);
     mix((uint64_t)variant);
     mix((uint64_t)colorFormat);
+    mix((uint64_t)topology);
     mix(doubleSided ? 1u : 0u);
     mix(blend ? 1u : 0u);
     if (auto it = meshPipelineCache.find(key); it != meshPipelineCache.end()) {
@@ -3430,6 +3435,7 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     }
 
     d.cullMode = doubleSided ? GPU::CullMode::none : GPU::CullMode::back;
+    d.topology = topology;
     GPU::ColorState color = meshRecipe.colorTarget;
     color.format = colorFormat;
     if (blend) {
@@ -3662,6 +3668,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         programs[kPbrProgram].vertexStages = {
             {allSemantics, shaderModule, "vertexMain"},
             {semanticBit(VertexSemantic::position), shaderModule, "vertexLean"},
+            {semanticBit(VertexSemantic::position), shaderModule, "vertexLine", true},
         };
         programs[kPbrProgram].fragmentModule = shaderModule;
         programs[kPbrProgram].fragmentEntries = {"fragmentMain_flat", "fragmentMain_textured", "fragmentMain_debug"};
@@ -4110,6 +4117,10 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         if (auto leanModule = device->createShaderModule(kDefaultVulkanLeanVertShader,
                                                          kDefaultVulkanLeanVertShaderSize)) {
             programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), leanModule, "main"});
+        }
+        if (auto lineModule = device->createShaderModule(kDefaultVulkanLineVertShader,
+                                                         kDefaultVulkanLineVertShaderSize)) {
+            programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), lineModule, "main", true});
         }
         programs[kPbrProgram].fragmentModule = fragModule;
         programs[kPbrProgram].fragmentEntries = {"", "main", ""};
@@ -9275,11 +9286,12 @@ void Renderer::renderPrimitive(
     ProgramHandle program = activeProgramPass ? activeProgramPass->program : draw.material->program;
     if (program >= programs.size()) program = kPbrProgram;
     const auto colorFormat = activeProgramPass ? activeProgramPass->colorFormat : GPU::PixelFormat::invalid;
-    bool debugView = program == kPbrProgram && viewMode == ViewMode::worldNormal && !customLayout;
+    bool debugView = program == kPbrProgram && viewMode == ViewMode::worldNormal && !customLayout &&
+                     draw.mesh->topology == GPU::PrimitiveTopology::triangleList;
     const MeshPipelineEntry* entry = debugView
         ? meshPipeline(program, MeshProgram::debug, layout, false, false, colorFormat)
         : meshPipeline(program, MeshProgram::textured, layout, doubleSided || (program == kPbrProgram && clippingActive()),
-                       useBlend, colorFormat);
+                       useBlend, colorFormat, draw.mesh->topology);
     if (!entry) return;
     activeMeshSlots = &entry->slots;
 
