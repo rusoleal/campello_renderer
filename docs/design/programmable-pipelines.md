@@ -1,6 +1,6 @@
 # Programmable pipelines: app-defined vertex layouts and shaders
 
-Status: **in progress** (2026-11-09). Phases 1 (vertex layouts, pipeline cache), 3 (app shader programs) and 4 (clip planes, section caps) and most of phase 2 (compact slots, binding contract) are implemented; the rest is proposed.
+Status: **in progress** (2026-11-09). Phases 1 (vertex layouts, pipeline cache), 3 (app shader programs), 4 (clip planes, section caps) and 5 (Slang spike: go for app programs, PBR planned) and most of phase 2 (compact slots, binding contract) are done; the rest is proposed.
 
 ## Problem
 
@@ -212,14 +212,35 @@ Each phase ships on its own, keeps the existing tests and image comparisons pass
 4. **PBR features.** *Clip planes done; tint deferred.*
    - Done: `setClipPlanes()` (6 world planes in the camera block, discard in the PBR fragment shader on Metal and Vulkan), section caps (back faces of single-sided materials in a cap colour, culling off while clipping), CPU culling of draws entirely clipped (`isClippedAway()` in `render_system`). BIM uses it for horizontal sections. DirectX: needs `default.hlsl` to read the clip block (dxc).
    - Deferred: per-draw tint/override. Materials already cover highlight and ghosting (BIM swaps materials), and colour-by-property on merged batches needs per-vertex colour (`COLOR_0`, which `GpuMesh` now carries) rather than a per-draw value; revisit with a concrete need.
-5. **Single-source shaders (optional).**
-   - Slang spike on the PBR shader; if it passes the image tests, move the built-in shaders and document it for apps.
+5. **Single-source shaders.** *Spike done (Slang 2026.20): go for app programs; PBR move planned.* See "Slang spike findings" below.
+   - Done: one transform contract on every backend (Metal also gets the transforms as per-instance attributes); `program_interface.slang`; `campello_renderer_add_shader_program(SLANG ...)` compiles one source to Metal, SPIR-V (`-fvk-invert-y`), HLSL (then dxc) and WGSL; the element-id test program is Slang and passes on Metal, with valid SPIR-V.
+   - Next (PBR): one binding layout for all backends (material group + frame group, the DirectX split from phase 2), port the Metal PBR shader (the most complete) to Slang, Metal image tests pixel-identical, then retire the three hand-written copies; split PBR by feature set for WebGPU's 16-texture limit.
 6. **Lines and topology.**
    - `GpuMesh` topology (lines, line strips) with a line program, for edges and drawing views.
 7. **WebGPU backend.**
    - PBR in WGSL (from Slang if phase 5 worked, hand-written otherwise), split into feature variants within 16 textures per stage.
    - Pipelines through the same cache; Emscripten build and an image test in a headless browser.
    - Needed for the web version of campello_bim.
+
+## Slang spike findings (2026-11-09, slangc 2026.20)
+
+**Vertex input locations.** Each target follows a different annotation: Metal and SPIR-V take `[[vk::location(n)]]`, HLSL and WGSL take the semantic. With both (`[[vk::location(n)]] float3 p : TEXCOORD<n>`) all four keep location *n*, and `TEXCOORD<n>` is DirectX's existing contract. Named semantics (`: POSITION`) make WGSL renumber inputs. `program_interface.slang` wraps it as `CAMPELLO_INPUT(type, name, n)` (n literal: it is pasted into the semantic; a macro parameter named `location` would also replace the `vk::location` attribute name).
+
+**Clip-space Y.** `-fvk-invert-y` negates `SV_Position.y` for SPIR-V, so sources contain no per-target code. Entry points: Metal and HLSL keep their names; SPIR-V renames to `main` (the CMake helper and `ShaderProgramDesc` defaults handle both).
+
+**Per-draw transforms.** One source needs one contract: Metal now also gets the transforms as per-instance attributes (16-19, 24-27), as Vulkan/DirectX do (the built-in Metal shaders keep `[[buffer(16)]]`).
+
+**Element-id program.** One `.slang` file; Metal output passes the r32uint id test; SPIR-V passes `spirv-val`; WGSL has the right `@location`s (not drawable until phase 7); HLSL has the right `TEXCOORD<n>` semantics (DXIL not built here: no dxc on macOS).
+
+**PBR.** The existing `default.hlsl` compiles through Slang to Metal (60 KB), SPIR-V (valid) and WGSL with warnings only (implicit conversions, D3D registers without Vulkan bindings). Two things block using that output directly:
+- *Bindings.* Slang maps D3D registers to the same Metal indices (`t0` -> `texture(0)`, `b24` -> `buffer(24)`) and needs explicit `[[vk::binding]]` for Vulkan, but the three backends' bind group layouts differ today (Metal shared layout, Vulkan material/frame sets, DirectX combined group). Moving PBR needs one layout, declared once in the Slang source, that every backend's bind group layouts follow.
+- *Feature parity.* The three hand-written PBR copies have drifted (lean meshes and clip planes are Metal/Vulkan only; the debug and flat variants are Metal only). The port should start from the Metal shader and be judged by pixel-identical Metal images.
+
+**WebGPU.** The PBR fragment shader in WGSL declares 21 textures (limit 16), confirming the feature-set split.
+
+**Tooling.** slangc is one 30 MB download per platform (macOS, Windows, Linux), no install. The built-in shaders would keep committed generated headers (as `metal_default.h` / `vulkan_default.h` today), so building the renderer never needs slangc, only editing shaders does. DXIL still needs dxc (or slangc with dxcompiler on Windows).
+
+**Recommendation.** Go: new shader work (app programs, the WebGPU path) is written in Slang from now on. The PBR move is its own step (estimate: several days), after the binding-layout unification, and it is what removes the remaining DirectX and WGSL gaps (clip planes, lean meshes, a fourth hand-written copy).
 
 ## Risks and open questions
 

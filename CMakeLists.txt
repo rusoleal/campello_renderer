@@ -176,6 +176,7 @@ if(CAMPELLO_RENDERER_BUILD_TEST)
     campello_renderer_add_shader_program(
         TARGET ${PROJECT_NAME}_test
         NAME element_id
+        SLANG test/shaders/element_id.slang
         METAL test/shaders/element_id.metal
         VULKAN_VERTEX test/shaders/element_id.vert
         VULKAN_FRAGMENT test/shaders/element_id.frag

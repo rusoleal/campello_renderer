@@ -10,6 +10,11 @@
 #       VULKAN_VERTEX   shaders/element_id.vert   # SPIR-V via glslc or glslangValidator
 #       VULKAN_FRAGMENT shaders/element_id.frag
 #       DIRECTX shaders/element_id.hlsl     # vertexMain + pixelMain via dxc, if found
+#       SLANG  shaders/element_id.slang     # one source for every backend (preferred):
+#                                           # vertexMain + fragmentMain, compiled with slangc
+#                                           # (CAMPELLO_SLANGC, or $SLANG_DIR/bin) to Metal,
+#                                           # SPIR-V, HLSL (then dxc) and WGSL; overrides the
+#                                           # per-backend sources when slangc is found
 #       VERTEX_READS "semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::custom0)")
 #
 # Generates <build>/campello_shaders/<NAME>_shaders.h:
@@ -23,7 +28,7 @@ set(CAMPELLO_RENDERER_SHADER_CMAKE_DIR "${CMAKE_CURRENT_LIST_DIR}" CACHE INTERNA
 set(CAMPELLO_RENDERER_SHADER_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../inc" CACHE INTERNAL "")
 
 function(campello_renderer_add_shader_program)
-    cmake_parse_arguments(ARG "" "TARGET;NAME;METAL;VULKAN_VERTEX;VULKAN_FRAGMENT;DIRECTX;VERTEX_READS" "" ${ARGN})
+    cmake_parse_arguments(ARG "" "TARGET;NAME;METAL;VULKAN_VERTEX;VULKAN_FRAGMENT;DIRECTX;SLANG;VERTEX_READS" "" ${ARGN})
     if(NOT ARG_TARGET OR NOT ARG_NAME)
         message(FATAL_ERROR "campello_renderer_add_shader_program: TARGET and NAME are required")
     endif()
@@ -36,6 +41,71 @@ function(campello_renderer_add_shader_program)
     file(GLOB interface_headers "${inc}/campello_renderer/shaders/program_interface.*")
     set(binaries "")
     set(embed_args "")
+    set(dx_pixel_entry pixelMain)
+
+    # Slang: one source -> Metal source, SPIR-V, HLSL, WGSL (then the
+    # per-backend steps below compile the Metal/HLSL as usual).
+    set(use_slang OFF)
+    if(ARG_SLANG)
+        find_program(CAMPELLO_SLANGC slangc HINTS "$ENV{SLANG_DIR}/bin")
+        if(CAMPELLO_SLANGC)
+            set(use_slang ON)
+        else()
+            message(STATUS "campello_renderer_add_shader_program(${ARG_NAME}): slangc not found "
+                           "(set CAMPELLO_SLANGC); using the per-backend sources")
+        endif()
+    endif()
+    if(use_slang)
+        get_filename_component(slang_src "${ARG_SLANG}" ABSOLUTE)
+        set(slang_deps "${slang_src}" ${interface_headers})
+        set(slang_cmd "${CAMPELLO_SLANGC}" "${slang_src}" -I "${inc}")
+        if(APPLE)
+            set(generated_metal "${out_dir}/${ARG_NAME}.slang.metal")
+            add_custom_command(OUTPUT "${generated_metal}"
+                COMMAND ${slang_cmd} -target metal -o "${generated_metal}"
+                DEPENDS ${slang_deps}
+                COMMENT "Slang -> Metal: ${ARG_NAME}"
+                VERBATIM)
+            set(ARG_METAL "${generated_metal}")
+        endif()
+        foreach(stage vertex fragment)
+            if(stage STREQUAL "vertex")
+                set(entry vertexMain)
+                set(var VULKAN_VERTEX)
+                set(flip -fvk-invert-y)  # Vulkan clip-space Y (see program_interface.slang)
+            else()
+                set(entry fragmentMain)
+                set(var VULKAN_FRAGMENT)
+                set(flip "")
+            endif()
+            set(spv "${out_dir}/${ARG_NAME}_${stage}.slang.spv")
+            add_custom_command(OUTPUT "${spv}"
+                COMMAND ${slang_cmd} -target spirv ${flip} -entry ${entry} -stage ${stage} -o "${spv}"
+                DEPENDS ${slang_deps}
+                COMMENT "Slang -> SPIR-V: ${ARG_NAME} (${stage})"
+                VERBATIM)
+            list(APPEND binaries "${spv}")
+            list(APPEND embed_args "-D${var}=${spv}")
+        endforeach()
+        set(ARG_VULKAN_VERTEX "")
+        set(ARG_VULKAN_FRAGMENT "")
+        set(generated_hlsl "${out_dir}/${ARG_NAME}.slang.hlsl")
+        add_custom_command(OUTPUT "${generated_hlsl}"
+            COMMAND ${slang_cmd} -target hlsl -o "${generated_hlsl}"
+            DEPENDS ${slang_deps}
+            COMMENT "Slang -> HLSL: ${ARG_NAME}"
+            VERBATIM)
+        set(ARG_DIRECTX "${generated_hlsl}")
+        set(dx_pixel_entry fragmentMain)
+        set(wgsl "${out_dir}/${ARG_NAME}.wgsl")
+        add_custom_command(OUTPUT "${wgsl}"
+            COMMAND ${slang_cmd} -target wgsl -o "${wgsl}"
+            DEPENDS ${slang_deps}
+            COMMENT "Slang -> WGSL: ${ARG_NAME}"
+            VERBATIM)
+        list(APPEND binaries "${wgsl}")
+        list(APPEND embed_args "-DWGSL=${wgsl}" "-DDIRECTX_FRAGMENT_ENTRY=fragmentMain")
+    endif()
 
     # Metal (Apple): .metal -> .air -> .metallib
     if(APPLE AND ARG_METAL)
@@ -44,7 +114,7 @@ function(campello_renderer_add_shader_program)
         else()
             set(sdk macosx)
         endif()
-        get_filename_component(src "${ARG_METAL}" ABSOLUTE)
+        get_filename_component(src "${ARG_METAL}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
         set(air "${out_dir}/${ARG_NAME}.air")
         set(lib "${out_dir}/${ARG_NAME}.metallib")
         add_custom_command(OUTPUT "${lib}"
@@ -96,7 +166,7 @@ function(campello_renderer_add_shader_program)
             set(ps "${out_dir}/${ARG_NAME}_ps.dxil")
             add_custom_command(OUTPUT "${vs}" "${ps}"
                 COMMAND "${CAMPELLO_DXC}" -T vs_6_0 -E vertexMain -I "${inc}" -Fo "${vs}" "${src}"
-                COMMAND "${CAMPELLO_DXC}" -T ps_6_0 -E pixelMain -I "${inc}" -Fo "${ps}" "${src}"
+                COMMAND "${CAMPELLO_DXC}" -T ps_6_0 -E ${dx_pixel_entry} -I "${inc}" -Fo "${ps}" "${src}"
                 DEPENDS "${src}" ${interface_headers}
                 COMMENT "Compiling DXIL shader program ${ARG_NAME}"
                 VERBATIM)
