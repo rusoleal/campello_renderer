@@ -440,6 +440,34 @@ vertex VertexOut vertexMain(
 }
 
 // ---------------------------------------------------------------------------
+// Lean vertex shader: position-only meshes (GpuMesh::positionOnly). Outputs
+// a zero normal, which fragmentMain_textured replaces with the flat face
+// normal derived from screen-space derivatives of the world position; no
+// skinning, morphing or instancing.
+// ---------------------------------------------------------------------------
+struct VertexInLean {
+    float3 position [[attribute(0)]];
+};
+
+vertex VertexOut vertexLean(
+    VertexInLean                 in             [[stage_in]],
+    device const NodeTransforms *nodeTransforms [[buffer(16)]])
+{
+    float4 localPos = float4(in.position, 1.0);
+    VertexOut out;
+    out.clipPosition   = nodeTransforms[0].mvp * localPos;
+    out.worldPos       = (nodeTransforms[0].model * localPos).xyz;
+    out.worldNormal    = float3(0.0);
+    out.worldTangent   = float3(0.0);
+    out.worldBitangent = float3(0.0);
+    out.texcoord0      = float2(0.0);
+    out.normalUV       = float2(0.0);
+    out.texcoord1      = float2(0.0);
+    out.color0         = float4(1.0);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Fragment variant: flat — Lambert shading with baseColorFactor only.
 // ---------------------------------------------------------------------------
 fragment float4 fragmentMain_flat(
@@ -758,7 +786,7 @@ float3 iblGGXFresnel(float NdotV, float roughness, float3 F0,
 }
 
 fragment float4 fragmentMain_textured(
-    VertexOut        in                        [[stage_in]],
+    VertexOut        inRaw                     [[stage_in]],
     constant MaterialUniforms &mat             [[buffer(17)]],
     constant CameraUniforms  &camera           [[buffer(18)]],
     texture2d<float> baseColorTexture          [[texture(0)]],
@@ -791,6 +819,23 @@ fragment float4 fragmentMain_textured(
     texturecube<float> irradianceEnvironmentMap  [[texture(27)]],
     texture2d<float> brdfLutTexture              [[texture(28)]])
 {
+    // Position-only meshes (vertexLean) carry no normal: use the flat face
+    // normal from screen-space derivatives of the world position, turned
+    // towards the camera, with a tangent frame built as vertexMain does.
+    // The derivatives are taken unconditionally (uniform control flow).
+    VertexOut in = inRaw;
+    float3 faceNormal = cross(dfdx(inRaw.worldPos), dfdy(inRaw.worldPos));
+    if (dot(inRaw.worldNormal, inRaw.worldNormal) < 1e-8) {
+        float3 N = length(faceNormal) > 1e-20 ? normalize(faceNormal) : float3(0.0, 0.0, 1.0);
+        if (dot(N, camera.cameraPos.xyz - inRaw.worldPos) < 0.0) {
+            N = -N;
+        }
+        float3 T = abs(N.y) < 0.999 ? normalize(cross(float3(0, 1, 0), N)) : normalize(cross(float3(1, 0, 0), N));
+        in.worldNormal    = N;
+        in.worldTangent   = T;
+        in.worldBitangent = cross(N, T);
+    }
+
     // uv is the shared TEXCOORD_0-based fallback every other texture below
     // reads unless it opts into texCoord=1 via its own selectUV() call.
     float2 uv = in.texcoord0;

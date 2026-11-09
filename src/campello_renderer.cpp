@@ -3733,6 +3733,37 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         pipelineTexturedBlendDoubleSided = device->createRenderPipeline(d);
     }
 
+    // --- Lean variants: position-only meshes (GpuMesh::positionOnly) ---
+    // One 12-byte vertex stream instead of eight; the textured fragment
+    // shader derives the flat face normal when the vertex normal is zero.
+    {
+        GPU::RenderPipelineDescriptor lean = base;
+        lean.vertex.entryPoint = "vertexLean";
+        lean.vertex.buffers.clear();
+        lean.vertex.buffers.push_back(makeLayout(
+            GPU::ComponentType::ctFloat, GPU::AccessorType::acVec3,
+            12.0, GPU::StepMode::vertex, VERTEX_SLOT_POSITION));
+        const auto makeLean = [&](bool doubleSided, bool blend) {
+            GPU::RenderPipelineDescriptor d = lean;
+            if (doubleSided) d.cullMode = GPU::CullMode::none;
+            GPU::ColorState colorState = cs;
+            if (blend) {
+                d.depthStencil = blendDs;
+                colorState.blend = alphaBlend;
+            }
+            GPU::FragmentDescriptor frag{};
+            frag.module     = shaderModule;
+            frag.entryPoint = "fragmentMain_textured";
+            frag.targets.push_back(colorState);
+            d.fragment = frag;
+            return device->createRenderPipeline(d);
+        };
+        pipelineLean                 = makeLean(false, false);
+        pipelineLeanDoubleSided      = makeLean(true, false);
+        pipelineLeanBlend            = makeLean(false, true);
+        pipelineLeanBlendDoubleSided = makeLean(true, true);
+    }
+
     // --- Skybox pipeline ---
     {
         // Skybox bind group layout: cube texture (0), sampler (1), uniform buffer (2).
@@ -9264,7 +9295,20 @@ void Renderer::renderPrimitive(
         wantedVariant = useBlend ? 7 : 2;
     }
 
-    if (viewMode == ViewMode::worldNormal) {
+    // Position-only meshes: the lean pipelines (variants 10-13), which read
+    // only the position stream and derive face normals in the fragment shader.
+    const bool lean = draw.mesh->positionOnly && supportsPositionOnlyMeshes();
+    if (lean) {
+        if (doubleSided) {
+            pipeline = useBlend ? pipelineLeanBlendDoubleSided : pipelineLeanDoubleSided;
+            wantedVariant = useBlend ? 13 : 11;
+        } else {
+            pipeline = useBlend ? pipelineLeanBlend : pipelineLean;
+            wantedVariant = useBlend ? 12 : 10;
+        }
+    }
+
+    if (viewMode == ViewMode::worldNormal && !lean) {
         wantedVariant = 3;
         pipeline = pipelineDebug;
     }
@@ -9276,7 +9320,7 @@ void Renderer::renderPrimitive(
 
     // --- 2. Bind bind groups ---
     bool needsTextures = (wantedVariant == 2 || wantedVariant == 5 ||
-                          wantedVariant == 7 || wantedVariant == 9);
+                          wantedVariant == 7 || wantedVariant == 9 || lean);
 #if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
     // DirectX: single combined bind group — see renderPrimitive()'s identical
     // branch / ensureDirectXPbrBindGroupLayout()'s doc comment.
@@ -9338,6 +9382,16 @@ void Renderer::renderPrimitive(
     auto &vb = draw.mesh->vertexBuffers;
     if (vb[VERTEX_SLOT_POSITION]) {
         setVertexBufferIfChanged(rpe, VERTEX_SLOT_POSITION, vb[VERTEX_SLOT_POSITION], 0);
+    }
+    if (lean) {
+        // vertexLean reads only the position stream and the transforms.
+        if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
+            rpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
+            rpe->drawIndexed(draw.mesh->indexCount, draw.instanceCount);
+        } else {
+            rpe->draw(draw.mesh->vertexCount, draw.instanceCount);
+        }
+        return;
     }
     if (vb[VERTEX_SLOT_NORMAL]) {
         setVertexBufferIfChanged(rpe, VERTEX_SLOT_NORMAL, vb[VERTEX_SLOT_NORMAL], 0);

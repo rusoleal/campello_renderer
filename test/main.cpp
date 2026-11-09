@@ -2763,3 +2763,80 @@ TEST(FrustumCulling, ProjectedRadiusShrinksWithDistance) {
     GpuMesh unbounded;
     EXPECT_GT(projectedRadiusPixels(clip, yScale, VMC::Matrix4<double>::identity(), unbounded, 1000), 1e100);
 }
+
+// Position-only meshes (GpuMesh::positionOnly) are drawn with the lean
+// pipelines, which derive the face normal in the fragment shader: a quad
+// facing the camera must come out the same colour as the same quad with an
+// explicit normal.
+TEST_F(OffscreenRenderTest, PositionOnlyMeshMatchesExplicitNormals) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsPositionOnlyMeshes()) GTEST_SKIP() << "No lean pipelines on this backend";
+
+    // A 1 x 1 quad in the z = 0 plane, facing +z (the camera).
+    float positions[] = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f, -0.5f, 0.5f, 0.0f};
+    float normals[]   = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    uint32_t indices[] = {0, 1, 2, 0, 2, 3};
+    const auto makeQuad = [&](bool lean) {
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(sizeof(positions), GPU::BufferUsage::vertex, positions);
+        if (!lean) {
+            mesh.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+                device->createBuffer(sizeof(normals), GPU::BufferUsage::vertex, normals);
+        }
+        mesh.indexBuffer = device->createBuffer(sizeof(indices), GPU::BufferUsage::index, indices);
+        mesh.indexCount = 6;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = 4;
+        mesh.positionOnly = lean;
+        return mesh;
+    };
+
+    namespace GLTF_NS = systems::leal::gltf;
+    GLTF_NS::Material plain("", nullptr, nullptr, nullptr, nullptr, VM::Vector3<double>(0.0, 0.0, 0.0),
+                            GLTF_NS::AlphaMode::opaque, 0.5, false, false, 1.0, 1.5, 0.0);
+    GpuMaterial* material = renderer->uploadMaterial(plain, *asset);
+    ASSERT_NE(material, nullptr);
+
+    const auto renderCentre = [&](GpuMesh& mesh) {
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        RenderScene scene;
+        scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                        VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                        VM::Vector3<double>(0.0, 1.0, 0.0));
+        scene.camera.projection =
+            VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+        scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+        DrawCall draw;
+        draw.mesh = &mesh;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        draw.instanceCount = 1;
+        scene.opaque.push_back(draw);
+        renderer->render(scene, view);
+        auto pixels = readBackPixels(tex);
+        const size_t centre = (32 * 64 + 32) * 4;
+        return std::array<int, 3>{pixels[centre], pixels[centre + 1], pixels[centre + 2]};
+    };
+
+    GpuMesh full = makeQuad(false);
+    GpuMesh lean = makeQuad(true);
+    const auto withNormals = renderCentre(full);
+    const auto derived = renderCentre(lean);
+    // Lit, not black (a zero or back-facing normal would come out dark) ...
+    EXPECT_GT(derived[0] + derived[1] + derived[2], 30);
+    // ... and the same shade as with the explicit normal.
+    for (int c = 0; c < 3; ++c) {
+        EXPECT_NEAR(derived[static_cast<size_t>(c)], withNormals[static_cast<size_t>(c)], 3) << "channel " << c;
+    }
+}

@@ -36,6 +36,14 @@ namespace systems::leal::campello_renderer {
         // render_system() skips the draw if the box is entirely outside the
         // camera frustum. Unset (the default): never culled. uploadMesh()
         // fills them from a float POSITION accessor's min/max.
+        // Position-only mesh: only vertexBuffers[VERTEX_SLOT_POSITION] is set
+        // (12 bytes per vertex). Drawn with the lean pipelines, which derive a
+        // flat per-face normal in the fragment shader (screen-space
+        // derivatives of the world position), so vertices can be shared
+        // between faces of different orientation. Only when
+        // Renderer::supportsPositionOnlyMeshes() is true.
+        bool positionOnly = false;
+
         bool hasBounds = false;
         std::array<float, 3> boundsMin{0.0f, 0.0f, 0.0f};
         std::array<float, 3> boundsMax{0.0f, 0.0f, 0.0f};
@@ -363,6 +371,14 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTexturedBlend;
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlatBlendDoubleSided;
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTexturedBlendDoubleSided;
+        // Lean pipelines for GpuMesh::positionOnly (opaque, double-sided,
+        // blend, blend double-sided): position-only vertex layout, face normal
+        // derived in the fragment shader. Null where a backend's shaders don't
+        // have the lean entry points yet.
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineLean;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineLeanDoubleSided;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineLeanBlend;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineLeanBlendDoubleSided;
 
         // Skybox pipeline — fullscreen triangle that samples an environment cubemap.
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineSkybox;
@@ -905,6 +921,13 @@ namespace systems::leal::campello_renderer {
         // kMaxFramesInFlight. The callback begins and ends its own render pass, using
         // LoadOp::load to keep the frame. Pass nullptr to remove it.
         void setOverlayCallback(OverlayCallback callback);
+
+        /// True when position-only meshes (GpuMesh::positionOnly) can be drawn:
+        /// this backend's shaders have the lean pipelines and they were created
+        /// (call after createDefaultPipelines()).
+        bool supportsPositionOnlyMeshes() const {
+            return pipelineLean && pipelineLeanDoubleSided && pipelineLeanBlend && pipelineLeanBlendDoubleSided;
+        }
 
         void setFxaaEnabled(bool enabled);
         bool isFxaaEnabled() const;
