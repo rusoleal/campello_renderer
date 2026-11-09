@@ -6,6 +6,9 @@
 #include <campello_renderer/campello_renderer.hpp>
 #include <vector_math/vector_math.hpp>
 
+#include <cmath>
+#include <cstdint>
+
 namespace systems::leal::campello_renderer {
 
 /// True when a mesh's local-space bounds lie entirely outside the view
@@ -41,6 +44,41 @@ inline bool isOutsideFrustum(const systems::leal::vector_math::Matrix4<double>& 
         if (p[0] * x + p[1] * y + p[2] * z + p[3] < 0.0) return true;
     }
     return false;
+}
+
+/// Radius in pixels of the mesh's bounding sphere on screen, for size
+/// culling: the sphere around the local bounds, scaled by `world`'s largest
+/// axis scale, at its distance from the camera. `projYScale` is the
+/// projection's [1][1] (1 / tan(fovY / 2) for a perspective projection) and
+/// `viewportHeight` the target height in pixels. Returns +infinity (never
+/// small) for meshes without bounds and for spheres reaching the camera
+/// plane, where the estimate breaks down.
+inline double projectedRadiusPixels(const systems::leal::vector_math::Matrix4<double>& clipFromWorld,
+                                    double projYScale,
+                                    const systems::leal::vector_math::Matrix4<double>& world,
+                                    const GpuMesh& mesh,
+                                    uint32_t viewportHeight)
+{
+    constexpr double NEVER_SMALL = 1e300;
+    if (!mesh.hasBounds || viewportHeight == 0) return NEVER_SMALL;
+    const double cx = 0.5 * (static_cast<double>(mesh.boundsMin[0]) + mesh.boundsMax[0]);
+    const double cy = 0.5 * (static_cast<double>(mesh.boundsMin[1]) + mesh.boundsMax[1]);
+    const double cz = 0.5 * (static_cast<double>(mesh.boundsMin[2]) + mesh.boundsMax[2]);
+    const double hx = 0.5 * (static_cast<double>(mesh.boundsMax[0]) - mesh.boundsMin[0]);
+    const double hy = 0.5 * (static_cast<double>(mesh.boundsMax[1]) - mesh.boundsMin[1]);
+    const double hz = 0.5 * (static_cast<double>(mesh.boundsMax[2]) - mesh.boundsMin[2]);
+    const double* w = world.data;  // row-major: column j is (w[j], w[4 + j], w[8 + j])
+    double scale = 0.0;
+    for (int j = 0; j < 3; ++j) {
+        const double len = w[j] * w[j] + w[4 + j] * w[4 + j] + w[8 + j] * w[8 + j];
+        if (len > scale) scale = len;
+    }
+    const double radius = std::sqrt(hx * hx + hy * hy + hz * hz) * std::sqrt(scale);
+    // Clip-space w of the centre = its distance in front of the camera.
+    const auto m = clipFromWorld * world;
+    const double depth = m.data[12] * cx + m.data[13] * cy + m.data[14] * cz + m.data[15];
+    if (depth <= radius) return NEVER_SMALL;
+    return radius * projYScale / depth * 0.5 * static_cast<double>(viewportHeight);
 }
 
 } // namespace systems::leal::campello_renderer

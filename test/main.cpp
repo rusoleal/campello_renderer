@@ -2741,3 +2741,25 @@ TEST_F(OffscreenRenderTest, UploadMeshTakesBoundsFromThePositionAccessor) {
     EXPECT_FLOAT_EQ(mesh->boundsMax[0], 0.5f);
     EXPECT_FLOAT_EQ(mesh->boundsMax[1], 0.5f);
 }
+
+TEST(FrustumCulling, ProjectedRadiusShrinksWithDistance) {
+    using systems::leal::campello_renderer::projectedRadiusPixels;
+    const auto clip = testClipFromWorld();  // camera at z = 5, 60 degree FOV
+    const double yScale = 1.0 / std::tan(30.0 * 3.14159265358979323846 / 180.0);
+    // A 1 m cube (sphere radius 0.866) at 5 m on a 1000 px high target:
+    // 0.866 * 1.732 / 5 * 500 = 150 px.
+    const auto cube = boxMesh(-0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f);
+    const double near = projectedRadiusPixels(clip, yScale, VMC::Matrix4<double>::identity(), cube, 1000);
+    EXPECT_NEAR(near, 150.0, 0.5);
+    // Ten times further: a tenth of the size (depth 50 instead of 5).
+    const double far = projectedRadiusPixels(clip, yScale, moved(0.0, 0.0, -45.0), cube, 1000);
+    EXPECT_NEAR(far, 15.0, 0.1);
+    // World scale counts (largest axis).
+    const double scaled = projectedRadiusPixels(
+        clip, yScale, VMC::Matrix4<double>::scale(VMC::Vector3<double>(2.0, 1.0, 1.0)), cube, 1000);
+    EXPECT_NEAR(scaled, 300.0, 1.0);
+    // Reaching the camera plane, or no bounds: never "small".
+    EXPECT_GT(projectedRadiusPixels(clip, yScale, moved(0.0, 0.0, 4.8), cube, 1000), 1e100);
+    GpuMesh unbounded;
+    EXPECT_GT(projectedRadiusPixels(clip, yScale, VMC::Matrix4<double>::identity(), unbounded, 1000), 1e100);
+}

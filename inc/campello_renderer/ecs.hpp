@@ -364,8 +364,18 @@ inline void skinning_system(campello::core::World& world, Renderer& renderer) {
 
 /// What render_system() did in its last call (optional output).
 struct RenderSystemStats {
-    uint32_t drawn = 0;   ///< draw calls submitted
-    uint32_t culled = 0;  ///< draws skipped by frustum culling
+    uint32_t drawn = 0;     ///< draw calls submitted
+    uint32_t culled = 0;    ///< draws skipped by frustum culling
+    uint32_t tooSmall = 0;  ///< draws skipped by size culling
+};
+
+/// Optional render_system() settings.
+struct RenderSystemOptions {
+    /// Size culling: skip draws whose bounding sphere covers less than this
+    /// radius on screen, in pixels (0: off). Needs `viewportHeight`.
+    float minPixelRadius = 0.0f;
+    /// Height of the target in pixels, for size culling.
+    uint32_t viewportHeight = 0;
 };
 
 // ------------------------------------------------------------------
@@ -382,8 +392,9 @@ struct RenderSystemStats {
 //
 // Draws whose mesh has bounds (GpuMesh::hasBounds) and lies entirely outside
 // the camera frustum are skipped (skinned meshes are never culled: their
-// bind-pose bounds don't follow the animation). `stats`, if given, reports
-// how many draws were submitted and culled.
+// bind-pose bounds don't follow the animation). With `options`, draws that
+// are too small on screen can be skipped too. `stats`, if given, reports how
+// many draws were submitted and culled.
 inline void render_system(
     campello::core::World& world,
     Renderer& renderer,
@@ -391,7 +402,8 @@ inline void render_system(
     uint32_t renderWidth = 0,
     uint32_t renderHeight = 0,
     const CameraData* cameraOverride = nullptr,
-    RenderSystemStats* stats = nullptr)
+    RenderSystemStats* stats = nullptr,
+    const RenderSystemOptions* options = nullptr)
 {
     RenderScene scene;
 
@@ -437,6 +449,12 @@ inline void render_system(
         const bool skinned = meshRenderer.jointMatrixBuffer && meshRenderer.jointCount > 0;
         if (!skinned && isOutsideFrustum(clipFromWorld, transform.worldMatrix, *meshRenderer.mesh)) {
             ++counted.culled;
+            continue;
+        }
+        if (!skinned && options && options->minPixelRadius > 0.0f &&
+            projectedRadiusPixels(clipFromWorld, scene.camera.projection.data[5], transform.worldMatrix,
+                                  *meshRenderer.mesh, options->viewportHeight) < options->minPixelRadius) {
+            ++counted.tooSmall;
             continue;
         }
         ++counted.drawn;
