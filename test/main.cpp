@@ -2638,7 +2638,15 @@ TEST_F(OffscreenRenderTest, DifferentPixelFormatBGRA8) {
 
 int main(int argc, char **argv) {
     testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
+    const int result = RUN_ALL_TESTS();
+#if defined(__EMSCRIPTEN__)
+    // Completion line for campello_gpu's tests/webgpu/run_in_browser.mjs.
+    const auto* unitTest = testing::UnitTest::GetInstance();
+    printf("CAMPELLO_WEBGPU_TESTS_DONE failures=%d tests=%d skipped=%d\n",
+           unitTest->failed_test_count(), unitTest->test_to_run_count(),
+           unitTest->skipped_test_count());
+#endif
+    return result;
 }
 
 
@@ -2815,6 +2823,9 @@ static const char *kGltfScaledTriangleQuantized = R"({
 
 TEST_F(OffscreenRenderTest, QuantizedPositionsRenderLikeFloatPositions) {
     if (!device) GTEST_SKIP() << "No GPU device available";
+#if !defined(__APPLE__)
+    GTEST_SKIP() << "KHR_mesh_quantization layouts are Metal-only so far";
+#endif
     const auto renderAsset = [&](const char *json) -> std::vector<uint8_t> {
         renderer = std::make_unique<systems::leal::campello_renderer::Renderer>(device);
         auto asset = GLTF::loadGLTF(std::string(json), kNoOpLoader);
@@ -2880,6 +2891,9 @@ static const char *kGltfMorphTriangleTemplate = R"({
 // shader reading them at another stride moves only the first vertex).
 TEST_F(OffscreenRenderTest, MorphTargetMovesEveryVertex) {
     if (!device) GTEST_SKIP() << "No GPU device available";
+#if !defined(__APPLE__)
+    GTEST_SKIP() << "morph targets are Metal-only so far";
+#endif
     const auto render = [&](double weight) -> std::vector<uint8_t> {
         renderer = std::make_unique<systems::leal::campello_renderer::Renderer>(device);
         char json[4096];

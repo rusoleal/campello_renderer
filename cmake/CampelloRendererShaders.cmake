@@ -10,6 +10,7 @@
 #       VULKAN_VERTEX   shaders/element_id.vert   # SPIR-V via glslc or glslangValidator
 #       VULKAN_FRAGMENT shaders/element_id.frag
 #       DIRECTX shaders/element_id.hlsl     # vertexMain + pixelMain via dxc, if found
+#       WGSL   shaders/element_id.wgsl      # vertexMain + fragmentMain, embedded as text (WebGPU)
 #       SLANG  shaders/element_id.slang     # one source for every backend (preferred):
 #                                           # vertexMain + fragmentMain, compiled with slangc
 #                                           # (CAMPELLO_SLANGC, or $SLANG_DIR/bin) to Metal,
@@ -28,7 +29,7 @@ set(CAMPELLO_RENDERER_SHADER_CMAKE_DIR "${CMAKE_CURRENT_LIST_DIR}" CACHE INTERNA
 set(CAMPELLO_RENDERER_SHADER_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../inc" CACHE INTERNAL "")
 
 function(campello_renderer_add_shader_program)
-    cmake_parse_arguments(ARG "" "TARGET;NAME;METAL;VULKAN_VERTEX;VULKAN_FRAGMENT;DIRECTX;SLANG;VERTEX_READS" "" ${ARGN})
+    cmake_parse_arguments(ARG "" "TARGET;NAME;METAL;VULKAN_VERTEX;VULKAN_FRAGMENT;DIRECTX;SLANG;WGSL;VERTEX_READS" "" ${ARGN})
     if(NOT ARG_TARGET OR NOT ARG_NAME)
         message(FATAL_ERROR "campello_renderer_add_shader_program: TARGET and NAME are required")
     endif()
@@ -173,6 +174,14 @@ function(campello_renderer_add_shader_program)
             list(APPEND binaries "${vs}" "${ps}")
             list(APPEND embed_args "-DDIRECTX_VERTEX=${vs}" "-DDIRECTX_FRAGMENT=${ps}")
         endif()
+    endif()
+
+    # WGSL (WebGPU): compiled by the browser, embedded as text. A Slang
+    # source already produced it above.
+    if(ARG_WGSL AND NOT use_slang)
+        get_filename_component(wgsl_src "${ARG_WGSL}" ABSOLUTE)
+        list(APPEND binaries "${wgsl_src}")
+        list(APPEND embed_args "-DWGSL=${wgsl_src}")
     endif()
 
     set(header "${out_dir}/${ARG_NAME}_shaders.h")

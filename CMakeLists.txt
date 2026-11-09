@@ -178,10 +178,24 @@ if(CAMPELLO_RENDERER_BUILD_TEST)
         NAME element_id
         SLANG test/shaders/element_id.slang
         METAL test/shaders/element_id.metal
+        WGSL test/shaders/element_id.wgsl
         VULKAN_VERTEX test/shaders/element_id.vert
         VULKAN_FRAGMENT test/shaders/element_id.frag
         VERTEX_READS "semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::custom0)")
-    add_test(NAME ${PROJECT_NAME}_test COMMAND ${PROJECT_NAME}_test)
+    if(EMSCRIPTEN)
+        # WebGPU: the suite is a web page, run in headless Chrome by
+        # campello_gpu's tests/webgpu/run_in_browser.mjs (see test/webgpu/).
+        set_target_properties(${PROJECT_NAME}_test PROPERTIES SUFFIX ".html")
+        target_link_options(${PROJECT_NAME}_test PRIVATE
+            -sALLOW_MEMORY_GROWTH=1
+            -sSTACK_SIZE=4MB
+            -sASYNCIFY_STACK_SIZE=262144
+            --shell-file ${CMAKE_CURRENT_SOURCE_DIR}/test/webgpu/shell.html)
+        set_property(TARGET ${PROJECT_NAME}_test APPEND PROPERTY LINK_DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/webgpu/shell.html)
+    else()
+        add_test(NAME ${PROJECT_NAME}_test COMMAND ${PROJECT_NAME}_test)
+    endif()
 
     # Windows: cmake --build only updates DLLs inside their own target output
     # directories (_deps/extern_campello_gpu-build/<config>/, etc.) — nothing
