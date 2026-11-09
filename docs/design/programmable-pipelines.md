@@ -1,6 +1,6 @@
 # Programmable pipelines: app-defined vertex layouts and shaders
 
-Status: **proposed** (2026-11-09). Nothing here is implemented yet.
+Status: **in progress** (2026-11-09). Phase 1 (vertex layouts and the pipeline cache) is implemented; the rest is proposed.
 
 ## Problem
 
@@ -192,12 +192,15 @@ The helper embeds the binaries in a header, as the library does for its own shad
 
 Each phase ships on its own, keeps the existing tests and image comparisons passing, and changes no existing public signature unless noted.
 
-1. **Layouts and the pipeline cache.**
+1. **Layouts and the pipeline cache.** *Done.*
+   - Implemented as `VertexLayout` (`vertex_layout.hpp`, attributes as semantic + format) and `GpuMesh::layout`. Each backend's recipe lists vertex stages with the semantics they read; a layout is drawn with the stage that reads the most attributes it has, so formats can vary (the vertex fetch converts them). Slots still follow the semantic (today's convention); compact slots move to phase 2.
    - Add `VertexLayoutDesc` and the cache, with the PBR program still internal.
    - Replace the `pipeline*` mesh members, the lean variants and `positionOnly` with layouts.
    - The capability check becomes `supports(...)`.
    - Absorbs the lean work. Medium-sized: most of it is `createDefaultPipelines()` and `renderPrimitive()`.
 2. **Binding contract.**
+   - Compact vertex slots and per-draw data (transforms, instances, joints, morph) in storage buffers on every backend (WebGPU constraints above).
+   - Fold `quantizedPipelines` (KHR_mesh_quantization, Metal) into layouts: they are the standard layout with other formats.
    - Write the table into the docs and add the per-language headers.
    - Split the DirectX combined bind group.
    - Test: a minimal "unlit colour" program written against the headers draws on Metal and Vulkan (DirectX when dxc is available in CI).

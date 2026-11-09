@@ -2764,10 +2764,96 @@ TEST(FrustumCulling, ProjectedRadiusShrinksWithDistance) {
     EXPECT_GT(projectedRadiusPixels(clip, yScale, VMC::Matrix4<double>::identity(), unbounded, 1000), 1e100);
 }
 
-// Position-only meshes (GpuMesh::positionOnly) are drawn with the lean
+// Position-only meshes (VertexLayout::positionOnly()) are drawn with the lean
 // pipelines, which derive the face normal in the fragment shader: a quad
 // facing the camera must come out the same colour as the same quad with an
 // explicit normal.
+TEST(VertexLayout, DescribesFormatsAndHashesThem) {
+    using CT = systems::leal::campello_gpu::ComponentType;
+    const VertexLayout standard = VertexLayout::standard();
+    EXPECT_EQ(standard.attributes.size(), kVertexSemanticCount);
+    EXPECT_EQ(standard.semanticMask(), (1u << kVertexSemanticCount) - 1u);
+    EXPECT_EQ(standard.find(VertexSemantic::position)->stride(), 12u);
+    EXPECT_EQ(standard.find(VertexSemantic::texcoord0)->stride(), 8u);
+    EXPECT_EQ(standard.find(VertexSemantic::joints)->stride(), 4u);  // unsigned byte x 4
+    EXPECT_EQ(VertexLayout::standard(CT::ctUnsignedShort).find(VertexSemantic::joints)->stride(), 8u);
+
+    const VertexLayout& lean = VertexLayout::positionOnly();
+    EXPECT_EQ(lean.semanticMask(), semanticBit(VertexSemantic::position));
+    EXPECT_EQ(lean.find(VertexSemantic::normal), nullptr);
+    // Equal layouts hash equal; a different format changes the hash.
+    EXPECT_EQ(VertexLayout::standard().hash(), standard.hash());
+    EXPECT_NE(VertexLayout::standard(CT::ctUnsignedShort).hash(), standard.hash());
+    EXPECT_NE(lean.hash(), standard.hash());
+}
+
+TEST_F(OffscreenRenderTest, MeshPipelinesComeFromLayoutsAndAreCached) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setSkyboxEnabled(false);
+
+    EXPECT_TRUE(renderer->supportsVertexLayout(renderer->standardVertexLayout()));
+    // Without positions no vertex stage applies.
+    VertexLayout normalsOnly;
+    normalsOnly.attributes.push_back({VertexSemantic::normal});
+    EXPECT_FALSE(renderer->supportsVertexLayout(normalsOnly));
+    // Extra attributes are fine: the lean stage reads only the position.
+    VertexLayout positionAndUv = VertexLayout::positionOnly();
+    positionAndUv.attributes.push_back({VertexSemantic::texcoord0, GPU::ComponentType::ctFloat, GPU::AccessorType::acVec2});
+    EXPECT_EQ(renderer->supportsVertexLayout(positionAndUv),
+              renderer->supportsVertexLayout(VertexLayout::positionOnly()));
+
+    // createDefaultPipelines() prewarms what the built-in paths draw with:
+    // drawing a standard, a position-only and an unsupported mesh creates
+    // nothing new (and the unsupported one is skipped, not a crash).
+    const size_t prewarmed = renderer->meshPipelineCount();
+    EXPECT_GT(prewarmed, 0u);
+    float positions[] = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f};
+    uint32_t indices[] = {0, 1, 2};
+    const auto makeMesh = [&](const VertexLayout* layout) {
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(sizeof(positions), GPU::BufferUsage::vertex, positions);
+        mesh.indexBuffer = device->createBuffer(sizeof(indices), GPU::BufferUsage::index, indices);
+        mesh.indexCount = 3;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = 3;
+        mesh.layout = layout;
+        return mesh;
+    };
+    GpuMesh standardMesh = makeMesh(nullptr);
+    GpuMesh leanMesh = makeMesh(&VertexLayout::positionOnly());
+    GpuMesh unsupported = makeMesh(&normalsOnly);
+    namespace GLTF_NS = systems::leal::gltf;
+    GLTF_NS::Material plain("", nullptr, nullptr, nullptr, nullptr, VM::Vector3<double>(0.0, 0.0, 0.0),
+                            GLTF_NS::AlphaMode::opaque, 0.5, false, false, 1.0, 1.5, 0.0);
+    GpuMaterial* material = renderer->uploadMaterial(plain, *asset);
+    ASSERT_NE(material, nullptr);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                    VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(1.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+    for (GpuMesh* mesh : {&standardMesh, &leanMesh, &unsupported}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    EXPECT_NO_THROW(renderer->render(scene, view));
+    EXPECT_EQ(renderer->meshPipelineCount(), prewarmed);
+}
+
 // OpaqueOrder::frontToBack only reorders draws: whatever order the scene
 // lists them in, the nearer of two overlapping quads must win, exactly as
 // with the default byState order.
@@ -2863,7 +2949,7 @@ TEST_F(OffscreenRenderTest, PositionOnlyMeshMatchesExplicitNormals) {
     renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
     renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     renderer->setSkyboxEnabled(false);
-    if (!renderer->supportsPositionOnlyMeshes()) GTEST_SKIP() << "No lean pipelines on this backend";
+    if (!renderer->supportsVertexLayout(VertexLayout::positionOnly())) GTEST_SKIP() << "No lean pipelines on this backend";
 
     // A 1 x 1 quad in the z = 0 plane, facing +z (the camera).
     float positions[] = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f, -0.5f, 0.5f, 0.0f};
@@ -2881,7 +2967,7 @@ TEST_F(OffscreenRenderTest, PositionOnlyMeshMatchesExplicitNormals) {
         mesh.indexCount = 6;
         mesh.indexFormat = GPU::IndexFormat::uint32;
         mesh.vertexCount = 4;
-        mesh.positionOnly = lean;
+        if (lean) mesh.layout = &VertexLayout::positionOnly();
         return mesh;
     };
 

@@ -19,6 +19,7 @@
 #include <campello_gpu/descriptors/bind_group_descriptor.hpp>
 #include <campello_gpu/bind_group.hpp>
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <unordered_set>
@@ -3532,9 +3533,125 @@ void Renderer::createQuantizedPipelinesIfNeeded() {
 #endif
 }
 
+const Renderer::MeshVertexStage* Renderer::vertexStageFor(const VertexLayout& layout) const {
+    // The stage that reads the most attributes among those reading only
+    // attributes the layout has (the full shader for glTF meshes, the lean
+    // one for position-only meshes). Ties: the first listed.
+    const uint32_t has = layout.semanticMask();
+    const MeshVertexStage* best = nullptr;
+    for (const auto& stage : meshRecipe.vertexStages) {
+        if ((stage.readMask & ~has) != 0) continue;
+        if (!best || std::popcount(stage.readMask) > std::popcount(best->readMask)) best = &stage;
+    }
+    return best;
+}
+
+std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> Renderer::meshPipeline(
+    MeshProgram program, const VertexLayout& layout, bool doubleSided, bool blend) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!meshRecipe.ready || !device) return nullptr;
+    // Normalise to what this backend distinguishes, so equivalent requests
+    // share one pipeline (Vulkan/DirectX: one fragment shader, no blending).
+    if (meshRecipe.fragmentEntries[(size_t)program].empty()) program = MeshProgram::textured;
+    if (!meshRecipe.supportsBlend) blend = false;
+    const MeshVertexStage* stage = vertexStageFor(layout);
+    if (!stage) return nullptr;
+
+    // Only the attributes the stage reads shape the pipeline.
+    VertexLayout read;
+    for (const auto& a : layout.attributes) {
+        if (stage->readMask & semanticBit(a.semantic)) read.attributes.push_back(a);
+    }
+    uint64_t key = read.hash();
+    const auto mix = [&key](uint64_t v) {
+        key ^= v + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    };
+    mix((uint64_t)(stage - meshRecipe.vertexStages.data()));
+    mix((uint64_t)program);
+    mix(doubleSided ? 1u : 0u);
+    mix(blend ? 1u : 0u);
+    if (auto it = meshPipelineCache.find(key); it != meshPipelineCache.end()) return it->second;
+
+    GPU::RenderPipelineDescriptor d = meshRecipe.base;
+    d.vertex.module     = stage->module;
+    d.vertex.entryPoint = stage->entryPoint;
+    // Vertex buffer slot = semantic (phase 1 convention); slots the stage
+    // doesn't read stay empty placeholders, then the per-draw buffers.
+    d.vertex.buffers.clear();
+    const auto emptyLayout = [] {
+        GPU::VertexLayout empty{};
+        empty.arrayStride = 0;
+        empty.stepMode    = GPU::StepMode::vertex;
+        return empty;
+    };
+    for (const auto& a : read.attributes) {
+        const auto slot = (size_t)a.semantic;
+        if (d.vertex.buffers.size() <= slot) d.vertex.buffers.resize(slot + 1, emptyLayout());
+        GPU::VertexLayout buffer{};
+        buffer.arrayStride = (double)a.stride();
+        buffer.stepMode    = GPU::StepMode::vertex;
+        GPU::VertexAttribute attr{};
+        attr.componentType  = a.componentType;
+        attr.accessorType   = a.accessorType;
+        attr.offset         = 0;
+        attr.shaderLocation = (uint32_t)slot;
+        attr.normalized     = a.normalized;
+        buffer.attributes.push_back(attr);
+        d.vertex.buffers[slot] = buffer;
+    }
+    if (!meshRecipe.perDrawBuffers.empty()) {
+        d.vertex.buffers.resize(meshRecipe.perDrawFirstSlot, emptyLayout());
+        for (const auto& b : meshRecipe.perDrawBuffers) d.vertex.buffers.push_back(b);
+    }
+
+    d.cullMode = doubleSided ? GPU::CullMode::none : GPU::CullMode::back;
+    GPU::ColorState color = meshRecipe.colorTarget;
+    if (blend) {
+        color.blend = meshRecipe.alphaBlend;
+        d.depthStencil = meshRecipe.blendDepthStencil;
+    }
+    GPU::FragmentDescriptor frag{};
+    frag.module     = meshRecipe.fragmentModule;
+    frag.entryPoint = meshRecipe.fragmentEntries[(size_t)program];
+    frag.targets.push_back(color);
+    d.fragment = frag;
+
+    auto pipeline = device->createRenderPipeline(d);
+    meshPipelineCache[key] = pipeline;  // a failed creation (nullptr) isn't retried every draw
+    return pipeline;
+}
+
+void Renderer::prewarmMeshPipelines() {
+    // The combinations the built-in draw paths use, created now rather than
+    // on the first frame that needs them.
+    for (const MeshProgram program : {MeshProgram::flat, MeshProgram::textured}) {
+        for (const bool doubleSided : {false, true}) {
+            for (const bool blend : {false, true}) {
+                meshPipeline(program, standardLayout, doubleSided, blend);
+            }
+        }
+    }
+    meshPipeline(MeshProgram::debug, standardLayout, false, false);
+    if (vertexStageFor(VertexLayout::positionOnly())) {
+        for (const bool doubleSided : {false, true}) {
+            for (const bool blend : {false, true}) {
+                meshPipeline(MeshProgram::textured, VertexLayout::positionOnly(), doubleSided, blend);
+            }
+        }
+    }
+}
+
 void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat colorFormat) {
     namespace GPU = systems::leal::campello_gpu;
     cachedColorFormat = colorFormat;
+
+    // Mesh pipelines are rebuilt from a fresh recipe (this also runs again
+    // when setScene() detects other joint/weight formats).
+    meshRecipe = MeshPipelineRecipe{};
+    meshPipelineCache.clear();
+    currentPipelineVariant = 0;
+    currentPipelineObject = nullptr;
+    standardLayout = VertexLayout::standard(jointsComponentType, weightsComponentType, weightsNormalized);
 
 #if defined(__APPLE__)
     using namespace systems::leal::campello_renderer::shaders;
@@ -3550,53 +3667,9 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     base.vertex.module     = shaderModule;
     base.vertex.entryPoint = "vertexMain";
 
-    // Slots 0–5: stage_in attributes. Slots 16/17 are raw [[buffer(N)]] in the
-    // shader and are not part of the vertex descriptor.
-    auto makeLayout = [](GPU::ComponentType ct, GPU::AccessorType at,
-                         double stride, GPU::StepMode sm, uint32_t location,
-                         bool normalized = false) {
-        GPU::VertexLayout layout{};
-        layout.arrayStride = stride;
-        layout.stepMode    = sm;
-        GPU::VertexAttribute attr{};
-        attr.componentType  = ct;
-        attr.accessorType   = at;
-        attr.offset         = 0;
-        attr.shaderLocation = location;
-        attr.normalized     = normalized;
-        layout.attributes.push_back(attr);
-        return layout;
-    };
-
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec3,
-        12.0, GPU::StepMode::vertex, VERTEX_SLOT_POSITION));
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec3,
-        12.0, GPU::StepMode::vertex, VERTEX_SLOT_NORMAL));
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec2,
-        8.0, GPU::StepMode::vertex, VERTEX_SLOT_TEXCOORD0));
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec4,
-        16.0, GPU::StepMode::vertex, VERTEX_SLOT_TANGENT));
-    // JOINTS_0 / WEIGHTS_0 — use detected component types (may be recreated in setScene()).
-    double jointsStride = (jointsComponentType == GPU::ComponentType::ctUnsignedShort) ? 8.0 : 4.0;
-    base.vertex.buffers.push_back(makeLayout(
-        jointsComponentType, GPU::AccessorType::acVec4,
-        jointsStride, GPU::StepMode::vertex, VERTEX_SLOT_JOINTS));
-    double weightsStride = (weightsComponentType == GPU::ComponentType::ctFloat) ? 16.0 :
-                           (weightsComponentType == GPU::ComponentType::ctUnsignedShort) ? 8.0 : 4.0;
-    base.vertex.buffers.push_back(makeLayout(
-        weightsComponentType, GPU::AccessorType::acVec4,
-        weightsStride, GPU::StepMode::vertex, VERTEX_SLOT_WEIGHTS, weightsNormalized));
-    // COLOR_0 (normalized to float4 on upload — see color0Buffers) / TEXCOORD_1 (float2).
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec4,
-        16.0, GPU::StepMode::vertex, VERTEX_SLOT_COLOR0));
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec2,
-        8.0, GPU::StepMode::vertex, VERTEX_SLOT_TEXCOORD1));
+    // Vertex buffers come from the mesh's VertexLayout (meshPipeline()).
+    // Slots 15-23 are raw [[buffer(N)]] arguments in the shader, not part
+    // of the vertex descriptor.
 
     GPU::DepthStencilDescriptor ds{};
     ds.format              = GPU::PixelFormat::depth32float;
@@ -3617,151 +3690,32 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     cs.format    = colorFormat;
     cs.writeMask = GPU::ColorWrite::all;
 
-    // --- Variant: flat (Phong + baseColorFactor, no texture) ---
+    // --- Mesh pipelines: the recipe meshPipeline() builds from ---
+    // Alpha blending: src * srcAlpha + dst * (1 - srcAlpha), without depth
+    // writes. Fragment variants: flat (no textures), textured (PBR), debug
+    // (normals). Vertex stages: vertexMain reads the full glTF layout,
+    // vertexLean only positions (flat normals derived in fragmentMain_textured).
     {
-        GPU::RenderPipelineDescriptor d = base;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_flat";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        pipelineFlat = device->createRenderPipeline(d);
-    }
+        GPU::BlendState alphaBlend{};
+        alphaBlend.color = { GPU::BlendFactor::srcAlpha, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
+        alphaBlend.alpha = { GPU::BlendFactor::one, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
+        GPU::DepthStencilDescriptor blendDs = ds;
+        blendDs.depthWriteEnabled = false;
 
-    // --- Variant: textured (Phong + baseColorTexture × baseColorFactor) ---
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_textured";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        pipelineTextured = device->createRenderPipeline(d);
-    }
-
-    // --- Variant: debug (flat normal visualization) ---
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_debug";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        pipelineDebug = device->createRenderPipeline(d);
-    }
-
-    // --- Double-sided variants (no back-face culling) ---
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.cullMode = GPU::CullMode::none;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_flat";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        pipelineFlatDoubleSided = device->createRenderPipeline(d);
-    }
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.cullMode = GPU::CullMode::none;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_textured";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        pipelineTexturedDoubleSided = device->createRenderPipeline(d);
-    }
-
-    // --- Alpha-blend variants (transparency) ---
-    // Standard alpha blending: src * srcAlpha + dst * (1 - srcAlpha)
-    // Depth write disabled for transparent materials to avoid artifacts
-    GPU::BlendState alphaBlend{};
-    alphaBlend.color = { GPU::BlendFactor::srcAlpha, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
-    alphaBlend.alpha = { GPU::BlendFactor::one, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
-    
-    GPU::DepthStencilDescriptor blendDs = ds;
-    blendDs.depthWriteEnabled = false;  // Don't write depth for transparent objects
-    
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.depthStencil = blendDs;
-        GPU::ColorState blendCs = cs;
-        blendCs.blend = alphaBlend;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_flat";
-        frag.targets.push_back(blendCs);
-        d.fragment = frag;
-        pipelineFlatBlend = device->createRenderPipeline(d);
-    }
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.depthStencil = blendDs;
-        GPU::ColorState blendCs = cs;
-        blendCs.blend = alphaBlend;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_textured";
-        frag.targets.push_back(blendCs);
-        d.fragment = frag;
-        pipelineTexturedBlend = device->createRenderPipeline(d);
-    }
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.cullMode = GPU::CullMode::none;
-        d.depthStencil = blendDs;
-        GPU::ColorState blendCs = cs;
-        blendCs.blend = alphaBlend;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_flat";
-        frag.targets.push_back(blendCs);
-        d.fragment = frag;
-        pipelineFlatBlendDoubleSided = device->createRenderPipeline(d);
-    }
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.cullMode = GPU::CullMode::none;
-        d.depthStencil = blendDs;
-        GPU::ColorState blendCs = cs;
-        blendCs.blend = alphaBlend;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_textured";
-        frag.targets.push_back(blendCs);
-        d.fragment = frag;
-        pipelineTexturedBlendDoubleSided = device->createRenderPipeline(d);
-    }
-
-    // --- Lean variants: position-only meshes (GpuMesh::positionOnly) ---
-    // One 12-byte vertex stream instead of eight; the textured fragment
-    // shader derives the flat face normal when the vertex normal is zero.
-    {
-        GPU::RenderPipelineDescriptor lean = base;
-        lean.vertex.entryPoint = "vertexLean";
-        lean.vertex.buffers.clear();
-        lean.vertex.buffers.push_back(makeLayout(
-            GPU::ComponentType::ctFloat, GPU::AccessorType::acVec3,
-            12.0, GPU::StepMode::vertex, VERTEX_SLOT_POSITION));
-        const auto makeLean = [&](bool doubleSided, bool blend) {
-            GPU::RenderPipelineDescriptor d = lean;
-            if (doubleSided) d.cullMode = GPU::CullMode::none;
-            GPU::ColorState colorState = cs;
-            if (blend) {
-                d.depthStencil = blendDs;
-                colorState.blend = alphaBlend;
-            }
-            GPU::FragmentDescriptor frag{};
-            frag.module     = shaderModule;
-            frag.entryPoint = "fragmentMain_textured";
-            frag.targets.push_back(colorState);
-            d.fragment = frag;
-            return device->createRenderPipeline(d);
+        meshRecipe.base = base;
+        meshRecipe.colorTarget = cs;
+        constexpr uint32_t allSemantics = (1u << kVertexSemanticCount) - 1u;
+        meshRecipe.vertexStages = {
+            {allSemantics, shaderModule, "vertexMain"},
+            {semanticBit(VertexSemantic::position), shaderModule, "vertexLean"},
         };
-        pipelineLean                 = makeLean(false, false);
-        pipelineLeanDoubleSided      = makeLean(true, false);
-        pipelineLeanBlend            = makeLean(false, true);
-        pipelineLeanBlendDoubleSided = makeLean(true, true);
+        meshRecipe.fragmentModule = shaderModule;
+        meshRecipe.fragmentEntries = {"fragmentMain_flat", "fragmentMain_textured", "fragmentMain_debug"};
+        meshRecipe.supportsBlend = true;
+        meshRecipe.alphaBlend = alphaBlend;
+        meshRecipe.blendDepthStencil = blendDs;
+        meshRecipe.ready = true;
+        prewarmMeshPipelines();
     }
 
     // --- Skybox pipeline ---
@@ -4159,53 +4113,33 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     // session notes.
     desc.frontFace = GPU::FrontFace::ccw;
 
-    // Vulkan: assign same pipeline to both variants until separate SPIR-V
-    // fragment shaders are compiled (flat variant TODO).
-    pipelineTextured = device->createRenderPipeline(desc);
-    pipelineFlat     = pipelineTextured;
-    pipelineDebug    = pipelineFlat;  // TODO: compile debug SPIR-V variant
-
-    // Double-sided variant: a real, separate VkPipeline (not aliased to the
-    // single-sided one above) with cullMode=none — glTF materials marked
-    // doubleSided need both faces rendered without culling (thin geometry
-    // like straps, leaves, cloth), and aliasing to the single-sided pipeline
-    // here silently culled one side of exactly that geometry.
-    desc.cullMode = GPU::CullMode::none;
-    pipelineTexturedDoubleSided = device->createRenderPipeline(desc);
-    pipelineFlatDoubleSided     = pipelineTexturedDoubleSided;
-
-    // Alpha-blend variants (TODO: proper blend state when Vulkan backend supports it).
-    // The double-sided+blend ones alias to the real double-sided pipeline above,
-    // not the single-sided one — culling is still correct even though blending
-    // itself isn't implemented yet, matching this same partial-implementation
-    // pattern the non-double-sided blend variants below already use.
-    pipelineFlatBlend             = pipelineFlat;
-    pipelineTexturedBlend         = pipelineTextured;
-    pipelineFlatBlendDoubleSided  = pipelineFlatDoubleSided;
-    pipelineTexturedBlendDoubleSided = pipelineTexturedDoubleSided;
-
-    // Lean variants for position-only meshes (GpuMesh::positionOnly):
-    // default_lean.vert reads only POSITION (slot 0) and the per-instance
-    // transforms (slot 16); default.frag derives the flat face normal when
-    // the interpolated one is zero. Slots 1-15 become empty placeholders so
-    // the vector index still matches the buffer slot. Blend aliases the
-    // opaque variants, as for the textured pipelines above.
-    if (auto leanModule = device->createShaderModule(kDefaultVulkanLeanVertShader,
-                                                     kDefaultVulkanLeanVertShaderSize)) {
-        GPU::RenderPipelineDescriptor lean = desc;
-        lean.vertex.module = leanModule;
-        for (int i = 1; i < (int)VERTEX_SLOT_MVP; i++) {
-            GPU::VertexLayout empty{};
-            empty.arrayStride = 0;
-            empty.stepMode    = GPU::StepMode::vertex;
-            lean.vertex.buffers[i] = empty;
+    // --- Mesh pipelines: the recipe meshPipeline() builds from ---
+    // One SPIR-V fragment shader for every program (no flat/debug variants
+    // yet) and no blend state yet (blend draws use the opaque state, depth
+    // writes included). default.vert reads POSITION, NORMAL, TEXCOORD_0,
+    // TANGENT, COLOR_0 and TEXCOORD_1 (no skinning); default_lean.vert only
+    // POSITION. Per-draw transforms stay per-instance attributes at slot 16
+    // (slot 17 an empty placeholder), taken from the layouts built above.
+    {
+        meshRecipe.base = desc;
+        meshRecipe.base.vertex.buffers.clear();
+        meshRecipe.colorTarget = cs;
+        meshRecipe.perDrawFirstSlot = VERTEX_SLOT_MVP;
+        meshRecipe.perDrawBuffers = {desc.vertex.buffers[VERTEX_SLOT_MVP], desc.vertex.buffers[VERTEX_SLOT_MATERIAL]};
+        const uint32_t standardReads =
+            semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::normal) |
+            semanticBit(VertexSemantic::texcoord0) | semanticBit(VertexSemantic::tangent) |
+            semanticBit(VertexSemantic::color0) | semanticBit(VertexSemantic::texcoord1);
+        meshRecipe.vertexStages.push_back({standardReads, vertModule, "main"});
+        if (auto leanModule = device->createShaderModule(kDefaultVulkanLeanVertShader,
+                                                         kDefaultVulkanLeanVertShaderSize)) {
+            meshRecipe.vertexStages.push_back({semanticBit(VertexSemantic::position), leanModule, "main"});
         }
-        lean.cullMode = GPU::CullMode::back;
-        pipelineLean = device->createRenderPipeline(lean);
-        lean.cullMode = GPU::CullMode::none;
-        pipelineLeanDoubleSided = device->createRenderPipeline(lean);
-        pipelineLeanBlend            = pipelineLean;
-        pipelineLeanBlendDoubleSided = pipelineLeanDoubleSided;
+        meshRecipe.fragmentModule = fragModule;
+        meshRecipe.fragmentEntries = {"", "main", ""};
+        meshRecipe.supportsBlend = false;
+        meshRecipe.ready = true;
+        prewarmMeshPipelines();
     }
 
     // --- FXAA post-process pipeline (Vulkan) ---
@@ -4625,26 +4559,27 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     desc.cullMode  = GPU::CullMode::back;
     desc.frontFace = GPU::FrontFace::ccw;
 
-    // DirectX: assign same pipeline to both variants until a separate flat
-    // HLSL fragment entry point is compiled (flat variant TODO — matches
-    // Vulkan's current partial-implementation state).
-    pipelineTextured = device->createRenderPipeline(desc);
-    pipelineFlat     = pipelineTextured;
-    pipelineDebug    = pipelineFlat;  // TODO: compile debug DXIL variant
-
-    // Double-sided variant: a real, separate pipeline (not aliased to the
-    // single-sided one above) with cullMode=none — see Vulkan's identical
-    // fix/comment for why aliasing here silently culled doubleSided geometry.
-    desc.cullMode = GPU::CullMode::none;
-    pipelineTexturedDoubleSided = device->createRenderPipeline(desc);
-    pipelineFlatDoubleSided     = pipelineTexturedDoubleSided;
-
-    // Alpha-blend variants (TODO: proper blend state when DirectX backend
-    // supports it — matches Vulkan's current partial-implementation state).
-    pipelineFlatBlend             = pipelineFlat;
-    pipelineTexturedBlend         = pipelineTextured;
-    pipelineFlatBlendDoubleSided  = pipelineFlatDoubleSided;
-    pipelineTexturedBlendDoubleSided = pipelineTexturedDoubleSided;
+    // --- Mesh pipelines: the recipe meshPipeline() builds from ---
+    // As on Vulkan: one pixel shader for every program, no blend state yet,
+    // transforms as per-instance attributes at slot 16. No lean vertex
+    // shader yet, so VertexLayout::positionOnly() is unsupported here.
+    {
+        meshRecipe.base = desc;
+        meshRecipe.base.vertex.buffers.clear();
+        meshRecipe.colorTarget = cs;
+        meshRecipe.perDrawFirstSlot = VERTEX_SLOT_MVP;
+        meshRecipe.perDrawBuffers = {desc.vertex.buffers[VERTEX_SLOT_MVP], desc.vertex.buffers[VERTEX_SLOT_MATERIAL]};
+        const uint32_t standardReads =
+            semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::normal) |
+            semanticBit(VertexSemantic::texcoord0) | semanticBit(VertexSemantic::tangent) |
+            semanticBit(VertexSemantic::color0) | semanticBit(VertexSemantic::texcoord1);
+        meshRecipe.vertexStages.push_back({standardReads, vertModule, "vertexMain"});
+        meshRecipe.fragmentModule = pixelModule;
+        meshRecipe.fragmentEntries = {"", "pixelMain", ""};
+        meshRecipe.supportsBlend = false;
+        meshRecipe.ready = true;
+        prewarmMeshPipelines();
+    }
 
     // --- FXAA post-process pipeline (DirectX) ---
     {
@@ -5518,11 +5453,7 @@ void Renderer::renderToTarget(
 
     namespace GPU = systems::leal::campello_gpu;
 
-    bool hasAnyPipeline = pipelineFlat || pipelineTextured || pipelineDebug ||
-                          pipelineFlatDoubleSided || pipelineTexturedDoubleSided ||
-                          pipelineFlatBlend || pipelineTexturedBlend ||
-                          pipelineFlatBlendDoubleSided || pipelineTexturedBlendDoubleSided;
-    if (!hasAnyPipeline) return;
+    if (!meshRecipe.ready) return;
     if (!useDeviceSwapchain && !colorView) return;
 
     bool hasRenderableScene = asset && asset->scenes && sceneIndex < asset->scenes->size();
@@ -6115,6 +6046,7 @@ void Renderer::renderToTarget(
     // causes a Metal debug-layer abort).
     auto drawOpaque = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe) {
         currentPipelineVariant = 0;
+        currentPipelineObject = nullptr;
         lastBoundVertexBuffers.fill({});
         for (auto &draw : opaqueQueue) {
             renderPrimitive(rpe, *draw.primitive, draw.nodeIndex);
@@ -6160,6 +6092,7 @@ void Renderer::renderToTarget(
                     return squaredDist(a.nodeIndex) > squaredDist(b.nodeIndex);
                 });
             currentPipelineVariant = 0;
+            currentPipelineObject = nullptr;
             if (freshEncoder) {
                 lastBoundVertexBuffers.fill({});
             }
@@ -6778,31 +6711,19 @@ void Renderer::renderPrimitive(
         }
     }
 
+    // Variant numbers (1 flat, 2 textured, 3 debug, 4/5 double-sided, 6-9
+    // blend) skip redundant setPipeline() calls and key quantizedPipelines.
     int wantedVariant = hasTexture ? 2 : 1;
-    std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipeline =
-        hasTexture ? pipelineTextured : pipelineFlat;
-
-    // Double-sided materials use no culling.
-    if (doubleSided) {
-        pipeline = hasTexture ? pipelineTexturedDoubleSided : pipelineFlatDoubleSided;
-        wantedVariant = hasTexture ? 5 : 4;
-    }
-    
+    if (doubleSided) wantedVariant = hasTexture ? 5 : 4;
     // Alpha-blend materials use blend pipelines (depth write disabled for transparency).
-    if (useBlend) {
-        if (doubleSided) {
-            pipeline = hasTexture ? pipelineTexturedBlendDoubleSided : pipelineFlatBlendDoubleSided;
-            wantedVariant = hasTexture ? 9 : 8;
-        } else {
-            pipeline = hasTexture ? pipelineTexturedBlend : pipelineFlatBlend;
-            wantedVariant = hasTexture ? 7 : 6;
-        }
-    }
+    if (useBlend) wantedVariant = doubleSided ? (hasTexture ? 9 : 8) : (hasTexture ? 7 : 6);
+    std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipeline = meshPipeline(
+        hasTexture ? MeshProgram::textured : MeshProgram::flat, standardLayout, doubleSided, useBlend);
 
     // Debug mode overrides pipeline selection.
     if (viewMode == ViewMode::worldNormal) {
         wantedVariant = 3;
-        pipeline      = pipelineDebug;
+        pipeline      = meshPipeline(MeshProgram::debug, standardLayout, false, false);
     }
 
     // KHR_mesh_quantization: if this primitive uses non-float accessors,
@@ -6828,6 +6749,7 @@ void Renderer::renderPrimitive(
     if (pipeline && wantedVariant != currentPipelineVariant) {
         rpe->setPipeline(pipeline);
         currentPipelineVariant = wantedVariant;
+        currentPipelineObject = pipeline.get();
     }
 
     // --- 2. Bind bind groups ---
@@ -6849,8 +6771,7 @@ void Renderer::renderPrimitive(
     // (pipelineFlat.get() == pipelineTextured.get(), false wherever Metal's
     // separately-compiled flat variant is in use) rather than special-casing
     // by platform macro.
-    bool sharesFlatAndTexturedPipeline =
-        pipelineFlat && pipelineFlat.get() == pipelineTextured.get();
+    bool sharesFlatAndTexturedPipeline = !hasFlatProgram();
     bool needsTextures = (wantedVariant == 2 || wantedVariant == 5 ||
                           wantedVariant == 7 || wantedVariant == 9) ||
                           sharesFlatAndTexturedPipeline;
@@ -8581,7 +8502,7 @@ void Renderer::render(const RenderScene& scene,
     using M4 = VM::Matrix4<double>;
 
     if (!colorView) return;
-    if (!pipelineFlat && !pipelineTextured && !pipelineDebug) return;
+    if (!meshRecipe.ready) return;
 
     // Frame-in-flight synchronization.
     auto &frame = frameResources[currentFrameIndex];
@@ -9024,6 +8945,7 @@ void Renderer::render(const RenderScene& scene,
                 }
                 drawSkybox(opaqueRpe);
                 currentPipelineVariant = 0;
+                currentPipelineObject = nullptr;
                 lastBoundVertexBuffers.fill({});
                 drawIdx = 0;
                 for (auto &draw : sortedOpaque) {
@@ -9159,6 +9081,7 @@ void Renderer::render(const RenderScene& scene,
                     transRpe->setScissorRect(0.0f, 0.0f, (float)sceneTargetWidth(), (float)sceneTargetHeight());
                 }
                 currentPipelineVariant = 0;
+                currentPipelineObject = nullptr;
                 lastBoundVertexBuffers.fill({});
                 drawIdx = (size_t)sortedOpaque.size();
                 for (auto &draw : scene.transparent) {
@@ -9208,6 +9131,7 @@ void Renderer::render(const RenderScene& scene,
         drawSkybox(rpe);
 
         currentPipelineVariant = 0;
+        currentPipelineObject = nullptr;
         lastBoundVertexBuffers.fill({});
         drawIdx = 0;
         for (auto &draw : sortedOpaque) {
@@ -9219,6 +9143,7 @@ void Renderer::render(const RenderScene& scene,
         // next setVertexBuffer() call becomes redundant from Metal's point of
         // view (see lastBoundVertexBuffers's doc comment).
         currentPipelineVariant = 0;
+        currentPipelineObject = nullptr;
         for (auto &draw : scene.transparent) {
             renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
         }
@@ -9357,43 +9282,27 @@ void Renderer::renderPrimitive(
     bool doubleSided = draw.material->doubleSided;
     bool useBlend    = draw.material->alphaBlend;
 
-    int wantedVariant = 2; // textured default
-    std::shared_ptr<GPU::RenderPipeline> pipeline = pipelineTextured;
+    // The mesh's own layout (nullptr: the standard glTF/PBR layout, whose
+    // missing attributes get fallback buffers below). A layout this backend
+    // can't draw is skipped.
+    const VertexLayout& layout = draw.mesh->layout ? *draw.mesh->layout : standardLayout;
+    const bool customLayout = draw.mesh->layout && !(*draw.mesh->layout == standardLayout);
+    bool debugView = viewMode == ViewMode::worldNormal && !customLayout;
+    std::shared_ptr<GPU::RenderPipeline> pipeline = debugView
+        ? meshPipeline(MeshProgram::debug, layout, false, false)
+        : meshPipeline(MeshProgram::textured, layout, doubleSided, useBlend);
+    if (!pipeline) return;
 
-    if (doubleSided) {
-        pipeline = useBlend ? pipelineTexturedBlendDoubleSided : pipelineTexturedDoubleSided;
-        wantedVariant = useBlend ? 9 : 5;
-    } else {
-        pipeline = useBlend ? pipelineTexturedBlend : pipelineTextured;
-        wantedVariant = useBlend ? 7 : 2;
-    }
-
-    // Position-only meshes: the lean pipelines (variants 10-13), which read
-    // only the position stream and derive face normals in the fragment shader.
-    const bool lean = draw.mesh->positionOnly && supportsPositionOnlyMeshes();
-    if (lean) {
-        if (doubleSided) {
-            pipeline = useBlend ? pipelineLeanBlendDoubleSided : pipelineLeanDoubleSided;
-            wantedVariant = useBlend ? 13 : 11;
-        } else {
-            pipeline = useBlend ? pipelineLeanBlend : pipelineLean;
-            wantedVariant = useBlend ? 12 : 10;
-        }
-    }
-
-    if (viewMode == ViewMode::worldNormal && !lean) {
-        wantedVariant = 3;
-        pipeline = pipelineDebug;
-    }
-
-    if (pipeline && wantedVariant != currentPipelineVariant) {
+    // Skip redundant setPipeline() calls: the bound pipeline object is
+    // tracked (reset with currentPipelineVariant between passes).
+    if (pipeline.get() != currentPipelineObject) {
         rpe->setPipeline(pipeline);
-        currentPipelineVariant = wantedVariant;
+        currentPipelineObject = pipeline.get();
+        currentPipelineVariant = -1;
     }
 
     // --- 2. Bind bind groups ---
-    bool needsTextures = (wantedVariant == 2 || wantedVariant == 5 ||
-                          wantedVariant == 7 || wantedVariant == 9 || lean);
+    bool needsTextures = !debugView;
 #if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
     // DirectX: single combined bind group — see renderPrimitive()'s identical
     // branch / ensureDirectXPbrBindGroupLayout()'s doc comment.
@@ -9456,8 +9365,15 @@ void Renderer::renderPrimitive(
     if (vb[VERTEX_SLOT_POSITION]) {
         setVertexBufferIfChanged(rpe, VERTEX_SLOT_POSITION, vb[VERTEX_SLOT_POSITION], 0);
     }
-    if (lean) {
-        // vertexLean reads only the position stream and the transforms.
+    if (customLayout) {
+        // Exactly the layout's attributes, at their semantic slots; no
+        // fallbacks (the pipeline's vertex stage reads only these).
+        for (const auto& a : layout.attributes) {
+            const auto slot = (size_t)a.semantic;
+            if (slot < vb.size() && vb[slot]) {
+                setVertexBufferIfChanged(rpe, (uint32_t)slot, vb[slot], 0);
+            }
+        }
         if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
             rpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
             rpe->drawIndexed(draw.mesh->indexCount, draw.instanceCount);

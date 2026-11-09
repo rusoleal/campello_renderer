@@ -18,6 +18,7 @@
 #include <campello_renderer/image.hpp>
 #include <campello_renderer/animation.hpp>
 #include <campello_renderer/procedural_texture_baker.hpp>
+#include <campello_renderer/vertex_layout.hpp>
 #include <vector_math/vector_math.hpp>
 
 namespace systems::leal::campello_image { class Image; }
@@ -36,13 +37,13 @@ namespace systems::leal::campello_renderer {
         // render_system() skips the draw if the box is entirely outside the
         // camera frustum. Unset (the default): never culled. uploadMesh()
         // fills them from a float POSITION accessor's min/max.
-        // Position-only mesh: only vertexBuffers[VERTEX_SLOT_POSITION] is set
-        // (12 bytes per vertex). Drawn with the lean pipelines, which derive a
-        // flat per-face normal in the fragment shader (screen-space
-        // derivatives of the world position), so vertices can be shared
-        // between faces of different orientation. Only when
-        // Renderer::supportsPositionOnlyMeshes() is true.
-        bool positionOnly = false;
+        // Vertex layout: which attributes vertexBuffers holds (indexed by
+        // VertexSemantic) and their formats. nullptr = the renderer's standard
+        // glTF/PBR layout (Renderer::standardVertexLayout()), with fallback
+        // buffers bound for missing attributes. Any other layout is drawn only
+        // if Renderer::supportsVertexLayout() accepts it, and must point at
+        // storage that outlives the mesh (e.g. VertexLayout::positionOnly()).
+        const VertexLayout* layout = nullptr;
 
         bool hasBounds = false;
         std::array<float, 3> boundsMin{0.0f, 0.0f, 0.0f};
@@ -369,28 +370,47 @@ namespace systems::leal::campello_renderer {
         void rebuildDirectXCombinedBindGroups(uint32_t frameIndex,
             const std::shared_ptr<systems::leal::campello_gpu::Texture>& sceneColorOrOpaque);
 
-        // Built-in pipeline variants created by createDefaultPipelines().
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlat;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTextured;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineDebug;  // Flat shaded, no lighting
-        
-        // Double-sided pipeline variants (no back-face culling).
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlatDoubleSided;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTexturedDoubleSided;
-        
-        // Alpha-blend pipeline variants (transparent materials).
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlatBlend;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTexturedBlend;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlatBlendDoubleSided;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTexturedBlendDoubleSided;
-        // Lean pipelines for GpuMesh::positionOnly (opaque, double-sided,
-        // blend, blend double-sided): position-only vertex layout, face normal
-        // derived in the fragment shader. Null where a backend's shaders don't
-        // have the lean entry points yet.
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineLean;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineLeanDoubleSided;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineLeanBlend;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineLeanBlendDoubleSided;
+        // Mesh pipelines (docs/design/programmable-pipelines.md, phase 1).
+        // createDefaultPipelines() fills a per-backend recipe; pipelines are
+        // built from it on first use per (program, vertex layout, culling,
+        // blending) and cached. The combinations the built-in paths use are
+        // created up front, so the first frame doesn't stall.
+        enum class MeshProgram : uint8_t { flat, textured, debug };
+        struct MeshVertexStage {
+            uint32_t readMask = 0;  // semantics the shader reads (semanticBit())
+            std::shared_ptr<systems::leal::campello_gpu::ShaderModule> module;
+            std::string entryPoint;
+        };
+        struct MeshPipelineRecipe {
+            bool ready = false;
+            // Everything but the vertex stage, fragment entry, culling and
+            // blending: pipeline layout, depth, topology, winding, color format.
+            systems::leal::campello_gpu::RenderPipelineDescriptor base;
+            systems::leal::campello_gpu::ColorState colorTarget;  // format and write mask
+            std::vector<MeshVertexStage> vertexStages;
+            std::shared_ptr<systems::leal::campello_gpu::ShaderModule> fragmentModule;
+            // Fragment entry point per MeshProgram; empty = the backend has no
+            // separate shader for it and uses the textured one.
+            std::array<std::string, 3> fragmentEntries;
+            bool supportsBlend = false;  // false: blend draws use the opaque state
+            systems::leal::campello_gpu::BlendState alphaBlend;
+            systems::leal::campello_gpu::DepthStencilDescriptor blendDepthStencil;
+            // Vertex buffer slots after the attributes (per-draw data such as
+            // Vulkan/DirectX's per-instance transforms at slot 16); empty on Metal.
+            std::vector<systems::leal::campello_gpu::VertexLayout> perDrawBuffers;
+            uint32_t perDrawFirstSlot = 0;
+        };
+        MeshPipelineRecipe meshRecipe;
+        std::unordered_map<uint64_t, std::shared_ptr<systems::leal::campello_gpu::RenderPipeline>> meshPipelineCache;
+        VertexLayout standardLayout = VertexLayout::standard();
+
+        const MeshVertexStage* vertexStageFor(const VertexLayout& layout) const;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> meshPipeline(
+            MeshProgram program, const VertexLayout& layout, bool doubleSided, bool blend);
+        void prewarmMeshPipelines();
+        // True when the backend has a separate flat fragment shader (Metal);
+        // elsewhere "flat" draws use the textured shader and its bind group.
+        bool hasFlatProgram() const { return !meshRecipe.fragmentEntries[0].empty(); }
 
         // Skybox pipeline — fullscreen triangle that samples an environment cubemap.
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineSkybox;
@@ -650,6 +670,7 @@ namespace systems::leal::campello_renderer {
         // to avoid redundant setPipeline() calls.
         // 0 = none, 1 = flat, 2 = textured, 3 = debug, 4 = flat double-sided, 5 = textured double-sided
         int currentPipelineVariant = 0;
+        const void* currentPipelineObject = nullptr;  // the pipeline last bound by renderPrimitive()
 
         // Tracks last-bound vertex buffer per slot within a render pass to avoid
         // redundant setVertexBuffer() calls (Metal debug layer asserts on these).
@@ -943,12 +964,18 @@ namespace systems::leal::campello_renderer {
         void setOpaqueOrder(OpaqueOrder order) { opaqueOrder = order; }
         OpaqueOrder getOpaqueOrder() const { return opaqueOrder; }
 
-        /// True when position-only meshes (GpuMesh::positionOnly) can be drawn:
-        /// this backend's shaders have the lean pipelines and they were created
-        /// (call after createDefaultPipelines()).
-        bool supportsPositionOnlyMeshes() const {
-            return pipelineLean && pipelineLeanDoubleSided && pipelineLeanBlend && pipelineLeanBlendDoubleSided;
+        /// True when meshes with this vertex layout (GpuMesh::layout) can be
+        /// drawn: the backend's shaders have a vertex stage that reads only
+        /// attributes the layout has (call after createDefaultPipelines()).
+        /// VertexLayout::positionOnly() is supported on Metal and Vulkan.
+        bool supportsVertexLayout(const VertexLayout& layout) const {
+            return meshRecipe.ready && vertexStageFor(layout) != nullptr;
         }
+        /// The layout of meshes with GpuMesh::layout == nullptr (glTF/PBR;
+        /// joint and weight formats follow the loaded asset).
+        const VertexLayout& standardVertexLayout() const { return standardLayout; }
+        /// Mesh pipelines created so far (cache size; for statistics and tests).
+        size_t meshPipelineCount() const { return meshPipelineCache.size(); }
 
         void setFxaaEnabled(bool enabled);
         bool isFxaaEnabled() const;
