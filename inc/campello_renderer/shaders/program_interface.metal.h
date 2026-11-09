@@ -20,8 +20,24 @@
 #define CAMPELLO_ATTRIBUTE_CUSTOM2    10
 #define CAMPELLO_ATTRIBUTE_CUSTOM3    11
 
-// Per-draw transforms: read element 0 of [[buffer(CAMPELLO_TRANSFORMS_BUFFER)]].
+// Per-draw transforms, two ways:
+//  - per-instance vertex attributes (preferred: the same contract as Vulkan,
+//    DirectX and WebGPU): put CAMPELLO_TRANSFORM_ATTRIBUTES in the
+//    [[stage_in]] struct and use CAMPELLO_MVP(in) / CAMPELLO_MODEL(in);
+//  - element 0 of [[buffer(CAMPELLO_TRANSFORMS_BUFFER)]] (what the built-in
+//    shaders read).
 #define CAMPELLO_TRANSFORMS_BUFFER 16
+#define CAMPELLO_TRANSFORM_ATTRIBUTES                      \
+    float4 campelloMvp0   [[attribute(16)]];               \
+    float4 campelloMvp1   [[attribute(17)]];               \
+    float4 campelloMvp2   [[attribute(18)]];               \
+    float4 campelloMvp3   [[attribute(19)]];               \
+    float4 campelloModel0 [[attribute(24)]];               \
+    float4 campelloModel1 [[attribute(25)]];               \
+    float4 campelloModel2 [[attribute(26)]];               \
+    float4 campelloModel3 [[attribute(27)]];
+#define CAMPELLO_MVP(in)   metal::float4x4((in).campelloMvp0, (in).campelloMvp1, (in).campelloMvp2, (in).campelloMvp3)
+#define CAMPELLO_MODEL(in) metal::float4x4((in).campelloModel0, (in).campelloModel1, (in).campelloModel2, (in).campelloModel3)
 
 namespace campello {
 

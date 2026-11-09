@@ -3460,6 +3460,10 @@ void Renderer::bindMeshBuffer(const std::shared_ptr<systems::leal::campello_gpu:
         slot = (uint32_t)physical;
     }
     setVertexBufferIfChanged(rpe, slot, buffer, offset);
+    // Metal: the transforms are also the built-in shaders' [[buffer(16)]].
+    if (logicalSlot == VERTEX_SLOT_MVP && meshRecipe.rawBufferSlots && slot != VERTEX_SLOT_MVP) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_MVP, buffer, offset);
+    }
 }
 
 void Renderer::prewarmMeshPipelines() {
@@ -3662,6 +3666,25 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         programs[kPbrProgram].fragmentModule = shaderModule;
         programs[kPbrProgram].fragmentEntries = {"fragmentMain_flat", "fragmentMain_textured", "fragmentMain_debug"};
         meshRecipe.rawBufferSlots = true;  // [[buffer(15..23)]]: lights, transforms, material, ...
+        // The per-draw transforms are also per-instance vertex attributes
+        // (locations 16-19 mvp, 24-27 model, the slot after the attributes),
+        // as on Vulkan/DirectX, so one program source (e.g. Slang) works on
+        // every backend. The built-in shaders keep reading [[buffer(16)]];
+        // bindMeshBuffer() binds the transforms at both.
+        {
+            GPU::VertexLayout transforms{};
+            transforms.arrayStride = 128;  // sizeof(NodeTransforms)
+            transforms.stepMode    = GPU::StepMode::instance;
+            for (uint32_t col = 0; col < 8; ++col) {
+                GPU::VertexAttribute attr{};
+                attr.componentType  = GPU::ComponentType::ctFloat;
+                attr.accessorType   = GPU::AccessorType::acVec4;
+                attr.offset         = col * 16;
+                attr.shaderLocation = col < 4 ? VERTEX_SLOT_MVP + col : 24 + (col - 4);
+                transforms.attributes.push_back(attr);
+            }
+            meshRecipe.perDrawBuffers = {{VERTEX_SLOT_MVP, transforms}};
+        }
         meshRecipe.supportsBlend = true;
         programs[kPbrProgram].supportsBlend = true;
         meshRecipe.alphaBlend = alphaBlend;
