@@ -4184,6 +4184,30 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     pipelineFlatBlendDoubleSided  = pipelineFlatDoubleSided;
     pipelineTexturedBlendDoubleSided = pipelineTexturedDoubleSided;
 
+    // Lean variants for position-only meshes (GpuMesh::positionOnly):
+    // default_lean.vert reads only POSITION (slot 0) and the per-instance
+    // transforms (slot 16); default.frag derives the flat face normal when
+    // the interpolated one is zero. Slots 1-15 become empty placeholders so
+    // the vector index still matches the buffer slot. Blend aliases the
+    // opaque variants, as for the textured pipelines above.
+    if (auto leanModule = device->createShaderModule(kDefaultVulkanLeanVertShader,
+                                                     kDefaultVulkanLeanVertShaderSize)) {
+        GPU::RenderPipelineDescriptor lean = desc;
+        lean.vertex.module = leanModule;
+        for (int i = 1; i < (int)VERTEX_SLOT_MVP; i++) {
+            GPU::VertexLayout empty{};
+            empty.arrayStride = 0;
+            empty.stepMode    = GPU::StepMode::vertex;
+            lean.vertex.buffers[i] = empty;
+        }
+        lean.cullMode = GPU::CullMode::back;
+        pipelineLean = device->createRenderPipeline(lean);
+        lean.cullMode = GPU::CullMode::none;
+        pipelineLeanDoubleSided = device->createRenderPipeline(lean);
+        pipelineLeanBlend            = pipelineLean;
+        pipelineLeanBlendDoubleSided = pipelineLeanDoubleSided;
+    }
+
     // --- FXAA post-process pipeline (Vulkan) ---
     {
         if (!fxaaBindGroupLayout) {

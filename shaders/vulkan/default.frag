@@ -159,9 +159,16 @@ layout(set = 0, binding = 23) uniform texture2D anisotropicTexture;         // r
 
 // --- Vertex stage inputs ---------------------------------------------------------
 layout(location = 0) in vec3 worldPos;
-layout(location = 1) in vec3 worldNormalIn;
-layout(location = 2) in vec3 worldTangentIn;
-layout(location = 3) in vec3 worldBitangentIn;
+layout(location = 1) in vec3 worldNormalRaw;
+layout(location = 2) in vec3 worldTangentRaw;
+layout(location = 3) in vec3 worldBitangentRaw;
+
+// The geometric frame the shading uses: the interpolated vertex frame, or for
+// position-only meshes (default_lean.vert, zero normal) the flat face normal
+// derived from screen-space derivatives of worldPos. Filled at the top of main().
+vec3 worldNormalIn;
+vec3 worldTangentIn;
+vec3 worldBitangentIn;
 layout(location = 4) in vec2 fragTexcoord0;
 layout(location = 5) in vec2 fragTexcoord1;
 layout(location = 6) in vec4 fragColor0;
@@ -370,6 +377,22 @@ vec3 linearToSRGBFast(vec3 color) {
 }
 
 void main() {
+    // Derivatives are taken unconditionally (uniform control flow).
+    vec3 faceNormal = cross(dFdx(worldPos), dFdy(worldPos));
+    worldNormalIn    = worldNormalRaw;
+    worldTangentIn   = worldTangentRaw;
+    worldBitangentIn = worldBitangentRaw;
+    if (dot(worldNormalRaw, worldNormalRaw) < 1e-8) {
+        vec3 N = length(faceNormal) > 1e-20 ? normalize(faceNormal) : vec3(0.0, 0.0, 1.0);
+        if (dot(N, camera.cameraPos.xyz - worldPos) < 0.0) {
+            N = -N;
+        }
+        vec3 T = abs(N.y) < 0.999 ? normalize(cross(vec3(0.0, 1.0, 0.0), N)) : normalize(cross(vec3(1.0, 0.0, 0.0), N));
+        worldNormalIn    = N;
+        worldTangentIn   = T;
+        worldBitangentIn = cross(N, T);
+    }
+
     vec2 uv0 = fragTexcoord0;
     if (mat.uvTransformRow0.w > 0.5) {
         uv0 = applyUvTransform(fragTexcoord0, mat.uvTransformRow0, mat.uvTransformRow1);
