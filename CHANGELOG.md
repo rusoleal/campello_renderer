@@ -20,6 +20,7 @@
 - Design proposal: `docs/design/programmable-pipelines.md` (app-defined vertex layouts and shader programs).
 - **Size culling in `render_system()`.** With `RenderSystemOptions{minPixelRadius, viewportHeight}`, draws whose bounding sphere covers fewer pixels than that on screen are skipped (counted in `RenderSystemStats::tooSmall`). The estimate is `projectedRadiusPixels()` in `culling.hpp`; meshes without bounds and spheres reaching the camera are never "small". Found in campello_bim, whose IFC reference models have thousands of batches.
 
+- **GPU frame time on the web without blocking.** `RenderStats::gpuFrameTimeMs` came from `CommandBuffer::getGPUExecutionTime()`, which on WebGPU yields (ASYNCIFY) until the timestamp readback resolves: inside a browser frame callback that ended the app's frame loop (campello_bim on the web stopped after its first frame). Web builds now ask with `getGPUExecutionTimeAsync()` at submit and report the latest result.
 ### Fixed
 - **Morph targets on Metal.** The vertex shader read the morph-target deltas as `device const float3*` (16-byte stride) while they are uploaded tightly packed (12 bytes per vertex), so only the first vertex of each primitive got its delta (the rest read neighbouring components or past the end). They are now `packed_float3`. New test: a morph target moves every vertex.
 

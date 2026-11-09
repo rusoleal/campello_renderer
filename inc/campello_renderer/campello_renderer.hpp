@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <array>
@@ -817,6 +818,11 @@ namespace systems::leal::campello_renderer {
 
         RenderStats lastFrameStats;
         double gpuFrameTimeMs = 0.0;  // latest completed render() command buffer
+        // Web: getGPUExecutionTime() would block (yield) until the timestamp
+        // readback resolves, so render() asks asynchronously and the result
+        // lands here; shared so a late callback outlives the Renderer safely.
+        std::shared_ptr<std::atomic<double>> gpuFrameTimeAsyncMs =
+            std::make_shared<std::atomic<double>>(0.0);
         OpaqueOrder opaqueOrder = OpaqueOrder::byState;
         bool defaultLightEnabled = true;
 

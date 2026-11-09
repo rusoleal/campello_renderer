@@ -8635,10 +8635,15 @@ void Renderer::render(const RenderScene& scene,
     }
     if (frame.fence) frame.fence->wait();
     if (frame.commandBuffer) {
+#if defined(__EMSCRIPTEN__)
+        // Asked asynchronously at submit (below): reading it here would yield.
+        gpuFrameTimeMs = gpuFrameTimeAsyncMs->load();
+#else
         // Completed (fence waited): its GPU time is available now.
         if (const uint64_t ns = frame.commandBuffer->getGPUExecutionTime()) {
             gpuFrameTimeMs = static_cast<double>(ns) / 1.0e6;
         }
+#endif
         frame.commandBuffer.reset();
     }
 
@@ -9387,6 +9392,13 @@ void Renderer::render(const RenderScene& scene,
 
     frame.commandBuffer = encoder->finish();
     device->submit(frame.commandBuffer, frame.fence);
+#if defined(__EMSCRIPTEN__)
+    if (frame.commandBuffer) {
+        frame.commandBuffer->getGPUExecutionTimeAsync([result = gpuFrameTimeAsyncMs](uint64_t ns) {
+            if (ns) result->store(static_cast<double>(ns) / 1.0e6);
+        });
+    }
+#endif
     currentFrameIndex = (currentFrameIndex + 1) % kMaxFramesInFlight;
 
     // Stats
