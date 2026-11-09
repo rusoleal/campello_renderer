@@ -8,6 +8,7 @@ The renderer has one hardcoded PBR pipeline per backend:
 
 - **Fixed vertex slots.** POSITION 0, NORMAL 1, TEXCOORD_0 2, TANGENT 3, JOINTS 4, WEIGHTS 5, COLOR_0 6, TEXCOORD_1 7, plus per-draw data at 15 (lights), 16 (NodeTransforms), 17 (material), 18 (camera), 19 (instance matrices), 20 (joints) and 21–23 (morph targets). `GpuMesh::vertexBuffers` is a fixed `std::array` of six.
 - **Embedded shaders.** `default.metal`, `default.vert/.frag` and `default.hlsl` are compiled offline by per-backend scripts into headers (`metal_default.h`, `vulkan_default.h`, ...).
+- **No WebGPU path.** campello_gpu has a WebGPU backend (WGSL via `createShaderModule(const char*)`), but under Emscripten the renderer's `createDefaultPipelines()` falls through to an empty `#else`. campello_bim will need a web version, so WebGPU is a fourth backend to design for, not an afterthought.
 - **Hand-made variants.** Each variant is a named member created in `createDefaultPipelines()`, once per backend: flat / textured / debug × single- or double-sided × opaque or blend, plus the lean position-only variants added for BIM (`pipelineLean*`, `supportsPositionOnlyMeshes()`).
 
 Every new need multiplies the variants across three backends. The lean meshes show it: a second vertex layout meant a second vertex shader per backend, four more pipeline members, a capability flag, and a branch in `renderPrimitive`. Apps can't add their own rendering at all, and BIM needs several kinds soon:
@@ -27,13 +28,30 @@ Every new need multiplies the variants across three backends. The lean meshes sh
 2. Apps can register their own shader programs, with a documented contract for the data the renderer provides (camera, transforms, lights, environment).
 3. The built-in PBR becomes the default program, registered through the same public API the apps use.
 4. Common app needs (clip planes, tint, id output) are built-in **features** of the PBR program, switched by uniforms, so most apps never write a shader.
-5. The existing API keeps working. glTF loading, `render_system`, materials and debug views don't change for current users.
+5. Four backends: Metal, Vulkan, DirectX and **WebGPU**. Every contract in this document has to fit WebGPU's limits (below), which are the tightest.
+6. The existing API keeps working. glTF loading, `render_system`, materials and debug views don't change for current users.
 
 ## Non-goals
 
 - A runtime shader compiler in the library. Shaders stay compiled offline (Vulkan and DirectX need binaries anyway).
 - A render graph or user-defined passes. The pass list stays the renderer's: skybox, opaque, scene-color copy (transmission), transparent, FXAA. Programs take part in passes; they don't define them. A render graph can come later on top of this.
 - Shader source injection (gluing app snippets into the PBR source). See "Hooks" below.
+
+## WebGPU constraints
+
+WebGPU's default limits are lower than what the renderer uses today, and a web build can't assume more:
+
+| Limit (default) | Value | Renderer today | Consequence |
+|---|---|---|---|
+| `maxVertexBuffers` | 8 | slots 0–7 attributes, 16 transforms, 17–19 placeholders/instances | Vertex buffer slots must be **compact**: a layout's attributes take slots 0..n-1, and per-draw data moves out of vertex slots 16+ |
+| `maxVertexAttributes` | 16 | 8 attributes + 8 matrix columns (MVP, model) | Per-draw matrices go to a storage buffer, not instance attributes |
+| `maxSampledTexturesPerShaderStage` | 16 | PBR fragment: 21 textures (glTF core 5, KHR extensions 12, IBL 3, scene color 1) | PBR is split into **variants by feature set**: core (5 + IBL 3 + scene color = 9) and extensions grouped so each variant stays ≤ 16 |
+| `maxSamplersPerShaderStage` | 16 | 8 | fine |
+| `maxBindGroups` | 4 | 2 (material, frame) | room for a per-draw group |
+| Derivatives (`dpdx`) | uniform control flow only | lean meshes take them unconditionally | already compatible |
+| Shading language | WGSL only | MSL, GLSL, HLSL | a fourth hand-written copy, or generated (Slang emits WGSL) |
+
+These shape the design below: compact vertex slots and a storage buffer for per-draw transforms on **all** backends (one contract, not a WebGPU special case), and PBR variants keyed by material features.
 
 ## Design
 
@@ -58,7 +76,8 @@ struct VertexLayoutDesc {
 
 - `GpuMesh` gains `const VertexLayoutDesc* layout` (or a small interned layout id) and `std::vector<Buffer>` replaces the fixed array. `uploadMesh()` fills both from the glTF accessors, so glTF users see no change.
 - The standard PBR layout is a predefined constant (`VertexLayouts::pbr()`), and so is `VertexLayouts::positionOnly()`. The `positionOnly` flag goes away: a lean mesh is just a mesh with that layout.
-- Per-draw data (transforms 16, instances 19, joints 20, morph 21–23) stays in renderer-owned slots above the attribute range, so attribute locations 0–14 belong to the layout.
+- **Compact slots:** a layout's attribute *i* is read from vertex buffer slot *i* (non-interleaved, as today), and the shader location comes from the semantic. A position-only mesh binds one buffer, a PBR mesh at most eight (WebGPU's limit).
+- **Per-draw data leaves the vertex slots.** Transforms (today slot 16), instance matrices (19), joints (20) and morph data (21–23) move to storage buffers indexed by the draw's instance index (`firstInstance` + `instance_index` / `[[instance_id]]` + base instance / `SV_InstanceID` + root constant), on every backend. On Metal they are already device buffers; on Vulkan and DirectX the transforms stop being per-instance vertex attributes.
 
 ### 2. Shader programs
 
@@ -75,6 +94,7 @@ struct ShaderProgramDesc {
     std::optional<ShaderStageSource> metalLibrary;        // one .metallib, both entry points
     std::optional<ShaderStageSource> vulkanVertex, vulkanFragment;
     std::optional<ShaderStageSource> directxVertex, directxFragment;
+    std::optional<std::string> wgsl;                       // WGSL source, both entry points
 
     std::vector<VertexLayoutDesc> acceptedLayouts;        // empty = any layout with a position
     FrameInputs   frameInputs;    // which renderer data it reads: camera, lights, environment, sceneColor
@@ -105,22 +125,22 @@ key = (program, layout hash, cullMode, blendMode, colorFormat, depthFormat, samp
 
 This is the core of the proposal: what a custom shader may rely on. It's written down once per backend and covered by tests that compile a minimal custom program on every backend.
 
-| Data | Metal | Vulkan | DirectX |
-|---|---|---|---|
-| Vertex attributes | `[[attribute(0..14)]]`, buffers 0–14 | locations 0–14 | `TEXCOORD0..14` |
-| NodeTransforms {mvp, model} | buffer 16 (vertex) | per-instance attribute, locations 16–19 and 24–27 | same as Vulkan |
-| Instance matrices | buffer 19 | (to define) | (to define) |
-| Camera | buffer 18 (fragment) | set 1 | combined group (to split) |
-| Lights | buffer 15 | set 1 | combined group (to split) |
-| Environment (IBL, BRDF LUT) | fragment textures | set 1 | combined group (to split) |
-| Program material | buffer 17 + its textures | set 0 | (to define) |
+| Data | Metal | Vulkan | DirectX | WebGPU |
+|---|---|---|---|---|
+| Vertex attributes | `[[attribute(i)]]`, buffers 0..n-1 | locations by semantic, bindings 0..n-1 | `TEXCOORDi`, slots 0..n-1 | `@location` by semantic, buffers 0..n-1 (n ≤ 8) |
+| NodeTransforms {mvp, model} | today buffer 16; target: storage buffer | today per-instance attributes 16–19, 24–27; target: storage buffer | same as Vulkan | storage buffer, group 2 |
+| Instance matrices | buffer 19 | (to define) | (to define) | storage buffer, group 2 |
+| Camera | buffer 18 (fragment) | set 1 | combined group (to split) | group 1 |
+| Lights | buffer 15 | set 1 | combined group (to split) | group 1 |
+| Environment (IBL, BRDF LUT) | fragment textures | set 1 | combined group (to split) | group 1 |
+| Program material | buffer 17 + its textures | set 0 | (to define) | group 0 (≤ 16 textures with the frame's) |
 
 Work implied by the table:
 
 - **DirectX** uses one combined material + frame bind group per frame-in-flight (`GpuMaterial::directxBindGroup`). It must be split into frame and material groups, as on Vulkan, before custom programs can work there.
 - **Vulkan** carries the transforms as per-instance vertex attributes and Metal as a device buffer. Both are fine for the contract; the table just has to say so.
 
-The same structs (`NodeTransforms`, `CameraUniforms`, `LightsUniforms`) ship as headers that shaders include, one per language: `campello_renderer.metal.h`, `campello_renderer.glsl`, `campello_renderer.hlsli`. Later this becomes one Slang module (see §6).
+The same structs (`NodeTransforms`, `CameraUniforms`, `LightsUniforms`) ship as headers that shaders include, one per language: `campello_renderer.metal.h`, `campello_renderer.glsl`, `campello_renderer.hlsli`, `campello_renderer.wgsl` (WGSL has no `#include`: the renderer prepends it to WGSL sources, which are compiled at runtime by the browser). Later this becomes one Slang module (see §6).
 
 ### 5. Hooks: built-in features, not source injection
 
@@ -135,15 +155,15 @@ Per-draw feature data rides on `DrawCall` (for example `DrawCall::tint`) and goe
 
 ### 6. Shader sources across three backends
 
-Writing every custom program three times (MSL, GLSL, HLSL) is the main cost of this proposal for app authors. The options:
+With WebGPU, every program is written **four** times (MSL, GLSL, HLSL, WGSL); that is the main cost of this proposal, for the library's own PBR shader as much as for apps. The options:
 
 | Option | Toolchain | Notes |
 |---|---|---|
-| A. Hand-written per backend (today) | xcrun metal, glslc / glslangValidator, dxc | No new tool; triple the work |
-| B. **Slang** → MSL, SPIR-V, DXIL | `slangc` (one binary on macOS/Windows/Linux) | Modules fit the binding-contract headers; MSL output is newer than the others |
-| C. HLSL → DXIL and SPIR-V (dxc) → MSL (SPIRV-Cross) | dxc + spirv-cross | Mature; two tools; Metal argument mapping needs care |
+| A. Hand-written per backend (today) | xcrun metal, glslc / glslangValidator, dxc; WGSL needs no compiler | No new tool; four copies to keep in step |
+| B. **Slang** → MSL, SPIR-V, DXIL, WGSL | `slangc` (one binary on macOS/Windows/Linux) | One source for four targets; modules fit the binding-contract headers; MSL and WGSL outputs are newer than the others |
+| C. HLSL → DXIL and SPIR-V (dxc) → MSL and WGSL (SPIRV-Cross, Tint/Naga) | dxc + spirv-cross + tint | Mature parts; three tools |
 
-Recommendation: keep A while the API settles (phases 1–4). Then spike B on the PBR shader: if the generated MSL/SPIR-V/DXIL matches today's images (the existing image tests), move the built-in shaders to Slang and offer it to apps. CMake gets a helper either way:
+Recommendation: A for phases 1–2 (the PBR shaders exist in three languages already). Before writing the WGSL PBR shader (phase 7), spike B: if Slang's output matches today's images (the existing image tests), move the built-in shaders to Slang first and get WGSL from it, instead of hand-writing a fourth 1,000-line copy. CMake gets a helper either way:
 
 ```cmake
 campello_renderer_add_shaders(my_app_shaders
@@ -191,11 +211,16 @@ Each phase ships on its own, keeps the existing tests and image comparisons pass
    - Slang spike on the PBR shader; if it passes the image tests, move the built-in shaders and document it for apps.
 6. **Lines and topology.**
    - `GpuMesh` topology (lines, line strips) with a line program, for edges and drawing views.
+7. **WebGPU backend.**
+   - PBR in WGSL (from Slang if phase 5 worked, hand-written otherwise), split into feature variants within 16 textures per stage.
+   - Pipelines through the same cache; Emscripten build and an image test in a headless browser.
+   - Needed for the web version of campello_bim.
 
 ## Risks and open questions
 
 - **Public API surface.** The binding contract becomes something apps depend on. Keep it small and versioned (`kBindingContractVersion`), and change it only with a major renderer version.
 - **Pipeline creation hitches.** On-demand creation costs a few ms the first time a combination is drawn; `prewarm` plus an async creation path (if campello_gpu gets one) handles it.
+- **WebGPU texture limit.** Splitting PBR by feature set means a material using many KHR extensions may need a variant per combination; group extensions so the common ones (clearcoat, transmission, sheen) fit, and fall back to dropping textures (keeping factors) beyond the limit, with a one-time warning.
 - **DirectX coverage.** CI is Windows-only but can't run the GPU tests today, and the DXIL headers aren't regenerated from macOS. Phase 2 needs dxc in CI to be credible.
 - **Skinning and morph targets** stay PBR-only at first; custom programs declare `drawInputs` without them until someone needs it.
 - **Where ECS integration lives.** `render_system` keeps building `DrawCall`s from components. A material component that names a program is enough; no new ECS concepts.
