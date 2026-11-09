@@ -60,7 +60,9 @@ namespace systems::leal::campello_renderer {
         ShaderBinary directxFragment;
         std::string directxVertexEntryPoint = "vertexMain";
         std::string directxFragmentEntryPoint = "pixelMain";
-        std::string wgsl;                     // reserved for the WebGPU backend
+        std::string wgsl;                     // WGSL source (WebGPU), both entry points
+        std::string wgslVertexEntryPoint = "vertexMain";
+        std::string wgslFragmentEntryPoint = "fragmentMain";
         /// The vertex attributes the vertex shader reads (semanticBit()s).
         /// A mesh is drawn only if its layout has all of them.
         uint32_t vertexReads = semanticBit(VertexSemantic::position);

@@ -218,10 +218,9 @@ Each phase ships on its own, keeps the existing tests and image comparisons pass
 6. **Lines and topology.** *Done (1-pixel lines).*
    - `GpuMesh::topology` in the pipeline key; a line vertex stage in the built-in program (Metal, Vulkan) with a clip-space depth offset so edges win over their faces; unlit materials give flat colours. campello_bim draws feature edges with it.
    - Later, for drawing views: wide lines (screen-space quads expanded in the vertex shader), dashes, line weights by category.
-7. **WebGPU backend.**
-   - PBR in WGSL (from Slang if phase 5 worked, hand-written otherwise), split into feature variants within 16 textures per stage.
-   - Pipelines through the same cache; Emscripten build and an image test in a headless browser.
-   - Needed for the web version of campello_bim.
+7. **WebGPU backend.** *Mesh rendering done (hand-written WGSL); not yet built with Emscripten.*
+   - Done: the web build shares Vulkan's bind-group code (`CAMPELLO_RENDERER_VK_BINDINGS`); `shaders/webgpu/default.wgsl` (core PBR feature set within 16 textures; material groups trimmed to bindings 0-9 + 24); transforms as a storage buffer (group 2) indexed by `firstInstance`, because **WebGPU vertex inputs stop at location 15** (the 16-19/24-27 attribute contract can't exist there); real alpha blending; app programs via `ShaderProgramDesc::wgsl`. `test/webgpu/run_wgsl_check.sh` checks the WGSL against the exact layouts and renders lean, line, glTF-layout, blended, clipped and capped draws in headless Chrome (Intel GPU via Chrome's Metal backend).
+   - Next: build the renderer with Emscripten and run its offscreen tests in the browser (campello_gpu's `run_in_browser.mjs`); WGSL versions of skybox, FXAA, downsample and the IBL bakes; feature variants for the KHR extension textures; then campello_bim's web version.
 
 ## Slang spike findings (2026-11-09, slangc 2026.20)
 

@@ -742,6 +742,24 @@ namespace systems::leal::campello_renderer {
         // 0 = none, 1 = flat, 2 = textured, 3 = debug, 4 = flat double-sided, 5 = textured double-sided
         int currentPipelineVariant = 0;
         const void* currentPipelineObject = nullptr;  // the pipeline last bound by renderPrimitive()
+        // WebGPU (programmable pipelines phase 7): per-draw transforms are a
+        // storage buffer (group 2) indexed by firstInstance, because WebGPU
+        // vertex inputs stop at location 15. Unused elsewhere.
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> webgpuDrawBindGroupLayout;
+        std::unordered_map<const void*, std::shared_ptr<systems::leal::campello_gpu::BindGroup>> webgpuDrawBindGroups;
+        const void* webgpuBoundDrawGroup = nullptr;
+        uint32_t webgpuFirstInstance = 0;
+        void bindWebGpuTransforms(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+                                  const std::shared_ptr<systems::leal::campello_gpu::Buffer> &buffer,
+                                  uint64_t offset);
+        // firstInstance for mesh draws: the transform index on WebGPU, 0 elsewhere.
+        uint32_t drawFirstInstance() const {
+#if defined(__EMSCRIPTEN__)
+            return webgpuFirstInstance;
+#else
+            return 0;
+#endif
+        }
 
         // Tracks last-bound vertex buffer per slot within a render pass to avoid
         // redundant setVertexBuffer() calls (Metal debug layer asserts on these).

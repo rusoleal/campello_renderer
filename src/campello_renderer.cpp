@@ -30,6 +30,38 @@
 #include "shaders/vulkan_default.h"
 #elif defined(_WIN32)
 #include "shaders/directx_default.h"
+#elif defined(__EMSCRIPTEN__)
+#include "shaders/webgpu_default.h"
+#endif
+
+// Vulkan and WebGPU share a binding model (bind groups/sets of numbered
+// bindings, separate texture and sampler entries), so the web build takes
+// the Vulkan code paths for bind groups; createDefaultPipelines() and
+// registerProgram() have WebGPU branches for the shaders (WGSL).
+#if defined(ANDROID) || defined(__linux__) || defined(__EMSCRIPTEN__)
+#define CAMPELLO_RENDERER_VK_BINDINGS 1
+#else
+#define CAMPELLO_RENDERER_VK_BINDINGS 0
+#endif
+
+// Per-draw transform buffers: vertex buffers everywhere, also storage
+// buffers on WebGPU (read through group 2 there, see bindWebGpuTransforms()).
+#if defined(__EMSCRIPTEN__)
+static constexpr auto kTransformBufferUsage = static_cast<systems::leal::campello_gpu::BufferUsage>(
+    static_cast<uint32_t>(systems::leal::campello_gpu::BufferUsage::vertex) |
+    static_cast<uint32_t>(systems::leal::campello_gpu::BufferUsage::storage));
+#else
+static constexpr auto kTransformBufferUsage = systems::leal::campello_gpu::BufferUsage::vertex;
+#endif
+
+#if defined(__EMSCRIPTEN__)
+// WebGPU allows 16 sampled textures per shader stage; the PBR fragment
+// shader (shaders/webgpu/default.wgsl) keeps the glTF core textures
+// (bindings 0-9) and drops the KHR extension textures (10-23), so material
+// bind groups built for the Vulkan layout lose those entries here.
+static void trimWebGpuMaterialEntries(systems::leal::campello_gpu::BindGroupDescriptor& desc) {
+    std::erase_if(desc.entries, [](const auto& entry) { return entry.binding >= 10 && entry.binding <= 23; });
+}
 #endif
 
 #include "environments/default_environment.h"
@@ -1126,7 +1158,11 @@ void Renderer::ensureBindGroupLayout() {
 // CameraUniforms buffers on Vulkan).
 void Renderer::ensureVulkanPbrBindGroupLayouts() {
     namespace GPU = systems::leal::campello_gpu;
-    if (vulkanMaterialBindGroupLayout && vulkanFrameBindGroupLayout) return;
+    if (vulkanMaterialBindGroupLayout && vulkanFrameBindGroupLayout
+#if defined(__EMSCRIPTEN__)
+        && webgpuDrawBindGroupLayout
+#endif
+    ) return;
 
     auto addTex = [](GPU::BindGroupLayoutDescriptor &desc, uint32_t binding,
                       GPU::TextureType dim = GPU::TextureType::tt2d) {
@@ -1166,6 +1202,7 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
         addTex(matDesc, 4);  addSamp(matDesc, 5);   // normal
         addTex(matDesc, 6);  addSamp(matDesc, 7);   // emissive
         addTex(matDesc, 8);  addSamp(matDesc, 9);   // occlusion
+#if !defined(__EMSCRIPTEN__)  // WebGPU: core textures only (trimWebGpuMaterialEntries())
         addTex(matDesc, 10); addSamp(matDesc, 11);  // specular
         addTex(matDesc, 12); addSamp(matDesc, 13);  // specularColor
         addTex(matDesc, 14);                        // sheenColor (reuses sampler 1)
@@ -1178,6 +1215,7 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
         addTex(matDesc, 21);                        // iridescence (reuses sampler 1)
         addTex(matDesc, 22);                        // iridescenceThickness (reuses sampler 1)
         addTex(matDesc, 23);                        // anisotropic (reuses sampler 1)
+#endif
         // Struct is 372 bytes (see buildSlotRaw()); bind the full 512-byte
         // per-slot stride so std140's block-size rounding (and Vulkan's
         // range-must-cover-declared-size requirement) never comes up short —
@@ -1200,6 +1238,22 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
         addSamp(frameDesc, 8);                              // brdfLutSampler (reuses fxaaSampler, clamp-to-edge)
         vulkanFrameBindGroupLayout = device->createBindGroupLayout(frameDesc);
     }
+#if defined(__EMSCRIPTEN__)
+    // --- Group 2 (WebGPU): per-draw transforms, read-only storage buffer
+    // read by the vertex stage (bindWebGpuTransforms()) ---
+    if (!webgpuDrawBindGroupLayout) {
+        GPU::BindGroupLayoutDescriptor drawDesc{};
+        GPU::EntryObject e{};
+        e.binding    = 0;
+        e.visibility = GPU::ShaderStage::vertex;
+        e.type       = GPU::EntryObjectType::buffer;
+        e.data.buffer.hasDinamicOffaset = false;
+        e.data.buffer.minBindingSize    = 128;
+        e.data.buffer.type              = GPU::EntryObjectBufferType::readOnlyStorage;
+        drawDesc.entries.push_back(e);
+        webgpuDrawBindGroupLayout = device->createBindGroupLayout(drawDesc);
+    }
+#endif
 }
 
 // DirectX-only: a single combined bind group layout carrying every per-material AND
@@ -1379,7 +1433,7 @@ void Renderer::rebuildDirectXCombinedBindGroups(uint32_t frameIndex,
 void Renderer::bakeIblResources() {
 #if defined(ANDROID) || defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
     namespace GPU = systems::leal::campello_gpu;
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
     if (!device || !environmentMap || !environmentSampler || !pipelineIblBake ||
         !iblBakeBindGroupLayout || !vulkanIblBakePipelineLayout) {
         return;
@@ -2006,7 +2060,7 @@ void Renderer::setScene(uint32_t index) {
         visibleNodeMask.assign(nodeCount, 0);
         using BU = systems::leal::campello_gpu::BufferUsage;
         for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
-            frameResources[f].transformBuffer = device->createBuffer(nodeCount * 128, BU::vertex);
+            frameResources[f].transformBuffer = device->createBuffer(nodeCount * 128, kTransformBufferUsage);
         }
         transformBuffer = frameResources[0].transformBuffer;
     }
@@ -2298,7 +2352,7 @@ void Renderer::setScene(uint32_t index) {
             (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::vertex) | uint32_t(GPU::BufferUsage::uniform)));
     }
 
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
     ensureVulkanPbrBindGroupLayouts();
     if (!defaultBindGroup && vulkanMaterialBindGroupLayout && defaultTexture && defaultSampler &&
         defaultMetallicRoughnessTexture && defaultNormalTexture &&
@@ -2330,6 +2384,9 @@ void Renderer::setScene(uint32_t index) {
             {23, defaultTexture}, // anisotropic
             {24, GPU::BufferBinding{materialUniformBuffer, 0, kMaterialUniformStride}},
         };
+#if defined(__EMSCRIPTEN__)
+        trimWebGpuMaterialEntries(bgDesc);
+#endif
         defaultBindGroup = device->createBindGroup(bgDesc, /*persistent=*/true);
         // No separate flat shader on Vulkan (pipelineFlat aliases pipelineTextured) —
         // reuse the same fully-populated bind group for both.
@@ -2442,7 +2499,7 @@ void Renderer::setScene(uint32_t index) {
     // Per-frame bind groups for lights, camera matrices, environment map,
     // and screen-space refraction source.
     for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
         ensureVulkanPbrBindGroupLayouts();
         if (!frameBindGroup[f] && vulkanFrameBindGroupLayout &&
             frameResources[f].lightsUniformBuffer &&
@@ -2751,7 +2808,7 @@ void Renderer::setScene(uint32_t index) {
 
             // Create bind group with all textures and static material buffer.
             // Lights (10) and camera (18) are bound separately via frameBindGroup.
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
             ensureVulkanPbrBindGroupLayouts();
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout  = vulkanMaterialBindGroupLayout;
@@ -2777,6 +2834,9 @@ void Renderer::setScene(uint32_t index) {
                                         (uint64_t)(m + 1) * kMaterialUniformStride,
                                         kMaterialUniformStride}},
             };
+#if defined(__EMSCRIPTEN__)
+            trimWebGpuMaterialEntries(bgDesc);
+#endif
             materialBindGroups[m] = device->createBindGroup(bgDesc, /*persistent=*/true);
             // No separate flat shader on Vulkan — reuse the same bind group.
             flatMaterialBindGroups[m] = materialBindGroups[m];
@@ -3458,6 +3518,14 @@ void Renderer::bindMeshBuffer(const std::shared_ptr<systems::leal::campello_gpu:
                               uint32_t logicalSlot,
                               const std::shared_ptr<systems::leal::campello_gpu::Buffer> &buffer,
                               uint64_t offset) {
+#if defined(__EMSCRIPTEN__)
+    // WebGPU: the transforms are a storage buffer (group 2), indexed by the
+    // draw's firstInstance, not a vertex buffer (locations 16+ don't exist).
+    if (logicalSlot == VERTEX_SLOT_MVP) {
+        bindWebGpuTransforms(rpe, buffer, offset);
+        return;
+    }
+#endif
     uint32_t slot = logicalSlot;
     if (activeMeshSlots) {
         if (logicalSlot >= activeMeshSlots->size()) return;
@@ -3471,6 +3539,33 @@ void Renderer::bindMeshBuffer(const std::shared_ptr<systems::leal::campello_gpu:
         setVertexBufferIfChanged(rpe, VERTEX_SLOT_MVP, buffer, offset);
     }
 }
+
+#if defined(__EMSCRIPTEN__)
+void Renderer::bindWebGpuTransforms(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+                                    const std::shared_ptr<systems::leal::campello_gpu::Buffer> &buffer,
+                                    uint64_t offset) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!buffer || !webgpuDrawBindGroupLayout) return;
+    auto& group = webgpuDrawBindGroups[buffer.get()];
+    if (!group) {
+        // Transform buffers are reallocated when they grow; drop groups of
+        // buffers that no longer exist so the map stays small.
+        if (webgpuDrawBindGroups.size() > 8) {
+            webgpuDrawBindGroups.clear();
+            webgpuBoundDrawGroup = nullptr;
+        }
+        GPU::BindGroupDescriptor desc{};
+        desc.layout = webgpuDrawBindGroupLayout;
+        desc.entries = {{0, GPU::BufferBinding{buffer, 0, buffer->getLength()}}};
+        group = webgpuDrawBindGroups[buffer.get()] = device->createBindGroup(desc, /*persistent=*/true);
+    }
+    if (group && group.get() != webgpuBoundDrawGroup) {
+        rpe->setBindGroup(2, group);
+        webgpuBoundDrawGroup = group.get();
+    }
+    webgpuFirstInstance = (uint32_t)(offset / 128);  // sizeof(NodeTransforms)
+}
+#endif
 
 void Renderer::prewarmMeshPipelines() {
     // The combinations the built-in draw paths use, created now rather than
@@ -3552,7 +3647,15 @@ ProgramHandle Renderer::registerProgram(const ShaderProgramDesc& desc) {
     program.vertexStages.push_back({desc.vertexReads, library, desc.metalVertexEntryPoint});
     program.fragmentModule = library;
     program.fragmentEntries[(size_t)MeshProgram::textured] = desc.metalFragmentEntryPoint;
-#elif defined(ANDROID) || defined(__linux__)
+#elif defined(__EMSCRIPTEN__)
+    // WGSL: one module with both entry points (compiled by the browser).
+    if (desc.wgsl.empty()) return kInvalidProgram;
+    auto module = device->createShaderModule(desc.wgsl.c_str());
+    if (!module) return kInvalidProgram;
+    program.vertexStages.push_back({desc.vertexReads, module, desc.wgslVertexEntryPoint});
+    program.fragmentModule = module;
+    program.fragmentEntries[(size_t)MeshProgram::textured] = desc.wgslFragmentEntryPoint;
+#elif CAMPELLO_RENDERER_VK_BINDINGS
     auto vertex = load(desc.vulkanVertex);
     auto fragment = load(desc.vulkanFragment);
     if (!vertex || !fragment) return kInvalidProgram;
@@ -3611,6 +3714,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     currentPipelineVariant = 0;
     currentPipelineObject = nullptr;
     activeMeshSlots = nullptr;
+    webgpuBoundDrawGroup = nullptr;
     standardLayout = VertexLayout::standard(jointsComponentType, weightsComponentType, weightsNormalized);
 
 #if defined(__APPLE__)
@@ -3921,12 +4025,19 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         pipelineIblBake = device->createRenderPipeline(iblDesc);
     }
 
-#elif defined(ANDROID) || defined(__linux__)
+#elif CAMPELLO_RENDERER_VK_BINDINGS
     using namespace systems::leal::campello_renderer::shaders;
 
     // Load separate vertex and fragment SPIR-V modules.
+#if defined(__EMSCRIPTEN__)
+    // WebGPU: one WGSL module with every PBR entry point (vs_main, vs_lean,
+    // vs_line, fs_main); shaders/webgpu/default.wgsl.
+    auto vertModule = device->createShaderModule(kDefaultWebGpuShader);
+    auto fragModule = vertModule;
+#else
     auto vertModule = device->createShaderModule(kDefaultVulkanVertShader, kDefaultVulkanVertShaderSize);
     auto fragModule = device->createShaderModule(kDefaultVulkanFragShader, kDefaultVulkanFragShaderSize);
+#endif
     if (!vertModule || !fragModule) return;
 
     GPU::RenderPipelineDescriptor desc{};
@@ -3946,6 +4057,9 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     ensureVulkanPbrBindGroupLayouts();
     GPU::PipelineLayoutDescriptor plDesc{};
     plDesc.bindGroupLayouts = { vulkanMaterialBindGroupLayout, vulkanFrameBindGroupLayout };
+#if defined(__EMSCRIPTEN__)
+    plDesc.bindGroupLayouts.push_back(webgpuDrawBindGroupLayout);
+#endif
     vulkanDefaultPipelineLayout = device->createPipelineLayout(plDesc);
     desc.layout = vulkanDefaultPipelineLayout;
 
@@ -4113,6 +4227,21 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::normal) |
             semanticBit(VertexSemantic::texcoord0) | semanticBit(VertexSemantic::tangent) |
             semanticBit(VertexSemantic::color0) | semanticBit(VertexSemantic::texcoord1);
+#if defined(__EMSCRIPTEN__)
+        programs[kPbrProgram].vertexStages.push_back({standardReads, vertModule, "vs_main"});
+        programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), vertModule, "vs_lean"});
+        programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), vertModule, "vs_line", true});
+        programs[kPbrProgram].fragmentModule = fragModule;
+        programs[kPbrProgram].fragmentEntries = {"", "fs_main", ""};
+        // WebGPU has blend state: alpha-blended materials blend, without depth writes.
+        meshRecipe.supportsBlend = true;
+        programs[kPbrProgram].supportsBlend = true;
+        meshRecipe.alphaBlend.color = { GPU::BlendFactor::srcAlpha, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
+        meshRecipe.alphaBlend.alpha = { GPU::BlendFactor::one, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
+        meshRecipe.blendDepthStencil = ds;
+        meshRecipe.blendDepthStencil.depthWriteEnabled = false;
+        meshRecipe.perDrawBuffers.clear();  // transforms: storage buffer, group 2
+#else
         programs[kPbrProgram].vertexStages.push_back({standardReads, vertModule, "main"});
         if (auto leanModule = device->createShaderModule(kDefaultVulkanLeanVertShader,
                                                          kDefaultVulkanLeanVertShaderSize)) {
@@ -4125,10 +4254,12 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         programs[kPbrProgram].fragmentModule = fragModule;
         programs[kPbrProgram].fragmentEntries = {"", "main", ""};
         meshRecipe.supportsBlend = false;
+#endif
         meshRecipe.ready = true;
         prewarmMeshPipelines();
     }
 
+#if !defined(__EMSCRIPTEN__)  // post-processing and bakes: no WGSL versions yet
     // --- FXAA post-process pipeline (Vulkan) ---
     {
         if (!fxaaBindGroupLayout) {
@@ -4393,6 +4524,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         }
     }
 
+#endif  // !__EMSCRIPTEN__
 #elif defined(_WIN32)
     using namespace systems::leal::campello_renderer::shaders;
 
@@ -5938,7 +6070,7 @@ void Renderer::renderToTarget(
     // Keep binding 22 as the safe placeholder here; we will switch it to
     // opaqueSceneTexture right before the transparent pass so the opaque
     // pass does not trigger a Metal read-write conflict.
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
         std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
@@ -6035,6 +6167,7 @@ void Renderer::renderToTarget(
         currentPipelineVariant = 0;
         currentPipelineObject = nullptr;
         activeMeshSlots = nullptr;
+        webgpuBoundDrawGroup = nullptr;
         lastBoundVertexBuffers.fill({});
         for (auto &draw : opaqueQueue) {
             renderPrimitive(rpe, *draw.primitive, draw.nodeIndex);
@@ -6082,6 +6215,7 @@ void Renderer::renderToTarget(
             currentPipelineVariant = 0;
             currentPipelineObject = nullptr;
             activeMeshSlots = nullptr;
+            webgpuBoundDrawGroup = nullptr;
             if (freshEncoder) {
                 lastBoundVertexBuffers.fill({});
             }
@@ -6221,7 +6355,7 @@ void Renderer::renderToTarget(
         // Switch binding 22 to the mipmapped opaque scene texture so
         // transmissive materials can sample it without conflicting with
         // the color attachment (which is sceneColorView or colorView).
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
         if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture[currentFrameIndex] &&
             environmentMap && environmentSampler && fxaaSampler) {
             GPU::BindGroupDescriptor bgDesc{};
@@ -7029,7 +7163,7 @@ void Renderer::renderPrimitive(
         // Use Draco-decompressed index buffer.
         rpe->setIndexBuffer(dracoIt->second.indexBuffer,
                            systems::leal::campello_gpu::IndexFormat::uint32, 0);
-        rpe->drawIndexed(dracoIt->second.indexCount, instanceCount);
+        rpe->drawIndexed(dracoIt->second.indexCount, instanceCount, 0, 0, drawFirstInstance());
     } else if (primitive.indices >= 0) {
         // Use standard GLTF index buffer.
         auto &idxAcc = (*asset->accessors)[(size_t)primitive.indices];
@@ -7039,7 +7173,7 @@ void Renderer::renderPrimitive(
         if (widenedIt != widenedIndexBuffers.end() && widenedIt->second) {
             rpe->setIndexBuffer(widenedIt->second,
                                 systems::leal::campello_gpu::IndexFormat::uint16, 0);
-            rpe->drawIndexed((uint32_t)idxAcc.count, instanceCount);
+            rpe->drawIndexed((uint32_t)idxAcc.count, instanceCount, 0, 0, drawFirstInstance());
             return;
         }
         if (idxAcc.bufferView >= 0) {
@@ -7052,17 +7186,17 @@ void Renderer::renderPrimitive(
                     ? systems::leal::campello_gpu::IndexFormat::uint16
                     : systems::leal::campello_gpu::IndexFormat::uint32;
                 rpe->setIndexBuffer(idxBuf, fmt, idxOffset);
-                rpe->drawIndexed((uint32_t)idxAcc.count, instanceCount);
+                rpe->drawIndexed((uint32_t)idxAcc.count, instanceCount, 0, 0, drawFirstInstance());
                 return;
             }
         }
-        rpe->draw((uint32_t)idxAcc.count, instanceCount);
+        rpe->draw((uint32_t)idxAcc.count, instanceCount, 0, drawFirstInstance());
     } else {
         // Non-indexed draw - need vertex count from POSITION accessor.
         auto posIt = primitive.attributes.find("POSITION");
         if (posIt != primitive.attributes.end()) {
             auto &posAcc = (*asset->accessors)[posIt->second];
-            rpe->draw((uint32_t)posAcc.count, instanceCount);
+            rpe->draw((uint32_t)posAcc.count, instanceCount, 0, drawFirstInstance());
         }
     }
 }
@@ -8330,7 +8464,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     }
 
     // --- Create bind groups ---
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
     ensureVulkanPbrBindGroupLayouts();
     GPU::BindGroupDescriptor bgDesc{};
     bgDesc.layout  = vulkanMaterialBindGroupLayout;
@@ -8356,6 +8490,9 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                                 (uint64_t)uniformSlot * kMaterialUniformStride,
                                 kMaterialUniformStride}},
     };
+#if defined(__EMSCRIPTEN__)
+    trimWebGpuMaterialEntries(bgDesc);
+#endif
     auto bindGroup = device->createBindGroup(bgDesc, /*persistent=*/true);
     // No separate flat shader on Vulkan — reuse the same bind group.
     auto flatBindGroup = bindGroup;
@@ -8545,7 +8682,7 @@ void Renderer::render(const RenderScene& scene,
     }
 
     // Update per-frame bind group (lights + camera + placeholder texture).
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
         std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
@@ -8642,7 +8779,7 @@ void Renderer::render(const RenderScene& scene,
     uint64_t requiredBytes = (uint64_t)(totalDraws + 1) * 128;
     if (!transformBuffer || transformBuffer->getLength() < requiredBytes) {
         uint64_t newSize = std::max(requiredBytes, (uint64_t)4096 * 128);
-        transformBuffer = device->createBuffer(newSize, GPU::BufferUsage::vertex);
+        transformBuffer = device->createBuffer(newSize, kTransformBufferUsage);
         frame.transformBuffer = transformBuffer;
     }
     std::vector<uint64_t> transformOffsets;
@@ -8733,7 +8870,7 @@ void Renderer::render(const RenderScene& scene,
     bool useIntermediate = useSsaa || useFxaa;
 
     // Update per-frame bind group (lights + camera + placeholder texture).
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
         std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
@@ -8934,6 +9071,7 @@ void Renderer::render(const RenderScene& scene,
                 currentPipelineVariant = 0;
                 currentPipelineObject = nullptr;
                 activeMeshSlots = nullptr;
+                webgpuBoundDrawGroup = nullptr;
                 lastBoundVertexBuffers.fill({});
                 drawIdx = 0;
                 for (auto &draw : sortedOpaque) {
@@ -8998,7 +9136,7 @@ void Renderer::render(const RenderScene& scene,
         }
 
         // Switch binding 22 to the mipmapped opaque scene texture for transmission.
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
         if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture[currentFrameIndex] &&
             environmentMap && environmentSampler && fxaaSampler) {
             GPU::BindGroupDescriptor bgDesc{};
@@ -9071,6 +9209,7 @@ void Renderer::render(const RenderScene& scene,
                 currentPipelineVariant = 0;
                 currentPipelineObject = nullptr;
                 activeMeshSlots = nullptr;
+                webgpuBoundDrawGroup = nullptr;
                 lastBoundVertexBuffers.fill({});
                 drawIdx = (size_t)sortedOpaque.size();
                 for (auto &draw : scene.transparent) {
@@ -9123,6 +9262,7 @@ void Renderer::render(const RenderScene& scene,
         currentPipelineVariant = 0;
         currentPipelineObject = nullptr;
         activeMeshSlots = nullptr;
+        webgpuBoundDrawGroup = nullptr;
         lastBoundVertexBuffers.fill({});
         drawIdx = 0;
         for (auto &draw : sortedOpaque) {
@@ -9136,6 +9276,7 @@ void Renderer::render(const RenderScene& scene,
         currentPipelineVariant = 0;
         currentPipelineObject = nullptr;
         activeMeshSlots = nullptr;
+        webgpuBoundDrawGroup = nullptr;
         if (!activeProgramPass || activeProgramPass->includeTransparent) {
             for (auto &draw : scene.transparent) {
                 renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
@@ -9378,9 +9519,9 @@ void Renderer::renderPrimitive(
         }
         if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
             rpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
-            rpe->drawIndexed(draw.mesh->indexCount, draw.instanceCount);
+            rpe->drawIndexed(draw.mesh->indexCount, draw.instanceCount, 0, 0, drawFirstInstance());
         } else {
-            rpe->draw(draw.mesh->vertexCount, draw.instanceCount);
+            rpe->draw(draw.mesh->vertexCount, draw.instanceCount, 0, drawFirstInstance());
         }
         return;
     }
@@ -9436,9 +9577,9 @@ void Renderer::renderPrimitive(
     // --- 7. Draw ---
     if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
         rpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
-        rpe->drawIndexed(draw.mesh->indexCount, draw.instanceCount);
+        rpe->drawIndexed(draw.mesh->indexCount, draw.instanceCount, 0, 0, drawFirstInstance());
     } else {
-        rpe->draw(draw.mesh->vertexCount, draw.instanceCount);
+        rpe->draw(draw.mesh->vertexCount, draw.instanceCount, 0, drawFirstInstance());
     }
 }
 
