@@ -153,6 +153,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
     endif()
 endif()
 
+# campello_renderer_add_shader_program(): app shader programs (program.hpp).
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CampelloRendererShaders.cmake)
+
 option(CAMPELLO_RENDERER_ECS_SUPPORT "Install ecs.hpp (requires campello_core at compile time)" ON)
 
 option(CAMPELLO_RENDERER_BUILD_TEST "Build unit tests" OFF)
@@ -169,6 +172,14 @@ if(CAMPELLO_RENDERER_BUILD_TEST)
         ${PROJECT_NAME}
         gtest
     )
+    # App shader program used by the program tests (registerProgram()).
+    campello_renderer_add_shader_program(
+        TARGET ${PROJECT_NAME}_test
+        NAME element_id
+        METAL test/shaders/element_id.metal
+        VULKAN_VERTEX test/shaders/element_id.vert
+        VULKAN_FRAGMENT test/shaders/element_id.frag
+        VERTEX_READS "semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::custom0)")
     add_test(NAME ${PROJECT_NAME}_test COMMAND ${PROJECT_NAME}_test)
 
     # Windows: cmake --build only updates DLLs inside their own target output

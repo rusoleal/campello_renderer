@@ -1,6 +1,6 @@
 # Programmable pipelines: app-defined vertex layouts and shaders
 
-Status: **in progress** (2026-11-09). Phase 1 (vertex layouts and the pipeline cache) and most of phase 2 (compact slots, binding contract) are implemented; the rest is proposed.
+Status: **in progress** (2026-11-09). Phases 1 (vertex layouts, pipeline cache) and 3 (app shader programs) and most of phase 2 (compact slots, binding contract) are implemented; the rest is proposed.
 
 ## Problem
 
@@ -204,9 +204,11 @@ Each phase ships on its own, keeps the existing tests and image comparisons pass
    - Moved to phase 3: the per-language interface headers (they are only useful once a custom program includes them).
    - Open: split the DirectX combined bind group. It changes `default.hlsl`'s registers, so it needs `dxc` (not available on macOS) and a Windows run.
    - Test: a minimal "unlit colour" program written against the headers draws on Metal and Vulkan (DirectX when dxc is available in CI).
-3. **Public program API.**
-   - `registerProgram`, `GpuMaterial::program`, PBR registered through it.
-   - BIM's first custom program: element ids for GPU picking.
+3. **Public program API.** *Done.*
+   - `registerProgram()` (`program.hpp`), `GpuMaterial::program`, `renderProgramPass()`; the PBR program is handle 0 in the same table (its pipelines come from the same cache). Programs share the built-in pipeline layout, so they may read the material/frame resources at the built-in bindings.
+   - Interface headers per language (`inc/campello_renderer/shaders/program_interface.*`) and `campello_renderer_add_shader_program()` (CMake) to compile and embed app programs.
+   - `VertexSemantic::custom0`-`3` for app vertex data; first program: element ids into `r32uint` (renderer test). campello_gpu needed a fix for integer/normalized vertex formats on Vulkan and DirectX (local branch `fix/vulkan-vertex-formats`, to release as 0.27.2).
+   - Not done: BIM GPU picking (its CPU BVH picking already returns the hit point that snapping needs; ids would add 4 bytes per vertex). The built-in shaders don't include the interface headers yet (they would need regenerated binaries on every backend).
 4. **PBR features.**
    - Clip planes, tint/override.
    - BIM section planes and selection highlight move onto these.

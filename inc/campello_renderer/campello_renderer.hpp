@@ -20,6 +20,7 @@
 #include <campello_renderer/animation.hpp>
 #include <campello_renderer/procedural_texture_baker.hpp>
 #include <campello_renderer/vertex_layout.hpp>
+#include <campello_renderer/program.hpp>
 #include <vector_math/vector_math.hpp>
 
 namespace systems::leal::campello_image { class Image; }
@@ -31,7 +32,9 @@ namespace systems::leal::campello_renderer {
         uint32_t indexCount = 0;
         systems::leal::campello_gpu::IndexFormat indexFormat =
             systems::leal::campello_gpu::IndexFormat::uint32;
-        std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, 6> vertexBuffers; // POSITION, NORMAL, UV, TANGENT, JOINTS, WEIGHTS
+        // One buffer per VertexSemantic (POSITION, NORMAL, TEXCOORD_0, TANGENT,
+        // JOINTS_0, WEIGHTS_0, COLOR_0, TEXCOORD_1, custom0-3), tightly packed.
+        std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, kVertexSemanticCount> vertexBuffers;
         uint32_t vertexCount = 0;
 
         // Local-space axis-aligned bounds of the vertex positions. When set,
@@ -80,6 +83,10 @@ namespace systems::leal::campello_renderer {
         bool alphaBlend = false;
         bool alphaMask = false;
         bool transmission = false; // true if KHR_materials_transmission is active
+        // Shader program drawing this material (Renderer::registerProgram());
+        // the built-in PBR shaders by default. The material's bind groups and
+        // uniforms are bound either way (custom programs may read them).
+        ProgramHandle program = kPbrProgram;
     };
 
     struct DrawCall {
@@ -380,24 +387,35 @@ namespace systems::leal::campello_renderer {
         // built from it on first use per (program, vertex layout, culling,
         // blending) and cached. The combinations the built-in paths use are
         // created up front, so the first frame doesn't stall.
+        // Fragment variants of a program: the built-in PBR program has three;
+        // app programs have one (textured).
         enum class MeshProgram : uint8_t { flat, textured, debug };
         struct MeshVertexStage {
             uint32_t readMask = 0;  // semantics the shader reads (semanticBit())
             std::shared_ptr<systems::leal::campello_gpu::ShaderModule> module;
             std::string entryPoint;
         };
+        // One registered program: its shaders (index = ProgramHandle;
+        // 0 = built-in PBR, rebuilt by createDefaultPipelines(), app programs
+        // kept across it).
+        struct ProgramState {
+            std::string name;
+            std::vector<MeshVertexStage> vertexStages;
+            std::shared_ptr<systems::leal::campello_gpu::ShaderModule> fragmentModule;
+            // Fragment entry point per MeshProgram variant; empty = no
+            // separate shader for that variant (the textured one is used).
+            std::array<std::string, 3> fragmentEntries;
+            bool supportsBlend = false;  // false: blend draws use the opaque state
+        };
+        std::vector<ProgramState> programs;
+        // Shared by all programs on this backend.
         struct MeshPipelineRecipe {
             bool ready = false;
             // Everything but the vertex stage, fragment entry, culling and
-            // blending: pipeline layout, depth, topology, winding, color format.
+            // blending: pipeline layout, depth, topology, winding.
             systems::leal::campello_gpu::RenderPipelineDescriptor base;
-            systems::leal::campello_gpu::ColorState colorTarget;  // format and write mask
-            std::vector<MeshVertexStage> vertexStages;
-            std::shared_ptr<systems::leal::campello_gpu::ShaderModule> fragmentModule;
-            // Fragment entry point per MeshProgram; empty = the backend has no
-            // separate shader for it and uses the textured one.
-            std::array<std::string, 3> fragmentEntries;
-            bool supportsBlend = false;  // false: blend draws use the opaque state
+            systems::leal::campello_gpu::ColorState colorTarget;  // default format and write mask
+            bool supportsBlend = false;  // the backend has blend state at all
             systems::leal::campello_gpu::BlendState alphaBlend;
             systems::leal::campello_gpu::DepthStencilDescriptor blendDepthStencil;
             // Per-draw data read as vertex buffers (Vulkan/DirectX: the
@@ -434,13 +452,23 @@ namespace systems::leal::campello_renderer {
         bool quantizedLayoutDetected = false;
         VertexLayout standardLayout = VertexLayout::standard();
 
-        const MeshVertexStage* vertexStageFor(const VertexLayout& layout) const;
+        const MeshVertexStage* vertexStageFor(ProgramHandle program, const VertexLayout& layout) const;
+        // colorFormat: invalid = the recipe's (createDefaultPipelines()) format.
         const MeshPipelineEntry* meshPipeline(
-            MeshProgram program, const VertexLayout& layout, bool doubleSided, bool blend);
+            ProgramHandle program, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
+            systems::leal::campello_gpu::PixelFormat colorFormat = systems::leal::campello_gpu::PixelFormat::invalid);
+        const MeshPipelineEntry* meshPipeline(
+            MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend) {
+            return meshPipeline(kPbrProgram, variant, layout, doubleSided, blend);
+        }
         void prewarmMeshPipelines();
         // True when the backend has a separate flat fragment shader (Metal);
         // elsewhere "flat" draws use the textured shader and its bind group.
-        bool hasFlatProgram() const { return !meshRecipe.fragmentEntries[0].empty(); }
+        bool hasFlatProgram() const { return !programs.empty() && !programs[0].fragmentEntries[0].empty(); }
+        // renderProgramPass() in progress (render() draws in its mode).
+        const ProgramPassOptions* activeProgramPass = nullptr;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> programPassDepthTexture;
+        std::shared_ptr<systems::leal::campello_gpu::TextureView> programPassDepthView;
 
         // Skybox pipeline — fullscreen triangle that samples an environment cubemap.
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineSkybox;
@@ -994,8 +1022,25 @@ namespace systems::leal::campello_renderer {
         /// attributes the layout has (call after createDefaultPipelines()).
         /// VertexLayout::positionOnly() is supported on Metal and Vulkan.
         bool supportsVertexLayout(const VertexLayout& layout) const {
-            return meshRecipe.ready && vertexStageFor(layout) != nullptr;
+            return supportsProgram(kPbrProgram, layout);
         }
+
+        /// Registers an app shader program (call after createDefaultPipelines();
+        /// see program.hpp for the shader contract). Returns kInvalidProgram
+        /// when the desc has no binary for this backend or it doesn't load.
+        ProgramHandle registerProgram(const ShaderProgramDesc& desc);
+        /// True when meshes with this layout can be drawn by the program.
+        bool supportsProgram(ProgramHandle program, const VertexLayout& layout) const {
+            return meshRecipe.ready && program < programs.size() && vertexStageFor(program, layout) != nullptr;
+        }
+        /// Draws the scene with one program into colorView (a texture of
+        /// options.colorFormat, renderWidth x renderHeight as set by
+        /// resize()): no skybox, anti-aliasing or transmission. Draws whose
+        /// layout the program can't read are skipped. Typical use: element
+        /// ids into an r32uint target, read back for picking.
+        void renderProgramPass(const RenderScene& scene,
+                               std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView,
+                               const ProgramPassOptions& options);
         /// The layout of meshes with GpuMesh::layout == nullptr (glTF/PBR;
         /// joint and weight formats follow the loaded asset).
         const VertexLayout& standardVertexLayout() const { return standardLayout; }

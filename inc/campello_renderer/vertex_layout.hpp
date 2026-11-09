@@ -24,8 +24,18 @@ namespace systems::leal::campello_renderer {
         weights   = 5,
         color0    = 6,
         texcoord1 = 7,
+        // App-defined per-vertex data for custom shader programs (e.g. a
+        // uint32 element id). Shader locations 8-11. The built-in PBR
+        // shaders don't read them, so a mesh may carry them and still be
+        // drawn by the built-in program.
+        custom0   = 8,
+        custom1   = 9,
+        custom2   = 10,
+        custom3   = 11,
     };
-    inline constexpr uint32_t kVertexSemanticCount = 8;
+    inline constexpr uint32_t kVertexSemanticCount = 12;
+    /// The glTF semantics (position .. texcoord1): what VertexLayout::standard() has.
+    inline constexpr uint32_t kStandardSemanticMask = 0xFFu;
 
     constexpr uint32_t semanticBit(VertexSemantic semantic) {
         return 1u << static_cast<uint32_t>(semantic);

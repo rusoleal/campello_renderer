@@ -1,3 +1,4 @@
+#include "element_id_shaders.h"
 #include <gtest/gtest.h>
 #include <campello_renderer/campello_renderer.hpp>
 #include <campello_renderer/procedural_texture_baker.hpp>
@@ -2849,11 +2850,104 @@ TEST_F(OffscreenRenderTest, QuantizedPositionsRenderLikeFloatPositions) {
     EXPECT_EQ(differing, 0u) << "quantized and float positions rendered differently";
 }
 
+// App shader programs (program.hpp): an element-id program compiled by
+// campello_renderer_add_shader_program() writes each quad's per-vertex id
+// (custom0) into an r32uint target through renderProgramPass().
+TEST_F(OffscreenRenderTest, ProgramPassWritesElementIds) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+
+    EXPECT_EQ(renderer->registerProgram(ShaderProgramDesc{}), kInvalidProgram) << "no binaries";
+    const ProgramHandle ids = renderer->registerProgram(element_id_shaders::desc());
+    if (ids == kInvalidProgram) GTEST_SKIP() << "element_id program not compiled for this backend";
+
+    // Layout: positions + a uint32 id per vertex.
+    VertexLayout layout = VertexLayout::positionOnly();
+    layout.attributes.push_back({VertexSemantic::custom0, GPU::ComponentType::ctUnsignedInt, GPU::AccessorType::acScalar});
+    EXPECT_TRUE(renderer->supportsProgram(ids, layout));
+    EXPECT_FALSE(renderer->supportsProgram(ids, VertexLayout::positionOnly())) << "custom0 is read";
+    EXPECT_EQ(renderer->supportsVertexLayout(layout), renderer->supportsVertexLayout(VertexLayout::positionOnly()))
+        << "PBR ignores the id attribute";
+
+    // Two 1 x 1 quads facing the camera: id 7 at x = -0.3 (z = 0), id 42 at
+    // x = +0.3 (z = 0.2, nearer), overlapping in the middle.
+    const auto makeQuad = [&](float cx, float z, uint32_t id) {
+        float positions[] = {cx - 0.5f, -0.5f, z, cx + 0.5f, -0.5f, z, cx + 0.5f, 0.5f, z, cx - 0.5f, 0.5f, z};
+        uint32_t idsPerVertex[] = {id, id, id, id};
+        uint32_t indices[] = {0, 1, 2, 0, 2, 3};
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(sizeof(positions), GPU::BufferUsage::vertex, positions);
+        mesh.indexBuffer = device->createBuffer(sizeof(indices), GPU::BufferUsage::index, indices);
+        mesh.indexCount = 6;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = 4;
+        mesh.layout = &layout;
+        mesh.vertexBuffers[(size_t)VertexSemantic::custom0] =
+            device->createBuffer(sizeof(idsPerVertex), GPU::BufferUsage::vertex, idsPerVertex);
+        return mesh;
+    };
+    GpuMesh left = makeQuad(-0.3f, 0.0f, 7);
+    GpuMesh right = makeQuad(0.3f, 0.2f, 42);
+
+    namespace GLTF_NS = systems::leal::gltf;
+    GLTF_NS::Material plain("", nullptr, nullptr, nullptr, nullptr, VM::Vector3<double>(0.0, 0.0, 0.0),
+                            GLTF_NS::AlphaMode::opaque, 0.5, false, false, 1.0, 1.5, 0.0);
+    GpuMaterial* material = renderer->uploadMaterial(plain, *asset);
+    ASSERT_NE(material, nullptr);
+
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                    VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection =
+        VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+    for (GpuMesh* mesh : {&left, &right}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+
+    auto tex = makeOffscreenTexture(64, 64, GPU::PixelFormat::r32uint);
+    ASSERT_NE(tex, nullptr);
+    auto view = tex->createView(GPU::PixelFormat::r32uint, 1);
+    ProgramPassOptions options;
+    options.program = ids;
+    options.colorFormat = GPU::PixelFormat::r32uint;
+    renderer->renderProgramPass(scene, view, options);
+
+    std::vector<uint32_t> pixels(64 * 64);
+    device->waitForIdle();
+    ASSERT_TRUE(tex->download(0, 0, pixels.data(), pixels.size() * sizeof(uint32_t)));
+    const auto at = [&](int x, int y) { return pixels[(size_t)y * 64 + (size_t)x]; };
+    EXPECT_EQ(at(2, 2), 0u) << "cleared background";
+    // 60 degree field of view from 3 m: the left quad covers about pixels
+    // 17-28 (x), the right one (nearer) about 36-47, both overlap 29-34.
+    EXPECT_EQ(at(22, 32), 7u) << "left quad only";
+    EXPECT_EQ(at(42, 32), 42u) << "right quad only";
+    EXPECT_EQ(at(32, 32), 42u) << "overlap: the nearer quad";
+
+    // The same scene still draws with the built-in program (the id attribute
+    // is ignored) into the normal color target.
+    auto colorTex = makeOffscreenTexture(64, 64);
+    auto colorView = colorTex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    EXPECT_NO_THROW(renderer->render(scene, colorView));
+}
+
 TEST(VertexLayout, DescribesFormatsAndHashesThem) {
     using CT = systems::leal::campello_gpu::ComponentType;
     const VertexLayout standard = VertexLayout::standard();
-    EXPECT_EQ(standard.attributes.size(), kVertexSemanticCount);
-    EXPECT_EQ(standard.semanticMask(), (1u << kVertexSemanticCount) - 1u);
+    EXPECT_EQ(standard.attributes.size(), 8u);
+    EXPECT_EQ(standard.semanticMask(), kStandardSemanticMask);
     EXPECT_EQ(standard.find(VertexSemantic::position)->stride(), 12u);
     EXPECT_EQ(standard.find(VertexSemantic::texcoord0)->stride(), 8u);
     EXPECT_EQ(standard.find(VertexSemantic::joints)->stride(), 4u);  // unsigned byte x 4

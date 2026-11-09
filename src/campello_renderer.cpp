@@ -3341,13 +3341,14 @@ void Renderer::detectQuantizedLayout() {
 #endif
 }
 
-const Renderer::MeshVertexStage* Renderer::vertexStageFor(const VertexLayout& layout) const {
+const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program, const VertexLayout& layout) const {
+    if (program >= programs.size()) return nullptr;
     // The stage that reads the most attributes among those reading only
     // attributes the layout has (the full shader for glTF meshes, the lean
     // one for position-only meshes). Ties: the first listed.
     const uint32_t has = layout.semanticMask();
     const MeshVertexStage* best = nullptr;
-    for (const auto& stage : meshRecipe.vertexStages) {
+    for (const auto& stage : programs[program].vertexStages) {
         if ((stage.readMask & ~has) != 0) continue;
         if (!best || std::popcount(stage.readMask) > std::popcount(best->readMask)) best = &stage;
     }
@@ -3355,14 +3356,19 @@ const Renderer::MeshVertexStage* Renderer::vertexStageFor(const VertexLayout& la
 }
 
 const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
-    MeshProgram program, const VertexLayout& layout, bool doubleSided, bool blend) {
+    ProgramHandle programHandle, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
+    systems::leal::campello_gpu::PixelFormat colorFormat) {
     namespace GPU = systems::leal::campello_gpu;
-    if (!meshRecipe.ready || !device) return nullptr;
-    // Normalise to what this backend distinguishes, so equivalent requests
-    // share one pipeline (Vulkan/DirectX: one fragment shader, no blending).
-    if (meshRecipe.fragmentEntries[(size_t)program].empty()) program = MeshProgram::textured;
-    if (!meshRecipe.supportsBlend) blend = false;
-    const MeshVertexStage* stage = vertexStageFor(layout);
+    if (!meshRecipe.ready || !device || programHandle >= programs.size()) return nullptr;
+    const ProgramState& program = programs[programHandle];
+    // Normalise to what this program/backend distinguishes, so equivalent
+    // requests share one pipeline (Vulkan/DirectX PBR: one fragment shader,
+    // no blending; app programs: one fragment shader).
+    if (program.fragmentEntries[(size_t)variant].empty()) variant = MeshProgram::textured;
+    if (program.fragmentEntries[(size_t)variant].empty()) return nullptr;
+    if (!meshRecipe.supportsBlend || !program.supportsBlend) blend = false;
+    if (colorFormat == GPU::PixelFormat::invalid) colorFormat = meshRecipe.colorTarget.format;
+    const MeshVertexStage* stage = vertexStageFor(programHandle, layout);
     if (!stage) return nullptr;
 
     // Only the attributes the stage reads shape the pipeline.
@@ -3374,8 +3380,10 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     const auto mix = [&key](uint64_t v) {
         key ^= v + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
     };
-    mix((uint64_t)(stage - meshRecipe.vertexStages.data()));
-    mix((uint64_t)program);
+    mix((uint64_t)(stage - program.vertexStages.data()));
+    mix((uint64_t)programHandle);
+    mix((uint64_t)variant);
+    mix((uint64_t)colorFormat);
     mix(doubleSided ? 1u : 0u);
     mix(blend ? 1u : 0u);
     if (auto it = meshPipelineCache.find(key); it != meshPipelineCache.end()) {
@@ -3418,13 +3426,14 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
 
     d.cullMode = doubleSided ? GPU::CullMode::none : GPU::CullMode::back;
     GPU::ColorState color = meshRecipe.colorTarget;
+    color.format = colorFormat;
     if (blend) {
         color.blend = meshRecipe.alphaBlend;
         d.depthStencil = meshRecipe.blendDepthStencil;
     }
     GPU::FragmentDescriptor frag{};
-    frag.module     = meshRecipe.fragmentModule;
-    frag.entryPoint = meshRecipe.fragmentEntries[(size_t)program];
+    frag.module     = program.fragmentModule;
+    frag.entryPoint = program.fragmentEntries[(size_t)variant];
     frag.targets.push_back(color);
     d.fragment = frag;
 
@@ -3459,13 +3468,72 @@ void Renderer::prewarmMeshPipelines() {
         }
     }
     meshPipeline(MeshProgram::debug, standardLayout, false, false);
-    if (vertexStageFor(VertexLayout::positionOnly())) {
+    if (vertexStageFor(kPbrProgram, VertexLayout::positionOnly())) {
         for (const bool doubleSided : {false, true}) {
             for (const bool blend : {false, true}) {
                 meshPipeline(MeshProgram::textured, VertexLayout::positionOnly(), doubleSided, blend);
             }
         }
     }
+}
+
+ProgramHandle Renderer::registerProgram(const ShaderProgramDesc& desc) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!device || !meshRecipe.ready) return kInvalidProgram;
+    const auto load = [&](const ShaderBinary& binary) -> std::shared_ptr<GPU::ShaderModule> {
+        if (binary.empty()) return nullptr;
+        return device->createShaderModule(static_cast<const uint8_t*>(binary.data), binary.size);
+    };
+    ProgramState program;
+    program.name = desc.name;
+    program.supportsBlend = desc.blending;
+#if defined(__APPLE__)
+    auto library = load(desc.metalLibrary);
+    if (!library) return kInvalidProgram;
+    program.vertexStages.push_back({desc.vertexReads, library, desc.metalVertexEntryPoint});
+    program.fragmentModule = library;
+    program.fragmentEntries[(size_t)MeshProgram::textured] = desc.metalFragmentEntryPoint;
+#elif defined(ANDROID) || defined(__linux__)
+    auto vertex = load(desc.vulkanVertex);
+    auto fragment = load(desc.vulkanFragment);
+    if (!vertex || !fragment) return kInvalidProgram;
+    program.vertexStages.push_back({desc.vertexReads, vertex, desc.vulkanVertexEntryPoint});
+    program.fragmentModule = fragment;
+    program.fragmentEntries[(size_t)MeshProgram::textured] = desc.vulkanFragmentEntryPoint;
+#elif defined(_WIN32)
+    auto vertex = load(desc.directxVertex);
+    auto fragment = load(desc.directxFragment);
+    if (!vertex || !fragment) return kInvalidProgram;
+    program.vertexStages.push_back({desc.vertexReads, vertex, desc.directxVertexEntryPoint});
+    program.fragmentModule = fragment;
+    program.fragmentEntries[(size_t)MeshProgram::textured] = desc.directxFragmentEntryPoint;
+#else
+    (void)load;
+    return kInvalidProgram;  // no WebGPU mesh path yet (programmable pipelines phase 7)
+#endif
+    programs.push_back(std::move(program));
+    return (ProgramHandle)(programs.size() - 1);
+}
+
+void Renderer::renderProgramPass(const RenderScene& scene,
+                                 std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView,
+                                 const ProgramPassOptions& options) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!colorView || !device || options.program >= programs.size()) return;
+    const uint32_t w = std::max(1u, renderWidth);
+    const uint32_t h = std::max(1u, renderHeight);
+    if (!programPassDepthTexture || programPassDepthTexture->getWidth() != w ||
+        programPassDepthTexture->getHeight() != h) {
+        programPassDepthTexture = device->createTexture(
+            GPU::TextureType::tt2d, GPU::PixelFormat::depth32float, w, h, 1, 1, 1, GPU::TextureUsage::renderTarget);
+        programPassDepthView = programPassDepthTexture
+            ? programPassDepthTexture->createView(GPU::PixelFormat::depth32float, 1, GPU::Aspect::depthOnly,
+                                                  0, 0, GPU::TextureType::tt2d)
+            : nullptr;
+    }
+    activeProgramPass = &options;
+    render(scene, std::move(colorView));
+    activeProgramPass = nullptr;
 }
 
 void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat colorFormat) {
@@ -3476,6 +3544,11 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     // when setScene() detects other joint/weight formats).
     meshRecipe = MeshPipelineRecipe{};
     meshPipelineCache.clear();
+    // Program 0 (built-in PBR) is rebuilt below; app programs keep their
+    // shaders (their pipelines are rebuilt from the new recipe on use).
+    if (programs.empty()) programs.resize(1);
+    programs[kPbrProgram] = ProgramState{};
+    programs[kPbrProgram].name = "pbr";
     currentPipelineVariant = 0;
     currentPipelineObject = nullptr;
     activeMeshSlots = nullptr;
@@ -3532,15 +3605,16 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 
         meshRecipe.base = base;
         meshRecipe.colorTarget = cs;
-        constexpr uint32_t allSemantics = (1u << kVertexSemanticCount) - 1u;
-        meshRecipe.vertexStages = {
+        constexpr uint32_t allSemantics = kStandardSemanticMask;
+        programs[kPbrProgram].vertexStages = {
             {allSemantics, shaderModule, "vertexMain"},
             {semanticBit(VertexSemantic::position), shaderModule, "vertexLean"},
         };
-        meshRecipe.fragmentModule = shaderModule;
-        meshRecipe.fragmentEntries = {"fragmentMain_flat", "fragmentMain_textured", "fragmentMain_debug"};
+        programs[kPbrProgram].fragmentModule = shaderModule;
+        programs[kPbrProgram].fragmentEntries = {"fragmentMain_flat", "fragmentMain_textured", "fragmentMain_debug"};
         meshRecipe.rawBufferSlots = true;  // [[buffer(15..23)]]: lights, transforms, material, ...
         meshRecipe.supportsBlend = true;
+        programs[kPbrProgram].supportsBlend = true;
         meshRecipe.alphaBlend = alphaBlend;
         meshRecipe.blendDepthStencil = blendDs;
         meshRecipe.ready = true;
@@ -3960,13 +4034,13 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::normal) |
             semanticBit(VertexSemantic::texcoord0) | semanticBit(VertexSemantic::tangent) |
             semanticBit(VertexSemantic::color0) | semanticBit(VertexSemantic::texcoord1);
-        meshRecipe.vertexStages.push_back({standardReads, vertModule, "main"});
+        programs[kPbrProgram].vertexStages.push_back({standardReads, vertModule, "main"});
         if (auto leanModule = device->createShaderModule(kDefaultVulkanLeanVertShader,
                                                          kDefaultVulkanLeanVertShaderSize)) {
-            meshRecipe.vertexStages.push_back({semanticBit(VertexSemantic::position), leanModule, "main"});
+            programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), leanModule, "main"});
         }
-        meshRecipe.fragmentModule = fragModule;
-        meshRecipe.fragmentEntries = {"", "main", ""};
+        programs[kPbrProgram].fragmentModule = fragModule;
+        programs[kPbrProgram].fragmentEntries = {"", "main", ""};
         meshRecipe.supportsBlend = false;
         meshRecipe.ready = true;
         prewarmMeshPipelines();
@@ -4402,9 +4476,9 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::normal) |
             semanticBit(VertexSemantic::texcoord0) | semanticBit(VertexSemantic::tangent) |
             semanticBit(VertexSemantic::color0) | semanticBit(VertexSemantic::texcoord1);
-        meshRecipe.vertexStages.push_back({standardReads, vertModule, "vertexMain"});
-        meshRecipe.fragmentModule = pixelModule;
-        meshRecipe.fragmentEntries = {"", "pixelMain", ""};
+        programs[kPbrProgram].vertexStages.push_back({standardReads, vertModule, "vertexMain"});
+        programs[kPbrProgram].fragmentModule = pixelModule;
+        programs[kPbrProgram].fragmentEntries = {"", "pixelMain", ""};
         meshRecipe.supportsBlend = false;
         meshRecipe.ready = true;
         prewarmMeshPipelines();
@@ -8564,8 +8638,9 @@ void Renderer::render(const RenderScene& scene,
     // ------------------------------------------------------------------
     ensureSceneColorTexture();
 
-    bool useSsaa = ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout && sceneColorView[currentFrameIndex];
-    bool useFxaa = fxaaEnabled && !useSsaa && pipelineFxaa && fxaaBindGroupLayout && sceneColorView[currentFrameIndex];
+    // A program pass (renderProgramPass()) draws straight into its target.
+    bool useSsaa = !activeProgramPass && ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout && sceneColorView[currentFrameIndex];
+    bool useFxaa = !activeProgramPass && fxaaEnabled && !useSsaa && pipelineFxaa && fxaaBindGroupLayout && sceneColorView[currentFrameIndex];
     bool useIntermediate = useSsaa || useFxaa;
 
     // Update per-frame bind group (lights + camera + placeholder texture).
@@ -8642,7 +8717,7 @@ void Renderer::render(const RenderScene& scene,
     // Detect whether any transparent draw needs screen-space refraction.
     bool needsScreenSpaceRefraction = false;
     for (auto &draw : scene.transparent) {
-        if (draw.material && draw.material->transmission) {
+        if (!activeProgramPass && draw.material && draw.material->transmission) {
             needsScreenSpaceRefraction = true;
             break;
         }
@@ -8922,17 +8997,18 @@ void Renderer::render(const RenderScene& scene,
         GPU::BeginRenderPassDescriptor desc{};
         GPU::ColorAttachment ca{};
         ca.view = useIntermediate ? sceneColorView[currentFrameIndex] : colorView;
-        ca.clearValue[0] = clearColor[0];
-        ca.clearValue[1] = clearColor[1];
-        ca.clearValue[2] = clearColor[2];
-        ca.clearValue[3] = clearColor[3];
+        for (int c = 0; c < 4; ++c) {
+            ca.clearValue[c] = activeProgramPass ? activeProgramPass->clearColor[(size_t)c] : clearColor[c];
+        }
         ca.loadOp  = GPU::LoadOp::clear;
         ca.storeOp = GPU::StoreOp::store;
         ca.depthSlice = 0;
         desc.colorAttachments.push_back(ca);
-        if (depthView) {
+        // A program pass has its own depth buffer at the target's (1x) size.
+        const auto passDepthView = activeProgramPass ? programPassDepthView : depthView;
+        if (passDepthView) {
             GPU::DepthStencilAttachment ds{};
-            ds.view = depthView;
+            ds.view = passDepthView;
             ds.depthClearValue = 1.0f;
             ds.depthLoadOp  = GPU::LoadOp::clear;
             ds.depthStoreOp = GPU::StoreOp::store;
@@ -8947,13 +9023,13 @@ void Renderer::render(const RenderScene& scene,
         auto rpe = encoder->beginRenderPass(desc);
         if (!rpe) return;
         if (renderWidth > 0 && renderHeight > 0) {
-            const float sw = (float)sceneTargetWidth();
-            const float sh = (float)sceneTargetHeight();
+            const float sw = activeProgramPass ? (float)renderWidth : (float)sceneTargetWidth();
+            const float sh = activeProgramPass ? (float)renderHeight : (float)sceneTargetHeight();
             rpe->setViewport(0.0f, 0.0f, sw, sh, 0.0f, 1.0f);
             rpe->setScissorRect(0.0f, 0.0f, sw, sh);
         }
 
-        drawSkybox(rpe);
+        if (!activeProgramPass) drawSkybox(rpe);
 
         currentPipelineVariant = 0;
         currentPipelineObject = nullptr;
@@ -8971,8 +9047,10 @@ void Renderer::render(const RenderScene& scene,
         currentPipelineVariant = 0;
         currentPipelineObject = nullptr;
         activeMeshSlots = nullptr;
-        for (auto &draw : scene.transparent) {
-            renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
+        if (!activeProgramPass || activeProgramPass->includeTransparent) {
+            for (auto &draw : scene.transparent) {
+                renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
+            }
         }
 
         rpe->end();
@@ -9114,10 +9192,15 @@ void Renderer::renderPrimitive(
     // can't draw is skipped.
     const VertexLayout& layout = draw.mesh->layout ? *draw.mesh->layout : standardLayout;
     const bool customLayout = draw.mesh->layout && !(*draw.mesh->layout == standardLayout);
-    bool debugView = viewMode == ViewMode::worldNormal && !customLayout;
+    // The material's program, or the program pass's for every draw
+    // (renderProgramPass()); an unknown handle falls back to PBR.
+    ProgramHandle program = activeProgramPass ? activeProgramPass->program : draw.material->program;
+    if (program >= programs.size()) program = kPbrProgram;
+    const auto colorFormat = activeProgramPass ? activeProgramPass->colorFormat : GPU::PixelFormat::invalid;
+    bool debugView = program == kPbrProgram && viewMode == ViewMode::worldNormal && !customLayout;
     const MeshPipelineEntry* entry = debugView
-        ? meshPipeline(MeshProgram::debug, layout, false, false)
-        : meshPipeline(MeshProgram::textured, layout, doubleSided, useBlend);
+        ? meshPipeline(program, MeshProgram::debug, layout, false, false, colorFormat)
+        : meshPipeline(program, MeshProgram::textured, layout, doubleSided, useBlend, colorFormat);
     if (!entry) return;
     activeMeshSlots = &entry->slots;
 
@@ -9158,8 +9241,8 @@ void Renderer::renderPrimitive(
     }
 
     // --- 4. Bind instance matrix ---
-    // GpuMesh::vertexBuffers only has the 6 per-vertex attribute slots
-    // (POSITION..WEIGHTS); VERTEX_SLOT_INSTANCE_MATRIX (19) is past its end, so
+    // GpuMesh::vertexBuffers only has the per-vertex attribute slots
+    // (one per VertexSemantic); VERTEX_SLOT_INSTANCE_MATRIX (19) is past its end, so
     // reading it was out of bounds. Only look there if the array ever grows.
     constexpr bool meshHasInstanceSlot =
         VERTEX_SLOT_INSTANCE_MATRIX < std::tuple_size_v<decltype(GpuMesh::vertexBuffers)>;
@@ -9235,15 +9318,17 @@ void Renderer::renderPrimitive(
     } else if (fallbackWeightBuffer) {
         bindMeshBuffer(rpe, VERTEX_SLOT_WEIGHTS, fallbackWeightBuffer, 0);
     }
-    // uploadMesh()/GpuMesh standalone meshes don't carry COLOR_0/TEXCOORD_1
-    // or morph target data (vertexBuffers is a fixed 6-slot array covering
-    // only POSITION/NORMAL/UV/TANGENT/JOINTS/WEIGHTS); bind the same white/
-    // zero fallbacks the primary GLTF-driven path uses so the shader reads
-    // spec-correct defaults instead of unbound/garbage buffers.
-    if (fallbackColor0Buffer) {
+    // COLOR_0 (float4) / TEXCOORD_1 (float2) when the app filled them in
+    // (uploadMesh() doesn't), else the same white/zero fallbacks the glTF
+    // path uses, so the shader reads spec-correct defaults. No morph data.
+    if (vb[VERTEX_SLOT_COLOR0]) {
+        bindMeshBuffer(rpe, VERTEX_SLOT_COLOR0, vb[VERTEX_SLOT_COLOR0], 0);
+    } else if (fallbackColor0Buffer) {
         bindMeshBuffer(rpe, VERTEX_SLOT_COLOR0, fallbackColor0Buffer, 0);
     }
-    if (fallbackTexCoord1Buffer) {
+    if (vb[VERTEX_SLOT_TEXCOORD1]) {
+        bindMeshBuffer(rpe, VERTEX_SLOT_TEXCOORD1, vb[VERTEX_SLOT_TEXCOORD1], 0);
+    } else if (fallbackTexCoord1Buffer) {
         bindMeshBuffer(rpe, VERTEX_SLOT_TEXCOORD1, fallbackTexCoord1Buffer, 0);
     }
     // bind the zero-weight default so the shader's blend loop is a no-op
