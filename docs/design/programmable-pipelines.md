@@ -1,0 +1,202 @@
+# Programmable pipelines: app-defined vertex layouts and shaders
+
+Status: **proposed** (2026-11-09). Nothing here is implemented yet.
+
+## Problem
+
+The renderer has one hardcoded PBR pipeline per backend:
+
+- **Fixed vertex slots.** POSITION 0, NORMAL 1, TEXCOORD_0 2, TANGENT 3, JOINTS 4, WEIGHTS 5, COLOR_0 6, TEXCOORD_1 7, plus per-draw data at 15 (lights), 16 (NodeTransforms), 17 (material), 18 (camera), 19 (instance matrices), 20 (joints) and 21–23 (morph targets). `GpuMesh::vertexBuffers` is a fixed `std::array` of six.
+- **Embedded shaders.** `default.metal`, `default.vert/.frag` and `default.hlsl` are compiled offline by per-backend scripts into headers (`metal_default.h`, `vulkan_default.h`, ...).
+- **Hand-made variants.** Each variant is a named member created in `createDefaultPipelines()`, once per backend: flat / textured / debug × single- or double-sided × opaque or blend, plus the lean position-only variants added for BIM (`pipelineLean*`, `supportsPositionOnlyMeshes()`).
+
+Every new need multiplies the variants across three backends. The lean meshes show it: a second vertex layout meant a second vertex shader per backend, four more pipeline members, a capability flag, and a branch in `renderPrimitive`. Apps can't add their own rendering at all, and BIM needs several kinds soon:
+
+| BIM need | Kind |
+|---|---|
+| Section planes (clip the model) | small change to the PBR shader |
+| Selection / hover tint, x-ray / ghost mode | small change to the PBR shader |
+| Position-only meshes (done, hardcoded) | different vertex layout |
+| Element edges, 2D drawing views (lines) | custom program, line topology |
+| GPU picking (element id buffer) | custom program, integer target |
+| Selection outline | custom program + post pass |
+
+## Goals
+
+1. A mesh describes its own vertex layout. Pipelines are built on demand from that layout and cached, not declared as members.
+2. Apps can register their own shader programs, with a documented contract for the data the renderer provides (camera, transforms, lights, environment).
+3. The built-in PBR becomes the default program, registered through the same public API the apps use.
+4. Common app needs (clip planes, tint, id output) are built-in **features** of the PBR program, switched by uniforms, so most apps never write a shader.
+5. The existing API keeps working. glTF loading, `render_system`, materials and debug views don't change for current users.
+
+## Non-goals
+
+- A runtime shader compiler in the library. Shaders stay compiled offline (Vulkan and DirectX need binaries anyway).
+- A render graph or user-defined passes. The pass list stays the renderer's: skybox, opaque, scene-color copy (transmission), transparent, FXAA. Programs take part in passes; they don't define them. A render graph can come later on top of this.
+- Shader source injection (gluing app snippets into the PBR source). See "Hooks" below.
+
+## Design
+
+### 1. Vertex layouts described by data
+
+```cpp
+enum class VertexSemantic : uint8_t { position, normal, tangent, texcoord0, texcoord1,
+                                      color0, joints, weights, custom0, custom1, custom2, custom3 };
+
+struct VertexAttributeDesc {
+    VertexSemantic semantic;
+    GPU::ComponentType component;   // ctFloat, ctUnsignedShort, ...
+    GPU::AccessorType  type;        // acVec2, acVec3, ...
+    uint32_t location;              // shader input location / [[attribute]]
+};
+
+struct VertexLayoutDesc {
+    std::vector<VertexAttributeDesc> attributes;   // one buffer per attribute (non-interleaved, as today)
+    uint64_t hash() const;
+};
+```
+
+- `GpuMesh` gains `const VertexLayoutDesc* layout` (or a small interned layout id) and `std::vector<Buffer>` replaces the fixed array. `uploadMesh()` fills both from the glTF accessors, so glTF users see no change.
+- The standard PBR layout is a predefined constant (`VertexLayouts::pbr()`), and so is `VertexLayouts::positionOnly()`. The `positionOnly` flag goes away: a lean mesh is just a mesh with that layout.
+- Per-draw data (transforms 16, instances 19, joints 20, morph 21–23) stays in renderer-owned slots above the attribute range, so attribute locations 0–14 belong to the layout.
+
+### 2. Shader programs
+
+```cpp
+struct ShaderStageSource {           // one compiled stage for one backend
+    const uint8_t* code; uint64_t size;
+    std::string entryPoint;
+};
+
+struct ShaderProgramDesc {
+    std::string name;
+    // Compiled binaries per backend. A backend with no binary can't draw
+    // the program; drawRenderables skips it and reports it once.
+    std::optional<ShaderStageSource> metalLibrary;        // one .metallib, both entry points
+    std::optional<ShaderStageSource> vulkanVertex, vulkanFragment;
+    std::optional<ShaderStageSource> directxVertex, directxFragment;
+
+    std::vector<VertexLayoutDesc> acceptedLayouts;        // empty = any layout with a position
+    FrameInputs   frameInputs;    // which renderer data it reads: camera, lights, environment, sceneColor
+    DrawInputs    drawInputs;     // transforms, instances, joints, morph
+    MaterialLayout materialLayout; // its own bind group: uniform block size + texture/sampler slots
+    PassMask      passes;         // opaque | transparent (later: depthOnly, id)
+    ColorTargets  targets;        // default: the scene color format; id programs: r32uint
+};
+
+ProgramHandle Renderer::registerProgram(const ShaderProgramDesc&);
+ProgramHandle Renderer::pbrProgram() const;     // the built-in one
+```
+
+- `GpuMaterial` gains `ProgramHandle program` (defaults to the PBR program) and a program-owned bind group. The current PBR material fields become the PBR program's material data.
+- Programs don't pick their render state. Cull mode and blending come from the material (`doubleSided`, `alphaBlend`), as today.
+
+### 3. Pipeline cache
+
+```
+key = (program, layout hash, cullMode, blendMode, colorFormat, depthFormat, sampleCount, pass)
+```
+
+- Pipelines are created on first use and kept in a hash map. That replaces the 13 `pipeline*` members for meshes; skybox, FXAA, downsample and IBL bake stay as fixed internal pipelines.
+- `prewarm(program, layout, ...)` lets apps create pipelines up front and avoid hitches on the first frame (Metal and D3D12 pipeline creation takes milliseconds).
+- `supportsPositionOnlyMeshes()` generalises to `bool supports(ProgramHandle, const VertexLayoutDesc&)`.
+
+### 4. Binding contract
+
+This is the core of the proposal: what a custom shader may rely on. It's written down once per backend and covered by tests that compile a minimal custom program on every backend.
+
+| Data | Metal | Vulkan | DirectX |
+|---|---|---|---|
+| Vertex attributes | `[[attribute(0..14)]]`, buffers 0–14 | locations 0–14 | `TEXCOORD0..14` |
+| NodeTransforms {mvp, model} | buffer 16 (vertex) | per-instance attribute, locations 16–19 and 24–27 | same as Vulkan |
+| Instance matrices | buffer 19 | (to define) | (to define) |
+| Camera | buffer 18 (fragment) | set 1 | combined group (to split) |
+| Lights | buffer 15 | set 1 | combined group (to split) |
+| Environment (IBL, BRDF LUT) | fragment textures | set 1 | combined group (to split) |
+| Program material | buffer 17 + its textures | set 0 | (to define) |
+
+Work implied by the table:
+
+- **DirectX** uses one combined material + frame bind group per frame-in-flight (`GpuMaterial::directxBindGroup`). It must be split into frame and material groups, as on Vulkan, before custom programs can work there.
+- **Vulkan** carries the transforms as per-instance vertex attributes and Metal as a device buffer. Both are fine for the contract; the table just has to say so.
+
+The same structs (`NodeTransforms`, `CameraUniforms`, `LightsUniforms`) ship as headers that shaders include, one per language: `campello_renderer.metal.h`, `campello_renderer.glsl`, `campello_renderer.hlsli`. Later this becomes one Slang module (see §6).
+
+### 5. Hooks: built-in features, not source injection
+
+Gluing app code into the PBR shader needs either a runtime compiler (not available for SPIR-V/DXIL without shipping one) or every combination compiled offline. Instead, the PBR program gets a few **features** switched by uniforms, covering the common needs:
+
+- **Clip planes:** up to 6 world-space planes in the frame data; fragments behind any enabled plane are discarded. Optionally the cut is capped (back faces drawn in a cap colour). These are BIM section planes.
+- **Tint / override:** a per-draw colour, mode (multiply, replace) and opacity. This gives selection highlight, ghost/x-ray, and colour-by-property.
+- **Flat-normal fallback:** what the lean meshes do today, kept as a feature of the PBR fragment shader.
+- **Debug views:** stay a PBR feature.
+
+Per-draw feature data rides on `DrawCall` (for example `DrawCall::tint`) and goes in the transforms buffer or a small per-draw uniform. Anything beyond the features is a custom program.
+
+### 6. Shader sources across three backends
+
+Writing every custom program three times (MSL, GLSL, HLSL) is the main cost of this proposal for app authors. The options:
+
+| Option | Toolchain | Notes |
+|---|---|---|
+| A. Hand-written per backend (today) | xcrun metal, glslc / glslangValidator, dxc | No new tool; triple the work |
+| B. **Slang** → MSL, SPIR-V, DXIL | `slangc` (one binary on macOS/Windows/Linux) | Modules fit the binding-contract headers; MSL output is newer than the others |
+| C. HLSL → DXIL and SPIR-V (dxc) → MSL (SPIRV-Cross) | dxc + spirv-cross | Mature; two tools; Metal argument mapping needs care |
+
+Recommendation: keep A while the API settles (phases 1–4). Then spike B on the PBR shader: if the generated MSL/SPIR-V/DXIL matches today's images (the existing image tests), move the built-in shaders to Slang and offer it to apps. CMake gets a helper either way:
+
+```cmake
+campello_renderer_add_shaders(my_app_shaders
+    PROGRAM bim_ids SOURCES shaders/bim_ids.slang   # or per-backend files
+    OUTPUT  ${CMAKE_CURRENT_BINARY_DIR}/bim_ids_shaders.h)
+```
+
+The helper embeds the binaries in a header, as the library does for its own shaders today.
+
+### 7. Taking part in passes
+
+| Pass | Today | Custom programs |
+|---|---|---|
+| Skybox | internal | — |
+| Opaque | PBR | yes, if `passes` has `opaque` |
+| Scene-color copy (transmission) | internal | — |
+| Transparent (sorted back to front) | PBR | yes, if `passes` has `transparent` |
+| FXAA | internal | — |
+| Depth-only (future: prepass, shadows) | — | needs a position-only version, which any position-carrying layout already allows |
+| Id (future: GPU picking) | — | separate target, own program |
+
+- Programs with a non-default color target (an id program) are drawn in their own render call (`renderIds(target, ...)`), not mixed into the lit frame.
+- Culling (frustum, size), batching and transparency sorting stay program-agnostic. They only use bounds and the material's blend flag.
+
+## Migration plan
+
+Each phase ships on its own, keeps the existing tests and image comparisons passing, and changes no existing public signature unless noted.
+
+1. **Layouts and the pipeline cache.**
+   - Add `VertexLayoutDesc` and the cache, with the PBR program still internal.
+   - Replace the `pipeline*` mesh members, the lean variants and `positionOnly` with layouts.
+   - The capability check becomes `supports(...)`.
+   - Absorbs the lean work. Medium-sized: most of it is `createDefaultPipelines()` and `renderPrimitive()`.
+2. **Binding contract.**
+   - Write the table into the docs and add the per-language headers.
+   - Split the DirectX combined bind group.
+   - Test: a minimal "unlit colour" program written against the headers draws on Metal and Vulkan (DirectX when dxc is available in CI).
+3. **Public program API.**
+   - `registerProgram`, `GpuMaterial::program`, PBR registered through it.
+   - BIM's first custom program: element ids for GPU picking.
+4. **PBR features.**
+   - Clip planes, tint/override.
+   - BIM section planes and selection highlight move onto these.
+5. **Single-source shaders (optional).**
+   - Slang spike on the PBR shader; if it passes the image tests, move the built-in shaders and document it for apps.
+6. **Lines and topology.**
+   - `GpuMesh` topology (lines, line strips) with a line program, for edges and drawing views.
+
+## Risks and open questions
+
+- **Public API surface.** The binding contract becomes something apps depend on. Keep it small and versioned (`kBindingContractVersion`), and change it only with a major renderer version.
+- **Pipeline creation hitches.** On-demand creation costs a few ms the first time a combination is drawn; `prewarm` plus an async creation path (if campello_gpu gets one) handles it.
+- **DirectX coverage.** CI is Windows-only but can't run the GPU tests today, and the DXIL headers aren't regenerated from macOS. Phase 2 needs dxc in CI to be credible.
+- **Skinning and morph targets** stay PBR-only at first; custom programs declare `drawInputs` without them until someone needs it.
+- **Where ECS integration lives.** `render_system` keeps building `DrawCall`s from components. A material component that names a program is enough; no new ECS concepts.
+- **Open: per-draw data for features.** Grow `NodeTransforms` (128 → 160 bytes for tint + flags) or add a separate per-draw buffer. Measure on the BIM office model (≈10k draws) before choosing.
