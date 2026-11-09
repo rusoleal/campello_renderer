@@ -43,7 +43,9 @@ namespace systems::leal::campello_renderer {
 
         bool operator==(const VertexAttributeFormat&) const = default;
 
-        /// Bytes per element (tightly packed).
+        /// Bytes per element: tightly packed, rounded up to 4 bytes (glTF
+        /// vertex attribute alignment; Metal requires it), e.g. 4 for a
+        /// normalized unsigned-byte vec3.
         uint32_t stride() const {
             using CT = systems::leal::campello_gpu::ComponentType;
             using AT = systems::leal::campello_gpu::AccessorType;
@@ -63,7 +65,7 @@ namespace systems::leal::campello_renderer {
                 case AT::acMat3: count = 9; break;
                 case AT::acMat4: count = 16; break;
             }
-            return size * count;
+            return (size * count + 3u) & ~3u;
         }
     };
 

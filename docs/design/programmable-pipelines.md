@@ -1,6 +1,6 @@
 # Programmable pipelines: app-defined vertex layouts and shaders
 
-Status: **in progress** (2026-11-09). Phase 1 (vertex layouts and the pipeline cache) is implemented; the rest is proposed.
+Status: **in progress** (2026-11-09). Phase 1 (vertex layouts and the pipeline cache) and most of phase 2 (compact slots, binding contract) are implemented; the rest is proposed.
 
 ## Problem
 
@@ -43,15 +43,15 @@ WebGPU's default limits are lower than what the renderer uses today, and a web b
 
 | Limit (default) | Value | Renderer today | Consequence |
 |---|---|---|---|
-| `maxVertexBuffers` | 8 | slots 0–7 attributes, 16 transforms, 17–19 placeholders/instances | Vertex buffer slots must be **compact**: a layout's attributes take slots 0..n-1, and per-draw data moves out of vertex slots 16+ |
-| `maxVertexAttributes` | 16 | 8 attributes + 8 matrix columns (MVP, model) | Per-draw matrices go to a storage buffer, not instance attributes |
+| `maxVertexBuffers` | 8 | slots 0–7 attributes, 16 transforms, 17–19 placeholders/instances | Vertex buffer slots must be **compact**: a layout's attributes take slots 0..n-1, then the per-draw transforms |
+| `maxVertexAttributes` | 16 | 8 attributes + 8 matrix columns (MVP, model) | Fits once the shader reads 6 attributes (no skinning): 6 + 8 = 14 |
 | `maxSampledTexturesPerShaderStage` | 16 | PBR fragment: 21 textures (glTF core 5, KHR extensions 12, IBL 3, scene color 1) | PBR is split into **variants by feature set**: core (5 + IBL 3 + scene color = 9) and extensions grouped so each variant stays ≤ 16 |
 | `maxSamplersPerShaderStage` | 16 | 8 | fine |
 | `maxBindGroups` | 4 | 2 (material, frame) | room for a per-draw group |
 | Derivatives (`dpdx`) | uniform control flow only | lean meshes take them unconditionally | already compatible |
 | Shading language | WGSL only | MSL, GLSL, HLSL | a fourth hand-written copy, or generated (Slang emits WGSL) |
 
-These shape the design below: compact vertex slots and a storage buffer for per-draw transforms on **all** backends (one contract, not a WebGPU special case), and PBR variants keyed by material features.
+These shape the design below: compact vertex slots on **all** backends (one contract, not a WebGPU special case), and PBR variants keyed by material features. Per-draw transforms can stay per-instance vertex attributes: a buffer's slot and a shader input's location are independent, so they keep locations 16–19/24–27 and only move to the slot after the attributes (7 buffers, 14 attributes for the standard shader).
 
 ## Design
 
@@ -77,7 +77,8 @@ struct VertexLayoutDesc {
 - `GpuMesh` gains `const VertexLayoutDesc* layout` (or a small interned layout id) and `std::vector<Buffer>` replaces the fixed array. `uploadMesh()` fills both from the glTF accessors, so glTF users see no change.
 - The standard PBR layout is a predefined constant (`VertexLayouts::pbr()`), and so is `VertexLayouts::positionOnly()`. The `positionOnly` flag goes away: a lean mesh is just a mesh with that layout.
 - **Compact slots:** a layout's attribute *i* is read from vertex buffer slot *i* (non-interleaved, as today), and the shader location comes from the semantic. A position-only mesh binds one buffer, a PBR mesh at most eight (WebGPU's limit).
-- **Per-draw data leaves the vertex slots.** Transforms (today slot 16), instance matrices (19), joints (20) and morph data (21–23) move to storage buffers indexed by the draw's instance index (`firstInstance` + `instance_index` / `[[instance_id]]` + base instance / `SV_InstanceID` + root constant), on every backend. On Metal they are already device buffers; on Vulkan and DirectX the transforms stop being per-instance vertex attributes.
+- **Per-draw data.** Transforms stay per-instance vertex attributes on Vulkan, DirectX and (later) WebGPU, in the slot after the attributes, and a `[[buffer(16)]]` argument on Metal. Instance matrices (19), joints (20) and morph data (21–23) are Metal-only features today (raw `[[buffer(n)]]` arguments); when they come to the other backends they become storage buffers (WebGPU has no room for more vertex buffers).
+- **Slot maps (implemented).** Each cached pipeline carries a map from logical slot (`VERTEX_SLOT_*`) to physical slot, or "not read". Draw code binds by logical slot and the map places or skips the buffer, so the same draw code serves every backend and layout.
 
 ### 2. Shader programs
 
@@ -127,9 +128,9 @@ This is the core of the proposal: what a custom shader may rely on. It's written
 
 | Data | Metal | Vulkan | DirectX | WebGPU |
 |---|---|---|---|---|
-| Vertex attributes | `[[attribute(i)]]`, buffers 0..n-1 | locations by semantic, bindings 0..n-1 | `TEXCOORDi`, slots 0..n-1 | `@location` by semantic, buffers 0..n-1 (n ≤ 8) |
-| NodeTransforms {mvp, model} | today buffer 16; target: storage buffer | today per-instance attributes 16–19, 24–27; target: storage buffer | same as Vulkan | storage buffer, group 2 |
-| Instance matrices | buffer 19 | (to define) | (to define) | storage buffer, group 2 |
+| Vertex attributes | `[[attribute(semantic)]]`, buffers 0..n-1 | `location = semantic`, bindings 0..n-1 | `TEXCOORD<semantic>`, input slots 0..n-1 | `@location(semantic)`, buffers 0..n-1 (n ≤ 7) |
+| NodeTransforms {mvp, model} (128 B per draw) | `[[buffer(16)]]` | per-instance attributes, locations 16–19 (MVP), 24–27 (model), binding n | same as Vulkan, `TEXCOORD16–19/24–27`, slot n | same as Vulkan, buffer n |
+| Instance matrices | `[[buffer(19)]]` | not supported yet | not supported yet | storage buffer, group 2 |
 | Camera | buffer 18 (fragment) | set 1 | combined group (to split) | group 1 |
 | Lights | buffer 15 | set 1 | combined group (to split) | group 1 |
 | Environment (IBL, BRDF LUT) | fragment textures | set 1 | combined group (to split) | group 1 |
@@ -198,11 +199,10 @@ Each phase ships on its own, keeps the existing tests and image comparisons pass
    - Replace the `pipeline*` mesh members, the lean variants and `positionOnly` with layouts.
    - The capability check becomes `supports(...)`.
    - Absorbs the lean work. Medium-sized: most of it is `createDefaultPipelines()` and `renderPrimitive()`.
-2. **Binding contract.**
-   - Compact vertex slots and per-draw data (transforms, instances, joints, morph) in storage buffers on every backend (WebGPU constraints above).
-   - Fold `quantizedPipelines` (KHR_mesh_quantization, Metal) into layouts: they are the standard layout with other formats.
-   - Write the table into the docs and add the per-language headers.
-   - Split the DirectX combined bind group.
+2. **Binding contract.** *Mostly done.*
+   - Done: compact vertex slots on every backend with per-pipeline slot maps; transforms in the slot after the attributes (WebGPU-sized); `quantizedPipelines` (KHR_mesh_quantization, Metal) folded into layouts (`quantizedLayout`, the standard layout with integer formats); the table above.
+   - Moved to phase 3: the per-language interface headers (they are only useful once a custom program includes them).
+   - Open: split the DirectX combined bind group. It changes `default.hlsl`'s registers, so it needs `dxc` (not available on macOS) and a Windows run.
    - Test: a minimal "unlit colour" program written against the headers draws on Metal and Vulkan (DirectX when dxc is available in CI).
 3. **Public program API.**
    - `registerProgram`, `GpuMaterial::program`, PBR registered through it.

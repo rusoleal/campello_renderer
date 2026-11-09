@@ -2768,6 +2768,87 @@ TEST(FrustumCulling, ProjectedRadiusShrinksWithDistance) {
 // pipelines, which derive the face normal in the fragment shader: a quad
 // facing the camera must come out the same colour as the same quad with an
 // explicit normal.
+// The same quad-scaled triangle with float positions and with
+// KHR_mesh_quantization positions (normalized int16 at +-32767 = +-1.0
+// exactly, padded to an 8-byte stride): the quantized layout must place the
+// vertices identically.
+static const char *kGltfScaledTriangleFloat = R"({
+    "asset": {"version": "2.0"},
+    "scene": 0,
+    "scenes": [{"nodes": [0]}],
+    "nodes": [{"mesh": 0, "scale": [0.5, 0.5, 0.5]}],
+    "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 2, "material": 0}]}],
+    "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0, "roughnessFactor": 1}, "doubleSided": true}],
+    "accessors": [
+        {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1, 1, 0], "min": [-1, -1, 0]},
+        {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"},
+        {"bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR"}
+    ],
+    "bufferViews": [
+        {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 36, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 72, "byteLength": 6}
+    ],
+    "buffers": [{"uri": "data:application/octet-stream;base64,AACAvwAAgL8AAAAAAACAPwAAgL8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAABAAIA", "byteLength": 78}]
+})";
+static const char *kGltfScaledTriangleQuantized = R"({
+    "asset": {"version": "2.0"},
+    "extensionsUsed": ["KHR_mesh_quantization"], "extensionsRequired": ["KHR_mesh_quantization"],
+    "scene": 0,
+    "scenes": [{"nodes": [0]}],
+    "nodes": [{"mesh": 0, "scale": [0.5, 0.5, 0.5]}],
+    "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 2, "material": 0}]}],
+    "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0, "roughnessFactor": 1}, "doubleSided": true}],
+    "accessors": [
+        {"bufferView": 0, "componentType": 5122, "normalized": true, "count": 3, "type": "VEC3", "max": [1, 1, 0], "min": [-1, -1, 0]},
+        {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"},
+        {"bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR"}
+    ],
+    "bufferViews": [
+        {"buffer": 0, "byteOffset": 0, "byteLength": 24},
+        {"buffer": 0, "byteOffset": 24, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 60, "byteLength": 6}
+    ],
+    "buffers": [{"uri": "data:application/octet-stream;base64,AYABgAAAAAD/fwGAAAAAAAAA/38AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAABAAIA", "byteLength": 66}]
+})";
+
+TEST_F(OffscreenRenderTest, QuantizedPositionsRenderLikeFloatPositions) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    const auto renderAsset = [&](const char *json) -> std::vector<uint8_t> {
+        renderer = std::make_unique<systems::leal::campello_renderer::Renderer>(device);
+        auto asset = GLTF::loadGLTF(std::string(json), kNoOpLoader);
+        if (!asset) return {};
+        renderer->setAsset(asset);
+        renderer->resize(64, 64);
+        renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+        renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        renderer->setSkyboxEnabled(false);
+        auto tex = makeOffscreenTexture(64, 64);
+        if (!tex) return {};
+        auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+        if (!view) return {};
+        renderer->render(view);
+        return readBackPixels(tex);
+    };
+    const auto floats = renderAsset(kGltfScaledTriangleFloat);
+    const auto quantized = renderAsset(kGltfScaledTriangleQuantized);
+    ASSERT_EQ(floats.size(), 64u * 64u * 4u);
+    ASSERT_EQ(quantized.size(), floats.size());
+    size_t lit = 0;
+    size_t differing = 0;
+    for (size_t i = 0; i < floats.size(); i += 4) {
+        if (floats[i] + floats[i + 1] + floats[i + 2] > 60) ++lit;  // ~70 of 4096
+        for (size_t c = 0; c < 3; ++c) {
+            if (std::abs(int(floats[i + c]) - int(quantized[i + c])) > 2) {
+                ++differing;
+                break;
+            }
+        }
+    }
+    EXPECT_GT(lit, 30u) << "the float triangle should cover part of the target";
+    EXPECT_EQ(differing, 0u) << "quantized and float positions rendered differently";
+}
+
 TEST(VertexLayout, DescribesFormatsAndHashesThem) {
     using CT = systems::leal::campello_gpu::ComponentType;
     const VertexLayout standard = VertexLayout::standard();

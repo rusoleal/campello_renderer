@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <array>
 #include <string>
 #include <unordered_map>
@@ -171,8 +172,12 @@ namespace systems::leal::campello_renderer {
         uint32_t getRenderWidth() const  { return renderWidth; }
         uint32_t getRenderHeight() const { return renderHeight; }
 
-        // Vertex buffer slot convention — must match the pipeline's vertex descriptor
-        // and the shader bindings.
+        // Logical vertex/raw buffer slots. Attributes 0-7 are VertexSemantic
+        // values (also their shader locations); 15-23 are per-draw data. The
+        // physical slot comes from each pipeline's slot map (meshPipeline()):
+        // attributes take compact slots 0..n-1 in semantic order, then the
+        // per-draw buffers; on Metal 15-23 are [[buffer(n)]] arguments at
+        // their own index.
         static constexpr uint32_t VERTEX_SLOT_POSITION   = 0;  // float3 POSITION
         static constexpr uint32_t VERTEX_SLOT_NORMAL     = 1;  // float3 NORMAL
         static constexpr uint32_t VERTEX_SLOT_TEXCOORD0  = 2;  // float2 TEXCOORD_0
@@ -395,17 +400,42 @@ namespace systems::leal::campello_renderer {
             bool supportsBlend = false;  // false: blend draws use the opaque state
             systems::leal::campello_gpu::BlendState alphaBlend;
             systems::leal::campello_gpu::DepthStencilDescriptor blendDepthStencil;
-            // Vertex buffer slots after the attributes (per-draw data such as
-            // Vulkan/DirectX's per-instance transforms at slot 16); empty on Metal.
-            std::vector<systems::leal::campello_gpu::VertexLayout> perDrawBuffers;
-            uint32_t perDrawFirstSlot = 0;
+            // Per-draw data read as vertex buffers (Vulkan/DirectX: the
+            // per-instance NodeTransforms), by logical slot (VERTEX_SLOT_*).
+            // They take the vertex buffer slots right after the attributes.
+            std::vector<std::pair<uint32_t, systems::leal::campello_gpu::VertexLayout>> perDrawBuffers;
+            // Metal: logical slots 8-23 are raw [[buffer(n)]] arguments, bound
+            // at their own index. Elsewhere they aren't vertex buffers and
+            // binding them is skipped.
+            bool rawBufferSlots = false;
+        };
+        // A cached pipeline and where its vertex buffers go: physical slot per
+        // logical slot (VERTEX_SLOT_*), -1 = not read by this pipeline.
+        // Attributes take compact slots 0..n-1 in semantic order (WebGPU
+        // allows 8 vertex buffers), then the per-draw buffers.
+        static constexpr size_t kLogicalSlotCount = 24;
+        struct MeshPipelineEntry {
+            std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipeline;
+            std::array<int8_t, kLogicalSlotCount> slots{};
         };
         MeshPipelineRecipe meshRecipe;
-        std::unordered_map<uint64_t, std::shared_ptr<systems::leal::campello_gpu::RenderPipeline>> meshPipelineCache;
+        std::unordered_map<uint64_t, MeshPipelineEntry> meshPipelineCache;
+        // Slot map of the pipeline renderPrimitive() bound; nullptr = identity.
+        const std::array<int8_t, kLogicalSlotCount>* activeMeshSlots = nullptr;
+        // Binds a mesh vertex/raw buffer by logical slot through activeMeshSlots.
+        void bindMeshBuffer(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+                            uint32_t logicalSlot,
+                            const std::shared_ptr<systems::leal::campello_gpu::Buffer> &buffer,
+                            uint64_t offset);
+        // KHR_mesh_quantization (Metal): the standard layout with the scene's
+        // integer POSITION/NORMAL/TEXCOORD_0/TANGENT formats; unset when the
+        // scene has none. Set by detectQuantizedLayout().
+        std::optional<VertexLayout> quantizedLayout;
+        bool quantizedLayoutDetected = false;
         VertexLayout standardLayout = VertexLayout::standard();
 
         const MeshVertexStage* vertexStageFor(const VertexLayout& layout) const;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> meshPipeline(
+        const MeshPipelineEntry* meshPipeline(
             MeshProgram program, const VertexLayout& layout, bool doubleSided, bool blend);
         void prewarmMeshPipelines();
         // True when the backend has a separate flat fragment shader (Metal);
@@ -495,11 +525,6 @@ namespace systems::leal::campello_renderer {
         systems::leal::campello_gpu::ComponentType weightsComponentType =
             systems::leal::campello_gpu::ComponentType::ctFloat;
         bool weightsNormalized = false;
-
-        // Pipeline variants for KHR_mesh_quantization (non-float vertex formats).
-        // Key is wantedVariant (1–9). Created lazily in setScene() when quantized
-        // accessors are detected.
-        std::unordered_map<int, std::shared_ptr<systems::leal::campello_gpu::RenderPipeline>> quantizedPipelines;
 
         // Per-draw buffers: material uniforms (baseColorFactor per material slot)
         // and a fallback zero-UV buffer for primitives without TEXCOORD_0.
@@ -848,9 +873,9 @@ namespace systems::leal::campello_renderer {
         // Must be called once before render(). Replaces createDefaultPipeline().
         void createDefaultPipelines(systems::leal::campello_gpu::PixelFormat colorFormat);
 
-        // Creates quantized pipeline variants when KHR_mesh_quantization accessors
-        // are detected in setScene(). Called lazily — only when needed.
-        void createQuantizedPipelinesIfNeeded();
+        // Detects KHR_mesh_quantization accessors in the scene (setScene())
+        // and sets quantizedLayout (Metal only; pipelines come from the cache).
+        void detectQuantizedLayout();
 
         // Render to the device's swapchain (Android / platforms where the device
         // owns the surface).
