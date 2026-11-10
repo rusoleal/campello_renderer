@@ -7685,6 +7685,8 @@ void Renderer::setEnvironmentUpAxis(UpAxis axis) {
     // Rebuild the built-in map if it's already made (setScene() makes it on
     // first use); a map the app set stays as it is.
     if (environmentIsBuiltin && environmentMap) {
+        // Frames in flight may still sample the old map and IBL textures.
+        device->waitForIdle();
         if (auto rebuilt = createBuiltinDefaultEnvironmentMap()) {
             setEnvironmentMap(rebuilt);
             environmentIsBuiltin = true;
