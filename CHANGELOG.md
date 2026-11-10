@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- **`Renderer::setEnvironmentUpAxis(UpAxis::z)`** for Z-up worlds (CAD, BIM, IFC). Equirectangular environments (`loadEquirectangularEnvironmentMap()` and the built-in default) are converted with their zenith towards +Z instead of +Y, so the horizon is level; the built-in map is rebuilt (and IBL rebaked) if it's already in use. Cube faces given directly are unchanged. Default `UpAxis::y`, as before. Found in campello_bim, whose sky was turned 90 degrees.
+- **`Renderer::setEnvironmentUpAxis(UpAxis::z)`** for Z-up worlds (CAD, BIM, IFC). Equirectangular environments (`loadEquirectangularEnvironmentMap()` and the built-in default) are converted with their zenith towards +Z instead of +Y, so the horizon is level; the built-in map is rebuilt (and IBL rebaked) if it's already in use. Cube faces given directly are unchanged. Default `UpAxis::y`, as before. Found in campello_bim, whose sky was turned 90 degrees. Test: the default camera (looking along -Z) sees the horizon with Y up and only ground with Z up.
 
 ## [0.14.0] - 2026-11-10
 

@@ -2080,6 +2080,42 @@ TEST_F(OffscreenRenderTest, ClearColorIsApplied) {
     }
 }
 
+TEST_F(OffscreenRenderTest, EnvironmentUpAxisTurnsTheSky) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    using Renderer = systems::leal::campello_renderer::Renderer;
+    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+    EXPECT_EQ(renderer->getEnvironmentUpAxis(), Renderer::UpAxis::y);
+
+    auto tex = makeOffscreenTexture(64, 64);
+    ASSERT_NE(tex, nullptr);
+    auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+    ASSERT_NE(view, nullptr);
+    // Brightness of the top and bottom rows' middle pixels.
+    const auto topAndBottom = [&]() {
+        renderer->render(view);
+        const auto pixels = readBackPixels(tex);
+        const auto luma = [&](size_t x, size_t y) {
+            const size_t i = (y * 64 + x) * 4;
+            return 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2];
+        };
+        return std::pair{luma(32, 2), luma(32, 61)};
+    };
+
+    // The default camera looks along -Z. Y up: across the horizon, sky above
+    // and ground below. Z up: straight down at the ground, top and bottom alike.
+    const auto [yTop, yBottom] = topAndBottom();
+    renderer->setEnvironmentUpAxis(Renderer::UpAxis::z);  // rebuilds the built-in map already in use
+    EXPECT_EQ(renderer->getEnvironmentUpAxis(), Renderer::UpAxis::z);
+    const auto [zTop, zBottom] = topAndBottom();
+    EXPECT_GT(std::abs(yTop - yBottom), 3.0 * std::abs(zTop - zBottom))
+        << "Y up " << yTop << "/" << yBottom << ", Z up " << zTop << "/" << zBottom;
+    device->waitForIdle();
+}
+
 TEST_F(OffscreenRenderTest, MultipleConsecutiveRenders) {
     if (!device) GTEST_SKIP() << "No GPU device available";
     auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
