@@ -2080,6 +2080,48 @@ TEST_F(OffscreenRenderTest, ClearColorIsApplied) {
     }
 }
 
+TEST_F(OffscreenRenderTest, EnvironmentUpAxisTurnsTheSky) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    using Renderer = systems::leal::campello_renderer::Renderer;
+    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    auto tex = makeOffscreenTexture(64, 64);
+    ASSERT_NE(tex, nullptr);
+    auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+    ASSERT_NE(view, nullptr);
+
+    // Brightness of the top and bottom rows' middle pixels, drawn by `r`
+    // configured as an app does: the axis is set before the first frame.
+    const auto topAndBottom = [&](Renderer& r) {
+        r.setAsset(asset);
+        r.resize(64, 64);
+        r.createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+        r.render(view);
+        const auto pixels = readBackPixels(tex);
+        const auto luma = [&](size_t x, size_t y) {
+            const size_t i = (y * 64 + x) * 4;
+            return 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2];
+        };
+        return std::pair{luma(32, 2), luma(32, 61)};
+    };
+
+    // The default camera looks along -Z. Y up: across the horizon, sky above
+    // and ground below. Z up: straight down at the ground, top and bottom alike.
+    EXPECT_EQ(renderer->getEnvironmentUpAxis(), Renderer::UpAxis::y);
+    const auto [yTop, yBottom] = topAndBottom(*renderer);
+    if (std::abs(yTop - yBottom) < 20.0) {
+        device->waitForIdle();
+        GTEST_SKIP() << "This backend draws no skybox offscreen (" << yTop << "/" << yBottom << ")";
+    }
+    renderer = std::make_unique<Renderer>(device);
+    renderer->setEnvironmentUpAxis(Renderer::UpAxis::z);
+    EXPECT_EQ(renderer->getEnvironmentUpAxis(), Renderer::UpAxis::z);
+    const auto [zTop, zBottom] = topAndBottom(*renderer);
+    EXPECT_GT(std::abs(yTop - yBottom), 3.0 * std::abs(zTop - zBottom))
+        << "Y up " << yTop << "/" << yBottom << ", Z up " << zTop << "/" << zBottom;
+    device->waitForIdle();
+}
+
 TEST_F(OffscreenRenderTest, MultipleConsecutiveRenders) {
     if (!device) GTEST_SKIP() << "No GPU device available";
     auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
