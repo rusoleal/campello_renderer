@@ -3265,6 +3265,7 @@ TEST_F(OffscreenRenderTest, MeshPipelinesComeFromLayoutsAndAreCached) {
     renderer->resize(64, 64);
     renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
     renderer->setSkyboxEnabled(false);
+    std::fprintf(stderr, "[diag] pipelines created\n");
 
     EXPECT_TRUE(renderer->supportsVertexLayout(renderer->standardVertexLayout()));
     // Without positions no vertex stage applies.
@@ -3280,6 +3281,7 @@ TEST_F(OffscreenRenderTest, MeshPipelinesComeFromLayoutsAndAreCached) {
     // createDefaultPipelines() prewarms what the built-in paths draw with:
     // drawing a standard, a position-only and an unsupported mesh creates
     // nothing new (and the unsupported one is skipped, not a crash).
+    std::fprintf(stderr, "[diag] layouts checked\n");
     const size_t prewarmed = renderer->meshPipelineCount();
     EXPECT_GT(prewarmed, 0u);
     float positions[] = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f};
@@ -3301,7 +3303,9 @@ TEST_F(OffscreenRenderTest, MeshPipelinesComeFromLayoutsAndAreCached) {
     namespace GLTF_NS = systems::leal::gltf;
     GLTF_NS::Material plain("", nullptr, nullptr, nullptr, nullptr, VM::Vector3<double>(0.0, 0.0, 0.0),
                             GLTF_NS::AlphaMode::opaque, 0.5, false, false, 1.0, 1.5, 0.0);
+    std::fprintf(stderr, "[diag] meshes created\n");
     GpuMaterial* material = renderer->uploadMaterial(plain, *asset);
+    std::fprintf(stderr, "[diag] material uploaded\n");
     ASSERT_NE(material, nullptr);
     RenderScene scene;
     scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
@@ -3318,7 +3322,9 @@ TEST_F(OffscreenRenderTest, MeshPipelinesComeFromLayoutsAndAreCached) {
     }
     auto tex = makeOffscreenTexture(64, 64);
     auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    std::fprintf(stderr, "[diag] rendering\n");
     EXPECT_NO_THROW(renderer->render(scene, view));
+    std::fprintf(stderr, "[diag] rendered\n");
     EXPECT_EQ(renderer->meshPipelineCount(), prewarmed);
 }
 

@@ -817,6 +817,10 @@ namespace systems::leal::campello_renderer {
         bool punctualLightsEnabled = true;
 
         RenderStats lastFrameStats;
+        // CPU copy of materialUniformBuffer's written slots, re-uploaded when
+        // uploadMaterial() grows the buffer (see writeMaterialUniform()).
+        std::vector<uint8_t> materialUniformShadow;
+        void writeMaterialUniform(uint64_t offset, const float* slot);
         double gpuFrameTimeMs = 0.0;  // latest completed render() command buffer
         // Web: getGPUExecutionTime() would block (yield) until the timestamp
         // readback resolves, so render() asks asynchronously and the result

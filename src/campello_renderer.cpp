@@ -2349,8 +2349,8 @@ void Renderer::setScene(uint32_t index) {
         // kept for any lingering references; uniform: Vulkan's MaterialUniforms UBO
         // (see ensureVulkanPbrBindGroupLayouts()) — Metal ignores usage flags entirely.
         materialUniformBuffer = device->createBuffer(bufSize,
-            (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::vertex) | uint32_t(GPU::BufferUsage::uniform) |
-                               uint32_t(GPU::BufferUsage::copySrc) | uint32_t(GPU::BufferUsage::copyDst)));
+            (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::vertex) | uint32_t(GPU::BufferUsage::uniform)));
+        materialUniformShadow.clear();
     }
 
 #if CAMPELLO_RENDERER_VK_BINDINGS
@@ -5969,7 +5969,7 @@ void Renderer::renderToTarget(
                       0.f,
                       (float)viewMode,
                       environmentIntensity, iblEnabled ? 1.f : 0.f, slot);
-            materialUniformBuffer->upload(0, (uint64_t)(93 * sizeof(float)), slot);
+            writeMaterialUniform(0, slot);
         }
 
         if (asset->materials) {
@@ -5980,8 +5980,7 @@ void Renderer::renderToTarget(
                                           environmentIntensity,
                                           iblEnabled ? 1.f : 0.f,
                                           slot);
-                materialUniformBuffer->upload((uint64_t)(i + 1) * kMaterialUniformStride,
-                                              (uint64_t)(93 * sizeof(float)), slot);
+                writeMaterialUniform((uint64_t)(i + 1) * kMaterialUniformStride, slot);
             }
         }
     }
@@ -8128,6 +8127,16 @@ GpuMesh* Renderer::uploadMesh(const systems::leal::gltf::Primitive& primitive,
 }
 
 
+// Writes one material's 93 floats at `offset` into the material uniform
+// buffer and its CPU shadow (the shadow refills the buffer when it grows).
+void Renderer::writeMaterialUniform(uint64_t offset, const float* slot) {
+    constexpr uint64_t size = 93 * sizeof(float);
+    if (!materialUniformBuffer) return;
+    materialUniformBuffer->upload(offset, size, const_cast<float*>(slot));
+    if (materialUniformShadow.size() < offset + size) materialUniformShadow.resize(offset + size, 0);
+    std::memcpy(materialUniformShadow.data() + offset, slot, size);
+}
+
 GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& material,
                                       const systems::leal::gltf::GLTF& asset) {
     namespace GPU = systems::leal::campello_gpu;
@@ -8450,21 +8459,16 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
         // Grow geometrically and keep what's there: earlier materials' slots
         // must survive, since draws (and DirectX's per-pass bind groups) read
         // them from whichever buffer is current. Standalone slots start at
-        // 10000, so without the copy every new standalone material zeroed the
-        // ones before it.
-        auto old = materialUniformBuffer;
-        const uint64_t oldSize = old ? old->getLength() : 0;
+        // 10000, so without this every new standalone material zeroed the
+        // ones before it. The contents come from the CPU shadow (a GPU copy
+        // isn't portable: DirectX keeps this buffer in an upload heap).
+        const uint64_t oldSize = materialUniformBuffer ? materialUniformBuffer->getLength() : 0;
         uint64_t newSize = std::max({requiredSize, (uint64_t)4096 * kMaterialUniformStride, oldSize * 2});
         materialUniformBuffer = device->createBuffer(newSize,
-            (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::vertex) | uint32_t(GPU::BufferUsage::uniform) |
-                               uint32_t(GPU::BufferUsage::copySrc) | uint32_t(GPU::BufferUsage::copyDst)));
-        if (old && materialUniformBuffer && oldSize > 0) {
-            if (auto encoder = device->createCommandEncoder()) {
-                encoder->copyBufferToBuffer(old, 0, materialUniformBuffer, 0, oldSize);
-                device->submit(encoder->finish());
-                // Before any later CPU write to those slots (rare: growth is geometric).
-                device->waitForIdle();
-            }
+            (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::vertex) | uint32_t(GPU::BufferUsage::uniform)));
+        if (materialUniformBuffer && !materialUniformShadow.empty()) {
+            materialUniformBuffer->upload(0, std::min<uint64_t>(materialUniformShadow.size(), newSize),
+                                          materialUniformShadow.data());
         }
     }
 
@@ -8476,8 +8480,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                                   environmentIntensity,
                                   iblEnabled ? 1.f : 0.f,
                                   slot);
-        materialUniformBuffer->upload((uint64_t)uniformSlot * kMaterialUniformStride,
-                                      (uint64_t)(93 * sizeof(float)), slot);
+        writeMaterialUniform((uint64_t)uniformSlot * kMaterialUniformStride, slot);
     }
 
     // --- Create bind groups ---
@@ -8624,8 +8627,7 @@ void Renderer::reuploadMaterialSlot(uint32_t uniformSlot,
                               environmentIntensity,
                               iblEnabled ? 1.f : 0.f,
                               slot);
-    materialUniformBuffer->upload((uint64_t)uniformSlot * kMaterialUniformStride,
-                                  (uint64_t)(93 * sizeof(float)), slot);
+    writeMaterialUniform((uint64_t)uniformSlot * kMaterialUniformStride, slot);
 }
 
 
