@@ -3409,6 +3409,69 @@ TEST_F(OffscreenRenderTest, FrontToBackOrderKeepsTheNearerSurface) {
     }
 }
 
+// Materials uploaded outside the asset take slots in the shared material
+// uniform buffer; growing it for later ones must keep the earlier ones (on
+// DirectX, bind groups rebuilt every pass read whichever buffer is current).
+TEST_F(OffscreenRenderTest, StandaloneMaterialsSurviveUniformBufferGrowth) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+
+    float positions[] = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f, -0.5f, 0.5f, 0.0f};
+    float normals[]   = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    uint32_t indices[] = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(sizeof(positions), GPU::BufferUsage::vertex, positions);
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+        device->createBuffer(sizeof(normals), GPU::BufferUsage::vertex, normals);
+    quad.indexBuffer = device->createBuffer(sizeof(indices), GPU::BufferUsage::index, indices);
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.setBoundsFromPositions(positions, 4);
+
+    namespace GLTF_NS = systems::leal::gltf;
+    const auto emissive = [&](double r, double g, double b) {
+        GLTF_NS::Material m("", nullptr, nullptr, nullptr, nullptr, VM::Vector3<double>(r, g, b),
+                            GLTF_NS::AlphaMode::opaque, 0.5, false, false, 1.0, 1.5, 0.0);
+        return renderer->uploadMaterial(m, *asset);
+    };
+    GpuMaterial* red = emissive(1.0, 0.0, 0.0);
+    ASSERT_NE(red, nullptr);
+    for (int i = 0; i < 40; ++i) {
+        ASSERT_NE(emissive(0.0, 0.0, 1.0), nullptr);
+    }
+
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                    VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection =
+        VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+    DrawCall draw;
+    draw.mesh = &quad;
+    draw.material = red;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque = {draw};
+    renderer->render(scene, view);
+    auto pixels = readBackPixels(tex);
+    const size_t centre = (32 * 64 + 32) * 4;
+    EXPECT_GT(pixels[centre], pixels[centre + 2] + 50)
+        << "first material should still be red; centre rgb " << int(pixels[centre]) << ", "
+        << int(pixels[centre + 1]) << ", " << int(pixels[centre + 2]);
+}
+
 TEST_F(OffscreenRenderTest, PositionOnlyMeshMatchesExplicitNormals) {
     if (!device) GTEST_SKIP() << "No GPU device available";
     namespace GPU = systems::leal::campello_gpu;

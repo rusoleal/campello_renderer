@@ -2349,7 +2349,8 @@ void Renderer::setScene(uint32_t index) {
         // kept for any lingering references; uniform: Vulkan's MaterialUniforms UBO
         // (see ensureVulkanPbrBindGroupLayouts()) — Metal ignores usage flags entirely.
         materialUniformBuffer = device->createBuffer(bufSize,
-            (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::vertex) | uint32_t(GPU::BufferUsage::uniform)));
+            (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::vertex) | uint32_t(GPU::BufferUsage::uniform) |
+                               uint32_t(GPU::BufferUsage::copySrc) | uint32_t(GPU::BufferUsage::copyDst)));
     }
 
 #if CAMPELLO_RENDERER_VK_BINDINGS
@@ -8446,9 +8447,25 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     // --- Ensure material uniform buffer is large enough ---
     uint64_t requiredSize = (uint64_t)(uniformSlot + 1) * kMaterialUniformStride;
     if (!materialUniformBuffer || materialUniformBuffer->getLength() < requiredSize) {
-        uint64_t newSize = std::max(requiredSize, (uint64_t)4096 * kMaterialUniformStride);
+        // Grow geometrically and keep what's there: earlier materials' slots
+        // must survive, since draws (and DirectX's per-pass bind groups) read
+        // them from whichever buffer is current. Standalone slots start at
+        // 10000, so without the copy every new standalone material zeroed the
+        // ones before it.
+        auto old = materialUniformBuffer;
+        const uint64_t oldSize = old ? old->getLength() : 0;
+        uint64_t newSize = std::max({requiredSize, (uint64_t)4096 * kMaterialUniformStride, oldSize * 2});
         materialUniformBuffer = device->createBuffer(newSize,
-            (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::vertex) | uint32_t(GPU::BufferUsage::uniform)));
+            (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::vertex) | uint32_t(GPU::BufferUsage::uniform) |
+                               uint32_t(GPU::BufferUsage::copySrc) | uint32_t(GPU::BufferUsage::copyDst)));
+        if (old && materialUniformBuffer && oldSize > 0) {
+            if (auto encoder = device->createCommandEncoder()) {
+                encoder->copyBufferToBuffer(old, 0, materialUniformBuffer, 0, oldSize);
+                device->submit(encoder->finish());
+                // Before any later CPU write to those slots (rare: growth is geometric).
+                device->waitForIdle();
+            }
+        }
     }
 
     // --- Upload material uniform data ---
