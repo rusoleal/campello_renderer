@@ -2236,6 +2236,7 @@ void Renderer::setScene(uint32_t index) {
     // box instead of a flat placeholder color.
     if (!environmentMap) {
         environmentMap = createBuiltinDefaultEnvironmentMap();
+        environmentIsBuiltin = environmentMap != nullptr;
     }
 
     // Fallback if the embedded skybox ever fails to decode/upload (e.g. GPU
@@ -7272,6 +7273,7 @@ bool Renderer::isDefaultLightEnabled() const {
 
 void Renderer::setEnvironmentMap(std::shared_ptr<systems::leal::campello_gpu::Texture> cubemap) {
     environmentMap = cubemap;
+    environmentIsBuiltin = false;
     for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
         // skyboxBindGroup is created once and cached (drawSkybox only builds it
         // when null), so it genuinely needs invalidating here to pick up the
@@ -7582,6 +7584,14 @@ Renderer::convertEquirectangularImageToCubemap(
                 float len = std::sqrt(dx*dx + dy*dy + dz*dz);
                 if (len > 0.0f) { dx /= len; dy /= len; dz /= len; }
 
+                // Z up: the same direction in the map's own Y-up frame
+                // (a -90 degree turn about X takes +Z to +Y).
+                if (environmentUpAxis == UpAxis::z) {
+                    const float worldY = dy;
+                    dy = dz;
+                    dz = -worldY;
+                }
+
                 // Equirectangular UV from direction.
                 // Standard convention: v=0 at top (+Y/zenith), v=1 at bottom (-Y/nadir).
                 float phi   = std::atan2(dz, dx);               // [-pi, pi]
@@ -7667,6 +7677,19 @@ Renderer::createBuiltinDefaultEnvironmentMap()
     // 512px per face — roughly matches the 1024x512 equirect source's own
     // detail without upsampling past it.
     return convertEquirectangularImageToCubemap(img, 512, kBuiltinEnvironmentExposure);
+}
+
+void Renderer::setEnvironmentUpAxis(UpAxis axis) {
+    if (axis == environmentUpAxis) return;
+    environmentUpAxis = axis;
+    // Rebuild the built-in map if it's already made (setScene() makes it on
+    // first use); a map the app set stays as it is.
+    if (environmentIsBuiltin && environmentMap) {
+        if (auto rebuilt = createBuiltinDefaultEnvironmentMap()) {
+            setEnvironmentMap(rebuilt);
+            environmentIsBuiltin = true;
+        }
+    }
 }
 
 void Renderer::setSkyboxEnabled(bool enabled) {

@@ -162,7 +162,6 @@ namespace systems::leal::campello_renderer {
     /// in submission order (most desktop GPUs; tile-based Apple GPUs remove
     /// hidden surfaces themselves).
     enum class OpaqueOrder { byState, frontToBack };
-
     struct RenderStats {
         uint32_t opaqueDrawCount = 0;
         uint32_t transparentDrawCount = 0;
@@ -184,6 +183,9 @@ namespace systems::leal::campello_renderer {
 
     class Renderer {
     public:
+        /// The world's up axis, for environment maps (setEnvironmentUpAxis()).
+        enum class UpAxis { y, z };
+
         uint32_t getRenderWidth() const  { return renderWidth; }
         uint32_t getRenderHeight() const { return renderHeight; }
 
@@ -536,6 +538,8 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::Sampler>          environmentSampler;
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        environmentBindGroup;
         bool skyboxEnabled = true;
+        UpAxis environmentUpAxis = UpAxis::y;
+        bool environmentIsBuiltin = false;  // environmentMap is createBuiltinDefaultEnvironmentMap()'s
         bool iblEnabled = true;
         float environmentIntensity = 1.0f;
         OverlayCallback overlayCallback;
@@ -1044,6 +1048,14 @@ namespace systems::leal::campello_renderer {
         // (half the equirectangular height). Returns nullptr on failure.
         std::shared_ptr<systems::leal::campello_gpu::Texture> loadEquirectangularEnvironmentMap(
             const std::string &path, uint32_t faceSize = 0);
+
+        // The world's up axis for equirectangular environments: their zenith
+        // (top row) is drawn towards +Y (default, glTF) or +Z (CAD, BIM, IFC).
+        // Applies to loadEquirectangularEnvironmentMap() and the built-in
+        // default map, which is rebuilt if it's already in use; cube faces
+        // given to loadEnvironmentMap() or setEnvironmentMap() are used as they are.
+        void setEnvironmentUpAxis(UpAxis axis);
+        UpAxis getEnvironmentUpAxis() const { return environmentUpAxis; }
 
         void setSkyboxEnabled(bool enabled);
         void setIBLEnabled(bool enabled);
