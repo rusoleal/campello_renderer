@@ -3395,13 +3395,16 @@ TEST_F(OffscreenRenderTest, FrontToBackOrderKeepsTheNearerSurface) {
 
     EXPECT_EQ(renderer->getOpaqueOrder(), OpaqueOrder::byState);
     const auto reference = renderCentre(true);
-    EXPECT_GT(reference[0], reference[2] + 50) << "near (red) quad should be in front";
+    EXPECT_GT(reference[0], reference[2] + 50)
+        << "near (red) quad should be in front; centre rgb " << reference[0] << ", " << reference[1] << ", "
+        << reference[2];
     renderer->setOpaqueOrder(OpaqueOrder::frontToBack);
     for (const bool nearFirst : {true, false}) {
         const auto pixel = renderCentre(nearFirst);
         for (int c = 0; c < 3; ++c) {
             EXPECT_NEAR(pixel[static_cast<size_t>(c)], reference[static_cast<size_t>(c)], 2)
-                << "channel " << c << (nearFirst ? ", near listed first" : ", far listed first");
+                << "channel " << c << (nearFirst ? ", near listed first" : ", far listed first") << "; rgb "
+                << pixel[0] << ", " << pixel[1] << ", " << pixel[2];
         }
     }
 }
