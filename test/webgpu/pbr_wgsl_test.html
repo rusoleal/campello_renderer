@@ -1,0 +1,268 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>campello_renderer WGSL PBR check</title>
+</head>
+<body>
+<pre id="out"></pre>
+<script type="module">
+// Validates shaders/webgpu/default.wgsl in a real browser, against the bind
+// group and vertex layouts campello_renderer creates on WebGPU (the Vulkan
+// layouts, trimmed to the glTF core textures; compact vertex slots), and
+// renders a few checks. No Emscripten needed. Run with
+// test/webgpu/run_wgsl_check.sh (campello_gpu's run_in_browser.mjs protocol:
+// PASS/FAIL lines, then CAMPELLO_WEBGPU_TESTS_DONE failures=N).
+
+let failures = 0;
+const log = (s) => { console.log(s); document.getElementById('out').textContent += s + '\n'; };
+const pass = (name) => log(`PASS ${name}`);
+const fail = (name, why) => { failures++; log(`FAIL ${name}: ${why}`); };
+const done = () => log(`CAMPELLO_WEBGPU_TESTS_DONE failures=${failures}`);
+
+async function scoped(device, fn) {
+  device.pushErrorScope('validation');
+  const value = fn();
+  const error = await device.popErrorScope();
+  return { value, error };
+}
+
+// --- column-major matrices (WebGPU clip: z in [0, 1]) ---
+function mul(a, b) {  // a * b, column-major 4x4
+  const r = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let row = 0; row < 4; row++) {
+    let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + row] * b[c * 4 + k]; r[c * 4 + row] = s;
+  }
+  return r;
+}
+function perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, far / (near - far), -1, 0, 0, far * near / (near - far), 0]);
+}
+function lookAtFromZ(eyeZ) {  // camera at (0, 0, eyeZ) looking at the origin, Y up
+  return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, -eyeZ, 1]);
+}
+const identity = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+
+async function main() {
+  if (!navigator.gpu) { fail('webgpu', 'navigator.gpu missing'); return done(); }
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) { fail('webgpu', 'no adapter'); return done(); }
+  const device = await adapter.requestDevice();
+  log(`adapter: ${adapter.info ? adapter.info.vendor + ' ' + adapter.info.architecture : '?'}`);
+
+  // 1. Compile.
+  const code = await (await fetch('default.wgsl')).text();
+  const module = device.createShaderModule({ code });
+  const info = await module.getCompilationInfo();
+  const errors = info.messages.filter((m) => m.type === 'error');
+  for (const m of info.messages) log(`  wgsl ${m.type} ${m.lineNum}:${m.linePos} ${m.message}`);
+  if (errors.length) { fail('compile', `${errors.length} error(s)`); return done(); }
+  pass('compile');
+
+  // 2. Layouts, as ensureVulkanPbrBindGroupLayouts() on the web.
+  const F = GPUShaderStage.FRAGMENT;
+  const tex = (binding, viewDimension = '2d') => ({ binding, visibility: F, texture: { sampleType: 'float', viewDimension } });
+  const smp = (binding) => ({ binding, visibility: F, sampler: { type: 'filtering' } });
+  const ubo = (binding) => ({ binding, visibility: F, buffer: { type: 'uniform' } });
+  const materialLayout = device.createBindGroupLayout({ entries: [
+    tex(0), smp(1), tex(2), smp(3), tex(4), smp(5), tex(6), smp(7), tex(8), smp(9), ubo(24)] });
+  const frameLayout = device.createBindGroupLayout({ entries: [
+    ubo(0), ubo(1), tex(2, 'cube'), smp(3), tex(4), smp(5), tex(6, 'cube'), tex(7), smp(8)] });
+  // Group 2: per-draw transforms (storage buffer, firstInstance = index).
+  const drawLayout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } }] });
+  const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [materialLayout, frameLayout, drawLayout] });
+
+  // Compact vertex slots (meshPipeline()): attributes in semantic order;
+  // transforms come from group 2, not vertex buffers.
+  const attr = (format, shaderLocation, arrayStride) => ({ arrayStride, stepMode: 'vertex', attributes: [{ format, offset: 0, shaderLocation }] });
+  const standardBuffers = [attr('float32x3', 0, 12), attr('float32x3', 1, 12), attr('float32x2', 2, 8),
+                           attr('float32x4', 3, 16), attr('float32x4', 6, 16), attr('float32x2', 7, 8)];
+  const positionBuffers = [attr('float32x3', 0, 12)];
+
+  const format = 'rgba8unorm';
+  const makePipeline = (entryPoint, buffers, topology, cullMode, blend) => device.createRenderPipeline({
+    layout: pipelineLayout,
+    vertex: { module, entryPoint, buffers },
+    fragment: { module, entryPoint: 'fs_main', targets: [{ format, blend: blend ? {
+      color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+      alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } : undefined }] },
+    primitive: { topology, cullMode, frontFace: 'ccw' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: !blend, depthCompare: 'less' },
+  });
+  const pipelines = {};
+  for (const [name, args] of Object.entries({
+    standard: ['vs_main', standardBuffers, 'triangle-list', 'back', false],
+    standardBlendDoubleSided: ['vs_main', standardBuffers, 'triangle-list', 'none', true],
+    lean: ['vs_lean', positionBuffers, 'triangle-list', 'back', false],
+    leanDoubleSided: ['vs_lean', positionBuffers, 'triangle-list', 'none', false],
+    line: ['vs_line', positionBuffers, 'line-list', 'none', false],
+  })) {
+    const { value, error } = await scoped(device, () => makePipeline(...args));
+    if (error) fail(`pipeline ${name}`, error.message); else { pass(`pipeline ${name}`); pipelines[name] = value; }
+  }
+  if (failures) return done();
+
+  // 3. Rendering checks on a 64 x 64 target.
+  const size = 64;
+  const white2d = device.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  device.queue.writeTexture({ texture: white2d }, new Uint8Array([255, 255, 255, 255]), { bytesPerRow: 4 }, [1, 1]);
+  const whiteCube = device.createTexture({ size: [1, 1, 6], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  for (let face = 0; face < 6; face++)
+    device.queue.writeTexture({ texture: whiteCube, origin: [0, 0, face] }, new Uint8Array([128, 128, 128, 255]), { bytesPerRow: 4 }, [1, 1, 1]);
+  const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+  const uniformBuffer = (bytes) => { const b = device.createBuffer({ size: bytes.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); device.queue.writeBuffer(b, 0, bytes); return b; };
+
+  // MaterialUniforms (offsets as buildSlotRaw()).
+  const material = ({ color = [1, 1, 1, 1], unlit = 0, doubleSided = 0 } = {}) => {
+    const f = new Float32Array(512 / 4);
+    f.set(color, 0);
+    f[12] = 0; f[13] = 1; f[14] = 1;           // metallic, roughness, normalScale
+    f[17] = unlit; f[22] = doubleSided;        // unlit (68), doubleSided (88)
+    f[28] = 1.5; f[29] = 1;                    // ior, specularFactor
+    f.set([1, 1, 1, 0], 36);                   // specularColorFactor (144)
+    f[69] = 1; f[70] = 0;                      // environmentIntensity (276), iblEnabled (280)
+    return uniformBuffer(f);
+  };
+  const materialGroup = (ubo) => device.createBindGroup({ layout: materialLayout, entries: [
+    { binding: 0, resource: white2d.createView() }, { binding: 1, resource: sampler },
+    { binding: 2, resource: white2d.createView() }, { binding: 3, resource: sampler },
+    { binding: 4, resource: white2d.createView() }, { binding: 5, resource: sampler },
+    { binding: 6, resource: white2d.createView() }, { binding: 7, resource: sampler },
+    { binding: 8, resource: white2d.createView() }, { binding: 9, resource: sampler },
+    { binding: 24, resource: { buffer: ubo } }] });
+
+  const proj = perspective(60 * Math.PI / 180, 1, 0.1, 100);
+  const view = lookAtFromZ(3);
+  const camera = ({ planes = [], caps = 0, capColor = [1, 0, 0, 1] } = {}) => {
+    const buf = new ArrayBuffer(288);
+    const f = new Float32Array(buf), u = new Uint32Array(buf);
+    f.set([0, 0, 3, 1], 0); f.set(view, 4); f.set(proj, 20); f.set([size, size], 36);
+    u[40] = planes.length; u[41] = caps; f.set(capColor, 44);
+    planes.forEach((p, i) => f.set(p, 48 + i * 4));
+    return uniformBuffer(new Uint8Array(buf));
+  };
+  const lightsBuffer = (() => {
+    const buf = new ArrayBuffer(272); const f = new Float32Array(buf), u = new Uint32Array(buf);
+    u[0] = 1; f.set([0.3, 0.5, 1, 0], 4); f.set([1, 1, 1, 3], 8); return uniformBuffer(new Uint8Array(buf));
+  })();
+  const frameGroup = (cameraUbo) => device.createBindGroup({ layout: frameLayout, entries: [
+    { binding: 0, resource: { buffer: lightsBuffer } }, { binding: 1, resource: { buffer: cameraUbo } },
+    { binding: 2, resource: whiteCube.createView({ dimension: 'cube' }) }, { binding: 3, resource: sampler },
+    { binding: 4, resource: white2d.createView() }, { binding: 5, resource: sampler },
+    { binding: 6, resource: whiteCube.createView({ dimension: 'cube' }) },
+    { binding: 7, resource: white2d.createView() }, { binding: 8, resource: sampler }] });
+
+  const vbuf = (arr) => { const b = device.createBuffer({ size: arr.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST }); device.queue.writeBuffer(b, 0, arr); return b; };
+  const ibuf = (arr) => { const b = device.createBuffer({ size: Math.ceil(arr.byteLength / 4) * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST }); device.queue.writeBuffer(b, 0, arr); return b; };
+  // Two NodeTransforms: index 0 (unused, zero) and index 1, so firstInstance is exercised.
+  const transformsData = new Float32Array(64);
+  transformsData.set([...mul(proj, view), ...identity], 32);
+  const transformsBuffer = device.createBuffer({ size: transformsData.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(transformsBuffer, 0, transformsData);
+  const drawGroup = device.createBindGroup({ layout: drawLayout, entries: [{ binding: 0, resource: { buffer: transformsBuffer } }] });
+  const quadPositions = vbuf(new Float32Array([-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0]));
+  const quadFront = ibuf(new Uint32Array([0, 1, 2, 0, 2, 3]));
+  const quadBack = ibuf(new Uint32Array([0, 2, 1, 0, 3, 2]));
+  const linePositions = vbuf(new Float32Array([-0.5, 0, 0, 0.5, 0, 0]));
+  const lineIndices = ibuf(new Uint32Array([0, 1]));
+
+  async function render(draws, cameraUbo) {
+    const color = device.createTexture({ size: [size, size], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    const depth = device.createTexture({ size: [size, size], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT });
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginRenderPass({
+      colorAttachments: [{ view: color.createView(), clearValue: [0, 0, 0, 1], loadOp: 'clear', storeOp: 'store' }],
+      depthStencilAttachment: { view: depth.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'discard' } });
+    pass.setBindGroup(1, frameGroup(cameraUbo));
+    pass.setBindGroup(2, drawGroup);
+    for (const d of draws) {
+      pass.setPipeline(d.pipeline);
+      pass.setBindGroup(0, materialGroup(d.material));
+      pass.setVertexBuffer(0, d.positions);
+      pass.setIndexBuffer(d.indices, 'uint32');
+      pass.drawIndexed(d.count, 1, 0, 0, 1);  // firstInstance 1 = transforms[1]
+    }
+    pass.end();
+    const read = device.createBuffer({ size: size * size * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyTextureToBuffer({ texture: color }, { buffer: read, bytesPerRow: size * 4 }, [size, size]);
+    device.queue.submit([enc.finish()]);
+    await read.mapAsync(GPUMapMode.READ);
+    const px = new Uint8Array(read.getMappedRange().slice(0));
+    read.unmap();
+    return (x, y) => Array.from(px.slice((y * size + x) * 4, (y * size + x) * 4 + 3));
+  }
+  const lit = (c) => c[0] + c[1] + c[2] > 30;
+
+  // Lit lean quad (covers about pixels 23-41).
+  const grey = material({ color: [0.8, 0.8, 0.8, 1] });
+  let at = await render([{ pipeline: pipelines.lean, material: grey, positions: quadPositions, indices: quadFront, count: 6 }], camera());
+  lit(at(32, 32)) && !lit(at(5, 5)) ? pass('lean quad lit, background clear') : fail('lean quad', `centre ${at(32, 32)} corner ${at(5, 5)}`);
+
+  // Unlit green line on top of its coplanar face.
+  const green = material({ color: [0, 1, 0, 1], unlit: 1 });
+  at = await render([{ pipeline: pipelines.lean, material: grey, positions: quadPositions, indices: quadFront, count: 6 },
+                     { pipeline: pipelines.line, material: green, positions: linePositions, indices: lineIndices, count: 2 }], camera());
+  let greenCount = 0;
+  for (let x = 25; x <= 39; x++) { const c = at(x, 31), d = at(x, 32); if ((c[1] > 200 && c[0] < 60) || (d[1] > 200 && d[0] < 60)) greenCount++; }
+  greenCount === 15 ? pass('line drawn over its face') : fail('line over face', `${greenCount}/15 green pixels`);
+
+  // Clip plane keeping x >= 0.
+  at = await render([{ pipeline: pipelines.lean, material: grey, positions: quadPositions, indices: quadFront, count: 6 }], camera({ planes: [[1, 0, 0, 0]] }));
+  !lit(at(26, 32)) && lit(at(38, 32)) ? pass('clip plane discards one side') : fail('clip plane', `left ${at(26, 32)} right ${at(38, 32)}`);
+
+  // Section cap: back face of a single-sided material in the cap colour.
+  at = await render([{ pipeline: pipelines.leanDoubleSided, material: grey, positions: quadPositions, indices: quadBack, count: 6 }],
+                    camera({ planes: [[0, 0, 1, 10]], caps: 1, capColor: [1, 0, 0, 1] }));
+  const cap = at(32, 32);
+  cap[0] === 255 && cap[1] === 0 && cap[2] === 0 ? pass('section cap colour') : fail('section cap', `${cap}`);
+
+  // Full glTF layout through vs_main: normals facing +z, white vertex colour.
+  {
+    const n = vbuf(new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]));
+    const uv = vbuf(new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]));
+    const tangent = vbuf(new Float32Array([1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1]));
+    const color = vbuf(new Float32Array(Array(16).fill(1)));
+    const enc = device.createCommandEncoder();
+    const colorTex = device.createTexture({ size: [size, size], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    const depth = device.createTexture({ size: [size, size], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT });
+    const rp = enc.beginRenderPass({
+      colorAttachments: [{ view: colorTex.createView(), clearValue: [0, 0, 0, 1], loadOp: 'clear', storeOp: 'store' }],
+      depthStencilAttachment: { view: depth.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'discard' } });
+    rp.setBindGroup(1, frameGroup(camera()));
+    rp.setBindGroup(2, drawGroup);
+    rp.setIndexBuffer(quadFront, 'uint32');
+    const nearPositions = vbuf(new Float32Array([-0.5, -0.5, 0.1, 0.5, -0.5, 0.1, 0.5, 0.5, 0.1, -0.5, 0.5, 0.1]));
+    const bindStandard = (pipeline, mat, positions) => {
+      rp.setPipeline(pipeline);
+      rp.setBindGroup(0, materialGroup(mat));
+      [positions, n, uv, tangent, color, uv].forEach((b, slot) => rp.setVertexBuffer(slot, b));
+    };
+    bindStandard(pipelines.standard, grey, quadPositions);
+    rp.drawIndexed(6, 1, 0, 0, 1);
+    // A half-transparent blue (alphaMode BLEND = 2) quad over it.
+    const blendMat = (() => { const f = new Float32Array(512 / 4);
+      f.set([0, 0, 1, 0.5], 0); f[13] = 1; f[14] = 1; f[15] = 2; f[17] = 1; f[28] = 1.5; f[29] = 1; f.set([1, 1, 1, 0], 36); f[69] = 1;
+      return uniformBuffer(f); })();
+    bindStandard(pipelines.standardBlendDoubleSided, blendMat, nearPositions);  // 0.1 closer: passes 'less'
+    rp.drawIndexed(6, 1, 0, 0, 1);
+    rp.end();
+    const read = device.createBuffer({ size: size * size * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyTextureToBuffer({ texture: colorTex }, { buffer: read, bytesPerRow: size * 4 }, [size, size]);
+    device.queue.submit([enc.finish()]);
+    await read.mapAsync(GPUMapMode.READ);
+    const px = new Uint8Array(read.getMappedRange().slice(0)); read.unmap();
+    const c = Array.from(px.slice((32 * size + 32) * 4, (32 * size + 32) * 4 + 3));
+    // Grey lit underneath, unlit blue (0, 0, 255) at alpha 0.5 on top: blue
+    // dominates but the red/green of the grey still shows.
+    c[2] > c[0] + 40 && c[0] > 20 && c[0] < 200 ? pass('glTF layout + alpha blending') : fail('glTF layout + blend', `${c}`);
+  }
+
+  done();
+}
+
+main().catch((e) => { fail('exception', e.stack || e); done(); });
+</script>
+</body>
+</html>

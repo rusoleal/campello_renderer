@@ -24,7 +24,7 @@ else()
     FetchContent_Declare(
             extern_gltf
             GIT_REPOSITORY https://github.com/rusoleal/gltf
-            GIT_TAG        v0.5.1
+            GIT_TAG        v0.5.2
     )
 endif()
 

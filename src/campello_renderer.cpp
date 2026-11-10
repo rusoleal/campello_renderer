@@ -19,6 +19,7 @@
 #include <campello_gpu/descriptors/bind_group_descriptor.hpp>
 #include <campello_gpu/bind_group.hpp>
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <unordered_set>
@@ -29,6 +30,38 @@
 #include "shaders/vulkan_default.h"
 #elif defined(_WIN32)
 #include "shaders/directx_default.h"
+#elif defined(__EMSCRIPTEN__)
+#include "shaders/webgpu_default.h"
+#endif
+
+// Vulkan and WebGPU share a binding model (bind groups/sets of numbered
+// bindings, separate texture and sampler entries), so the web build takes
+// the Vulkan code paths for bind groups; createDefaultPipelines() and
+// registerProgram() have WebGPU branches for the shaders (WGSL).
+#if defined(ANDROID) || defined(__linux__) || defined(__EMSCRIPTEN__)
+#define CAMPELLO_RENDERER_VK_BINDINGS 1
+#else
+#define CAMPELLO_RENDERER_VK_BINDINGS 0
+#endif
+
+// Per-draw transform buffers: vertex buffers everywhere, also storage
+// buffers on WebGPU (read through group 2 there, see bindWebGpuTransforms()).
+#if defined(__EMSCRIPTEN__)
+static constexpr auto kTransformBufferUsage = static_cast<systems::leal::campello_gpu::BufferUsage>(
+    static_cast<uint32_t>(systems::leal::campello_gpu::BufferUsage::vertex) |
+    static_cast<uint32_t>(systems::leal::campello_gpu::BufferUsage::storage));
+#else
+static constexpr auto kTransformBufferUsage = systems::leal::campello_gpu::BufferUsage::vertex;
+#endif
+
+#if defined(__EMSCRIPTEN__)
+// WebGPU allows 16 sampled textures per shader stage; the PBR fragment
+// shader (shaders/webgpu/default.wgsl) keeps the glTF core textures
+// (bindings 0-9) and drops the KHR extension textures (10-23), so material
+// bind groups built for the Vulkan layout lose those entries here.
+static void trimWebGpuMaterialEntries(systems::leal::campello_gpu::BindGroupDescriptor& desc) {
+    std::erase_if(desc.entries, [](const auto& entry) { return entry.binding >= 10 && entry.binding <= 23; });
+}
 #endif
 
 #include "environments/default_environment.h"
@@ -580,6 +613,10 @@ static void buildMaterialSlotFromGltf(const systems::leal::gltf::Material& mat,
                  viewModeValue,
                  environmentIntensityValue, iblEnabledValue,
                  out);
+    // Offset 88 (_padding / _pad0 in the shaders): double-sided flag, so
+    // section caps (clip planes) only paint back faces of closed, single-
+    // sided surfaces.
+    out[22] = mat.doubleSided ? 1.f : 0.f;
 }
 
 // ---------------------------------------------------------------------------
@@ -751,7 +788,8 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         materialBindGroups.clear();
         flatMaterialBindGroups.clear();
         defaultFlatBindGroup = nullptr;
-        quantizedPipelines.clear();
+        quantizedLayout.reset();
+        quantizedLayoutDetected = false;
         dracoPrimitiveBuffers.clear();
         deinterleavedBuffers.clear();
         widenedIndexBuffers.clear();
@@ -1120,7 +1158,11 @@ void Renderer::ensureBindGroupLayout() {
 // CameraUniforms buffers on Vulkan).
 void Renderer::ensureVulkanPbrBindGroupLayouts() {
     namespace GPU = systems::leal::campello_gpu;
-    if (vulkanMaterialBindGroupLayout && vulkanFrameBindGroupLayout) return;
+    if (vulkanMaterialBindGroupLayout && vulkanFrameBindGroupLayout
+#if defined(__EMSCRIPTEN__)
+        && webgpuDrawBindGroupLayout
+#endif
+    ) return;
 
     auto addTex = [](GPU::BindGroupLayoutDescriptor &desc, uint32_t binding,
                       GPU::TextureType dim = GPU::TextureType::tt2d) {
@@ -1160,6 +1202,7 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
         addTex(matDesc, 4);  addSamp(matDesc, 5);   // normal
         addTex(matDesc, 6);  addSamp(matDesc, 7);   // emissive
         addTex(matDesc, 8);  addSamp(matDesc, 9);   // occlusion
+#if !defined(__EMSCRIPTEN__)  // WebGPU: core textures only (trimWebGpuMaterialEntries())
         addTex(matDesc, 10); addSamp(matDesc, 11);  // specular
         addTex(matDesc, 12); addSamp(matDesc, 13);  // specularColor
         addTex(matDesc, 14);                        // sheenColor (reuses sampler 1)
@@ -1172,6 +1215,7 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
         addTex(matDesc, 21);                        // iridescence (reuses sampler 1)
         addTex(matDesc, 22);                        // iridescenceThickness (reuses sampler 1)
         addTex(matDesc, 23);                        // anisotropic (reuses sampler 1)
+#endif
         // Struct is 372 bytes (see buildSlotRaw()); bind the full 512-byte
         // per-slot stride so std140's block-size rounding (and Vulkan's
         // range-must-cover-declared-size requirement) never comes up short —
@@ -1184,7 +1228,7 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
     if (!vulkanFrameBindGroupLayout) {
         GPU::BindGroupLayoutDescriptor frameDesc{};
         addBuf(frameDesc, 0, 272);                          // LightsUniform
-        addBuf(frameDesc, 1, 160);                          // CameraUniforms
+        addBuf(frameDesc, 1, kCameraUniformSize);           // CameraUniforms + clip planes
         addTex(frameDesc, 2, GPU::TextureType::ttCube);     // environmentMap (prefiltered specular — see bakeIblResources())
         addSamp(frameDesc, 3);                              // environmentSampler
         addTex(frameDesc, 4);                               // sceneColorTexture
@@ -1194,6 +1238,22 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
         addSamp(frameDesc, 8);                              // brdfLutSampler (reuses fxaaSampler, clamp-to-edge)
         vulkanFrameBindGroupLayout = device->createBindGroupLayout(frameDesc);
     }
+#if defined(__EMSCRIPTEN__)
+    // --- Group 2 (WebGPU): per-draw transforms, read-only storage buffer
+    // read by the vertex stage (bindWebGpuTransforms()) ---
+    if (!webgpuDrawBindGroupLayout) {
+        GPU::BindGroupLayoutDescriptor drawDesc{};
+        GPU::EntryObject e{};
+        e.binding    = 0;
+        e.visibility = GPU::ShaderStage::vertex;
+        e.type       = GPU::EntryObjectType::buffer;
+        e.data.buffer.hasDinamicOffaset = false;
+        e.data.buffer.minBindingSize    = 128;
+        e.data.buffer.type              = GPU::EntryObjectBufferType::readOnlyStorage;
+        drawDesc.entries.push_back(e);
+        webgpuDrawBindGroupLayout = device->createBindGroupLayout(drawDesc);
+    }
+#endif
 }
 
 // DirectX-only: a single combined bind group layout carrying every per-material AND
@@ -1373,7 +1433,7 @@ void Renderer::rebuildDirectXCombinedBindGroups(uint32_t frameIndex,
 void Renderer::bakeIblResources() {
 #if defined(ANDROID) || defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
     namespace GPU = systems::leal::campello_gpu;
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
     if (!device || !environmentMap || !environmentSampler || !pipelineIblBake ||
         !iblBakeBindGroupLayout || !vulkanIblBakePipelineLayout) {
         return;
@@ -2000,7 +2060,7 @@ void Renderer::setScene(uint32_t index) {
         visibleNodeMask.assign(nodeCount, 0);
         using BU = systems::leal::campello_gpu::BufferUsage;
         for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
-            frameResources[f].transformBuffer = device->createBuffer(nodeCount * 128, BU::vertex);
+            frameResources[f].transformBuffer = device->createBuffer(nodeCount * 128, kTransformBufferUsage);
         }
         transformBuffer = frameResources[0].transformBuffer;
     }
@@ -2267,10 +2327,11 @@ void Renderer::setScene(uint32_t index) {
             frameResources[f].lightsUniformBuffer->upload(0, 272, zeros);
         }
         if (!frameResources[f].cameraPositionBuffer) {
-            frameResources[f].cameraPositionBuffer = device->createBuffer(160, GPU::BufferUsage::uniform);
+            frameResources[f].cameraPositionBuffer = device->createBuffer(kCameraUniformSize, GPU::BufferUsage::uniform);
             float defaultCam[40] = {0.f};
             defaultCam[2] = 3.f;
             frameResources[f].cameraPositionBuffer->upload(0, 160, defaultCam);
+            uploadClipUniforms(frameResources[f].cameraPositionBuffer);
         }
         if (!frameResources[f].fence) {
             frameResources[f].fence = device->createFence();
@@ -2289,9 +2350,10 @@ void Renderer::setScene(uint32_t index) {
         // (see ensureVulkanPbrBindGroupLayouts()) — Metal ignores usage flags entirely.
         materialUniformBuffer = device->createBuffer(bufSize,
             (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::vertex) | uint32_t(GPU::BufferUsage::uniform)));
+        materialUniformShadow.clear();
     }
 
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
     ensureVulkanPbrBindGroupLayouts();
     if (!defaultBindGroup && vulkanMaterialBindGroupLayout && defaultTexture && defaultSampler &&
         defaultMetallicRoughnessTexture && defaultNormalTexture &&
@@ -2323,6 +2385,9 @@ void Renderer::setScene(uint32_t index) {
             {23, defaultTexture}, // anisotropic
             {24, GPU::BufferBinding{materialUniformBuffer, 0, kMaterialUniformStride}},
         };
+#if defined(__EMSCRIPTEN__)
+        trimWebGpuMaterialEntries(bgDesc);
+#endif
         defaultBindGroup = device->createBindGroup(bgDesc, /*persistent=*/true);
         // No separate flat shader on Vulkan (pipelineFlat aliases pipelineTextured) —
         // reuse the same fully-populated bind group for both.
@@ -2435,7 +2500,7 @@ void Renderer::setScene(uint32_t index) {
     // Per-frame bind groups for lights, camera matrices, environment map,
     // and screen-space refraction source.
     for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
         ensureVulkanPbrBindGroupLayouts();
         if (!frameBindGroup[f] && vulkanFrameBindGroupLayout &&
             frameResources[f].lightsUniformBuffer &&
@@ -2445,7 +2510,7 @@ void Renderer::setScene(uint32_t index) {
             bgDesc.layout  = vulkanFrameBindGroupLayout;
             bgDesc.entries = {
                 {0, GPU::BufferBinding{frameResources[f].lightsUniformBuffer, 0, 272}},
-                {1, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, 160}},
+                {1, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, kCameraUniformSize}},
                 {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
                 {3, environmentSampler},
                 {4, defaultTexture},
@@ -2470,7 +2535,7 @@ void Renderer::setScene(uint32_t index) {
             bgDesc.layout  = bindGroupLayout;
             bgDesc.entries = {
                 {10, GPU::BufferBinding{frameResources[f].lightsUniformBuffer, 0, 272}},
-                {18, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, 160}},
+                {18, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, kCameraUniformSize}},
                 {22, defaultTexture},
             };
             frameBindGroup[f] = device->createBindGroup(bgDesc);
@@ -2744,7 +2809,7 @@ void Renderer::setScene(uint32_t index) {
 
             // Create bind group with all textures and static material buffer.
             // Lights (10) and camera (18) are bound separately via frameBindGroup.
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
             ensureVulkanPbrBindGroupLayouts();
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout  = vulkanMaterialBindGroupLayout;
@@ -2770,6 +2835,9 @@ void Renderer::setScene(uint32_t index) {
                                         (uint64_t)(m + 1) * kMaterialUniformStride,
                                         kMaterialUniformStride}},
             };
+#if defined(__EMSCRIPTEN__)
+            trimWebGpuMaterialEntries(bgDesc);
+#endif
             materialBindGroups[m] = device->createBindGroup(bgDesc, /*persistent=*/true);
             // No separate flat shader on Vulkan — reuse the same bind group.
             flatMaterialBindGroups[m] = materialBindGroups[m];
@@ -3248,7 +3316,8 @@ void Renderer::setScene(uint32_t index) {
                 createDefaultPipelines(cachedColorFormat);
             }
             // Clear quantized pipelines so they get recreated with the new types.
-            quantizedPipelines.clear();
+            quantizedLayout.reset();
+        quantizedLayoutDetected = false;
         }
     }
 
@@ -3256,7 +3325,7 @@ void Renderer::setScene(uint32_t index) {
     stopAllAnimations();
 
     // Create quantized pipeline variants if this asset uses KHR_mesh_quantization.
-    createQuantizedPipelinesIfNeeded();
+    detectQuantizedLayout();
 
     // Populate engine-native caches for the new RenderScene API.
     if (asset->materials) {
@@ -3277,15 +3346,16 @@ void Renderer::setScene(uint32_t index) {
 // Pipeline / resize
 // ---------------------------------------------------------------------------
 
-void Renderer::createQuantizedPipelinesIfNeeded() {
+void Renderer::detectQuantizedLayout() {
     namespace GPU = systems::leal::campello_gpu;
 
-    if (!quantizedPipelines.empty()) return;
+    if (quantizedLayoutDetected) return;
     if (!asset || !asset->meshes || !asset->accessors) return;
-    if (cachedColorFormat == GPU::PixelFormat::invalid) return;
+    quantizedLayoutDetected = true;
 
-    // Scan the scene to find the first non-float accessor and determine
-    // which component types are used for each semantic.
+#if defined(__APPLE__)
+    // Scan the scene for non-float accessors and note the component type of
+    // each semantic (scene-wide, as before: one quantized layout per scene).
     GPU::ComponentType posType = GPU::ComponentType::ctFloat;
     GPU::ComponentType normType = GPU::ComponentType::ctFloat;
     GPU::ComponentType texType = GPU::ComponentType::ctFloat;
@@ -3315,226 +3385,338 @@ void Renderer::createQuantizedPipelinesIfNeeded() {
 
     if (!hasQuantized) return;
 
-#if defined(__APPLE__)
-    using namespace systems::leal::campello_renderer::shaders;
-    auto shaderModule = device->createShaderModule(kDefaultMetalShader, kDefaultMetalShaderSize);
-    if (!shaderModule) return;
-
-    auto makeLayout = [](GPU::ComponentType ct, GPU::AccessorType at,
-                         double stride, GPU::StepMode sm, uint32_t location,
-                         bool normalized) {
-        GPU::VertexLayout layout{};
-        layout.arrayStride = stride;
-        layout.stepMode    = sm;
-        GPU::VertexAttribute attr{};
-        attr.componentType  = ct;
-        attr.accessorType   = at;
-        attr.offset         = 0;
-        attr.shaderLocation = location;
-        attr.normalized     = normalized;
-        layout.attributes.push_back(attr);
-        return layout;
+    // Integer types are normalized for KHR_mesh_quantization (the vertex
+    // fetch converts them to float; strides are padded to 4 bytes).
+    const auto normalized = [](GPU::ComponentType ct) {
+        return ct != GPU::ComponentType::ctFloat && ct != GPU::ComponentType::ctUnsignedInt;
     };
-
-    // Strides depend on component size, padded to 4-byte boundary for Metal.
-    auto compSize = [](GPU::ComponentType ct) -> double {
-        switch (ct) {
-            case GPU::ComponentType::ctByte: return 1;
-            case GPU::ComponentType::ctUnsignedByte: return 1;
-            case GPU::ComponentType::ctShort: return 2;
-            case GPU::ComponentType::ctUnsignedShort: return 2;
-            case GPU::ComponentType::ctUnsignedInt: return 4;
-            case GPU::ComponentType::ctFloat: return 4;
+    VertexLayout layout = standardLayout;
+    for (auto &a : layout.attributes) {
+        GPU::ComponentType ct = GPU::ComponentType::ctFloat;
+        switch (a.semantic) {
+            case VertexSemantic::position:  ct = posType; break;
+            case VertexSemantic::normal:    ct = normType; break;
+            case VertexSemantic::texcoord0: ct = texType; break;
+            case VertexSemantic::tangent:   ct = tanType; break;
+            default: continue;
         }
-        return 4;
+        a.componentType = ct;
+        a.normalized    = normalized(ct);
+    }
+    quantizedLayout = layout;
+#endif
+}
+
+const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines) const {
+    if (program >= programs.size()) return nullptr;
+    // The stage that reads the most attributes among those reading only
+    // attributes the layout has (the full shader for glTF meshes, the lean
+    // one for position-only meshes). Ties: the first listed.
+    const uint32_t has = layout.semanticMask();
+    const MeshVertexStage* best = nullptr;
+    for (const auto& stage : programs[program].vertexStages) {
+        if (stage.lines != lines) continue;
+        if ((stage.readMask & ~has) != 0) continue;
+        if (!best || std::popcount(stage.readMask) > std::popcount(best->readMask)) best = &stage;
+    }
+    return best;
+}
+
+const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
+    ProgramHandle programHandle, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
+    systems::leal::campello_gpu::PixelFormat colorFormat, systems::leal::campello_gpu::PrimitiveTopology topology) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!meshRecipe.ready || !device || programHandle >= programs.size()) return nullptr;
+    const ProgramState& program = programs[programHandle];
+    // Normalise to what this program/backend distinguishes, so equivalent
+    // requests share one pipeline (Vulkan/DirectX PBR: one fragment shader,
+    // no blending; app programs: one fragment shader).
+    if (program.fragmentEntries[(size_t)variant].empty()) variant = MeshProgram::textured;
+    if (program.fragmentEntries[(size_t)variant].empty()) return nullptr;
+    if (!meshRecipe.supportsBlend || !program.supportsBlend) blend = false;
+    if (colorFormat == GPU::PixelFormat::invalid) colorFormat = meshRecipe.colorTarget.format;
+    const bool lines = topology != GPU::PrimitiveTopology::triangleList &&
+                       topology != GPU::PrimitiveTopology::triangleStrip;
+    if (lines) doubleSided = true;  // no faces to cull
+    const MeshVertexStage* stage = vertexStageFor(programHandle, layout, lines);
+    if (!stage) return nullptr;
+
+    // Only the attributes the stage reads shape the pipeline.
+    VertexLayout read;
+    for (const auto& a : layout.attributes) {
+        if (stage->readMask & semanticBit(a.semantic)) read.attributes.push_back(a);
+    }
+    uint64_t key = read.hash();
+    const auto mix = [&key](uint64_t v) {
+        key ^= v + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
     };
-    auto paddedStride = [&](double raw) -> double {
-        uint32_t u = static_cast<uint32_t>(raw);
-        return static_cast<double>((u + 3) & ~uint32_t(3));
-    };
+    mix((uint64_t)(stage - program.vertexStages.data()));
+    mix((uint64_t)programHandle);
+    mix((uint64_t)variant);
+    mix((uint64_t)colorFormat);
+    mix((uint64_t)topology);
+    mix(doubleSided ? 1u : 0u);
+    mix(blend ? 1u : 0u);
+    if (auto it = meshPipelineCache.find(key); it != meshPipelineCache.end()) {
+        return it->second.pipeline ? &it->second : nullptr;
+    }
 
-    // Only integer types are normalized for KHR_mesh_quantization.
-    bool posNorm = (posType != GPU::ComponentType::ctFloat && posType != GPU::ComponentType::ctUnsignedInt);
-    bool normNorm = (normType != GPU::ComponentType::ctFloat && normType != GPU::ComponentType::ctUnsignedInt);
-    bool texNorm = (texType != GPU::ComponentType::ctFloat && texType != GPU::ComponentType::ctUnsignedInt);
-    bool tanNorm = (tanType != GPU::ComponentType::ctFloat && tanType != GPU::ComponentType::ctUnsignedInt);
+    GPU::RenderPipelineDescriptor d = meshRecipe.base;
+    d.vertex.module     = stage->module;
+    d.vertex.entryPoint = stage->entryPoint;
+    // Compact vertex buffer slots: the attributes the stage reads, in
+    // semantic order (shader locations stay the semantic), then the per-draw
+    // buffers. The entry's slot map tells renderPrimitive() where each
+    // logical slot (VERTEX_SLOT_*) goes.
+    MeshPipelineEntry entry;
+    entry.slots.fill(-1);
+    d.vertex.buffers.clear();
+    for (const auto& a : read.attributes) {
+        GPU::VertexLayout buffer{};
+        buffer.arrayStride = (double)a.stride();
+        buffer.stepMode    = GPU::StepMode::vertex;
+        GPU::VertexAttribute attr{};
+        attr.componentType  = a.componentType;
+        attr.accessorType   = a.accessorType;
+        attr.offset         = 0;
+        attr.shaderLocation = (uint32_t)a.semantic;
+        attr.normalized     = a.normalized;
+        buffer.attributes.push_back(attr);
+        entry.slots[(size_t)a.semantic] = (int8_t)d.vertex.buffers.size();
+        d.vertex.buffers.push_back(buffer);
+    }
+    for (const auto& [logical, buffer] : meshRecipe.perDrawBuffers) {
+        entry.slots[logical] = (int8_t)d.vertex.buffers.size();
+        d.vertex.buffers.push_back(buffer);
+    }
+    if (meshRecipe.rawBufferSlots) {
+        for (size_t logical = kVertexSemanticCount; logical < kLogicalSlotCount; ++logical) {
+            if (entry.slots[logical] < 0) entry.slots[logical] = (int8_t)logical;
+        }
+    }
 
-    GPU::RenderPipelineDescriptor base{};
-    base.vertex.module     = shaderModule;
-    base.vertex.entryPoint = "vertexMain";
-    base.vertex.buffers.push_back(makeLayout(
-        posType, GPU::AccessorType::acVec3,
-        paddedStride(3.0 * compSize(posType)), GPU::StepMode::vertex, VERTEX_SLOT_POSITION, posNorm));
-    base.vertex.buffers.push_back(makeLayout(
-        normType, GPU::AccessorType::acVec3,
-        paddedStride(3.0 * compSize(normType)), GPU::StepMode::vertex, VERTEX_SLOT_NORMAL, normNorm));
-    base.vertex.buffers.push_back(makeLayout(
-        texType, GPU::AccessorType::acVec2,
-        paddedStride(2.0 * compSize(texType)), GPU::StepMode::vertex, VERTEX_SLOT_TEXCOORD0, texNorm));
-    base.vertex.buffers.push_back(makeLayout(
-        tanType, GPU::AccessorType::acVec4,
-        paddedStride(4.0 * compSize(tanType)), GPU::StepMode::vertex, VERTEX_SLOT_TANGENT, tanNorm));
-    // JOINTS_0 / WEIGHTS_0 for skinning — use detected component types.
-    double qJointsStride = (jointsComponentType == GPU::ComponentType::ctUnsignedShort) ? 8.0 : 4.0;
-    base.vertex.buffers.push_back(makeLayout(
-        jointsComponentType, GPU::AccessorType::acVec4,
-        qJointsStride, GPU::StepMode::vertex, VERTEX_SLOT_JOINTS, false));
-    double qWeightsStride = (weightsComponentType == GPU::ComponentType::ctFloat) ? 16.0 :
-                            (weightsComponentType == GPU::ComponentType::ctUnsignedShort) ? 8.0 : 4.0;
-    base.vertex.buffers.push_back(makeLayout(
-        weightsComponentType, GPU::AccessorType::acVec4,
-        qWeightsStride, GPU::StepMode::vertex, VERTEX_SLOT_WEIGHTS, weightsNormalized));
-    // COLOR_0 (normalized to float4 on upload — see color0Buffers) / TEXCOORD_1 (float2).
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec4,
-        16.0, GPU::StepMode::vertex, VERTEX_SLOT_COLOR0, false));
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec2,
-        8.0, GPU::StepMode::vertex, VERTEX_SLOT_TEXCOORD1, false));
+    d.cullMode = doubleSided ? GPU::CullMode::none : GPU::CullMode::back;
+    d.topology = topology;
+    GPU::ColorState color = meshRecipe.colorTarget;
+    color.format = colorFormat;
+    if (blend) {
+        color.blend = meshRecipe.alphaBlend;
+        d.depthStencil = meshRecipe.blendDepthStencil;
+    }
+    GPU::FragmentDescriptor frag{};
+    frag.module     = program.fragmentModule;
+    frag.entryPoint = program.fragmentEntries[(size_t)variant];
+    frag.targets.push_back(color);
+    d.fragment = frag;
 
-    GPU::DepthStencilDescriptor ds{};
-    ds.format              = GPU::PixelFormat::depth32float;
-    ds.depthWriteEnabled   = true;
-    ds.depthCompare        = GPU::CompareOp::less;
-    ds.depthBias           = 0.0;
-    ds.depthBiasClamp      = 0.0;
-    ds.depthBiasSlopeScale = 0.0;
-    ds.stencilReadMask     = 0xFFFFFFFF;
-    ds.stencilWriteMask    = 0xFFFFFFFF;
-    base.depthStencil      = ds;
+    entry.pipeline = device->createRenderPipeline(d);
+    // A failed creation (null pipeline) is cached too, so it isn't retried every draw.
+    auto& stored = meshPipelineCache[key] = entry;
+    return stored.pipeline ? &stored : nullptr;
+}
 
-    base.topology  = GPU::PrimitiveTopology::triangleList;
-    base.cullMode  = GPU::CullMode::back;
-    base.frontFace = GPU::FrontFace::ccw;
-
-    GPU::ColorState cs{};
-    cs.format    = cachedColorFormat;
-    cs.writeMask = GPU::ColorWrite::all;
-
-    // Helper to create a variant and store it in the map.
-    auto storeVariant = [&](int variant, const GPU::RenderPipelineDescriptor &d) {
-        auto pipe = device->createRenderPipeline(d);
-        if (pipe) quantizedPipelines[variant] = pipe;
-    };
-
-    // Variant 1: flat
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_flat";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        storeVariant(1, d);
-    }
-    // Variant 2: textured
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_textured";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        storeVariant(2, d);
-    }
-    // Variant 3: debug
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_debug";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        storeVariant(3, d);
-    }
-    // Variant 4: flat double-sided
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.cullMode = GPU::CullMode::none;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_flat";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        storeVariant(4, d);
-    }
-    // Variant 5: textured double-sided
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.cullMode = GPU::CullMode::none;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_textured";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        storeVariant(5, d);
-    }
-    // Blend state
-    GPU::BlendState alphaBlend{};
-    alphaBlend.color = { GPU::BlendFactor::srcAlpha, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
-    alphaBlend.alpha = { GPU::BlendFactor::one, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
-    GPU::DepthStencilDescriptor blendDs = ds;
-    blendDs.depthWriteEnabled = false;
-    // Variant 6: flat blend
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.depthStencil = blendDs;
-        GPU::ColorState blendCs = cs;
-        blendCs.blend = alphaBlend;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_flat";
-        frag.targets.push_back(blendCs);
-        d.fragment = frag;
-        storeVariant(6, d);
-    }
-    // Variant 7: textured blend
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.depthStencil = blendDs;
-        GPU::ColorState blendCs = cs;
-        blendCs.blend = alphaBlend;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_textured";
-        frag.targets.push_back(blendCs);
-        d.fragment = frag;
-        storeVariant(7, d);
-    }
-    // Variant 8: flat blend double-sided
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.cullMode = GPU::CullMode::none;
-        d.depthStencil = blendDs;
-        GPU::ColorState blendCs = cs;
-        blendCs.blend = alphaBlend;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_flat";
-        frag.targets.push_back(blendCs);
-        d.fragment = frag;
-        storeVariant(8, d);
-    }
-    // Variant 9: textured blend double-sided
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.cullMode = GPU::CullMode::none;
-        d.depthStencil = blendDs;
-        GPU::ColorState blendCs = cs;
-        blendCs.blend = alphaBlend;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_textured";
-        frag.targets.push_back(blendCs);
-        d.fragment = frag;
-        storeVariant(9, d);
+void Renderer::bindMeshBuffer(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+                              uint32_t logicalSlot,
+                              const std::shared_ptr<systems::leal::campello_gpu::Buffer> &buffer,
+                              uint64_t offset) {
+#if defined(__EMSCRIPTEN__)
+    // WebGPU: the transforms are a storage buffer (group 2), indexed by the
+    // draw's firstInstance, not a vertex buffer (locations 16+ don't exist).
+    if (logicalSlot == VERTEX_SLOT_MVP) {
+        bindWebGpuTransforms(rpe, buffer, offset);
+        return;
     }
 #endif
+    uint32_t slot = logicalSlot;
+    if (activeMeshSlots) {
+        if (logicalSlot >= activeMeshSlots->size()) return;
+        const int8_t physical = (*activeMeshSlots)[logicalSlot];
+        if (physical < 0) return;  // not read by the bound pipeline
+        slot = (uint32_t)physical;
+    }
+    setVertexBufferIfChanged(rpe, slot, buffer, offset);
+    // Metal: the transforms are also the built-in shaders' [[buffer(16)]].
+    if (logicalSlot == VERTEX_SLOT_MVP && meshRecipe.rawBufferSlots && slot != VERTEX_SLOT_MVP) {
+        setVertexBufferIfChanged(rpe, VERTEX_SLOT_MVP, buffer, offset);
+    }
+}
+
+#if defined(__EMSCRIPTEN__)
+void Renderer::bindWebGpuTransforms(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+                                    const std::shared_ptr<systems::leal::campello_gpu::Buffer> &buffer,
+                                    uint64_t offset) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!buffer || !webgpuDrawBindGroupLayout) return;
+    auto& group = webgpuDrawBindGroups[buffer.get()];
+    if (!group) {
+        // Transform buffers are reallocated when they grow; drop groups of
+        // buffers that no longer exist so the map stays small.
+        if (webgpuDrawBindGroups.size() > 8) {
+            webgpuDrawBindGroups.clear();
+            webgpuBoundDrawGroup = nullptr;
+        }
+        GPU::BindGroupDescriptor desc{};
+        desc.layout = webgpuDrawBindGroupLayout;
+        desc.entries = {{0, GPU::BufferBinding{buffer, 0, buffer->getLength()}}};
+        group = webgpuDrawBindGroups[buffer.get()] = device->createBindGroup(desc, /*persistent=*/true);
+    }
+    if (group && group.get() != webgpuBoundDrawGroup) {
+        rpe->setBindGroup(2, group);
+        webgpuBoundDrawGroup = group.get();
+    }
+    webgpuFirstInstance = (uint32_t)(offset / 128);  // sizeof(NodeTransforms)
+}
+#endif
+
+void Renderer::prewarmMeshPipelines() {
+    // The combinations the built-in draw paths use, created now rather than
+    // on the first frame that needs them.
+    for (const MeshProgram program : {MeshProgram::flat, MeshProgram::textured}) {
+        for (const bool doubleSided : {false, true}) {
+            for (const bool blend : {false, true}) {
+                meshPipeline(program, standardLayout, doubleSided, blend);
+            }
+        }
+    }
+    meshPipeline(MeshProgram::debug, standardLayout, false, false);
+    if (vertexStageFor(kPbrProgram, VertexLayout::positionOnly())) {
+        for (const bool doubleSided : {false, true}) {
+            for (const bool blend : {false, true}) {
+                meshPipeline(MeshProgram::textured, VertexLayout::positionOnly(), doubleSided, blend);
+            }
+        }
+    }
+}
+
+void Renderer::setClipPlanes(const std::vector<std::array<double, 4>>& planes) {
+    clipPlanes.clear();
+    for (const auto& p : planes) {
+        if (clipPlanes.size() == kMaxClipPlanes) break;
+        const double length = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+        if (length <= 0.0) continue;
+        clipPlanes.push_back({p[0] / length, p[1] / length, p[2] / length, p[3] / length});
+    }
+}
+
+void Renderer::setSectionCaps(bool enabled, float r, float g, float b) {
+    sectionCapsEnabled = enabled;
+    sectionCapColor = {r, g, b, 1.0f};
+}
+
+bool Renderer::supportsClipPlanes() const {
+#if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
+    return false;  // default.hlsl doesn't read the clip block yet
+#else
+    return meshRecipe.ready;
+#endif
+}
+
+void Renderer::uploadClipUniforms(const std::shared_ptr<systems::leal::campello_gpu::Buffer>& buffer) const {
+    // Layout after the 160-byte camera block (CameraUniforms in the shaders):
+    // uint4 clipInfo (x = plane count, y = caps on), float4 capColor,
+    // float4 clipPlanes[6] (xyz = unit normal, w = d; kept where n.p + d >= 0).
+    if (!buffer) return;
+    struct {
+        uint32_t info[4];
+        float capColor[4];
+        float planes[kMaxClipPlanes][4];
+    } block{};
+    const bool active = clippingActive();
+    block.info[0] = active ? (uint32_t)clipPlanes.size() : 0u;
+    block.info[1] = active && sectionCapsEnabled ? 1u : 0u;
+    for (int c = 0; c < 4; ++c) block.capColor[c] = sectionCapColor[(size_t)c];
+    for (size_t i = 0; i < clipPlanes.size(); ++i) {
+        for (int c = 0; c < 4; ++c) block.planes[i][c] = (float)clipPlanes[i][(size_t)c];
+    }
+    static_assert(sizeof(block) == kCameraUniformSize - 160, "clip block size");
+    buffer->upload(160, sizeof(block), &block);
+}
+
+ProgramHandle Renderer::registerProgram(const ShaderProgramDesc& desc) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!device || !meshRecipe.ready) return kInvalidProgram;
+    const auto load = [&](const ShaderBinary& binary) -> std::shared_ptr<GPU::ShaderModule> {
+        if (binary.empty()) return nullptr;
+        return device->createShaderModule(static_cast<const uint8_t*>(binary.data), binary.size);
+    };
+    ProgramState program;
+    program.name = desc.name;
+    program.supportsBlend = desc.blending;
+#if defined(__APPLE__)
+    auto library = load(desc.metalLibrary);
+    if (!library) return kInvalidProgram;
+    program.vertexStages.push_back({desc.vertexReads, library, desc.metalVertexEntryPoint});
+    program.fragmentModule = library;
+    program.fragmentEntries[(size_t)MeshProgram::textured] = desc.metalFragmentEntryPoint;
+#elif defined(__EMSCRIPTEN__)
+    // WGSL: one module with both entry points (compiled by the browser).
+    if (desc.wgsl.empty()) return kInvalidProgram;
+    auto module = device->createShaderModule(desc.wgsl.c_str());
+    if (!module) return kInvalidProgram;
+    program.vertexStages.push_back({desc.vertexReads, module, desc.wgslVertexEntryPoint});
+    program.fragmentModule = module;
+    program.fragmentEntries[(size_t)MeshProgram::textured] = desc.wgslFragmentEntryPoint;
+#elif CAMPELLO_RENDERER_VK_BINDINGS
+    auto vertex = load(desc.vulkanVertex);
+    auto fragment = load(desc.vulkanFragment);
+    if (!vertex || !fragment) return kInvalidProgram;
+    program.vertexStages.push_back({desc.vertexReads, vertex, desc.vulkanVertexEntryPoint});
+    program.fragmentModule = fragment;
+    program.fragmentEntries[(size_t)MeshProgram::textured] = desc.vulkanFragmentEntryPoint;
+#elif defined(_WIN32)
+    auto vertex = load(desc.directxVertex);
+    auto fragment = load(desc.directxFragment);
+    if (!vertex || !fragment) return kInvalidProgram;
+    program.vertexStages.push_back({desc.vertexReads, vertex, desc.directxVertexEntryPoint});
+    program.fragmentModule = fragment;
+    program.fragmentEntries[(size_t)MeshProgram::textured] = desc.directxFragmentEntryPoint;
+#else
+    (void)load;
+    return kInvalidProgram;  // no WebGPU mesh path yet (programmable pipelines phase 7)
+#endif
+    programs.push_back(std::move(program));
+    return (ProgramHandle)(programs.size() - 1);
+}
+
+void Renderer::renderProgramPass(const RenderScene& scene,
+                                 std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView,
+                                 const ProgramPassOptions& options) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!colorView || !device || options.program >= programs.size()) return;
+    const uint32_t w = std::max(1u, renderWidth);
+    const uint32_t h = std::max(1u, renderHeight);
+    if (!programPassDepthTexture || programPassDepthTexture->getWidth() != w ||
+        programPassDepthTexture->getHeight() != h) {
+        programPassDepthTexture = device->createTexture(
+            GPU::TextureType::tt2d, GPU::PixelFormat::depth32float, w, h, 1, 1, 1, GPU::TextureUsage::renderTarget);
+        programPassDepthView = programPassDepthTexture
+            ? programPassDepthTexture->createView(GPU::PixelFormat::depth32float, 1, GPU::Aspect::depthOnly,
+                                                  0, 0, GPU::TextureType::tt2d)
+            : nullptr;
+    }
+    activeProgramPass = &options;
+    render(scene, std::move(colorView));
+    activeProgramPass = nullptr;
 }
 
 void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat colorFormat) {
     namespace GPU = systems::leal::campello_gpu;
     cachedColorFormat = colorFormat;
+
+    // Mesh pipelines are rebuilt from a fresh recipe (this also runs again
+    // when setScene() detects other joint/weight formats).
+    meshRecipe = MeshPipelineRecipe{};
+    meshPipelineCache.clear();
+    // Program 0 (built-in PBR) is rebuilt below; app programs keep their
+    // shaders (their pipelines are rebuilt from the new recipe on use).
+    if (programs.empty()) programs.resize(1);
+    programs[kPbrProgram] = ProgramState{};
+    programs[kPbrProgram].name = "pbr";
+    currentPipelineVariant = 0;
+    currentPipelineObject = nullptr;
+    activeMeshSlots = nullptr;
+    webgpuBoundDrawGroup = nullptr;
+    standardLayout = VertexLayout::standard(jointsComponentType, weightsComponentType, weightsNormalized);
 
 #if defined(__APPLE__)
     using namespace systems::leal::campello_renderer::shaders;
@@ -3550,53 +3732,9 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     base.vertex.module     = shaderModule;
     base.vertex.entryPoint = "vertexMain";
 
-    // Slots 0–5: stage_in attributes. Slots 16/17 are raw [[buffer(N)]] in the
-    // shader and are not part of the vertex descriptor.
-    auto makeLayout = [](GPU::ComponentType ct, GPU::AccessorType at,
-                         double stride, GPU::StepMode sm, uint32_t location,
-                         bool normalized = false) {
-        GPU::VertexLayout layout{};
-        layout.arrayStride = stride;
-        layout.stepMode    = sm;
-        GPU::VertexAttribute attr{};
-        attr.componentType  = ct;
-        attr.accessorType   = at;
-        attr.offset         = 0;
-        attr.shaderLocation = location;
-        attr.normalized     = normalized;
-        layout.attributes.push_back(attr);
-        return layout;
-    };
-
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec3,
-        12.0, GPU::StepMode::vertex, VERTEX_SLOT_POSITION));
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec3,
-        12.0, GPU::StepMode::vertex, VERTEX_SLOT_NORMAL));
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec2,
-        8.0, GPU::StepMode::vertex, VERTEX_SLOT_TEXCOORD0));
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec4,
-        16.0, GPU::StepMode::vertex, VERTEX_SLOT_TANGENT));
-    // JOINTS_0 / WEIGHTS_0 — use detected component types (may be recreated in setScene()).
-    double jointsStride = (jointsComponentType == GPU::ComponentType::ctUnsignedShort) ? 8.0 : 4.0;
-    base.vertex.buffers.push_back(makeLayout(
-        jointsComponentType, GPU::AccessorType::acVec4,
-        jointsStride, GPU::StepMode::vertex, VERTEX_SLOT_JOINTS));
-    double weightsStride = (weightsComponentType == GPU::ComponentType::ctFloat) ? 16.0 :
-                           (weightsComponentType == GPU::ComponentType::ctUnsignedShort) ? 8.0 : 4.0;
-    base.vertex.buffers.push_back(makeLayout(
-        weightsComponentType, GPU::AccessorType::acVec4,
-        weightsStride, GPU::StepMode::vertex, VERTEX_SLOT_WEIGHTS, weightsNormalized));
-    // COLOR_0 (normalized to float4 on upload — see color0Buffers) / TEXCOORD_1 (float2).
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec4,
-        16.0, GPU::StepMode::vertex, VERTEX_SLOT_COLOR0));
-    base.vertex.buffers.push_back(makeLayout(
-        GPU::ComponentType::ctFloat, GPU::AccessorType::acVec2,
-        8.0, GPU::StepMode::vertex, VERTEX_SLOT_TEXCOORD1));
+    // Vertex buffers come from the mesh's VertexLayout (meshPipeline()).
+    // Slots 15-23 are raw [[buffer(N)]] arguments in the shader, not part
+    // of the vertex descriptor.
 
     GPU::DepthStencilDescriptor ds{};
     ds.format              = GPU::PixelFormat::depth32float;
@@ -3617,120 +3755,54 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     cs.format    = colorFormat;
     cs.writeMask = GPU::ColorWrite::all;
 
-    // --- Variant: flat (Phong + baseColorFactor, no texture) ---
+    // --- Mesh pipelines: the recipe meshPipeline() builds from ---
+    // Alpha blending: src * srcAlpha + dst * (1 - srcAlpha), without depth
+    // writes. Fragment variants: flat (no textures), textured (PBR), debug
+    // (normals). Vertex stages: vertexMain reads the full glTF layout,
+    // vertexLean only positions (flat normals derived in fragmentMain_textured).
     {
-        GPU::RenderPipelineDescriptor d = base;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_flat";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        pipelineFlat = device->createRenderPipeline(d);
-    }
+        GPU::BlendState alphaBlend{};
+        alphaBlend.color = { GPU::BlendFactor::srcAlpha, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
+        alphaBlend.alpha = { GPU::BlendFactor::one, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
+        GPU::DepthStencilDescriptor blendDs = ds;
+        blendDs.depthWriteEnabled = false;
 
-    // --- Variant: textured (Phong + baseColorTexture × baseColorFactor) ---
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_textured";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        pipelineTextured = device->createRenderPipeline(d);
-    }
-
-    // --- Variant: debug (flat normal visualization) ---
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_debug";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        pipelineDebug = device->createRenderPipeline(d);
-    }
-
-    // --- Double-sided variants (no back-face culling) ---
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.cullMode = GPU::CullMode::none;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_flat";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        pipelineFlatDoubleSided = device->createRenderPipeline(d);
-    }
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.cullMode = GPU::CullMode::none;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_textured";
-        frag.targets.push_back(cs);
-        d.fragment = frag;
-        pipelineTexturedDoubleSided = device->createRenderPipeline(d);
-    }
-
-    // --- Alpha-blend variants (transparency) ---
-    // Standard alpha blending: src * srcAlpha + dst * (1 - srcAlpha)
-    // Depth write disabled for transparent materials to avoid artifacts
-    GPU::BlendState alphaBlend{};
-    alphaBlend.color = { GPU::BlendFactor::srcAlpha, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
-    alphaBlend.alpha = { GPU::BlendFactor::one, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
-    
-    GPU::DepthStencilDescriptor blendDs = ds;
-    blendDs.depthWriteEnabled = false;  // Don't write depth for transparent objects
-    
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.depthStencil = blendDs;
-        GPU::ColorState blendCs = cs;
-        blendCs.blend = alphaBlend;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_flat";
-        frag.targets.push_back(blendCs);
-        d.fragment = frag;
-        pipelineFlatBlend = device->createRenderPipeline(d);
-    }
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.depthStencil = blendDs;
-        GPU::ColorState blendCs = cs;
-        blendCs.blend = alphaBlend;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_textured";
-        frag.targets.push_back(blendCs);
-        d.fragment = frag;
-        pipelineTexturedBlend = device->createRenderPipeline(d);
-    }
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.cullMode = GPU::CullMode::none;
-        d.depthStencil = blendDs;
-        GPU::ColorState blendCs = cs;
-        blendCs.blend = alphaBlend;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_flat";
-        frag.targets.push_back(blendCs);
-        d.fragment = frag;
-        pipelineFlatBlendDoubleSided = device->createRenderPipeline(d);
-    }
-    {
-        GPU::RenderPipelineDescriptor d = base;
-        d.cullMode = GPU::CullMode::none;
-        d.depthStencil = blendDs;
-        GPU::ColorState blendCs = cs;
-        blendCs.blend = alphaBlend;
-        GPU::FragmentDescriptor frag{};
-        frag.module     = shaderModule;
-        frag.entryPoint = "fragmentMain_textured";
-        frag.targets.push_back(blendCs);
-        d.fragment = frag;
-        pipelineTexturedBlendDoubleSided = device->createRenderPipeline(d);
+        meshRecipe.base = base;
+        meshRecipe.colorTarget = cs;
+        constexpr uint32_t allSemantics = kStandardSemanticMask;
+        programs[kPbrProgram].vertexStages = {
+            {allSemantics, shaderModule, "vertexMain"},
+            {semanticBit(VertexSemantic::position), shaderModule, "vertexLean"},
+            {semanticBit(VertexSemantic::position), shaderModule, "vertexLine", true},
+        };
+        programs[kPbrProgram].fragmentModule = shaderModule;
+        programs[kPbrProgram].fragmentEntries = {"fragmentMain_flat", "fragmentMain_textured", "fragmentMain_debug"};
+        meshRecipe.rawBufferSlots = true;  // [[buffer(15..23)]]: lights, transforms, material, ...
+        // The per-draw transforms are also per-instance vertex attributes
+        // (locations 16-19 mvp, 24-27 model, the slot after the attributes),
+        // as on Vulkan/DirectX, so one program source (e.g. Slang) works on
+        // every backend. The built-in shaders keep reading [[buffer(16)]];
+        // bindMeshBuffer() binds the transforms at both.
+        {
+            GPU::VertexLayout transforms{};
+            transforms.arrayStride = 128;  // sizeof(NodeTransforms)
+            transforms.stepMode    = GPU::StepMode::instance;
+            for (uint32_t col = 0; col < 8; ++col) {
+                GPU::VertexAttribute attr{};
+                attr.componentType  = GPU::ComponentType::ctFloat;
+                attr.accessorType   = GPU::AccessorType::acVec4;
+                attr.offset         = col * 16;
+                attr.shaderLocation = col < 4 ? VERTEX_SLOT_MVP + col : 24 + (col - 4);
+                transforms.attributes.push_back(attr);
+            }
+            meshRecipe.perDrawBuffers = {{VERTEX_SLOT_MVP, transforms}};
+        }
+        meshRecipe.supportsBlend = true;
+        programs[kPbrProgram].supportsBlend = true;
+        meshRecipe.alphaBlend = alphaBlend;
+        meshRecipe.blendDepthStencil = blendDs;
+        meshRecipe.ready = true;
+        prewarmMeshPipelines();
     }
 
     // --- Skybox pipeline ---
@@ -3954,12 +4026,19 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         pipelineIblBake = device->createRenderPipeline(iblDesc);
     }
 
-#elif defined(ANDROID) || defined(__linux__)
+#elif CAMPELLO_RENDERER_VK_BINDINGS
     using namespace systems::leal::campello_renderer::shaders;
 
     // Load separate vertex and fragment SPIR-V modules.
+#if defined(__EMSCRIPTEN__)
+    // WebGPU: one WGSL module with every PBR entry point (vs_main, vs_lean,
+    // vs_line, fs_main); shaders/webgpu/default.wgsl.
+    auto vertModule = device->createShaderModule(kDefaultWebGpuShader);
+    auto fragModule = vertModule;
+#else
     auto vertModule = device->createShaderModule(kDefaultVulkanVertShader, kDefaultVulkanVertShaderSize);
     auto fragModule = device->createShaderModule(kDefaultVulkanFragShader, kDefaultVulkanFragShaderSize);
+#endif
     if (!vertModule || !fragModule) return;
 
     GPU::RenderPipelineDescriptor desc{};
@@ -3979,6 +4058,9 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     ensureVulkanPbrBindGroupLayouts();
     GPU::PipelineLayoutDescriptor plDesc{};
     plDesc.bindGroupLayouts = { vulkanMaterialBindGroupLayout, vulkanFrameBindGroupLayout };
+#if defined(__EMSCRIPTEN__)
+    plDesc.bindGroupLayouts.push_back(webgpuDrawBindGroupLayout);
+#endif
     vulkanDefaultPipelineLayout = device->createPipelineLayout(plDesc);
     desc.layout = vulkanDefaultPipelineLayout;
 
@@ -4128,31 +4210,57 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     // session notes.
     desc.frontFace = GPU::FrontFace::ccw;
 
-    // Vulkan: assign same pipeline to both variants until separate SPIR-V
-    // fragment shaders are compiled (flat variant TODO).
-    pipelineTextured = device->createRenderPipeline(desc);
-    pipelineFlat     = pipelineTextured;
-    pipelineDebug    = pipelineFlat;  // TODO: compile debug SPIR-V variant
+    // --- Mesh pipelines: the recipe meshPipeline() builds from ---
+    // One SPIR-V fragment shader for every program (no flat/debug variants
+    // yet) and no blend state yet (blend draws use the opaque state, depth
+    // writes included). default.vert reads POSITION, NORMAL, TEXCOORD_0,
+    // TANGENT, COLOR_0 and TEXCOORD_1 (no skinning); default_lean.vert only
+    // POSITION. Per-draw transforms are per-instance attributes (locations
+    // 16-19, 24-27) in the slot after the attributes (meshPipeline()); the
+    // standard layout uses 7 vertex buffers and 14 attributes, within
+    // WebGPU's 8 and 16.
+    {
+        meshRecipe.base = desc;
+        meshRecipe.base.vertex.buffers.clear();
+        meshRecipe.colorTarget = cs;
+        meshRecipe.perDrawBuffers = {{VERTEX_SLOT_MVP, desc.vertex.buffers[VERTEX_SLOT_MVP]}};
+        const uint32_t standardReads =
+            semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::normal) |
+            semanticBit(VertexSemantic::texcoord0) | semanticBit(VertexSemantic::tangent) |
+            semanticBit(VertexSemantic::color0) | semanticBit(VertexSemantic::texcoord1);
+#if defined(__EMSCRIPTEN__)
+        programs[kPbrProgram].vertexStages.push_back({standardReads, vertModule, "vs_main"});
+        programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), vertModule, "vs_lean"});
+        programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), vertModule, "vs_line", true});
+        programs[kPbrProgram].fragmentModule = fragModule;
+        programs[kPbrProgram].fragmentEntries = {"", "fs_main", ""};
+        // WebGPU has blend state: alpha-blended materials blend, without depth writes.
+        meshRecipe.supportsBlend = true;
+        programs[kPbrProgram].supportsBlend = true;
+        meshRecipe.alphaBlend.color = { GPU::BlendFactor::srcAlpha, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
+        meshRecipe.alphaBlend.alpha = { GPU::BlendFactor::one, GPU::BlendFactor::oneMinusSrcAlpha, GPU::BlendOperation::add };
+        meshRecipe.blendDepthStencil = ds;
+        meshRecipe.blendDepthStencil.depthWriteEnabled = false;
+        meshRecipe.perDrawBuffers.clear();  // transforms: storage buffer, group 2
+#else
+        programs[kPbrProgram].vertexStages.push_back({standardReads, vertModule, "main"});
+        if (auto leanModule = device->createShaderModule(kDefaultVulkanLeanVertShader,
+                                                         kDefaultVulkanLeanVertShaderSize)) {
+            programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), leanModule, "main"});
+        }
+        if (auto lineModule = device->createShaderModule(kDefaultVulkanLineVertShader,
+                                                         kDefaultVulkanLineVertShaderSize)) {
+            programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), lineModule, "main", true});
+        }
+        programs[kPbrProgram].fragmentModule = fragModule;
+        programs[kPbrProgram].fragmentEntries = {"", "main", ""};
+        meshRecipe.supportsBlend = false;
+#endif
+        meshRecipe.ready = true;
+        prewarmMeshPipelines();
+    }
 
-    // Double-sided variant: a real, separate VkPipeline (not aliased to the
-    // single-sided one above) with cullMode=none — glTF materials marked
-    // doubleSided need both faces rendered without culling (thin geometry
-    // like straps, leaves, cloth), and aliasing to the single-sided pipeline
-    // here silently culled one side of exactly that geometry.
-    desc.cullMode = GPU::CullMode::none;
-    pipelineTexturedDoubleSided = device->createRenderPipeline(desc);
-    pipelineFlatDoubleSided     = pipelineTexturedDoubleSided;
-
-    // Alpha-blend variants (TODO: proper blend state when Vulkan backend supports it).
-    // The double-sided+blend ones alias to the real double-sided pipeline above,
-    // not the single-sided one — culling is still correct even though blending
-    // itself isn't implemented yet, matching this same partial-implementation
-    // pattern the non-double-sided blend variants below already use.
-    pipelineFlatBlend             = pipelineFlat;
-    pipelineTexturedBlend         = pipelineTextured;
-    pipelineFlatBlendDoubleSided  = pipelineFlatDoubleSided;
-    pipelineTexturedBlendDoubleSided = pipelineTexturedDoubleSided;
-
+#if !defined(__EMSCRIPTEN__)  // post-processing and bakes: no WGSL versions yet
     // --- FXAA post-process pipeline (Vulkan) ---
     {
         if (!fxaaBindGroupLayout) {
@@ -4417,6 +4525,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         }
     }
 
+#endif  // !__EMSCRIPTEN__
 #elif defined(_WIN32)
     using namespace systems::leal::campello_renderer::shaders;
 
@@ -4570,26 +4679,26 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     desc.cullMode  = GPU::CullMode::back;
     desc.frontFace = GPU::FrontFace::ccw;
 
-    // DirectX: assign same pipeline to both variants until a separate flat
-    // HLSL fragment entry point is compiled (flat variant TODO — matches
-    // Vulkan's current partial-implementation state).
-    pipelineTextured = device->createRenderPipeline(desc);
-    pipelineFlat     = pipelineTextured;
-    pipelineDebug    = pipelineFlat;  // TODO: compile debug DXIL variant
-
-    // Double-sided variant: a real, separate pipeline (not aliased to the
-    // single-sided one above) with cullMode=none — see Vulkan's identical
-    // fix/comment for why aliasing here silently culled doubleSided geometry.
-    desc.cullMode = GPU::CullMode::none;
-    pipelineTexturedDoubleSided = device->createRenderPipeline(desc);
-    pipelineFlatDoubleSided     = pipelineTexturedDoubleSided;
-
-    // Alpha-blend variants (TODO: proper blend state when DirectX backend
-    // supports it — matches Vulkan's current partial-implementation state).
-    pipelineFlatBlend             = pipelineFlat;
-    pipelineTexturedBlend         = pipelineTextured;
-    pipelineFlatBlendDoubleSided  = pipelineFlatDoubleSided;
-    pipelineTexturedBlendDoubleSided = pipelineTexturedDoubleSided;
+    // --- Mesh pipelines: the recipe meshPipeline() builds from ---
+    // As on Vulkan: one pixel shader for every program, no blend state yet,
+    // transforms as per-instance attributes after the attribute slots. No lean vertex
+    // shader yet, so VertexLayout::positionOnly() is unsupported here.
+    {
+        meshRecipe.base = desc;
+        meshRecipe.base.vertex.buffers.clear();
+        meshRecipe.colorTarget = cs;
+        meshRecipe.perDrawBuffers = {{VERTEX_SLOT_MVP, desc.vertex.buffers[VERTEX_SLOT_MVP]}};
+        const uint32_t standardReads =
+            semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::normal) |
+            semanticBit(VertexSemantic::texcoord0) | semanticBit(VertexSemantic::tangent) |
+            semanticBit(VertexSemantic::color0) | semanticBit(VertexSemantic::texcoord1);
+        programs[kPbrProgram].vertexStages.push_back({standardReads, vertModule, "vertexMain"});
+        programs[kPbrProgram].fragmentModule = pixelModule;
+        programs[kPbrProgram].fragmentEntries = {"", "pixelMain", ""};
+        meshRecipe.supportsBlend = false;
+        meshRecipe.ready = true;
+        prewarmMeshPipelines();
+    }
 
     // --- FXAA post-process pipeline (DirectX) ---
     {
@@ -5463,11 +5572,7 @@ void Renderer::renderToTarget(
 
     namespace GPU = systems::leal::campello_gpu;
 
-    bool hasAnyPipeline = pipelineFlat || pipelineTextured || pipelineDebug ||
-                          pipelineFlatDoubleSided || pipelineTexturedDoubleSided ||
-                          pipelineFlatBlend || pipelineTexturedBlend ||
-                          pipelineFlatBlendDoubleSided || pipelineTexturedBlendDoubleSided;
-    if (!hasAnyPipeline) return;
+    if (!meshRecipe.ready) return;
     if (!useDeviceSwapchain && !colorView) return;
 
     bool hasRenderableScene = asset && asset->scenes && sceneIndex < asset->scenes->size();
@@ -5635,6 +5740,7 @@ void Renderer::renderToTarget(
             camData[37] = (float)renderHeight;
 
             cameraPositionBuffer->upload(0, 160, camData);
+            uploadClipUniforms(cameraPositionBuffer);
         }
     }
 
@@ -5863,7 +5969,7 @@ void Renderer::renderToTarget(
                       0.f,
                       (float)viewMode,
                       environmentIntensity, iblEnabled ? 1.f : 0.f, slot);
-            materialUniformBuffer->upload(0, (uint64_t)(93 * sizeof(float)), slot);
+            writeMaterialUniform(0, slot);
         }
 
         if (asset->materials) {
@@ -5874,8 +5980,7 @@ void Renderer::renderToTarget(
                                           environmentIntensity,
                                           iblEnabled ? 1.f : 0.f,
                                           slot);
-                materialUniformBuffer->upload((uint64_t)(i + 1) * kMaterialUniformStride,
-                                              (uint64_t)(93 * sizeof(float)), slot);
+                writeMaterialUniform((uint64_t)(i + 1) * kMaterialUniformStride, slot);
             }
         }
     }
@@ -5965,7 +6070,7 @@ void Renderer::renderToTarget(
     // Keep binding 22 as the safe placeholder here; we will switch it to
     // opaqueSceneTexture right before the transparent pass so the opaque
     // pass does not trigger a Metal read-write conflict.
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
         std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
@@ -5973,7 +6078,7 @@ void Renderer::renderToTarget(
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
             {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-            {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
             {3, environmentSampler},
             {4, scTex},
@@ -5996,7 +6101,7 @@ void Renderer::renderToTarget(
         bgDesc.layout = bindGroupLayout;
         bgDesc.entries = {
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-            {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
@@ -6060,6 +6165,9 @@ void Renderer::renderToTarget(
     // causes a Metal debug-layer abort).
     auto drawOpaque = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe) {
         currentPipelineVariant = 0;
+        currentPipelineObject = nullptr;
+        activeMeshSlots = nullptr;
+        webgpuBoundDrawGroup = nullptr;
         lastBoundVertexBuffers.fill({});
         for (auto &draw : opaqueQueue) {
             renderPrimitive(rpe, *draw.primitive, draw.nodeIndex);
@@ -6105,6 +6213,9 @@ void Renderer::renderToTarget(
                     return squaredDist(a.nodeIndex) > squaredDist(b.nodeIndex);
                 });
             currentPipelineVariant = 0;
+            currentPipelineObject = nullptr;
+            activeMeshSlots = nullptr;
+            webgpuBoundDrawGroup = nullptr;
             if (freshEncoder) {
                 lastBoundVertexBuffers.fill({});
             }
@@ -6244,14 +6355,14 @@ void Renderer::renderToTarget(
         // Switch binding 22 to the mipmapped opaque scene texture so
         // transmissive materials can sample it without conflicting with
         // the color attachment (which is sceneColorView or colorView).
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
         if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture[currentFrameIndex] &&
             environmentMap && environmentSampler && fxaaSampler) {
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout = vulkanFrameBindGroupLayout;
             bgDesc.entries = {
                 {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-                {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+                {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
                 {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
                 {3, environmentSampler},
                 {4, opaqueSceneTexture[currentFrameIndex]},
@@ -6272,7 +6383,7 @@ void Renderer::renderToTarget(
             bgDesc.layout = bindGroupLayout;
             bgDesc.entries = {
                 {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-                {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+                {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
                 {22, opaqueSceneTexture[currentFrameIndex]},
                 // See the other frame-bind-group construction site's comment
                 // on why environment bindings live here, not per-material.
@@ -6723,57 +6834,42 @@ void Renderer::renderPrimitive(
         }
     }
 
+    // Variant numbers (1 flat, 2 textured, 3 debug, 4/5 double-sided, 6-9
+    // blend) tell which bind groups the shader reads (step 2).
     int wantedVariant = hasTexture ? 2 : 1;
-    std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipeline =
-        hasTexture ? pipelineTextured : pipelineFlat;
-
-    // Double-sided materials use no culling.
-    if (doubleSided) {
-        pipeline = hasTexture ? pipelineTexturedDoubleSided : pipelineFlatDoubleSided;
-        wantedVariant = hasTexture ? 5 : 4;
-    }
-    
+    if (doubleSided) wantedVariant = hasTexture ? 5 : 4;
     // Alpha-blend materials use blend pipelines (depth write disabled for transparency).
-    if (useBlend) {
-        if (doubleSided) {
-            pipeline = hasTexture ? pipelineTexturedBlendDoubleSided : pipelineFlatBlendDoubleSided;
-            wantedVariant = hasTexture ? 9 : 8;
-        } else {
-            pipeline = hasTexture ? pipelineTexturedBlend : pipelineFlatBlend;
-            wantedVariant = hasTexture ? 7 : 6;
-        }
-    }
+    if (useBlend) wantedVariant = doubleSided ? (hasTexture ? 9 : 8) : (hasTexture ? 7 : 6);
+    const bool debugView = viewMode == ViewMode::worldNormal;
+    if (debugView) wantedVariant = 3;
 
-    // Debug mode overrides pipeline selection.
-    if (viewMode == ViewMode::worldNormal) {
-        wantedVariant = 3;
-        pipeline      = pipelineDebug;
-    }
-
-    // KHR_mesh_quantization: if this primitive uses non-float accessors,
-    // switch to the quantized pipeline variant for the current wantedVariant.
-    if (asset->accessors && !quantizedPipelines.empty()) {
-        bool usesQuantized = false;
+    // KHR_mesh_quantization (Metal): primitives with non-float accessors use
+    // the scene's quantized layout (integer formats, converted on fetch).
+    const VertexLayout* layout = &standardLayout;
+    if (quantizedLayout && asset->accessors) {
         for (auto &[semantic, accIdx] : primitive.attributes) {
             if (accIdx < 0 || (size_t)accIdx >= asset->accessors->size()) continue;
             auto &acc = (*asset->accessors)[(size_t)accIdx];
             if (acc.componentType != systems::leal::gltf::ComponentType::ctFloat) {
-                usesQuantized = true;
+                layout = &*quantizedLayout;
                 break;
             }
         }
-        if (usesQuantized) {
-            auto it = quantizedPipelines.find(wantedVariant);
-            if (it != quantizedPipelines.end() && it->second) {
-                pipeline = it->second;
-            }
-        }
     }
-
-    if (pipeline && wantedVariant != currentPipelineVariant) {
-        rpe->setPipeline(pipeline);
-        currentPipelineVariant = wantedVariant;
+    // Clip planes: the clip test is in the textured shader, and without
+    // culling the back faces seen through the cut become section caps.
+    const bool clipping = clippingActive();
+    const MeshPipelineEntry* entry = debugView
+        ? meshPipeline(MeshProgram::debug, *layout, false, false)
+        : meshPipeline((hasTexture || clipping) ? MeshProgram::textured : MeshProgram::flat, *layout,
+                       doubleSided || clipping, useBlend);
+    if (!entry) return;
+    activeMeshSlots = &entry->slots;
+    if (entry->pipeline.get() != currentPipelineObject) {
+        rpe->setPipeline(entry->pipeline);
+        currentPipelineObject = entry->pipeline.get();
     }
+    currentPipelineVariant = wantedVariant;
 
     // --- 2. Bind bind groups ---
     // Index 0: textures + samplers.
@@ -6794,8 +6890,7 @@ void Renderer::renderPrimitive(
     // (pipelineFlat.get() == pipelineTextured.get(), false wherever Metal's
     // separately-compiled flat variant is in use) rather than special-casing
     // by platform macro.
-    bool sharesFlatAndTexturedPipeline =
-        pipelineFlat && pipelineFlat.get() == pipelineTextured.get();
+    bool sharesFlatAndTexturedPipeline = !hasFlatProgram();
     bool needsTextures = (wantedVariant == 2 || wantedVariant == 5 ||
                           wantedVariant == 7 || wantedVariant == 9) ||
                           sharesFlatAndTexturedPipeline;
@@ -6840,7 +6935,7 @@ void Renderer::renderPrimitive(
         uint64_t offset = nodeIndex * 128; // 32 floats * 4 bytes
         if (offset + 128 <= transformBuffer->getLength()) {
             // (bind debug removed)
-            setVertexBufferIfChanged(rpe, VERTEX_SLOT_MVP, transformBuffer, offset);
+            bindMeshBuffer(rpe, VERTEX_SLOT_MVP, transformBuffer, offset);
         }
     }
 
@@ -6849,7 +6944,7 @@ void Renderer::renderPrimitive(
     if (materialUniformBuffer) {
         uint64_t matOffset = (uint64_t)(matIdx + 1) * kMaterialUniformStride;
         if (matOffset + kMaterialUniformStride <= materialUniformBuffer->getLength()) {
-            setVertexBufferIfChanged(rpe, VERTEX_SLOT_MATERIAL, materialUniformBuffer, matOffset);
+            bindMeshBuffer(rpe, VERTEX_SLOT_MATERIAL, materialUniformBuffer, matOffset);
         }
     }
 
@@ -6858,11 +6953,11 @@ void Renderer::renderPrimitive(
     auto instIt = nodeInstanceData.find(nodeIndex);
     if (instIt != nodeInstanceData.end() && instIt->second.matrixBuffer) {
         if (instIt->second.visibleCount == 0) return;
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_INSTANCE_MATRIX, instIt->second.matrixBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_INSTANCE_MATRIX, instIt->second.matrixBuffer, 0);
         instanceCount = instIt->second.visibleCount;
     } else if (defaultInstanceMatrixBuffer) {
         // Bind identity matrix for non-instanced objects
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_INSTANCE_MATRIX, defaultInstanceMatrixBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_INSTANCE_MATRIX, defaultInstanceMatrixBuffer, 0);
     }
 
     // --- 5b. Bind joint matrix palette for skeletal meshes ---
@@ -6870,11 +6965,11 @@ void Renderer::renderPrimitive(
     if (skinIdx >= 0 && (size_t)skinIdx < skinData.size() &&
         frameResources[currentFrameIndex].jointMatrixBuffer) {
         auto &sd = skinData[(size_t)skinIdx];
-        setVertexBufferIfChanged(
+        bindMeshBuffer(
             rpe, VERTEX_SLOT_JOINT_MATRICES,
             frameResources[currentFrameIndex].jointMatrixBuffer, sd.gpuOffset);
     } else if (defaultJointMatrixBuffer) {
-        setVertexBufferIfChanged(
+        bindMeshBuffer(
             rpe, VERTEX_SLOT_JOINT_MATRICES, defaultJointMatrixBuffer, 0);
     }
 
@@ -6893,7 +6988,7 @@ void Renderer::renderPrimitive(
         auto bindDracoAttribute = [&](const std::string &semantic, uint32_t slot) -> bool {
             auto it = dracoBufs.attributeBuffers.find(semantic);
             if (it != dracoBufs.attributeBuffers.end() && it->second) {
-                setVertexBufferIfChanged(rpe, slot, it->second, 0);
+                bindMeshBuffer(rpe, slot, it->second, 0);
                 return true;
             }
             return false;
@@ -6903,14 +6998,14 @@ void Renderer::renderPrimitive(
         bindDracoAttribute("NORMAL",   VERTEX_SLOT_NORMAL);
         if (!bindDracoAttribute("TANGENT", VERTEX_SLOT_TANGENT)) {
             if (fallbackTangentBuffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_TANGENT, fallbackTangentBuffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_TANGENT, fallbackTangentBuffer, 0);
             }
         }
 
         // TEXCOORD_0: bind real data or fallback zero buffer
         if (!bindDracoAttribute("TEXCOORD_0", VERTEX_SLOT_TEXCOORD0)) {
             if (fallbackUVBuffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD0, fallbackUVBuffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_TEXCOORD0, fallbackUVBuffer, 0);
             }
         }
         // TEXCOORD_1: bind real data or fallback zero buffer. Assumes the
@@ -6918,7 +7013,7 @@ void Renderer::renderPrimitive(
         // far); a quantized TEXCOORD_1 under Draco is not specially handled.
         if (!bindDracoAttribute("TEXCOORD_1", VERTEX_SLOT_TEXCOORD1)) {
             if (fallbackTexCoord1Buffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD1, fallbackTexCoord1Buffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_TEXCOORD1, fallbackTexCoord1Buffer, 0);
             }
         }
         // COLOR_0: bind real data or fallback white buffer. Assumes the
@@ -6927,19 +7022,19 @@ void Renderer::renderPrimitive(
         // would bind with a mismatched stride if encountered.
         if (!bindDracoAttribute("COLOR_0", VERTEX_SLOT_COLOR0)) {
             if (fallbackColor0Buffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_COLOR0, fallbackColor0Buffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_COLOR0, fallbackColor0Buffer, 0);
             }
         }
 
         // JOINTS_0 / WEIGHTS_0 for skeletal meshes
         if (!bindDracoAttribute("JOINTS_0", VERTEX_SLOT_JOINTS)) {
             if (fallbackJointBuffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_JOINTS, fallbackJointBuffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_JOINTS, fallbackJointBuffer, 0);
             }
         }
         if (!bindDracoAttribute("WEIGHTS_0", VERTEX_SLOT_WEIGHTS)) {
             if (fallbackWeightBuffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_WEIGHTS, fallbackWeightBuffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_WEIGHTS, fallbackWeightBuffer, 0);
             }
         }
     } else {
@@ -6956,7 +7051,7 @@ void Renderer::renderPrimitive(
             if (semantic == "COLOR_0") {
                 auto colorIt = color0Buffers.find(accIdx);
                 if (colorIt != color0Buffers.end() && colorIt->second) {
-                    setVertexBufferIfChanged(rpe, slot, colorIt->second, 0);
+                    bindMeshBuffer(rpe, slot, colorIt->second, 0);
                     return true;
                 }
                 return false;
@@ -6969,13 +7064,13 @@ void Renderer::renderPrimitive(
             // buffer view (byteStride > 0).
             auto deinterIt = deinterleavedBuffers.find(accIdx);
             if (deinterIt != deinterleavedBuffers.end() && deinterIt->second) {
-                setVertexBufferIfChanged(rpe, slot, deinterIt->second, 0);
+                bindMeshBuffer(rpe, slot, deinterIt->second, 0);
                 return true;
             }
 
             auto  buf = gpuBuffers[bv.buffer];
             if (buf) {
-                setVertexBufferIfChanged(rpe, slot, buf, bv.byteOffset + acc.byteOffset);
+                bindMeshBuffer(rpe, slot, buf, bv.byteOffset + acc.byteOffset);
                 return true;
             }
             return false;
@@ -6984,43 +7079,43 @@ void Renderer::renderPrimitive(
         positionBound = bindAttribute("POSITION", VERTEX_SLOT_POSITION);
         bool normalBound = bindAttribute("NORMAL",   VERTEX_SLOT_NORMAL);
         if (!normalBound && fallbackNormalBuffer) {
-            setVertexBufferIfChanged(rpe, VERTEX_SLOT_NORMAL, fallbackNormalBuffer, 0);
+            bindMeshBuffer(rpe, VERTEX_SLOT_NORMAL, fallbackNormalBuffer, 0);
         }
         bool tangentBound = bindAttribute("TANGENT",  VERTEX_SLOT_TANGENT);
         if (!tangentBound && fallbackTangentBuffer) {
-            setVertexBufferIfChanged(rpe, VERTEX_SLOT_TANGENT, fallbackTangentBuffer, 0);
+            bindMeshBuffer(rpe, VERTEX_SLOT_TANGENT, fallbackTangentBuffer, 0);
         }
 
         // TEXCOORD_0: bind real data or fallback zero buffer
         if (!bindAttribute("TEXCOORD_0", VERTEX_SLOT_TEXCOORD0)) {
             if (fallbackUVBuffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD0, fallbackUVBuffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_TEXCOORD0, fallbackUVBuffer, 0);
             }
         }
         // TEXCOORD_1: bind real data or fallback zero buffer. Assumes float2
         // (no quantized-TEXCOORD_1 detection, unlike TEXCOORD_0).
         if (!bindAttribute("TEXCOORD_1", VERTEX_SLOT_TEXCOORD1)) {
             if (fallbackTexCoord1Buffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD1, fallbackTexCoord1Buffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_TEXCOORD1, fallbackTexCoord1Buffer, 0);
             }
         }
         // COLOR_0: bind real data (normalized to float4 by color0Buffers) or
         // fallback white buffer.
         if (!bindAttribute("COLOR_0", VERTEX_SLOT_COLOR0)) {
             if (fallbackColor0Buffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_COLOR0, fallbackColor0Buffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_COLOR0, fallbackColor0Buffer, 0);
             }
         }
 
         // JOINTS_0 / WEIGHTS_0 for skeletal meshes
         if (!bindAttribute("JOINTS_0", VERTEX_SLOT_JOINTS)) {
             if (fallbackJointBuffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_JOINTS, fallbackJointBuffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_JOINTS, fallbackJointBuffer, 0);
             }
         }
         if (!bindAttribute("WEIGHTS_0", VERTEX_SLOT_WEIGHTS)) {
             if (fallbackWeightBuffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_WEIGHTS, fallbackWeightBuffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_WEIGHTS, fallbackWeightBuffer, 0);
             }
         }
     }
@@ -7036,25 +7131,25 @@ void Renderer::renderPrimitive(
     {
         auto morphIt = morphBuffers.find(&primitive);
         if (morphIt != morphBuffers.end() && morphIt->second.positionDeltas) {
-            setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_POSITION, morphIt->second.positionDeltas, 0);
+            bindMeshBuffer(rpe, VERTEX_SLOT_MORPH_POSITION, morphIt->second.positionDeltas, 0);
             if (morphIt->second.normalDeltas) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_NORMAL, morphIt->second.normalDeltas, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_MORPH_NORMAL, morphIt->second.normalDeltas, 0);
             } else if (fallbackTangentBuffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_NORMAL, fallbackTangentBuffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_MORPH_NORMAL, fallbackTangentBuffer, 0);
             }
             auto weightIt = morphNodeUniformBuffers.find(nodeIndex);
             if (weightIt != morphNodeUniformBuffers.end() && weightIt->second) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_INFO, weightIt->second, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_MORPH_INFO, weightIt->second, 0);
             } else if (defaultMorphInfoBuffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_INFO, defaultMorphInfoBuffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_MORPH_INFO, defaultMorphInfoBuffer, 0);
             }
         } else {
             if (defaultMorphInfoBuffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_INFO, defaultMorphInfoBuffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_MORPH_INFO, defaultMorphInfoBuffer, 0);
             }
             if (fallbackTangentBuffer) {
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_POSITION, fallbackTangentBuffer, 0);
-                setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_NORMAL, fallbackTangentBuffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_MORPH_POSITION, fallbackTangentBuffer, 0);
+                bindMeshBuffer(rpe, VERTEX_SLOT_MORPH_NORMAL, fallbackTangentBuffer, 0);
             }
         }
     }
@@ -7068,7 +7163,7 @@ void Renderer::renderPrimitive(
         // Use Draco-decompressed index buffer.
         rpe->setIndexBuffer(dracoIt->second.indexBuffer,
                            systems::leal::campello_gpu::IndexFormat::uint32, 0);
-        rpe->drawIndexed(dracoIt->second.indexCount, instanceCount);
+        rpe->drawIndexed(dracoIt->second.indexCount, instanceCount, 0, 0, drawFirstInstance());
     } else if (primitive.indices >= 0) {
         // Use standard GLTF index buffer.
         auto &idxAcc = (*asset->accessors)[(size_t)primitive.indices];
@@ -7078,7 +7173,7 @@ void Renderer::renderPrimitive(
         if (widenedIt != widenedIndexBuffers.end() && widenedIt->second) {
             rpe->setIndexBuffer(widenedIt->second,
                                 systems::leal::campello_gpu::IndexFormat::uint16, 0);
-            rpe->drawIndexed((uint32_t)idxAcc.count, instanceCount);
+            rpe->drawIndexed((uint32_t)idxAcc.count, instanceCount, 0, 0, drawFirstInstance());
             return;
         }
         if (idxAcc.bufferView >= 0) {
@@ -7091,17 +7186,17 @@ void Renderer::renderPrimitive(
                     ? systems::leal::campello_gpu::IndexFormat::uint16
                     : systems::leal::campello_gpu::IndexFormat::uint32;
                 rpe->setIndexBuffer(idxBuf, fmt, idxOffset);
-                rpe->drawIndexed((uint32_t)idxAcc.count, instanceCount);
+                rpe->drawIndexed((uint32_t)idxAcc.count, instanceCount, 0, 0, drawFirstInstance());
                 return;
             }
         }
-        rpe->draw((uint32_t)idxAcc.count, instanceCount);
+        rpe->draw((uint32_t)idxAcc.count, instanceCount, 0, drawFirstInstance());
     } else {
         // Non-indexed draw - need vertex count from POSITION accessor.
         auto posIt = primitive.attributes.find("POSITION");
         if (posIt != primitive.attributes.end()) {
             auto &posAcc = (*asset->accessors)[posIt->second];
-            rpe->draw((uint32_t)posAcc.count, instanceCount);
+            rpe->draw((uint32_t)posAcc.count, instanceCount, 0, drawFirstInstance());
         }
     }
 }
@@ -7919,6 +8014,24 @@ GpuMesh* Renderer::uploadMesh(const systems::leal::gltf::Primitive& primitive,
 
     auto mesh = std::make_unique<GpuMesh>();
 
+    // Bounds for frustum culling (render_system), from the POSITION
+    // accessor's min/max (required by glTF). Float positions only: quantized
+    // ones (KHR_mesh_quantization) are dequantized by the node transform, so
+    // their raw min/max aren't shader-space positions.
+    if (auto posIt = primitive.attributes.find("POSITION");
+        posIt != primitive.attributes.end() && asset.accessors && posIt->second >= 0 &&
+        (size_t)posIt->second < asset.accessors->size()) {
+        const auto& posAcc = (*asset.accessors)[(size_t)posIt->second];
+        if (posAcc.componentType == systems::leal::gltf::ComponentType::ctFloat && posAcc.min && posAcc.max &&
+            posAcc.min->size() >= 3 && posAcc.max->size() >= 3) {
+            mesh->hasBounds = true;
+            for (size_t a = 0; a < 3; ++a) {
+                mesh->boundsMin[a] = (float)(*posAcc.min)[a];
+                mesh->boundsMax[a] = (float)(*posAcc.max)[a];
+            }
+        }
+    }
+
     // --- Index buffer ---
     if (primitive.indices >= 0 && asset.accessors) {
         auto& idxAcc = (*asset.accessors)[(size_t)primitive.indices];
@@ -8013,6 +8126,16 @@ GpuMesh* Renderer::uploadMesh(const systems::leal::gltf::Primitive& primitive,
     return result;
 }
 
+
+// Writes one material's 93 floats at `offset` into the material uniform
+// buffer and its CPU shadow (the shadow refills the buffer when it grows).
+void Renderer::writeMaterialUniform(uint64_t offset, const float* slot) {
+    constexpr uint64_t size = 93 * sizeof(float);
+    if (!materialUniformBuffer) return;
+    materialUniformBuffer->upload(offset, size, const_cast<float*>(slot));
+    if (materialUniformShadow.size() < offset + size) materialUniformShadow.resize(offset + size, 0);
+    std::memcpy(materialUniformShadow.data() + offset, slot, size);
+}
 
 GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& material,
                                       const systems::leal::gltf::GLTF& asset) {
@@ -8333,9 +8456,20 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     // --- Ensure material uniform buffer is large enough ---
     uint64_t requiredSize = (uint64_t)(uniformSlot + 1) * kMaterialUniformStride;
     if (!materialUniformBuffer || materialUniformBuffer->getLength() < requiredSize) {
-        uint64_t newSize = std::max(requiredSize, (uint64_t)4096 * kMaterialUniformStride);
+        // Grow geometrically and keep what's there: earlier materials' slots
+        // must survive, since draws (and DirectX's per-pass bind groups) read
+        // them from whichever buffer is current. Standalone slots start at
+        // 10000, so without this every new standalone material zeroed the
+        // ones before it. The contents come from the CPU shadow (a GPU copy
+        // isn't portable: DirectX keeps this buffer in an upload heap).
+        const uint64_t oldSize = materialUniformBuffer ? materialUniformBuffer->getLength() : 0;
+        uint64_t newSize = std::max({requiredSize, (uint64_t)4096 * kMaterialUniformStride, oldSize * 2});
         materialUniformBuffer = device->createBuffer(newSize,
             (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::vertex) | uint32_t(GPU::BufferUsage::uniform)));
+        if (materialUniformBuffer && !materialUniformShadow.empty()) {
+            materialUniformBuffer->upload(0, std::min<uint64_t>(materialUniformShadow.size(), newSize),
+                                          materialUniformShadow.data());
+        }
     }
 
     // --- Upload material uniform data ---
@@ -8346,12 +8480,11 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                                   environmentIntensity,
                                   iblEnabled ? 1.f : 0.f,
                                   slot);
-        materialUniformBuffer->upload((uint64_t)uniformSlot * kMaterialUniformStride,
-                                      (uint64_t)(93 * sizeof(float)), slot);
+        writeMaterialUniform((uint64_t)uniformSlot * kMaterialUniformStride, slot);
     }
 
     // --- Create bind groups ---
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
     ensureVulkanPbrBindGroupLayouts();
     GPU::BindGroupDescriptor bgDesc{};
     bgDesc.layout  = vulkanMaterialBindGroupLayout;
@@ -8377,6 +8510,9 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                                 (uint64_t)uniformSlot * kMaterialUniformStride,
                                 kMaterialUniformStride}},
     };
+#if defined(__EMSCRIPTEN__)
+    trimWebGpuMaterialEntries(bgDesc);
+#endif
     auto bindGroup = device->createBindGroup(bgDesc, /*persistent=*/true);
     // No separate flat shader on Vulkan — reuse the same bind group.
     auto flatBindGroup = bindGroup;
@@ -8491,8 +8627,7 @@ void Renderer::reuploadMaterialSlot(uint32_t uniformSlot,
                               environmentIntensity,
                               iblEnabled ? 1.f : 0.f,
                               slot);
-    materialUniformBuffer->upload((uint64_t)uniformSlot * kMaterialUniformStride,
-                                  (uint64_t)(93 * sizeof(float)), slot);
+    writeMaterialUniform((uint64_t)uniformSlot * kMaterialUniformStride, slot);
 }
 
 
@@ -8508,7 +8643,7 @@ void Renderer::render(const RenderScene& scene,
     using M4 = VM::Matrix4<double>;
 
     if (!colorView) return;
-    if (!pipelineFlat && !pipelineTextured && !pipelineDebug) return;
+    if (!meshRecipe.ready) return;
 
     // Frame-in-flight synchronization.
     auto &frame = frameResources[currentFrameIndex];
@@ -8518,6 +8653,18 @@ void Renderer::render(const RenderScene& scene,
         frame.fence = device->createFence();
     }
     if (frame.fence) frame.fence->wait();
+    if (frame.commandBuffer) {
+#if defined(__EMSCRIPTEN__)
+        // Asked asynchronously at submit (below): reading it here would yield.
+        gpuFrameTimeMs = gpuFrameTimeAsyncMs->load();
+#else
+        // Completed (fence waited): its GPU time is available now.
+        if (const uint64_t ns = frame.commandBuffer->getGPUExecutionTime()) {
+            gpuFrameTimeMs = static_cast<double>(ns) / 1.0e6;
+        }
+#endif
+        frame.commandBuffer.reset();
+    }
 
     transformBuffer      = frame.transformBuffer;
     cameraPositionBuffer = frame.cameraPositionBuffer;
@@ -8555,10 +8702,11 @@ void Renderer::render(const RenderScene& scene,
         camData[36] = (float)renderWidth;
         camData[37] = (float)renderHeight;
         cameraPositionBuffer->upload(0, 160, camData);
+            uploadClipUniforms(cameraPositionBuffer);
     }
 
     // Update per-frame bind group (lights + camera + placeholder texture).
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
         std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
@@ -8566,7 +8714,7 @@ void Renderer::render(const RenderScene& scene,
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
             {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-            {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
             {3, environmentSampler},
             {4, scTex},
@@ -8589,7 +8737,7 @@ void Renderer::render(const RenderScene& scene,
         bgDesc.layout = bindGroupLayout;
         bgDesc.entries = {
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-            {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
@@ -8655,7 +8803,7 @@ void Renderer::render(const RenderScene& scene,
     uint64_t requiredBytes = (uint64_t)(totalDraws + 1) * 128;
     if (!transformBuffer || transformBuffer->getLength() < requiredBytes) {
         uint64_t newSize = std::max(requiredBytes, (uint64_t)4096 * 128);
-        transformBuffer = device->createBuffer(newSize, GPU::BufferUsage::vertex);
+        transformBuffer = device->createBuffer(newSize, kTransformBufferUsage);
         frame.transformBuffer = transformBuffer;
     }
     std::vector<uint64_t> transformOffsets;
@@ -8681,6 +8829,45 @@ void Renderer::render(const RenderScene& scene,
     // match it. (Uploading in scene.opaque order gave each draw another draw's
     // transform whenever sorting reordered them.)
     std::vector<systems::leal::campello_renderer::DrawCall> sortedOpaque = scene.opaque;
+    if (opaqueOrder == OpaqueOrder::frontToBack) {
+        // Pipeline class first (blend, double-sided), then nearest first, so
+        // early depth testing rejects hidden fragments on GPUs that shade in
+        // submission order. Distance: camera to the world-space centre of
+        // the mesh bounds (the node origin when the mesh has none).
+        const auto &eye = scene.camera.position;
+        std::vector<std::pair<double, uint32_t>> order(sortedOpaque.size());
+        for (uint32_t i = 0; i < sortedOpaque.size(); ++i) {
+            const auto &draw = sortedOpaque[i];
+            double c[3] = {0.0, 0.0, 0.0};
+            if (draw.mesh && draw.mesh->hasBounds) {
+                for (int k = 0; k < 3; ++k) {
+                    c[k] = 0.5 * ((double)draw.mesh->boundsMin[k] + (double)draw.mesh->boundsMax[k]);
+                }
+            }
+            const double *m = draw.worldTransform.data;
+            double d2 = 0.0;
+            for (int r = 0; r < 3; ++r) {
+                const double w = m[r * 4] * c[0] + m[r * 4 + 1] * c[1] + m[r * 4 + 2] * c[2] + m[r * 4 + 3];
+                const double e = r == 0 ? eye.x() : r == 1 ? eye.y() : eye.z();
+                d2 += (w - e) * (w - e);
+            }
+            order[i] = {d2, i};
+        }
+        const auto rank = [](const systems::leal::campello_renderer::DrawCall &d) {
+            return !d.material ? 0 : (d.material->alphaBlend ? 2 : 0) + (d.material->doubleSided ? 1 : 0);
+        };
+        std::sort(order.begin(), order.end(), [&](const auto &a, const auto &b) {
+            const int ra = rank(sortedOpaque[a.second]);
+            const int rb = rank(sortedOpaque[b.second]);
+            if (ra != rb) return ra < rb;
+            if (a.first != b.first) return a.first < b.first;
+            return a.second < b.second;
+        });
+        std::vector<systems::leal::campello_renderer::DrawCall> byDepth;
+        byDepth.reserve(sortedOpaque.size());
+        for (const auto &entry : order) byDepth.push_back(sortedOpaque[entry.second]);
+        sortedOpaque = std::move(byDepth);
+    } else {
     std::sort(sortedOpaque.begin(), sortedOpaque.end(),
         [](const systems::leal::campello_renderer::DrawCall &a,
            const systems::leal::campello_renderer::DrawCall &b) {
@@ -8692,6 +8879,7 @@ void Renderer::render(const RenderScene& scene,
             if (a.material != b.material) return a.material < b.material;
             return a.mesh < b.mesh;
         });
+    }
     for (auto &draw : sortedOpaque)      uploadOneTransform(draw);
     for (auto &draw : scene.transparent) uploadOneTransform(draw);
 
@@ -8700,12 +8888,13 @@ void Renderer::render(const RenderScene& scene,
     // ------------------------------------------------------------------
     ensureSceneColorTexture();
 
-    bool useSsaa = ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout && sceneColorView[currentFrameIndex];
-    bool useFxaa = fxaaEnabled && !useSsaa && pipelineFxaa && fxaaBindGroupLayout && sceneColorView[currentFrameIndex];
+    // A program pass (renderProgramPass()) draws straight into its target.
+    bool useSsaa = !activeProgramPass && ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout && sceneColorView[currentFrameIndex];
+    bool useFxaa = !activeProgramPass && fxaaEnabled && !useSsaa && pipelineFxaa && fxaaBindGroupLayout && sceneColorView[currentFrameIndex];
     bool useIntermediate = useSsaa || useFxaa;
 
     // Update per-frame bind group (lights + camera + placeholder texture).
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
         std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
@@ -8713,7 +8902,7 @@ void Renderer::render(const RenderScene& scene,
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
             {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-            {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
             {3, environmentSampler},
             {4, scTex},
@@ -8731,7 +8920,7 @@ void Renderer::render(const RenderScene& scene,
         bgDesc.layout = bindGroupLayout;
         bgDesc.entries = {
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-            {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+            {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
@@ -8778,7 +8967,7 @@ void Renderer::render(const RenderScene& scene,
     // Detect whether any transparent draw needs screen-space refraction.
     bool needsScreenSpaceRefraction = false;
     for (auto &draw : scene.transparent) {
-        if (draw.material && draw.material->transmission) {
+        if (!activeProgramPass && draw.material && draw.material->transmission) {
             needsScreenSpaceRefraction = true;
             break;
         }
@@ -8904,6 +9093,9 @@ void Renderer::render(const RenderScene& scene,
                 }
                 drawSkybox(opaqueRpe);
                 currentPipelineVariant = 0;
+                currentPipelineObject = nullptr;
+                activeMeshSlots = nullptr;
+                webgpuBoundDrawGroup = nullptr;
                 lastBoundVertexBuffers.fill({});
                 drawIdx = 0;
                 for (auto &draw : sortedOpaque) {
@@ -8968,14 +9160,14 @@ void Renderer::render(const RenderScene& scene,
         }
 
         // Switch binding 22 to the mipmapped opaque scene texture for transmission.
-#if defined(ANDROID) || defined(__linux__)
+#if CAMPELLO_RENDERER_VK_BINDINGS
         if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture[currentFrameIndex] &&
             environmentMap && environmentSampler && fxaaSampler) {
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout = vulkanFrameBindGroupLayout;
             bgDesc.entries = {
                 {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-                {1, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+                {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
                 {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
                 {3, environmentSampler},
                 {4, opaqueSceneTexture[currentFrameIndex]},
@@ -8992,7 +9184,7 @@ void Renderer::render(const RenderScene& scene,
             bgDesc.layout = bindGroupLayout;
             bgDesc.entries = {
                 {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
-                {18, GPU::BufferBinding{cameraPositionBuffer, 0, 160}},
+                {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
                 {22, opaqueSceneTexture[currentFrameIndex]},
                 // See the other frame-bind-group construction site's comment
                 // on why environment bindings live here, not per-material.
@@ -9039,6 +9231,9 @@ void Renderer::render(const RenderScene& scene,
                     transRpe->setScissorRect(0.0f, 0.0f, (float)sceneTargetWidth(), (float)sceneTargetHeight());
                 }
                 currentPipelineVariant = 0;
+                currentPipelineObject = nullptr;
+                activeMeshSlots = nullptr;
+                webgpuBoundDrawGroup = nullptr;
                 lastBoundVertexBuffers.fill({});
                 drawIdx = (size_t)sortedOpaque.size();
                 for (auto &draw : scene.transparent) {
@@ -9054,17 +9249,18 @@ void Renderer::render(const RenderScene& scene,
         GPU::BeginRenderPassDescriptor desc{};
         GPU::ColorAttachment ca{};
         ca.view = useIntermediate ? sceneColorView[currentFrameIndex] : colorView;
-        ca.clearValue[0] = clearColor[0];
-        ca.clearValue[1] = clearColor[1];
-        ca.clearValue[2] = clearColor[2];
-        ca.clearValue[3] = clearColor[3];
+        for (int c = 0; c < 4; ++c) {
+            ca.clearValue[c] = activeProgramPass ? activeProgramPass->clearColor[(size_t)c] : clearColor[c];
+        }
         ca.loadOp  = GPU::LoadOp::clear;
         ca.storeOp = GPU::StoreOp::store;
         ca.depthSlice = 0;
         desc.colorAttachments.push_back(ca);
-        if (depthView) {
+        // A program pass has its own depth buffer at the target's (1x) size.
+        const auto passDepthView = activeProgramPass ? programPassDepthView : depthView;
+        if (passDepthView) {
             GPU::DepthStencilAttachment ds{};
-            ds.view = depthView;
+            ds.view = passDepthView;
             ds.depthClearValue = 1.0f;
             ds.depthLoadOp  = GPU::LoadOp::clear;
             ds.depthStoreOp = GPU::StoreOp::store;
@@ -9079,15 +9275,18 @@ void Renderer::render(const RenderScene& scene,
         auto rpe = encoder->beginRenderPass(desc);
         if (!rpe) return;
         if (renderWidth > 0 && renderHeight > 0) {
-            const float sw = (float)sceneTargetWidth();
-            const float sh = (float)sceneTargetHeight();
+            const float sw = activeProgramPass ? (float)renderWidth : (float)sceneTargetWidth();
+            const float sh = activeProgramPass ? (float)renderHeight : (float)sceneTargetHeight();
             rpe->setViewport(0.0f, 0.0f, sw, sh, 0.0f, 1.0f);
             rpe->setScissorRect(0.0f, 0.0f, sw, sh);
         }
 
-        drawSkybox(rpe);
+        if (!activeProgramPass) drawSkybox(rpe);
 
         currentPipelineVariant = 0;
+        currentPipelineObject = nullptr;
+        activeMeshSlots = nullptr;
+        webgpuBoundDrawGroup = nullptr;
         lastBoundVertexBuffers.fill({});
         drawIdx = 0;
         for (auto &draw : sortedOpaque) {
@@ -9099,8 +9298,13 @@ void Renderer::render(const RenderScene& scene,
         // next setVertexBuffer() call becomes redundant from Metal's point of
         // view (see lastBoundVertexBuffers's doc comment).
         currentPipelineVariant = 0;
-        for (auto &draw : scene.transparent) {
-            renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
+        currentPipelineObject = nullptr;
+        activeMeshSlots = nullptr;
+        webgpuBoundDrawGroup = nullptr;
+        if (!activeProgramPass || activeProgramPass->includeTransparent) {
+            for (auto &draw : scene.transparent) {
+                renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
+            }
         }
 
         rpe->end();
@@ -9205,10 +9409,19 @@ void Renderer::render(const RenderScene& scene,
         }
     }
 
-    device->submit(encoder->finish(), frame.fence);
+    frame.commandBuffer = encoder->finish();
+    device->submit(frame.commandBuffer, frame.fence);
+#if defined(__EMSCRIPTEN__)
+    if (frame.commandBuffer) {
+        frame.commandBuffer->getGPUExecutionTimeAsync([result = gpuFrameTimeAsyncMs](uint64_t ns) {
+            if (ns) result->store(static_cast<double>(ns) / 1.0e6);
+        });
+    }
+#endif
     currentFrameIndex = (currentFrameIndex + 1) % kMaxFramesInFlight;
 
     // Stats
+    lastFrameStats.gpuFrameTimeMs = gpuFrameTimeMs;
     lastFrameStats.opaqueDrawCount = (uint32_t)scene.opaque.size();
     lastFrameStats.transparentDrawCount = (uint32_t)scene.transparent.size();
     lastFrameStats.totalDrawCount = lastFrameStats.opaqueDrawCount + lastFrameStats.transparentDrawCount;
@@ -9235,30 +9448,35 @@ void Renderer::renderPrimitive(
     bool doubleSided = draw.material->doubleSided;
     bool useBlend    = draw.material->alphaBlend;
 
-    int wantedVariant = 2; // textured default
-    std::shared_ptr<GPU::RenderPipeline> pipeline = pipelineTextured;
+    // The mesh's own layout (nullptr: the standard glTF/PBR layout, whose
+    // missing attributes get fallback buffers below). A layout this backend
+    // can't draw is skipped.
+    const VertexLayout& layout = draw.mesh->layout ? *draw.mesh->layout : standardLayout;
+    const bool customLayout = draw.mesh->layout && !(*draw.mesh->layout == standardLayout);
+    // The material's program, or the program pass's for every draw
+    // (renderProgramPass()); an unknown handle falls back to PBR.
+    ProgramHandle program = activeProgramPass ? activeProgramPass->program : draw.material->program;
+    if (program >= programs.size()) program = kPbrProgram;
+    const auto colorFormat = activeProgramPass ? activeProgramPass->colorFormat : GPU::PixelFormat::invalid;
+    bool debugView = program == kPbrProgram && viewMode == ViewMode::worldNormal && !customLayout &&
+                     draw.mesh->topology == GPU::PrimitiveTopology::triangleList;
+    const MeshPipelineEntry* entry = debugView
+        ? meshPipeline(program, MeshProgram::debug, layout, false, false, colorFormat)
+        : meshPipeline(program, MeshProgram::textured, layout, doubleSided || (program == kPbrProgram && clippingActive()),
+                       useBlend, colorFormat, draw.mesh->topology);
+    if (!entry) return;
+    activeMeshSlots = &entry->slots;
 
-    if (doubleSided) {
-        pipeline = useBlend ? pipelineTexturedBlendDoubleSided : pipelineTexturedDoubleSided;
-        wantedVariant = useBlend ? 9 : 5;
-    } else {
-        pipeline = useBlend ? pipelineTexturedBlend : pipelineTextured;
-        wantedVariant = useBlend ? 7 : 2;
-    }
-
-    if (viewMode == ViewMode::worldNormal) {
-        wantedVariant = 3;
-        pipeline = pipelineDebug;
-    }
-
-    if (pipeline && wantedVariant != currentPipelineVariant) {
-        rpe->setPipeline(pipeline);
-        currentPipelineVariant = wantedVariant;
+    // Skip redundant setPipeline() calls: the bound pipeline object is
+    // tracked (reset with currentPipelineVariant between passes).
+    if (entry->pipeline.get() != currentPipelineObject) {
+        rpe->setPipeline(entry->pipeline);
+        currentPipelineObject = entry->pipeline.get();
+        currentPipelineVariant = -1;
     }
 
     // --- 2. Bind bind groups ---
-    bool needsTextures = (wantedVariant == 2 || wantedVariant == 5 ||
-                          wantedVariant == 7 || wantedVariant == 9);
+    bool needsTextures = !debugView;
 #if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
     // DirectX: single combined bind group — see renderPrimitive()'s identical
     // branch / ensureDirectXPbrBindGroupLayout()'s doc comment.
@@ -9282,12 +9500,12 @@ void Renderer::renderPrimitive(
 
     // --- 3. Bind transform ---
     if (transformBuffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_MVP, transformBuffer, transformOffset);
+        bindMeshBuffer(rpe, VERTEX_SLOT_MVP, transformBuffer, transformOffset);
     }
 
     // --- 4. Bind instance matrix ---
-    // GpuMesh::vertexBuffers only has the 6 per-vertex attribute slots
-    // (POSITION..WEIGHTS); VERTEX_SLOT_INSTANCE_MATRIX (19) is past its end, so
+    // GpuMesh::vertexBuffers only has the per-vertex attribute slots
+    // (one per VertexSemantic); VERTEX_SLOT_INSTANCE_MATRIX (19) is past its end, so
     // reading it was out of bounds. Only look there if the array ever grows.
     constexpr bool meshHasInstanceSlot =
         VERTEX_SLOT_INSTANCE_MATRIX < std::tuple_size_v<decltype(GpuMesh::vertexBuffers)>;
@@ -9296,84 +9514,103 @@ void Renderer::renderPrimitive(
         meshInstanceBuffer = draw.mesh->vertexBuffers[VERTEX_SLOT_INSTANCE_MATRIX];
     }
     if (draw.instanceCount > 1 && meshInstanceBuffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_INSTANCE_MATRIX, meshInstanceBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_INSTANCE_MATRIX, meshInstanceBuffer, 0);
     } else if (defaultInstanceMatrixBuffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_INSTANCE_MATRIX, defaultInstanceMatrixBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_INSTANCE_MATRIX, defaultInstanceMatrixBuffer, 0);
     }
 
     // --- 5. Bind material uniforms ---
     if (materialUniformBuffer && draw.material) {
         uint64_t matOffset = (uint64_t)draw.material->uniformSlot * kMaterialUniformStride;
         if (matOffset + kMaterialUniformStride <= materialUniformBuffer->getLength()) {
-            setVertexBufferIfChanged(rpe, VERTEX_SLOT_MATERIAL, materialUniformBuffer, matOffset);
+            bindMeshBuffer(rpe, VERTEX_SLOT_MATERIAL, materialUniformBuffer, matOffset);
         }
     }
 
     // --- 6. Bind joint matrices ---
     if (draw.jointMatrixBuffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_JOINT_MATRICES, draw.jointMatrixBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_JOINT_MATRICES, draw.jointMatrixBuffer, 0);
     } else if (defaultJointMatrixBuffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_JOINT_MATRICES, defaultJointMatrixBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_JOINT_MATRICES, defaultJointMatrixBuffer, 0);
     }
 
     // --- 6. Bind vertex attributes ---
     auto &vb = draw.mesh->vertexBuffers;
     if (vb[VERTEX_SLOT_POSITION]) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_POSITION, vb[VERTEX_SLOT_POSITION], 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_POSITION, vb[VERTEX_SLOT_POSITION], 0);
+    }
+    if (customLayout) {
+        // Exactly the layout's attributes (bindMeshBuffer() maps them to the
+        // pipeline's slots and skips those it doesn't read); no fallbacks.
+        for (const auto& a : layout.attributes) {
+            const auto slot = (size_t)a.semantic;
+            if (slot < vb.size() && vb[slot]) {
+                bindMeshBuffer(rpe, (uint32_t)slot, vb[slot], 0);
+            }
+        }
+        if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
+            rpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
+            rpe->drawIndexed(draw.mesh->indexCount, draw.instanceCount, 0, 0, drawFirstInstance());
+        } else {
+            rpe->draw(draw.mesh->vertexCount, draw.instanceCount, 0, drawFirstInstance());
+        }
+        return;
     }
     if (vb[VERTEX_SLOT_NORMAL]) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_NORMAL, vb[VERTEX_SLOT_NORMAL], 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_NORMAL, vb[VERTEX_SLOT_NORMAL], 0);
     } else if (fallbackNormalBuffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_NORMAL, fallbackNormalBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_NORMAL, fallbackNormalBuffer, 0);
     }
     if (vb[VERTEX_SLOT_TANGENT]) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_TANGENT, vb[VERTEX_SLOT_TANGENT], 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_TANGENT, vb[VERTEX_SLOT_TANGENT], 0);
     } else if (fallbackTangentBuffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_TANGENT, fallbackTangentBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_TANGENT, fallbackTangentBuffer, 0);
     }
     if (vb[VERTEX_SLOT_TEXCOORD0]) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD0, vb[VERTEX_SLOT_TEXCOORD0], 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_TEXCOORD0, vb[VERTEX_SLOT_TEXCOORD0], 0);
     } else if (fallbackUVBuffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD0, fallbackUVBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_TEXCOORD0, fallbackUVBuffer, 0);
     }
     if (vb[VERTEX_SLOT_JOINTS]) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_JOINTS, vb[VERTEX_SLOT_JOINTS], 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_JOINTS, vb[VERTEX_SLOT_JOINTS], 0);
     } else if (fallbackJointBuffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_JOINTS, fallbackJointBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_JOINTS, fallbackJointBuffer, 0);
     }
     if (vb[VERTEX_SLOT_WEIGHTS]) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_WEIGHTS, vb[VERTEX_SLOT_WEIGHTS], 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_WEIGHTS, vb[VERTEX_SLOT_WEIGHTS], 0);
     } else if (fallbackWeightBuffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_WEIGHTS, fallbackWeightBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_WEIGHTS, fallbackWeightBuffer, 0);
     }
-    // uploadMesh()/GpuMesh standalone meshes don't carry COLOR_0/TEXCOORD_1
-    // or morph target data (vertexBuffers is a fixed 6-slot array covering
-    // only POSITION/NORMAL/UV/TANGENT/JOINTS/WEIGHTS); bind the same white/
-    // zero fallbacks the primary GLTF-driven path uses so the shader reads
-    // spec-correct defaults instead of unbound/garbage buffers.
-    if (fallbackColor0Buffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_COLOR0, fallbackColor0Buffer, 0);
+    // COLOR_0 (float4) / TEXCOORD_1 (float2) when the app filled them in
+    // (uploadMesh() doesn't), else the same white/zero fallbacks the glTF
+    // path uses, so the shader reads spec-correct defaults. No morph data.
+    if (vb[VERTEX_SLOT_COLOR0]) {
+        bindMeshBuffer(rpe, VERTEX_SLOT_COLOR0, vb[VERTEX_SLOT_COLOR0], 0);
+    } else if (fallbackColor0Buffer) {
+        bindMeshBuffer(rpe, VERTEX_SLOT_COLOR0, fallbackColor0Buffer, 0);
     }
-    if (fallbackTexCoord1Buffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_TEXCOORD1, fallbackTexCoord1Buffer, 0);
+    if (vb[VERTEX_SLOT_TEXCOORD1]) {
+        bindMeshBuffer(rpe, VERTEX_SLOT_TEXCOORD1, vb[VERTEX_SLOT_TEXCOORD1], 0);
+    } else if (fallbackTexCoord1Buffer) {
+        bindMeshBuffer(rpe, VERTEX_SLOT_TEXCOORD1, fallbackTexCoord1Buffer, 0);
     }
     // bind the zero-weight default so the shader's blend loop is a no-op
     // (buffer 21 is a non-pointer `constant` reference — Metal requires
     // something valid bound there regardless of whether it's used).
     if (defaultMorphInfoBuffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_INFO, defaultMorphInfoBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_MORPH_INFO, defaultMorphInfoBuffer, 0);
     }
     if (fallbackTangentBuffer) {
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_POSITION, fallbackTangentBuffer, 0);
-        setVertexBufferIfChanged(rpe, VERTEX_SLOT_MORPH_NORMAL, fallbackTangentBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_MORPH_POSITION, fallbackTangentBuffer, 0);
+        bindMeshBuffer(rpe, VERTEX_SLOT_MORPH_NORMAL, fallbackTangentBuffer, 0);
     }
 
     // --- 7. Draw ---
     if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
         rpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
-        rpe->drawIndexed(draw.mesh->indexCount, draw.instanceCount);
+        rpe->drawIndexed(draw.mesh->indexCount, draw.instanceCount, 0, 0, drawFirstInstance());
     } else {
-        rpe->draw(draw.mesh->vertexCount, draw.instanceCount);
+        rpe->draw(draw.mesh->vertexCount, draw.instanceCount, 0, drawFirstInstance());
     }
 }
 

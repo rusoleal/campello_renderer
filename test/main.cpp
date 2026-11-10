@@ -1,6 +1,8 @@
+#include "element_id_shaders.h"
 #include <gtest/gtest.h>
 #include <campello_renderer/campello_renderer.hpp>
 #include <campello_renderer/procedural_texture_baker.hpp>
+#include <campello_renderer/culling.hpp>
 #include <gltf/gltf.hpp>
 #include <future>
 #include <vector>
@@ -2636,5 +2638,912 @@ TEST_F(OffscreenRenderTest, DifferentPixelFormatBGRA8) {
 
 int main(int argc, char **argv) {
     testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
+    const int result = RUN_ALL_TESTS();
+#if defined(__EMSCRIPTEN__)
+    // Completion line for campello_gpu's tests/webgpu/run_in_browser.mjs.
+    const auto* unitTest = testing::UnitTest::GetInstance();
+    printf("CAMPELLO_WEBGPU_TESTS_DONE failures=%d tests=%d skipped=%d\n",
+           unitTest->failed_test_count(), unitTest->test_to_run_count(),
+           unitTest->skipped_test_count());
+#endif
+    return result;
+}
+
+
+// ---------------------------------------------------------------------------
+// Frustum culling (culling.hpp): pure math, no GPU.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+namespace VMC = systems::leal::vector_math;
+using systems::leal::campello_renderer::GpuMesh;
+using systems::leal::campello_renderer::isOutsideFrustum;
+
+// Camera at (0, 0, 5) looking at the origin, 60 degree vertical FOV, square,
+// near 0.1, far 1000 (the same set-up as ECSPathRendersToOffscreen).
+VMC::Matrix4<double> testClipFromWorld() {
+    const auto view = VMC::Matrix4<double>::lookAt(
+        VMC::Vector3<double>(0.0, 0.0, 5.0), VMC::Vector3<double>(0.0, 0.0, 0.0), VMC::Vector3<double>(0.0, 1.0, 0.0));
+    const auto projection = VMC::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 1000.0);
+    return projection * view;
+}
+
+GpuMesh boxMesh(float x0, float y0, float z0, float x1, float y1, float z1) {
+    GpuMesh mesh;
+    mesh.hasBounds = true;
+    mesh.boundsMin = {x0, y0, z0};
+    mesh.boundsMax = {x1, y1, z1};
+    return mesh;
+}
+
+VMC::Matrix4<double> moved(double x, double y, double z) {
+    return VMC::Matrix4<double>::translate(VMC::Vector3<double>(x, y, z));
+}
+
+} // namespace
+
+TEST(FrustumCulling, BoxInFrontIsVisible) {
+    const auto box = boxMesh(-0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f);
+    EXPECT_FALSE(isOutsideFrustum(testClipFromWorld(), VMC::Matrix4<double>::identity(), box));
+}
+
+TEST(FrustumCulling, BoxesOutsideEachPlaneAreCulled) {
+    const auto clip = testClipFromWorld();
+    const auto box = boxMesh(-0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f);
+    EXPECT_TRUE(isOutsideFrustum(clip, moved(100.0, 0.0, 0.0), box));    // right
+    EXPECT_TRUE(isOutsideFrustum(clip, moved(-100.0, 0.0, 0.0), box));   // left
+    EXPECT_TRUE(isOutsideFrustum(clip, moved(0.0, 100.0, 0.0), box));    // top
+    EXPECT_TRUE(isOutsideFrustum(clip, moved(0.0, -100.0, 0.0), box));   // bottom
+    EXPECT_TRUE(isOutsideFrustum(clip, moved(0.0, 0.0, 20.0), box));     // behind the camera
+    EXPECT_TRUE(isOutsideFrustum(clip, moved(0.0, 0.0, -2000.0), box));  // beyond the far plane
+}
+
+TEST(FrustumCulling, BoxCrossingTheEdgeIsVisible) {
+    // At the origin (5 units away) the half-width is 5 * tan(30 deg) = 2.89:
+    // a box from x = 2 to 10 straddles the right plane.
+    EXPECT_FALSE(isOutsideFrustum(testClipFromWorld(), VMC::Matrix4<double>::identity(),
+                                  boxMesh(2.0f, -0.5f, -0.5f, 10.0f, 0.5f, 0.5f)));
+}
+
+TEST(FrustumCulling, WorldTransformIsApplied) {
+    const auto clip = testClipFromWorld();
+    // Local bounds far to the right; the world transform brings them back in.
+    const auto box = boxMesh(50.0f, -0.5f, -0.5f, 60.0f, 0.5f, 0.5f);
+    EXPECT_TRUE(isOutsideFrustum(clip, VMC::Matrix4<double>::identity(), box));
+    EXPECT_FALSE(isOutsideFrustum(clip, moved(-55.0, 0.0, 0.0), box));
+    // A half turn about Y maps local x 50..60 to world x -60..-50: still outside.
+    EXPECT_TRUE(isOutsideFrustum(clip, VMC::Matrix4<double>::rotateY(3.14159265358979323846), box));
+}
+
+TEST(FrustumCulling, MeshWithoutBoundsIsNeverCulled) {
+    GpuMesh mesh;  // hasBounds == false
+    EXPECT_FALSE(isOutsideFrustum(testClipFromWorld(), moved(1e6, 1e6, 1e6), mesh));
+}
+
+TEST(FrustumCulling, BoundsFromPositions) {
+    GpuMesh mesh;
+    const float xyz[] = {1.0f, -2.0f, 3.0f, -4.0f, 5.0f, 0.5f, 2.0f, 0.0f, -6.0f};
+    mesh.setBoundsFromPositions(xyz, 3);
+    ASSERT_TRUE(mesh.hasBounds);
+    EXPECT_FLOAT_EQ(mesh.boundsMin[0], -4.0f);
+    EXPECT_FLOAT_EQ(mesh.boundsMin[1], -2.0f);
+    EXPECT_FLOAT_EQ(mesh.boundsMin[2], -6.0f);
+    EXPECT_FLOAT_EQ(mesh.boundsMax[0], 2.0f);
+    EXPECT_FLOAT_EQ(mesh.boundsMax[1], 5.0f);
+    EXPECT_FLOAT_EQ(mesh.boundsMax[2], 3.0f);
+    GpuMesh empty;
+    empty.setBoundsFromPositions(xyz, 0);
+    EXPECT_FALSE(empty.hasBounds);
+}
+
+TEST_F(OffscreenRenderTest, UploadMeshTakesBoundsFromThePositionAccessor) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    GpuMesh* mesh = renderer->uploadMesh(asset->meshes->front().primitives.front(), *asset);
+    ASSERT_NE(mesh, nullptr);
+    ASSERT_TRUE(mesh->hasBounds);  // POSITION min [-0.5, -0.5, 0], max [0.5, 0.5, 0]
+    EXPECT_FLOAT_EQ(mesh->boundsMin[0], -0.5f);
+    EXPECT_FLOAT_EQ(mesh->boundsMin[1], -0.5f);
+    EXPECT_FLOAT_EQ(mesh->boundsMax[0], 0.5f);
+    EXPECT_FLOAT_EQ(mesh->boundsMax[1], 0.5f);
+}
+
+TEST(FrustumCulling, ProjectedRadiusShrinksWithDistance) {
+    using systems::leal::campello_renderer::projectedRadiusPixels;
+    const auto clip = testClipFromWorld();  // camera at z = 5, 60 degree FOV
+    const double yScale = 1.0 / std::tan(30.0 * 3.14159265358979323846 / 180.0);
+    // A 1 m cube (sphere radius 0.866) at 5 m on a 1000 px high target:
+    // 0.866 * 1.732 / 5 * 500 = 150 px.
+    const auto cube = boxMesh(-0.5f, -0.5f, -0.5f, 0.5f, 0.5f, 0.5f);
+    const double near = projectedRadiusPixels(clip, yScale, VMC::Matrix4<double>::identity(), cube, 1000);
+    EXPECT_NEAR(near, 150.0, 0.5);
+    // Ten times further: a tenth of the size (depth 50 instead of 5).
+    const double far = projectedRadiusPixels(clip, yScale, moved(0.0, 0.0, -45.0), cube, 1000);
+    EXPECT_NEAR(far, 15.0, 0.1);
+    // World scale counts (largest axis).
+    const double scaled = projectedRadiusPixels(
+        clip, yScale, VMC::Matrix4<double>::scale(VMC::Vector3<double>(2.0, 1.0, 1.0)), cube, 1000);
+    EXPECT_NEAR(scaled, 300.0, 1.0);
+    // Reaching the camera plane, or no bounds: never "small".
+    EXPECT_GT(projectedRadiusPixels(clip, yScale, moved(0.0, 0.0, 4.8), cube, 1000), 1e100);
+    GpuMesh unbounded;
+    EXPECT_GT(projectedRadiusPixels(clip, yScale, VMC::Matrix4<double>::identity(), unbounded, 1000), 1e100);
+}
+
+// Position-only meshes (VertexLayout::positionOnly()) are drawn with the lean
+// pipelines, which derive the face normal in the fragment shader: a quad
+// facing the camera must come out the same colour as the same quad with an
+// explicit normal.
+// The same quad-scaled triangle with float positions and with
+// KHR_mesh_quantization positions (normalized int16 at +-32767 = +-1.0
+// exactly, padded to an 8-byte stride): the quantized layout must place the
+// vertices identically.
+static const char *kGltfScaledTriangleFloat = R"({
+    "asset": {"version": "2.0"},
+    "scene": 0,
+    "scenes": [{"nodes": [0]}],
+    "nodes": [{"mesh": 0, "scale": [0.5, 0.5, 0.5]}],
+    "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 2, "material": 0}]}],
+    "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0, "roughnessFactor": 1}, "doubleSided": true}],
+    "accessors": [
+        {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1, 1, 0], "min": [-1, -1, 0]},
+        {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"},
+        {"bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR"}
+    ],
+    "bufferViews": [
+        {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 36, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 72, "byteLength": 6}
+    ],
+    "buffers": [{"uri": "data:application/octet-stream;base64,AACAvwAAgL8AAAAAAACAPwAAgL8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAABAAIA", "byteLength": 78}]
+})";
+static const char *kGltfScaledTriangleQuantized = R"({
+    "asset": {"version": "2.0"},
+    "extensionsUsed": ["KHR_mesh_quantization"], "extensionsRequired": ["KHR_mesh_quantization"],
+    "scene": 0,
+    "scenes": [{"nodes": [0]}],
+    "nodes": [{"mesh": 0, "scale": [0.5, 0.5, 0.5]}],
+    "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 2, "material": 0}]}],
+    "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0, "roughnessFactor": 1}, "doubleSided": true}],
+    "accessors": [
+        {"bufferView": 0, "componentType": 5122, "normalized": true, "count": 3, "type": "VEC3", "max": [1, 1, 0], "min": [-1, -1, 0]},
+        {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"},
+        {"bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR"}
+    ],
+    "bufferViews": [
+        {"buffer": 0, "byteOffset": 0, "byteLength": 24},
+        {"buffer": 0, "byteOffset": 24, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 60, "byteLength": 6}
+    ],
+    "buffers": [{"uri": "data:application/octet-stream;base64,AYABgAAAAAD/fwGAAAAAAAAA/38AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAABAAIA", "byteLength": 66}]
+})";
+
+TEST_F(OffscreenRenderTest, QuantizedPositionsRenderLikeFloatPositions) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+#if !defined(__APPLE__)
+    GTEST_SKIP() << "KHR_mesh_quantization layouts are Metal-only so far";
+#endif
+    const auto renderAsset = [&](const char *json) -> std::vector<uint8_t> {
+        renderer = std::make_unique<systems::leal::campello_renderer::Renderer>(device);
+        auto asset = GLTF::loadGLTF(std::string(json), kNoOpLoader);
+        if (!asset) return {};
+        renderer->setAsset(asset);
+        renderer->resize(64, 64);
+        renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+        renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        renderer->setSkyboxEnabled(false);
+        auto tex = makeOffscreenTexture(64, 64);
+        if (!tex) return {};
+        auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+        if (!view) return {};
+        renderer->render(view);
+        return readBackPixels(tex);
+    };
+    const auto floats = renderAsset(kGltfScaledTriangleFloat);
+    const auto quantized = renderAsset(kGltfScaledTriangleQuantized);
+    ASSERT_EQ(floats.size(), 64u * 64u * 4u);
+    ASSERT_EQ(quantized.size(), floats.size());
+    size_t lit = 0;
+    size_t differing = 0;
+    for (size_t i = 0; i < floats.size(); i += 4) {
+        if (floats[i] + floats[i + 1] + floats[i + 2] > 60) ++lit;  // ~70 of 4096
+        for (size_t c = 0; c < 3; ++c) {
+            if (std::abs(int(floats[i + c]) - int(quantized[i + c])) > 2) {
+                ++differing;
+                break;
+            }
+        }
+    }
+    EXPECT_GT(lit, 30u) << "the float triangle should cover part of the target";
+    EXPECT_EQ(differing, 0u) << "quantized and float positions rendered differently";
+}
+
+// A camera-facing triangle with one morph target moving every vertex
+// +0.4 in x; the mesh's default weight is the template placeholder.
+static const char *kGltfMorphTriangleTemplate = R"({
+    "asset": {"version": "2.0"},
+    "scene": 0,
+    "scenes": [{"nodes": [0]}],
+    "nodes": [{"mesh": 0}],
+    "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "targets": [{"POSITION": 2}], "indices": 3, "material": 0}],
+                "weights": [%f]}],
+    "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0, "roughnessFactor": 1}, "doubleSided": true}],
+    "accessors": [
+        {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [0.5, 0.5, 0], "min": [-0.5, -0.5, 0]},
+        {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"},
+        {"bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC3", "max": [0.4, 0, 0], "min": [0.4, 0, 0]},
+        {"bufferView": 3, "componentType": 5123, "count": 3, "type": "SCALAR"}
+    ],
+    "bufferViews": [
+        {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 36, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 72, "byteLength": 36},
+        {"buffer": 0, "byteOffset": 108, "byteLength": 6}
+    ],
+    "buffers": [{"uri": "data:application/octet-stream;base64,AAAAvwAAAL8AAAAAAAAAPwAAAL8AAAAAAAAAAAAAAD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/zczMPgAAAAAAAAAAzczMPgAAAAAAAAAAzczMPgAAAAAAAAAAAAABAAIA", "byteLength": 114}]
+})";
+
+// Morph-target deltas are uploaded tightly packed (12 bytes per vertex):
+// with weight 1 the whole triangle moves right, its right edge too (a
+// shader reading them at another stride moves only the first vertex).
+TEST_F(OffscreenRenderTest, MorphTargetMovesEveryVertex) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+#if !defined(__APPLE__)
+    GTEST_SKIP() << "morph targets are Metal-only so far";
+#endif
+    const auto render = [&](double weight) -> std::vector<uint8_t> {
+        renderer = std::make_unique<systems::leal::campello_renderer::Renderer>(device);
+        char json[4096];
+        snprintf(json, sizeof(json), kGltfMorphTriangleTemplate, weight);
+        auto asset = GLTF::loadGLTF(std::string(json), kNoOpLoader);
+        if (!asset) return {};
+        renderer->setAsset(asset);
+        renderer->resize(64, 64);
+        renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+        renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        renderer->setSkyboxEnabled(false);
+        auto tex = makeOffscreenTexture(64, 64);
+        if (!tex) return {};
+        auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+        renderer->render(view);
+        return readBackPixels(tex);
+    };
+    // Leftmost and rightmost lit columns.
+    const auto extent = [](const std::vector<uint8_t>& p) {
+        int left = 64, right = -1;
+        for (int y = 0; y < 64; ++y) {
+            for (int x = 0; x < 64; ++x) {
+                const size_t i = (size_t(y) * 64 + size_t(x)) * 4;
+                if (p[i] + p[i + 1] + p[i + 2] > 30) {
+                    left = std::min(left, x);
+                    right = std::max(right, x);
+                }
+            }
+        }
+        return std::pair{left, right};
+    };
+    const auto rest = render(0.0);
+    const auto moved = render(1.0);
+    ASSERT_EQ(rest.size(), 64u * 64u * 4u);
+    ASSERT_EQ(moved.size(), rest.size());
+    const auto [restLeft, restRight] = extent(rest);
+    const auto [movedLeft, movedRight] = extent(moved);
+    ASSERT_GE(restRight, 0) << "triangle not drawn";
+    EXPECT_GT(movedLeft, restLeft + 2) << "left edge should move right";
+    EXPECT_GT(movedRight, restRight + 2) << "right edge should move right too";
+}
+
+// Lines (GpuMesh::topology): an unlit green line over a lit quad in the same
+// plane is drawn along its whole length (the line stage's depth offset wins
+// the depth test) and only on its own row.
+static const char *kGltfLineMaterials = R"({
+    "asset": {"version": "2.0"},
+    "extensionsUsed": ["KHR_materials_unlit"],
+    "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0, 1, 0, 1]}, "extensions": {"KHR_materials_unlit": {}}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [1, 0, 0, 1], "metallicFactor": 0, "roughnessFactor": 1}}
+    ]
+})";
+
+TEST_F(OffscreenRenderTest, LinesDrawOnTopOfTheirFaces) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    ASSERT_TRUE(asset->materials && asset->materials->size() == 2);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsLines()) GTEST_SKIP() << "No line stage on this backend";
+    GpuMaterial* green = renderer->uploadMaterial((*asset->materials)[0], *asset);
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(green, nullptr);
+    ASSERT_NE(red, nullptr);
+
+    // A 1.2 x 1.2 quad at z = 0 and a horizontal line along its middle,
+    // both position-only.
+    float quadPositions[] = {-0.6f, -0.6f, 0.0f, 0.6f, -0.6f, 0.0f, 0.6f, 0.6f, 0.0f, -0.6f, 0.6f, 0.0f};
+    uint32_t quadIndices[] = {0, 1, 2, 0, 2, 3};
+    float linePositions[] = {-0.6f, 0.0f, 0.0f, 0.6f, 0.0f, 0.0f};
+    uint32_t lineIndices[] = {0, 1};
+    const auto makeMesh = [&](float* positions, size_t positionBytes, uint32_t* indices, uint32_t indexCount,
+                              GPU::PrimitiveTopology topology) {
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positionBytes, GPU::BufferUsage::vertex, positions);
+        mesh.indexBuffer = device->createBuffer(indexCount * sizeof(uint32_t), GPU::BufferUsage::index, indices);
+        mesh.indexCount = indexCount;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = (uint32_t)(positionBytes / 12);
+        mesh.layout = &VertexLayout::positionOnly();
+        mesh.topology = topology;
+        return mesh;
+    };
+    GpuMesh quad = makeMesh(quadPositions, sizeof(quadPositions), quadIndices, 6, GPU::PrimitiveTopology::triangleList);
+    GpuMesh line = makeMesh(linePositions, sizeof(linePositions), lineIndices, 2, GPU::PrimitiveTopology::lineList);
+
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                    VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection =
+        VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+    for (auto [mesh, material] : {std::pair{&quad, red}, std::pair{&line, green}}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    renderer->render(scene, view);
+    const auto pixels = readBackPixels(tex);
+    const auto isGreen = [&](int x, int y) {
+        const size_t i = (size_t(y) * 64 + size_t(x)) * 4;
+        return pixels[i + 1] > 200 && pixels[i] < 60 && pixels[i + 2] < 60;
+    };
+    // The line's row (it may land on row 31 or 32): green along the quad.
+    int greenOnLine = 0;
+    for (int x = 22; x <= 41; ++x) {
+        if (isGreen(x, 31) || isGreen(x, 32)) ++greenOnLine;
+    }
+    EXPECT_EQ(greenOnLine, 20) << "line hidden by its coplanar face somewhere";
+    // Away from it: the quad, not the line.
+    EXPECT_FALSE(isGreen(32, 26));
+    EXPECT_FALSE(isGreen(32, 38));
+    const size_t quadPixel = (size_t(26) * 64 + 32) * 4;
+    EXPECT_GT(pixels[quadPixel], 40) << "lit red quad";
+}
+
+// App shader programs (program.hpp): an element-id program compiled by
+// campello_renderer_add_shader_program() writes each quad's per-vertex id
+// (custom0) into an r32uint target through renderProgramPass().
+TEST_F(OffscreenRenderTest, ProgramPassWritesElementIds) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+
+    EXPECT_EQ(renderer->registerProgram(ShaderProgramDesc{}), kInvalidProgram) << "no binaries";
+    const ProgramHandle ids = renderer->registerProgram(element_id_shaders::desc());
+    if (ids == kInvalidProgram) GTEST_SKIP() << "element_id program not compiled for this backend";
+
+    // Layout: positions + a uint32 id per vertex.
+    VertexLayout layout = VertexLayout::positionOnly();
+    layout.attributes.push_back({VertexSemantic::custom0, GPU::ComponentType::ctUnsignedInt, GPU::AccessorType::acScalar});
+    EXPECT_TRUE(renderer->supportsProgram(ids, layout));
+    EXPECT_FALSE(renderer->supportsProgram(ids, VertexLayout::positionOnly())) << "custom0 is read";
+    EXPECT_EQ(renderer->supportsVertexLayout(layout), renderer->supportsVertexLayout(VertexLayout::positionOnly()))
+        << "PBR ignores the id attribute";
+
+    // Two 1 x 1 quads facing the camera: id 7 at x = -0.3 (z = 0), id 42 at
+    // x = +0.3 (z = 0.2, nearer), overlapping in the middle.
+    const auto makeQuad = [&](float cx, float z, uint32_t id) {
+        float positions[] = {cx - 0.5f, -0.5f, z, cx + 0.5f, -0.5f, z, cx + 0.5f, 0.5f, z, cx - 0.5f, 0.5f, z};
+        uint32_t idsPerVertex[] = {id, id, id, id};
+        uint32_t indices[] = {0, 1, 2, 0, 2, 3};
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(sizeof(positions), GPU::BufferUsage::vertex, positions);
+        mesh.indexBuffer = device->createBuffer(sizeof(indices), GPU::BufferUsage::index, indices);
+        mesh.indexCount = 6;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = 4;
+        mesh.layout = &layout;
+        mesh.vertexBuffers[(size_t)VertexSemantic::custom0] =
+            device->createBuffer(sizeof(idsPerVertex), GPU::BufferUsage::vertex, idsPerVertex);
+        return mesh;
+    };
+    GpuMesh left = makeQuad(-0.3f, 0.0f, 7);
+    GpuMesh right = makeQuad(0.3f, 0.2f, 42);
+
+    namespace GLTF_NS = systems::leal::gltf;
+    GLTF_NS::Material plain("", nullptr, nullptr, nullptr, nullptr, VM::Vector3<double>(0.0, 0.0, 0.0),
+                            GLTF_NS::AlphaMode::opaque, 0.5, false, false, 1.0, 1.5, 0.0);
+    GpuMaterial* material = renderer->uploadMaterial(plain, *asset);
+    ASSERT_NE(material, nullptr);
+
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                    VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection =
+        VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+    for (GpuMesh* mesh : {&left, &right}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+
+    auto tex = makeOffscreenTexture(64, 64, GPU::PixelFormat::r32uint);
+    ASSERT_NE(tex, nullptr);
+    auto view = tex->createView(GPU::PixelFormat::r32uint, 1);
+    ProgramPassOptions options;
+    options.program = ids;
+    options.colorFormat = GPU::PixelFormat::r32uint;
+    renderer->renderProgramPass(scene, view, options);
+
+    std::vector<uint32_t> pixels(64 * 64);
+    device->waitForIdle();
+    ASSERT_TRUE(tex->download(0, 0, pixels.data(), pixels.size() * sizeof(uint32_t)));
+    const auto at = [&](int x, int y) { return pixels[(size_t)y * 64 + (size_t)x]; };
+    EXPECT_EQ(at(2, 2), 0u) << "cleared background";
+    // 60 degree field of view from 3 m: the left quad covers about pixels
+    // 17-28 (x), the right one (nearer) about 36-47, both overlap 29-34.
+    EXPECT_EQ(at(22, 32), 7u) << "left quad only";
+    EXPECT_EQ(at(42, 32), 42u) << "right quad only";
+    EXPECT_EQ(at(32, 32), 42u) << "overlap: the nearer quad";
+
+    // The same scene still draws with the built-in program (the id attribute
+    // is ignored) into the normal color target.
+    auto colorTex = makeOffscreenTexture(64, 64);
+    auto colorView = colorTex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    EXPECT_NO_THROW(renderer->render(scene, colorView));
+}
+
+TEST(ClipPlanes, IsClippedAwayTestsTheBoxInLocalSpace) {
+    namespace VM = systems::leal::vector_math;
+    GpuMesh mesh;
+    mesh.hasBounds = true;
+    mesh.boundsMin = {-1.0f, -1.0f, -1.0f};
+    mesh.boundsMax = {1.0f, 1.0f, 1.0f};
+    const auto identity = VM::Matrix4<double>::identity();
+    // Kept where n.p + d >= 0.
+    EXPECT_TRUE(isClippedAway({{1.0, 0.0, 0.0, -2.0}}, identity, mesh));   // keep x >= 2
+    EXPECT_FALSE(isClippedAway({{1.0, 0.0, 0.0, 0.0}}, identity, mesh));   // keep x >= 0: straddles
+    EXPECT_FALSE(isClippedAway({{-1.0, 0.0, 0.0, -0.999}}, identity, mesh)); // keep x <= -0.999
+    EXPECT_FALSE(isClippedAway({}, identity, mesh));
+    // Moved to x = 5: now entirely kept by "x >= 2", and clipped by "x <= 3".
+    auto moved = VM::Matrix4<double>::identity();
+    moved.data[3] = 5.0;
+    EXPECT_FALSE(isClippedAway({{1.0, 0.0, 0.0, -2.0}}, moved, mesh));
+    EXPECT_TRUE(isClippedAway({{-1.0, 0.0, 0.0, 3.0}}, moved, mesh));
+    // Any plane clipping it is enough.
+    EXPECT_TRUE(isClippedAway({{0.0, 0.0, 1.0, 10.0}, {-1.0, 0.0, 0.0, 3.0}}, moved, mesh));
+    mesh.hasBounds = false;
+    EXPECT_FALSE(isClippedAway({{1.0, 0.0, 0.0, -2.0}}, identity, mesh));
+}
+
+// Clip planes in the built-in PBR shader: the clipped half of a quad is
+// discarded; with section caps, the back face of a single-sided quad (no
+// longer culled while clipping) takes the cap colour, a double-sided one
+// doesn't.
+TEST_F(OffscreenRenderTest, ClipPlanesDiscardAndCapBackFaces) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsClipPlanes()) GTEST_SKIP() << "No clip planes on this backend";
+
+    // 1 x 1 quad at z = 0, counter-clockwise seen from +z (front) or not.
+    const auto makeQuad = [&](bool facingCamera) {
+        float positions[] = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f, -0.5f, 0.5f, 0.0f};
+        float normals[] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+        uint32_t front[] = {0, 1, 2, 0, 2, 3};
+        uint32_t back[] = {0, 2, 1, 0, 3, 2};
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(sizeof(positions), GPU::BufferUsage::vertex, positions);
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+            device->createBuffer(sizeof(normals), GPU::BufferUsage::vertex, normals);
+        mesh.indexBuffer = device->createBuffer(sizeof(front), GPU::BufferUsage::index, facingCamera ? front : back);
+        mesh.indexCount = 6;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = 4;
+        mesh.setBoundsFromPositions(positions, 4);
+        return mesh;
+    };
+    GpuMesh frontQuad = makeQuad(true);
+    GpuMesh backQuad = makeQuad(false);
+    namespace GLTF_NS = systems::leal::gltf;
+    const auto material = [&](bool doubleSided) {
+        GLTF_NS::Material m("", nullptr, nullptr, nullptr, nullptr, VM::Vector3<double>(0.0, 0.0, 0.0),
+                            GLTF_NS::AlphaMode::opaque, 0.5, doubleSided, false, 1.0, 1.5, 0.0);
+        return renderer->uploadMaterial(m, *asset);
+    };
+    GpuMaterial* singleSided = material(false);
+    GpuMaterial* doubleSided = material(true);
+    ASSERT_NE(singleSided, nullptr);
+    ASSERT_NE(doubleSided, nullptr);
+
+    const auto render = [&](GpuMesh& mesh, GpuMaterial* mat) {
+        RenderScene scene;
+        scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                        VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                        VM::Vector3<double>(0.0, 1.0, 0.0));
+        scene.camera.projection =
+            VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+        scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+        DrawCall draw;
+        draw.mesh = &mesh;
+        draw.material = mat;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        return readBackPixels(tex);
+    };
+    const auto pixel = [](const std::vector<uint8_t>& p, int x, int y) {
+        const size_t i = ((size_t)y * 64 + (size_t)x) * 4;
+        return std::array<int, 3>{p[i], p[i + 1], p[i + 2]};
+    };
+    const auto lit = [](std::array<int, 3> c) { return c[0] + c[1] + c[2] > 30; };
+
+    // The quad covers about pixels 23-41. No clipping: both halves lit.
+    auto plain = render(frontQuad, singleSided);
+    EXPECT_TRUE(lit(pixel(plain, 26, 32)));
+    EXPECT_TRUE(lit(pixel(plain, 38, 32)));
+    // Keep x >= 0: the left half is discarded.
+    renderer->setClipPlanes({{1.0, 0.0, 0.0, 0.0}});
+    auto half = render(frontQuad, singleSided);
+    EXPECT_FALSE(lit(pixel(half, 26, 32))) << "clipped side discarded";
+    EXPECT_TRUE(lit(pixel(half, 38, 32))) << "kept side drawn";
+
+    // A plane keeping everything; red caps.
+    renderer->setClipPlanes({{0.0, 0.0, 1.0, 10.0}});
+    renderer->setSectionCaps(true, 1.0f, 0.0f, 0.0f);
+    const auto cap = pixel(render(backQuad, singleSided), 32, 32);
+    EXPECT_EQ(cap, (std::array<int, 3>{255, 0, 0})) << "single-sided back face: cap colour";
+    const auto twoSided = pixel(render(backQuad, doubleSided), 32, 32);
+    EXPECT_TRUE(lit(twoSided));
+    EXPECT_NE(twoSided, (std::array<int, 3>{255, 0, 0})) << "double-sided back face is shaded, not capped";
+    // Clipping off: the single-sided back face is culled again.
+    renderer->setClipPlanes({});
+    EXPECT_FALSE(lit(pixel(render(backQuad, singleSided), 32, 32))) << "back face culled";
+}
+
+TEST(VertexLayout, DescribesFormatsAndHashesThem) {
+    using CT = systems::leal::campello_gpu::ComponentType;
+    const VertexLayout standard = VertexLayout::standard();
+    EXPECT_EQ(standard.attributes.size(), 8u);
+    EXPECT_EQ(standard.semanticMask(), kStandardSemanticMask);
+    EXPECT_EQ(standard.find(VertexSemantic::position)->stride(), 12u);
+    EXPECT_EQ(standard.find(VertexSemantic::texcoord0)->stride(), 8u);
+    EXPECT_EQ(standard.find(VertexSemantic::joints)->stride(), 4u);  // unsigned byte x 4
+    EXPECT_EQ(VertexLayout::standard(CT::ctUnsignedShort).find(VertexSemantic::joints)->stride(), 8u);
+
+    const VertexLayout& lean = VertexLayout::positionOnly();
+    EXPECT_EQ(lean.semanticMask(), semanticBit(VertexSemantic::position));
+    EXPECT_EQ(lean.find(VertexSemantic::normal), nullptr);
+    // Equal layouts hash equal; a different format changes the hash.
+    EXPECT_EQ(VertexLayout::standard().hash(), standard.hash());
+    EXPECT_NE(VertexLayout::standard(CT::ctUnsignedShort).hash(), standard.hash());
+    EXPECT_NE(lean.hash(), standard.hash());
+}
+
+TEST_F(OffscreenRenderTest, MeshPipelinesComeFromLayoutsAndAreCached) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setSkyboxEnabled(false);
+
+    EXPECT_TRUE(renderer->supportsVertexLayout(renderer->standardVertexLayout()));
+    // Without positions no vertex stage applies.
+    VertexLayout normalsOnly;
+    normalsOnly.attributes.push_back({VertexSemantic::normal});
+    EXPECT_FALSE(renderer->supportsVertexLayout(normalsOnly));
+    // Extra attributes are fine: the lean stage reads only the position.
+    VertexLayout positionAndUv = VertexLayout::positionOnly();
+    positionAndUv.attributes.push_back({VertexSemantic::texcoord0, GPU::ComponentType::ctFloat, GPU::AccessorType::acVec2});
+    EXPECT_EQ(renderer->supportsVertexLayout(positionAndUv),
+              renderer->supportsVertexLayout(VertexLayout::positionOnly()));
+
+    // createDefaultPipelines() prewarms what the built-in paths draw with:
+    // drawing a standard, a position-only and an unsupported mesh creates
+    // nothing new (and the unsupported one is skipped, not a crash).
+    const size_t prewarmed = renderer->meshPipelineCount();
+    EXPECT_GT(prewarmed, 0u);
+    float positions[] = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f};
+    uint32_t indices[] = {0, 1, 2};
+    const auto makeMesh = [&](const VertexLayout* layout) {
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(sizeof(positions), GPU::BufferUsage::vertex, positions);
+        mesh.indexBuffer = device->createBuffer(sizeof(indices), GPU::BufferUsage::index, indices);
+        mesh.indexCount = 3;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = 3;
+        mesh.layout = layout;
+        return mesh;
+    };
+    GpuMesh standardMesh = makeMesh(nullptr);
+    GpuMesh leanMesh = makeMesh(&VertexLayout::positionOnly());
+    GpuMesh unsupported = makeMesh(&normalsOnly);
+    namespace GLTF_NS = systems::leal::gltf;
+    GLTF_NS::Material plain("", nullptr, nullptr, nullptr, nullptr, VM::Vector3<double>(0.0, 0.0, 0.0),
+                            GLTF_NS::AlphaMode::opaque, 0.5, false, false, 1.0, 1.5, 0.0);
+    GpuMaterial* material = renderer->uploadMaterial(plain, *asset);
+    ASSERT_NE(material, nullptr);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                    VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(1.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+    for (GpuMesh* mesh : {&standardMesh, &leanMesh, &unsupported}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    EXPECT_NO_THROW(renderer->render(scene, view));
+    EXPECT_EQ(renderer->meshPipelineCount(), prewarmed);
+    // The meshes' buffers die with this scope: let the GPU finish with them
+    // first (DirectX and Vulkan don't keep in-flight resources alive).
+    device->waitForIdle();
+}
+
+// OpaqueOrder::frontToBack only reorders draws: whatever order the scene
+// lists them in, the nearer of two overlapping quads must win, exactly as
+// with the default byState order.
+TEST_F(OffscreenRenderTest, FrontToBackOrderKeepsTheNearerSurface) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+
+    // A 1 x 1 quad in the z = 0 plane, facing +z (the camera), with bounds.
+    float positions[] = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f, -0.5f, 0.5f, 0.0f};
+    float normals[]   = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    uint32_t indices[] = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(sizeof(positions), GPU::BufferUsage::vertex, positions);
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+        device->createBuffer(sizeof(normals), GPU::BufferUsage::vertex, normals);
+    quad.indexBuffer = device->createBuffer(sizeof(indices), GPU::BufferUsage::index, indices);
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.setBoundsFromPositions(positions, 4);
+
+    namespace GLTF_NS = systems::leal::gltf;
+    const auto emissive = [&](double r, double g, double b) {
+        GLTF_NS::Material m("", nullptr, nullptr, nullptr, nullptr, VM::Vector3<double>(r, g, b),
+                            GLTF_NS::AlphaMode::opaque, 0.5, false, false, 1.0, 1.5, 0.0);
+        return renderer->uploadMaterial(m, *asset);
+    };
+    GpuMaterial* red = emissive(1.0, 0.0, 0.0);
+    GpuMaterial* blue = emissive(0.0, 0.0, 1.0);
+    ASSERT_NE(red, nullptr);
+    ASSERT_NE(blue, nullptr);
+
+    const auto translate = [](double z) {
+        auto m = VM::Matrix4<double>::identity();
+        m.data[11] = z;  // row-major, column vectors: translation in the last column
+        return m;
+    };
+    const auto renderCentre = [&](bool nearListedFirst) {
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        RenderScene scene;
+        scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                        VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                        VM::Vector3<double>(0.0, 1.0, 0.0));
+        scene.camera.projection =
+            VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+        scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+        DrawCall nearDraw;
+        nearDraw.mesh = &quad;
+        nearDraw.material = red;
+        nearDraw.worldTransform = translate(0.3);
+        DrawCall farDraw = nearDraw;
+        farDraw.material = blue;
+        farDraw.worldTransform = translate(-0.3);
+        scene.opaque = nearListedFirst ? std::vector<DrawCall>{nearDraw, farDraw}
+                                       : std::vector<DrawCall>{farDraw, nearDraw};
+        renderer->render(scene, view);
+        auto pixels = readBackPixels(tex);
+        const size_t centre = (32 * 64 + 32) * 4;
+        return std::array<int, 3>{pixels[centre], pixels[centre + 1], pixels[centre + 2]};
+    };
+
+    EXPECT_EQ(renderer->getOpaqueOrder(), OpaqueOrder::byState);
+    const auto reference = renderCentre(true);
+    EXPECT_GT(reference[0], reference[2] + 50)
+        << "near (red) quad should be in front; centre rgb " << reference[0] << ", " << reference[1] << ", "
+        << reference[2];
+    renderer->setOpaqueOrder(OpaqueOrder::frontToBack);
+    for (const bool nearFirst : {true, false}) {
+        const auto pixel = renderCentre(nearFirst);
+        for (int c = 0; c < 3; ++c) {
+            EXPECT_NEAR(pixel[static_cast<size_t>(c)], reference[static_cast<size_t>(c)], 2)
+                << "channel " << c << (nearFirst ? ", near listed first" : ", far listed first") << "; rgb "
+                << pixel[0] << ", " << pixel[1] << ", " << pixel[2];
+        }
+    }
+}
+
+// Materials uploaded outside the asset take slots in the shared material
+// uniform buffer; growing it for later ones must keep the earlier ones (on
+// DirectX, bind groups rebuilt every pass read whichever buffer is current).
+TEST_F(OffscreenRenderTest, StandaloneMaterialsSurviveUniformBufferGrowth) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+
+    float positions[] = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f, -0.5f, 0.5f, 0.0f};
+    float normals[]   = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    uint32_t indices[] = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(sizeof(positions), GPU::BufferUsage::vertex, positions);
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+        device->createBuffer(sizeof(normals), GPU::BufferUsage::vertex, normals);
+    quad.indexBuffer = device->createBuffer(sizeof(indices), GPU::BufferUsage::index, indices);
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.setBoundsFromPositions(positions, 4);
+
+    namespace GLTF_NS = systems::leal::gltf;
+    const auto emissive = [&](double r, double g, double b) {
+        GLTF_NS::Material m("", nullptr, nullptr, nullptr, nullptr, VM::Vector3<double>(r, g, b),
+                            GLTF_NS::AlphaMode::opaque, 0.5, false, false, 1.0, 1.5, 0.0);
+        return renderer->uploadMaterial(m, *asset);
+    };
+    GpuMaterial* red = emissive(1.0, 0.0, 0.0);
+    ASSERT_NE(red, nullptr);
+    for (int i = 0; i < 40; ++i) {
+        ASSERT_NE(emissive(0.0, 0.0, 1.0), nullptr);
+    }
+
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                    VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection =
+        VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+    DrawCall draw;
+    draw.mesh = &quad;
+    draw.material = red;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque = {draw};
+    renderer->render(scene, view);
+    auto pixels = readBackPixels(tex);
+    const size_t centre = (32 * 64 + 32) * 4;
+    EXPECT_GT(pixels[centre], pixels[centre + 2] + 50)
+        << "first material should still be red; centre rgb " << int(pixels[centre]) << ", "
+        << int(pixels[centre + 1]) << ", " << int(pixels[centre + 2]);
+}
+
+TEST_F(OffscreenRenderTest, PositionOnlyMeshMatchesExplicitNormals) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsVertexLayout(VertexLayout::positionOnly())) GTEST_SKIP() << "No lean pipelines on this backend";
+
+    // A 1 x 1 quad in the z = 0 plane, facing +z (the camera).
+    float positions[] = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f, -0.5f, 0.5f, 0.0f};
+    float normals[]   = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    uint32_t indices[] = {0, 1, 2, 0, 2, 3};
+    const auto makeQuad = [&](bool lean) {
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(sizeof(positions), GPU::BufferUsage::vertex, positions);
+        if (!lean) {
+            mesh.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+                device->createBuffer(sizeof(normals), GPU::BufferUsage::vertex, normals);
+        }
+        mesh.indexBuffer = device->createBuffer(sizeof(indices), GPU::BufferUsage::index, indices);
+        mesh.indexCount = 6;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = 4;
+        if (lean) mesh.layout = &VertexLayout::positionOnly();
+        return mesh;
+    };
+
+    namespace GLTF_NS = systems::leal::gltf;
+    GLTF_NS::Material plain("", nullptr, nullptr, nullptr, nullptr, VM::Vector3<double>(0.0, 0.0, 0.0),
+                            GLTF_NS::AlphaMode::opaque, 0.5, false, false, 1.0, 1.5, 0.0);
+    GpuMaterial* material = renderer->uploadMaterial(plain, *asset);
+    ASSERT_NE(material, nullptr);
+
+    const auto renderCentre = [&](GpuMesh& mesh) {
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        RenderScene scene;
+        scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                        VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                        VM::Vector3<double>(0.0, 1.0, 0.0));
+        scene.camera.projection =
+            VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+        scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+        DrawCall draw;
+        draw.mesh = &mesh;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        draw.instanceCount = 1;
+        scene.opaque.push_back(draw);
+        renderer->render(scene, view);
+        auto pixels = readBackPixels(tex);
+        const size_t centre = (32 * 64 + 32) * 4;
+        return std::array<int, 3>{pixels[centre], pixels[centre + 1], pixels[centre + 2]};
+    };
+
+    GpuMesh full = makeQuad(false);
+    GpuMesh lean = makeQuad(true);
+    const auto withNormals = renderCentre(full);
+    const auto derived = renderCentre(lean);
+    // Lit, not black (a zero or back-facing normal would come out dark) ...
+    EXPECT_GT(derived[0] + derived[1] + derived[2], 30);
+    // ... and the same shade as with the explicit normal.
+    for (int c = 0; c < 3; ++c) {
+        EXPECT_NEAR(derived[static_cast<size_t>(c)], withNormals[static_cast<size_t>(c)], 3) << "channel " << c;
+    }
 }

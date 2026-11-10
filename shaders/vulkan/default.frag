@@ -41,7 +41,7 @@ layout(std140, set = 0, binding = 24) uniform MaterialUniforms {
     float hasEmissiveTexture;        // 76
     float hasOcclusionTexture;       // 80
     float occlusionStrength;         // 84
-    float _pad0;                     // 88
+    float doubleSided;               // 88: 1 = double-sided material (no section cap)
     float _pad1;                     // 92
     vec4  emissiveFactor;            // 96
     float ior;                       // 112
@@ -117,6 +117,10 @@ layout(std140, set = 1, binding = 1) uniform CameraUniforms {
     mat4 projMatrix;
     vec2 screenSize;
     vec2 _cpad;
+    // Clip block (Renderer::uploadClipUniforms()).
+    uvec4 clipInfo;       // x = plane count, y = section caps on
+    vec4  capColor;
+    vec4  clipPlanes[6];  // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
 } camera;
 
 layout(set = 1, binding = 2) uniform textureCube environmentMap;
@@ -159,9 +163,16 @@ layout(set = 0, binding = 23) uniform texture2D anisotropicTexture;         // r
 
 // --- Vertex stage inputs ---------------------------------------------------------
 layout(location = 0) in vec3 worldPos;
-layout(location = 1) in vec3 worldNormalIn;
-layout(location = 2) in vec3 worldTangentIn;
-layout(location = 3) in vec3 worldBitangentIn;
+layout(location = 1) in vec3 worldNormalRaw;
+layout(location = 2) in vec3 worldTangentRaw;
+layout(location = 3) in vec3 worldBitangentRaw;
+
+// The geometric frame the shading uses: the interpolated vertex frame, or for
+// position-only meshes (default_lean.vert, zero normal) the flat face normal
+// derived from screen-space derivatives of worldPos. Filled at the top of main().
+vec3 worldNormalIn;
+vec3 worldTangentIn;
+vec3 worldBitangentIn;
 layout(location = 4) in vec2 fragTexcoord0;
 layout(location = 5) in vec2 fragTexcoord1;
 layout(location = 6) in vec4 fragColor0;
@@ -370,6 +381,35 @@ vec3 linearToSRGBFast(vec3 color) {
 }
 
 void main() {
+    // Derivatives are taken unconditionally (uniform control flow).
+    vec3 faceNormal = cross(dFdx(worldPos), dFdy(worldPos));
+    worldNormalIn    = worldNormalRaw;
+    worldTangentIn   = worldTangentRaw;
+    worldBitangentIn = worldBitangentRaw;
+    if (dot(worldNormalRaw, worldNormalRaw) < 1e-8) {
+        vec3 N = length(faceNormal) > 1e-20 ? normalize(faceNormal) : vec3(0.0, 0.0, 1.0);
+        if (dot(N, camera.cameraPos.xyz - worldPos) < 0.0) {
+            N = -N;
+        }
+        vec3 T = abs(N.y) < 0.999 ? normalize(cross(vec3(0.0, 1.0, 0.0), N)) : normalize(cross(vec3(1.0, 0.0, 0.0), N));
+        worldNormalIn    = N;
+        worldTangentIn   = T;
+        worldBitangentIn = cross(N, T);
+    }
+
+    // Clip planes (Renderer::setClipPlanes()): discard the clipped side. With
+    // section caps on, back faces of single-sided surfaces (the inside of a
+    // cut solid, visible through the cut) take the cap colour.
+    for (uint i = 0u; i < camera.clipInfo.x; ++i) {
+        if (dot(camera.clipPlanes[i].xyz, worldPos) + camera.clipPlanes[i].w < 0.0) {
+            discard;
+        }
+    }
+    if (camera.clipInfo.y != 0u && !gl_FrontFacing && mat.doubleSided < 0.5) {
+        outColor = vec4(camera.capColor.rgb, 1.0);
+        return;
+    }
+
     vec2 uv0 = fragTexcoord0;
     if (mat.uvTransformRow0.w > 0.5) {
         uv0 = applyUvTransform(fragTexcoord0, mat.uvTransformRow0, mat.uvTransformRow1);

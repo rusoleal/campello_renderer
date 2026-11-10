@@ -1,7 +1,9 @@
 #pragma once
 
 #include <functional>
+#include <atomic>
 #include <memory>
+#include <optional>
 #include <array>
 #include <string>
 #include <unordered_map>
@@ -18,6 +20,8 @@
 #include <campello_renderer/image.hpp>
 #include <campello_renderer/animation.hpp>
 #include <campello_renderer/procedural_texture_baker.hpp>
+#include <campello_renderer/vertex_layout.hpp>
+#include <campello_renderer/program.hpp>
 #include <vector_math/vector_math.hpp>
 
 namespace systems::leal::campello_image { class Image; }
@@ -29,9 +33,49 @@ namespace systems::leal::campello_renderer {
         uint32_t indexCount = 0;
         systems::leal::campello_gpu::IndexFormat indexFormat =
             systems::leal::campello_gpu::IndexFormat::uint32;
-        std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, 6> vertexBuffers; // POSITION, NORMAL, UV, TANGENT, JOINTS, WEIGHTS
+        // One buffer per VertexSemantic (POSITION, NORMAL, TEXCOORD_0, TANGENT,
+        // JOINTS_0, WEIGHTS_0, COLOR_0, TEXCOORD_1, custom0-3), tightly packed.
+        std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, kVertexSemanticCount> vertexBuffers;
         uint32_t vertexCount = 0;
-        // topology, bounds — reserved for future phases
+
+        // Local-space axis-aligned bounds of the vertex positions. When set,
+        // render_system() skips the draw if the box is entirely outside the
+        // camera frustum. Unset (the default): never culled. uploadMesh()
+        // fills them from a float POSITION accessor's min/max.
+        // Vertex layout: which attributes vertexBuffers holds (indexed by
+        // VertexSemantic) and their formats. nullptr = the renderer's standard
+        // glTF/PBR layout (Renderer::standardVertexLayout()), with fallback
+        // buffers bound for missing attributes. Any other layout is drawn only
+        // if Renderer::supportsVertexLayout() accepts it, and must point at
+        // storage that outlives the mesh (e.g. VertexLayout::positionOnly()).
+        const VertexLayout* layout = nullptr;
+        // Primitive topology. Lines (lineList, lineStrip) are drawn by the
+        // built-in program with its line vertex stage (Metal, Vulkan): one
+        // pixel wide, nudged towards the camera so edges stay visible on
+        // their faces, no culling; use an unlit material for a flat colour.
+        // Clip planes apply to them too.
+        systems::leal::campello_gpu::PrimitiveTopology topology =
+            systems::leal::campello_gpu::PrimitiveTopology::triangleList;
+
+        bool hasBounds = false;
+        std::array<float, 3> boundsMin{0.0f, 0.0f, 0.0f};
+        std::array<float, 3> boundsMax{0.0f, 0.0f, 0.0f};
+
+        /// Sets the bounds from tightly packed xyz positions.
+        void setBoundsFromPositions(const float* xyz, size_t count) {
+            hasBounds = count > 0;
+            if (!hasBounds) return;
+            boundsMin = {xyz[0], xyz[1], xyz[2]};
+            boundsMax = boundsMin;
+            for (size_t i = 1; i < count; ++i) {
+                for (size_t a = 0; a < 3; ++a) {
+                    const float v = xyz[i * 3 + a];
+                    if (v < boundsMin[a]) boundsMin[a] = v;
+                    if (v > boundsMax[a]) boundsMax[a] = v;
+                }
+            }
+        }
+        // topology — reserved for future phases
     };
 
     struct GpuMaterial {
@@ -47,6 +91,10 @@ namespace systems::leal::campello_renderer {
         bool alphaBlend = false;
         bool alphaMask = false;
         bool transmission = false; // true if KHR_materials_transmission is active
+        // Shader program drawing this material (Renderer::registerProgram());
+        // the built-in PBR shaders by default. The material's bind groups and
+        // uniforms are bound either way (custom programs may read them).
+        ProgramHandle program = kPbrProgram;
     };
 
     struct DrawCall {
@@ -107,6 +155,14 @@ namespace systems::leal::campello_renderer {
         dispersion = 20,
     };
 
+    /// Order of opaque draws within a frame. `byState` (default) groups draws
+    /// by material and mesh to minimise state changes. `frontToBack` keeps the
+    /// pipeline classes (single/double-sided) together and draws nearer meshes
+    /// first, so early depth testing skips hidden fragments on GPUs that shade
+    /// in submission order (most desktop GPUs; tile-based Apple GPUs remove
+    /// hidden surfaces themselves).
+    enum class OpaqueOrder { byState, frontToBack };
+
     struct RenderStats {
         uint32_t opaqueDrawCount = 0;
         uint32_t transparentDrawCount = 0;
@@ -115,6 +171,10 @@ namespace systems::leal::campello_renderer {
         uint32_t visibleNodeCount = 0;
         uint32_t instanceCount = 0;
         double cpuFrameTimeMs = 0.0;
+        // GPU execution time of the most recent render() whose command buffer
+        // has completed (frames in flight: usually two or three frames old).
+        // 0 when the backend doesn't report it (Metal does).
+        double gpuFrameTimeMs = 0.0;
     };
 
     using OverlayCallback = std::function<void(
@@ -127,8 +187,12 @@ namespace systems::leal::campello_renderer {
         uint32_t getRenderWidth() const  { return renderWidth; }
         uint32_t getRenderHeight() const { return renderHeight; }
 
-        // Vertex buffer slot convention — must match the pipeline's vertex descriptor
-        // and the shader bindings.
+        // Logical vertex/raw buffer slots. Attributes 0-7 are VertexSemantic
+        // values (also their shader locations); 15-23 are per-draw data. The
+        // physical slot comes from each pipeline's slot map (meshPipeline()):
+        // attributes take compact slots 0..n-1 in semantic order, then the
+        // per-draw buffers; on Metal 15-23 are [[buffer(n)]] arguments at
+        // their own index.
         static constexpr uint32_t VERTEX_SLOT_POSITION   = 0;  // float3 POSITION
         static constexpr uint32_t VERTEX_SLOT_NORMAL     = 1;  // float3 NORMAL
         static constexpr uint32_t VERTEX_SLOT_TEXCOORD0  = 2;  // float2 TEXCOORD_0
@@ -326,20 +390,104 @@ namespace systems::leal::campello_renderer {
         void rebuildDirectXCombinedBindGroups(uint32_t frameIndex,
             const std::shared_ptr<systems::leal::campello_gpu::Texture>& sceneColorOrOpaque);
 
-        // Built-in pipeline variants created by createDefaultPipelines().
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlat;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTextured;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineDebug;  // Flat shaded, no lighting
-        
-        // Double-sided pipeline variants (no back-face culling).
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlatDoubleSided;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTexturedDoubleSided;
-        
-        // Alpha-blend pipeline variants (transparent materials).
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlatBlend;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTexturedBlend;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFlatBlendDoubleSided;
-        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTexturedBlendDoubleSided;
+        // Mesh pipelines (docs/design/programmable-pipelines.md, phase 1).
+        // createDefaultPipelines() fills a per-backend recipe; pipelines are
+        // built from it on first use per (program, vertex layout, culling,
+        // blending) and cached. The combinations the built-in paths use are
+        // created up front, so the first frame doesn't stall.
+        // Fragment variants of a program: the built-in PBR program has three;
+        // app programs have one (textured).
+        enum class MeshProgram : uint8_t { flat, textured, debug };
+        struct MeshVertexStage {
+            uint32_t readMask = 0;  // semantics the shader reads (semanticBit())
+            std::shared_ptr<systems::leal::campello_gpu::ShaderModule> module;
+            std::string entryPoint;
+            bool lines = false;     // stage for line/point topologies (vs triangles)
+        };
+        // One registered program: its shaders (index = ProgramHandle;
+        // 0 = built-in PBR, rebuilt by createDefaultPipelines(), app programs
+        // kept across it).
+        struct ProgramState {
+            std::string name;
+            std::vector<MeshVertexStage> vertexStages;
+            std::shared_ptr<systems::leal::campello_gpu::ShaderModule> fragmentModule;
+            // Fragment entry point per MeshProgram variant; empty = no
+            // separate shader for that variant (the textured one is used).
+            std::array<std::string, 3> fragmentEntries;
+            bool supportsBlend = false;  // false: blend draws use the opaque state
+        };
+        std::vector<ProgramState> programs;
+        // Shared by all programs on this backend.
+        struct MeshPipelineRecipe {
+            bool ready = false;
+            // Everything but the vertex stage, fragment entry, culling and
+            // blending: pipeline layout, depth, topology, winding.
+            systems::leal::campello_gpu::RenderPipelineDescriptor base;
+            systems::leal::campello_gpu::ColorState colorTarget;  // default format and write mask
+            bool supportsBlend = false;  // the backend has blend state at all
+            systems::leal::campello_gpu::BlendState alphaBlend;
+            systems::leal::campello_gpu::DepthStencilDescriptor blendDepthStencil;
+            // Per-draw data read as vertex buffers (Vulkan/DirectX: the
+            // per-instance NodeTransforms), by logical slot (VERTEX_SLOT_*).
+            // They take the vertex buffer slots right after the attributes.
+            std::vector<std::pair<uint32_t, systems::leal::campello_gpu::VertexLayout>> perDrawBuffers;
+            // Metal: logical slots 8-23 are raw [[buffer(n)]] arguments, bound
+            // at their own index. Elsewhere they aren't vertex buffers and
+            // binding them is skipped.
+            bool rawBufferSlots = false;
+        };
+        // A cached pipeline and where its vertex buffers go: physical slot per
+        // logical slot (VERTEX_SLOT_*), -1 = not read by this pipeline.
+        // Attributes take compact slots 0..n-1 in semantic order (WebGPU
+        // allows 8 vertex buffers), then the per-draw buffers.
+        static constexpr size_t kLogicalSlotCount = 24;
+        struct MeshPipelineEntry {
+            std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipeline;
+            std::array<int8_t, kLogicalSlotCount> slots{};
+        };
+        MeshPipelineRecipe meshRecipe;
+        std::unordered_map<uint64_t, MeshPipelineEntry> meshPipelineCache;
+        // Slot map of the pipeline renderPrimitive() bound; nullptr = identity.
+        const std::array<int8_t, kLogicalSlotCount>* activeMeshSlots = nullptr;
+        // Binds a mesh vertex/raw buffer by logical slot through activeMeshSlots.
+        void bindMeshBuffer(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+                            uint32_t logicalSlot,
+                            const std::shared_ptr<systems::leal::campello_gpu::Buffer> &buffer,
+                            uint64_t offset);
+        // KHR_mesh_quantization (Metal): the standard layout with the scene's
+        // integer POSITION/NORMAL/TEXCOORD_0/TANGENT formats; unset when the
+        // scene has none. Set by detectQuantizedLayout().
+        std::optional<VertexLayout> quantizedLayout;
+        bool quantizedLayoutDetected = false;
+        VertexLayout standardLayout = VertexLayout::standard();
+
+        const MeshVertexStage* vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines = false) const;
+        // colorFormat: invalid = the recipe's (createDefaultPipelines()) format.
+        const MeshPipelineEntry* meshPipeline(
+            ProgramHandle program, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
+            systems::leal::campello_gpu::PixelFormat colorFormat = systems::leal::campello_gpu::PixelFormat::invalid,
+            systems::leal::campello_gpu::PrimitiveTopology topology =
+                systems::leal::campello_gpu::PrimitiveTopology::triangleList);
+        const MeshPipelineEntry* meshPipeline(
+            MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend) {
+            return meshPipeline(kPbrProgram, variant, layout, doubleSided, blend);
+        }
+        void prewarmMeshPipelines();
+        // True when the backend has a separate flat fragment shader (Metal);
+        // elsewhere "flat" draws use the textured shader and its bind group.
+        bool hasFlatProgram() const { return !programs.empty() && !programs[0].fragmentEntries[0].empty(); }
+        // renderProgramPass() in progress (render() draws in its mode).
+        const ProgramPassOptions* activeProgramPass = nullptr;
+        // Clip planes (setClipPlanes()); uploaded after the camera block.
+        std::vector<std::array<double, 4>> clipPlanes;
+        bool sectionCapsEnabled = true;
+        std::array<float, 4> sectionCapColor{0.35f, 0.35f, 0.38f, 1.0f};
+        bool clippingActive() const { return !clipPlanes.empty() && supportsClipPlanes(); }
+        void uploadClipUniforms(const std::shared_ptr<systems::leal::campello_gpu::Buffer>& buffer) const;
+        // CameraUniforms (160 bytes) + clip block (128 bytes).
+        static constexpr uint64_t kCameraUniformSize = 288;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> programPassDepthTexture;
+        std::shared_ptr<systems::leal::campello_gpu::TextureView> programPassDepthView;
 
         // Skybox pipeline — fullscreen triangle that samples an environment cubemap.
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineSkybox;
@@ -425,11 +573,6 @@ namespace systems::leal::campello_renderer {
             systems::leal::campello_gpu::ComponentType::ctFloat;
         bool weightsNormalized = false;
 
-        // Pipeline variants for KHR_mesh_quantization (non-float vertex formats).
-        // Key is wantedVariant (1–9). Created lazily in setScene() when quantized
-        // accessors are detected.
-        std::unordered_map<int, std::shared_ptr<systems::leal::campello_gpu::RenderPipeline>> quantizedPipelines;
-
         // Per-draw buffers: material uniforms (baseColorFactor per material slot)
         // and a fallback zero-UV buffer for primitives without TEXCOORD_0.
         std::shared_ptr<systems::leal::campello_gpu::Buffer> fallbackUVBuffer;
@@ -485,6 +628,9 @@ namespace systems::leal::campello_renderer {
             std::shared_ptr<systems::leal::campello_gpu::Buffer> lightsUniformBuffer;
             std::shared_ptr<systems::leal::campello_gpu::Buffer> jointMatrixBuffer;
             std::shared_ptr<systems::leal::campello_gpu::Fence>  fence;
+            // render()'s command buffer, kept to read its GPU time once the
+            // fence says it completed.
+            std::shared_ptr<systems::leal::campello_gpu::CommandBuffer> commandBuffer;
         };
         FrameResources frameResources[kMaxFramesInFlight];
         uint32_t currentFrameIndex = 0;
@@ -596,6 +742,25 @@ namespace systems::leal::campello_renderer {
         // to avoid redundant setPipeline() calls.
         // 0 = none, 1 = flat, 2 = textured, 3 = debug, 4 = flat double-sided, 5 = textured double-sided
         int currentPipelineVariant = 0;
+        const void* currentPipelineObject = nullptr;  // the pipeline last bound by renderPrimitive()
+        // WebGPU (programmable pipelines phase 7): per-draw transforms are a
+        // storage buffer (group 2) indexed by firstInstance, because WebGPU
+        // vertex inputs stop at location 15. Unused elsewhere.
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> webgpuDrawBindGroupLayout;
+        std::unordered_map<const void*, std::shared_ptr<systems::leal::campello_gpu::BindGroup>> webgpuDrawBindGroups;
+        const void* webgpuBoundDrawGroup = nullptr;
+        uint32_t webgpuFirstInstance = 0;
+        void bindWebGpuTransforms(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+                                  const std::shared_ptr<systems::leal::campello_gpu::Buffer> &buffer,
+                                  uint64_t offset);
+        // firstInstance for mesh draws: the transform index on WebGPU, 0 elsewhere.
+        uint32_t drawFirstInstance() const {
+#if defined(__EMSCRIPTEN__)
+            return webgpuFirstInstance;
+#else
+            return 0;
+#endif
+        }
 
         // Tracks last-bound vertex buffer per slot within a render pass to avoid
         // redundant setVertexBuffer() calls (Metal debug layer asserts on these).
@@ -652,6 +817,17 @@ namespace systems::leal::campello_renderer {
         bool punctualLightsEnabled = true;
 
         RenderStats lastFrameStats;
+        // CPU copy of materialUniformBuffer's written slots, re-uploaded when
+        // uploadMaterial() grows the buffer (see writeMaterialUniform()).
+        std::vector<uint8_t> materialUniformShadow;
+        void writeMaterialUniform(uint64_t offset, const float* slot);
+        double gpuFrameTimeMs = 0.0;  // latest completed render() command buffer
+        // Web: getGPUExecutionTime() would block (yield) until the timestamp
+        // readback resolves, so render() asks asynchronously and the result
+        // lands here; shared so a late callback outlives the Renderer safely.
+        std::shared_ptr<std::atomic<double>> gpuFrameTimeAsyncMs =
+            std::make_shared<std::atomic<double>>(0.0);
+        OpaqueOrder opaqueOrder = OpaqueOrder::byState;
         bool defaultLightEnabled = true;
 
         // KHR_texture_procedurals — load-time baked textures.
@@ -771,9 +947,9 @@ namespace systems::leal::campello_renderer {
         // Must be called once before render(). Replaces createDefaultPipeline().
         void createDefaultPipelines(systems::leal::campello_gpu::PixelFormat colorFormat);
 
-        // Creates quantized pipeline variants when KHR_mesh_quantization accessors
-        // are detected in setScene(). Called lazily — only when needed.
-        void createQuantizedPipelinesIfNeeded();
+        // Detects KHR_mesh_quantization accessors in the scene (setScene())
+        // and sets quantizedLayout (Metal only; pipelines come from the cache).
+        void detectQuantizedLayout();
 
         // Render to the device's swapchain (Android / platforms where the device
         // owns the surface).
@@ -882,6 +1058,58 @@ namespace systems::leal::campello_renderer {
         // kMaxFramesInFlight. The callback begins and ends its own render pass, using
         // LoadOp::load to keep the frame. Pass nullptr to remove it.
         void setOverlayCallback(OverlayCallback callback);
+
+        /// Order of opaque draws within a frame (see OpaqueOrder).
+        void setOpaqueOrder(OpaqueOrder order) { opaqueOrder = order; }
+        OpaqueOrder getOpaqueOrder() const { return opaqueOrder; }
+
+        /// True when meshes with this vertex layout (GpuMesh::layout) can be
+        /// drawn: the backend's shaders have a vertex stage that reads only
+        /// attributes the layout has (call after createDefaultPipelines()).
+        /// VertexLayout::positionOnly() is supported on Metal and Vulkan.
+        bool supportsVertexLayout(const VertexLayout& layout) const {
+            return supportsProgram(kPbrProgram, layout);
+        }
+
+        /// Registers an app shader program (call after createDefaultPipelines();
+        /// see program.hpp for the shader contract). Returns kInvalidProgram
+        /// when the desc has no binary for this backend or it doesn't load.
+        ProgramHandle registerProgram(const ShaderProgramDesc& desc);
+        /// True when meshes with this layout can be drawn by the program.
+        bool supportsProgram(ProgramHandle program, const VertexLayout& layout) const {
+            return meshRecipe.ready && program < programs.size() && vertexStageFor(program, layout) != nullptr;
+        }
+        /// True when line meshes (GpuMesh::topology lineList/lineStrip) with
+        /// this layout can be drawn by the built-in program (Metal, Vulkan).
+        bool supportsLines(const VertexLayout& layout = VertexLayout::positionOnly()) const {
+            return meshRecipe.ready && vertexStageFor(kPbrProgram, layout, true) != nullptr;
+        }
+        /// Draws the scene with one program into colorView (a texture of
+        /// options.colorFormat, renderWidth x renderHeight as set by
+        /// resize()): no skybox, anti-aliasing or transmission. Draws whose
+        /// layout the program can't read are skipped. Typical use: element
+        /// ids into an r32uint target, read back for picking.
+        void renderProgramPass(const RenderScene& scene,
+                               std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView,
+                               const ProgramPassOptions& options);
+        /// The layout of meshes with GpuMesh::layout == nullptr (glTF/PBR;
+        /// joint and weight formats follow the loaded asset).
+        const VertexLayout& standardVertexLayout() const { return standardLayout; }
+        /// Clip planes (world space, up to 6): fragments where n.p + d < 0 for
+        /// any plane are discarded; planes are {nx, ny, nz, d} (normalised
+        /// here). While planes are set, built-in materials draw without
+        /// back-face culling, so the inside of cut solids shows; with section
+        /// caps on, back faces of single-sided materials are painted in the
+        /// cap colour (a solid-looking cut). Empty = no clipping. Only on
+        /// backends where supportsClipPlanes() (Metal, Vulkan; not DirectX yet).
+        void setClipPlanes(const std::vector<std::array<double, 4>>& planes);
+        const std::vector<std::array<double, 4>>& getClipPlanes() const { return clipPlanes; }
+        void setSectionCaps(bool enabled, float r = 0.35f, float g = 0.35f, float b = 0.38f);
+        bool supportsClipPlanes() const;
+        static constexpr size_t kMaxClipPlanes = 6;
+
+        /// Mesh pipelines created so far (cache size; for statistics and tests).
+        size_t meshPipelineCount() const { return meshPipelineCache.size(); }
 
         void setFxaaEnabled(bool enabled);
         bool isFxaaEnabled() const;

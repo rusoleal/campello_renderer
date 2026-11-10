@@ -2,6 +2,7 @@
 
 #include <campello/core/core.hpp>
 #include <campello_renderer/campello_renderer.hpp>
+#include <campello_renderer/culling.hpp>
 #include <campello_renderer/animation.hpp>
 #include <vector_math/vector_math.hpp>
 #include <functional>
@@ -358,6 +359,26 @@ inline void skinning_system(campello::core::World& world, Renderer& renderer) {
 }
 
 // ------------------------------------------------------------------
+// Frustum culling (isOutsideFrustum() is in culling.hpp)
+// ------------------------------------------------------------------
+
+/// What render_system() did in its last call (optional output).
+struct RenderSystemStats {
+    uint32_t drawn = 0;     ///< draw calls submitted
+    uint32_t culled = 0;    ///< draws skipped by frustum culling
+    uint32_t tooSmall = 0;  ///< draws skipped by size culling
+};
+
+/// Optional render_system() settings.
+struct RenderSystemOptions {
+    /// Size culling: skip draws whose bounding sphere covers less than this
+    /// radius on screen, in pixels (0: off). Needs `viewportHeight`.
+    float minPixelRadius = 0.0f;
+    /// Height of the target in pixels, for size culling.
+    uint32_t viewportHeight = 0;
+};
+
+// ------------------------------------------------------------------
 // Render system
 // ------------------------------------------------------------------
 // cameraOverride: when non-null, used verbatim as the scene camera and the
@@ -368,13 +389,21 @@ inline void skinning_system(campello::core::World& world, Renderer& renderer) {
 // sees" once the scene is actually playing -- pass an override only in
 // the former case; passing nullptr in the latter preserves the original
 // entity-driven (or built-in-default-fallback) behavior exactly.
+//
+// Draws whose mesh has bounds (GpuMesh::hasBounds) and lies entirely outside
+// the camera frustum are skipped (skinned meshes are never culled: their
+// bind-pose bounds don't follow the animation). With `options`, draws that
+// are too small on screen can be skipped too. `stats`, if given, reports how
+// many draws were submitted and culled.
 inline void render_system(
     campello::core::World& world,
     Renderer& renderer,
     std::shared_ptr<systems::leal::campello_gpu::TextureView> target,
     uint32_t renderWidth = 0,
     uint32_t renderHeight = 0,
-    const CameraData* cameraOverride = nullptr)
+    const CameraData* cameraOverride = nullptr,
+    RenderSystemStats* stats = nullptr,
+    const RenderSystemOptions* options = nullptr)
 {
     RenderScene scene;
 
@@ -412,9 +441,29 @@ inline void render_system(
         scene.lights.push_back(buildLightData(transform, light));
     }
 
-    // 3. Draw calls
+    // 3. Draw calls (frustum-culled when the mesh has bounds)
+    const auto clipFromWorld = scene.camera.projection * scene.camera.view;
+    RenderSystemStats counted;
+    const bool clipping = !renderer.getClipPlanes().empty() && renderer.supportsClipPlanes();
     for (auto [transform, meshRenderer] : world.query<Transform, MeshRenderer>()) {
         if (!meshRenderer.mesh || !meshRenderer.material) continue;
+        const bool skinned = meshRenderer.jointMatrixBuffer && meshRenderer.jointCount > 0;
+        if (!skinned && isOutsideFrustum(clipFromWorld, transform.worldMatrix, *meshRenderer.mesh)) {
+            ++counted.culled;
+            continue;
+        }
+        // Entirely on the clipped side of a clip plane (setClipPlanes()).
+        if (!skinned && clipping && isClippedAway(renderer.getClipPlanes(), transform.worldMatrix, *meshRenderer.mesh)) {
+            ++counted.culled;
+            continue;
+        }
+        if (!skinned && options && options->minPixelRadius > 0.0f &&
+            projectedRadiusPixels(clipFromWorld, scene.camera.projection.data[5], transform.worldMatrix,
+                                  *meshRenderer.mesh, options->viewportHeight) < options->minPixelRadius) {
+            ++counted.tooSmall;
+            continue;
+        }
+        ++counted.drawn;
         DrawCall draw;
         draw.mesh = meshRenderer.mesh;
         draw.material = meshRenderer.material;
@@ -432,6 +481,8 @@ inline void render_system(
             scene.opaque.push_back(draw);
         }
     }
+
+    if (stats) *stats = counted;
 
     // 4. Sort transparent back-to-front
     sortTransparentBackToFront(scene.transparent, scene.camera.position);

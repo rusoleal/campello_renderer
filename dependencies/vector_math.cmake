@@ -20,7 +20,7 @@ message(STATUS "Fetching vector_math v0.6.0 from GitHub")
 FetchContent_Declare(
         extern_vector_math
         GIT_REPOSITORY https://github.com/rusoleal/vector_math
-        GIT_TAG        v0.6.0
+        GIT_TAG        v0.6.1
 )
 
 if(NOT extern_vector_math_POPULATED)

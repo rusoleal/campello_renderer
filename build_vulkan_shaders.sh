@@ -19,8 +19,16 @@ else
 fi
 
 if ! command -v "$GLSLC" &>/dev/null && [ ! -x "$GLSLC" ]; then
-    echo "Error: glslc not found. Set ANDROID_NDK or ensure glslc is in PATH."
-    exit 1
+    if command -v glslangValidator &>/dev/null; then
+        # Same GLSL frontend as glslc (shaderc wraps glslang); -V = Vulkan SPIR-V.
+        GLSLC_WRAPPER="$(mktemp)"
+        printf '#!/bin/bash\nexec glslangValidator -V "$1" -o "$3" > /dev/null\n' > "$GLSLC_WRAPPER"
+        chmod +x "$GLSLC_WRAPPER"
+        GLSLC="$GLSLC_WRAPPER"
+    else
+        echo "Error: neither glslc nor glslangValidator found. Set ANDROID_NDK or install one."
+        exit 1
+    fi
 fi
 
 echo "Using glslc: $GLSLC"
@@ -33,6 +41,12 @@ echo "Compiled: default.vert → default_vert.spv"
 
 "$GLSLC" "$SHADER_DIR/default.frag" -o "$SHADER_DIR/default_frag.spv"
 echo "Compiled: default.frag → default_frag.spv"
+
+"$GLSLC" "$SHADER_DIR/default_lean.vert" -o "$SHADER_DIR/default_lean_vert.spv"
+echo "Compiled: default_lean.vert → default_lean_vert.spv"
+
+"$GLSLC" "$SHADER_DIR/default_line.vert" -o "$SHADER_DIR/default_line_vert.spv"
+echo "Compiled: default_line.vert → default_line_vert.spv"
 
 "$GLSLC" "$SHADER_DIR/fxaa.vert" -o "$SHADER_DIR/fxaa_vert.spv"
 echo "Compiled: fxaa.vert → fxaa_vert.spv"
@@ -82,7 +96,7 @@ spv_to_c_array() {
 # ---------------------------------------------------------------------------
 # Generate the header using Python (available on all host platforms).
 # ---------------------------------------------------------------------------
-python3 - "$SHADER_DIR/default_vert.spv" "$SHADER_DIR/default_frag.spv" "$SHADER_DIR/fxaa_vert.spv" "$SHADER_DIR/fxaa_frag.spv" "$SHADER_DIR/downsample_frag.spv" "$SHADER_DIR/procedural_bake.spv" "$SHADER_DIR/ibl_bake_frag.spv" "$SHADER_DIR/skybox_frag.spv" "$OUT_HEADER" <<'PYEOF'
+python3 - "$SHADER_DIR/default_vert.spv" "$SHADER_DIR/default_frag.spv" "$SHADER_DIR/fxaa_vert.spv" "$SHADER_DIR/fxaa_frag.spv" "$SHADER_DIR/downsample_frag.spv" "$SHADER_DIR/procedural_bake.spv" "$SHADER_DIR/ibl_bake_frag.spv" "$SHADER_DIR/skybox_frag.spv" "$SHADER_DIR/default_lean_vert.spv" "$SHADER_DIR/default_line_vert.spv" "$OUT_HEADER" <<'PYEOF'
 import sys, os
 
 def spv_to_hex_lines(path):
@@ -93,7 +107,7 @@ def spv_to_hex_lines(path):
         lines.append("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",")
     return "\n".join(lines), len(data)
 
-vert_path, frag_path, fxaa_vert_path, fxaa_frag_path, downsample_frag_path, procedural_bake_path, ibl_bake_frag_path, skybox_frag_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9]
+vert_path, frag_path, fxaa_vert_path, fxaa_frag_path, downsample_frag_path, procedural_bake_path, ibl_bake_frag_path, skybox_frag_path, lean_vert_path, line_vert_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11]
 
 vert_hex, vert_size = spv_to_hex_lines(vert_path)
 frag_hex, frag_size = spv_to_hex_lines(frag_path)
@@ -103,6 +117,8 @@ downsample_frag_hex, downsample_frag_size = spv_to_hex_lines(downsample_frag_pat
 procedural_bake_hex, procedural_bake_size = spv_to_hex_lines(procedural_bake_path)
 ibl_bake_frag_hex, ibl_bake_frag_size = spv_to_hex_lines(ibl_bake_frag_path)
 skybox_frag_hex, skybox_frag_size = spv_to_hex_lines(skybox_frag_path)
+lean_vert_hex, lean_vert_size = spv_to_hex_lines(lean_vert_path)
+line_vert_hex, line_vert_size = spv_to_hex_lines(line_vert_path)
 
 header = f"""#pragma once
 
@@ -124,6 +140,16 @@ static const unsigned char kDefaultVulkanFragShader[] = {{
 {frag_hex}
 }};
 static const unsigned int kDefaultVulkanFragShaderSize = {frag_size};
+
+static const unsigned char kDefaultVulkanLeanVertShader[] = {{
+{lean_vert_hex}
+}};
+static const unsigned int kDefaultVulkanLeanVertShaderSize = {lean_vert_size};
+
+static const unsigned char kDefaultVulkanLineVertShader[] = {{
+{line_vert_hex}
+}};
+static const unsigned int kDefaultVulkanLineVertShaderSize = {line_vert_size};
 
 static const unsigned char kDefaultVulkanFxaaVertShader[] = {{
 {fxaa_vert_hex}

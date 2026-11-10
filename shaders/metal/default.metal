@@ -131,7 +131,7 @@ struct MaterialUniforms {
     float  hasEmissiveTexture;
     float  hasOcclusionTexture;
     float  occlusionStrength;
-    float  _padding;
+    float  doubleSided;           // 1 = double-sided material (no section cap)
     float4 emissiveFactor;        // xyz = emissive RGB, w unused
     float  ior;
     float  specularFactor;
@@ -243,6 +243,10 @@ struct CameraUniforms {
     float4x4 projMatrix;
     float2   screenSize;
     float2   _pad;
+    // Clip block (Renderer::uploadClipUniforms()).
+    uint4    clipInfo;       // x = plane count, y = section caps on
+    float4   capColor;
+    float4   clipPlanes[6];  // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
 };
 
 constant float VIEW_MODE_NORMAL       = 0.0;
@@ -323,8 +327,10 @@ vertex VertexOut vertexMain(
     device const float4x4    *instanceMatrices   [[buffer(19)]],
     device const float4x4    *jointMatrices      [[buffer(20)]],
     constant MorphInfo       &morph              [[buffer(21)]],
-    device const float3      *morphPositions     [[buffer(22)]],
-    device const float3      *morphNormals       [[buffer(23)]],
+    // Deltas are uploaded tightly packed (3 floats per vertex): packed_float3,
+    // not float3 (16-byte stride in device memory).
+    device const packed_float3 *morphPositions   [[buffer(22)]],
+    device const packed_float3 *morphNormals     [[buffer(23)]],
     uint                       vertexID          [[vertex_id]])
 {
     // Apply KHR_texture_transform when hasUVTransform flag (row0.w) is set.
@@ -368,9 +374,9 @@ vertex VertexOut vertexMain(
         for (uint i = 0; i < morphTargetCount; i++) {
             float w = morph.weights[i];
             if (w != 0.0) {
-                morphedPosition += w * morphPositions[i * morphVertexCount + vertexID];
+                morphedPosition += w * float3(morphPositions[i * morphVertexCount + vertexID]);
                 if (morphHasNormal) {
-                    morphedNormal += w * morphNormals[i * morphVertexCount + vertexID];
+                    morphedNormal += w * float3(morphNormals[i * morphVertexCount + vertexID]);
                 }
             }
         }
@@ -436,6 +442,63 @@ vertex VertexOut vertexMain(
     out.texcoord1      = in.texcoord1;
     out.color0         = in.color0;
 
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Lean vertex shader: position-only meshes (GpuMesh::positionOnly). Outputs
+// a zero normal, which fragmentMain_textured replaces with the flat face
+// normal derived from screen-space derivatives of the world position; no
+// skinning, morphing or instancing.
+// ---------------------------------------------------------------------------
+struct VertexInLean {
+    float3 position [[attribute(0)]];
+};
+
+vertex VertexOut vertexLean(
+    VertexInLean                 in             [[stage_in]],
+    device const NodeTransforms *nodeTransforms [[buffer(16)]])
+{
+    float4 localPos = float4(in.position, 1.0);
+    VertexOut out;
+    out.clipPosition   = nodeTransforms[0].mvp * localPos;
+    out.worldPos       = (nodeTransforms[0].model * localPos).xyz;
+    out.worldNormal    = float3(0.0);
+    out.worldTangent   = float3(0.0);
+    out.worldBitangent = float3(0.0);
+    out.texcoord0      = float2(0.0);
+    out.normalUV       = float2(0.0);
+    out.texcoord1      = float2(0.0);
+    out.color0         = float4(1.0);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Line vertex shader: line meshes (GpuMesh::topology lineList/lineStrip),
+// position only. As vertexLean, plus a small clip-space depth offset towards
+// the camera so edges drawn on their own faces win the depth test (depth
+// bias doesn't apply to lines on Metal/Vulkan). The offset is in normalized
+// depth, so its world size follows depth precision (about 2 cm at 100 m
+// with a near plane at 1 m).
+// ---------------------------------------------------------------------------
+constant float kLineDepthOffset = 4.0e-6;
+
+vertex VertexOut vertexLine(
+    VertexInLean                 in             [[stage_in]],
+    device const NodeTransforms *nodeTransforms [[buffer(16)]])
+{
+    float4 localPos = float4(in.position, 1.0);
+    VertexOut out;
+    out.clipPosition   = nodeTransforms[0].mvp * localPos;
+    out.clipPosition.z -= kLineDepthOffset * out.clipPosition.w;
+    out.worldPos       = (nodeTransforms[0].model * localPos).xyz;
+    out.worldNormal    = float3(0.0);
+    out.worldTangent   = float3(0.0);
+    out.worldBitangent = float3(0.0);
+    out.texcoord0      = float2(0.0);
+    out.normalUV       = float2(0.0);
+    out.texcoord1      = float2(0.0);
+    out.color0         = float4(1.0);
     return out;
 }
 
@@ -758,7 +821,7 @@ float3 iblGGXFresnel(float NdotV, float roughness, float3 F0,
 }
 
 fragment float4 fragmentMain_textured(
-    VertexOut        in                        [[stage_in]],
+    VertexOut        inRaw                     [[stage_in]],
     constant MaterialUniforms &mat             [[buffer(17)]],
     constant CameraUniforms  &camera           [[buffer(18)]],
     texture2d<float> baseColorTexture          [[texture(0)]],
@@ -789,8 +852,38 @@ fragment float4 fragmentMain_textured(
     texture2d<float> iridescenceThicknessTexture [[texture(25)]],
     texture2d<float> anisotropicTexture          [[texture(26)]],
     texturecube<float> irradianceEnvironmentMap  [[texture(27)]],
-    texture2d<float> brdfLutTexture              [[texture(28)]])
+    texture2d<float> brdfLutTexture              [[texture(28)]],
+    bool             frontFacing                 [[front_facing]])
 {
+    // Position-only meshes (vertexLean) carry no normal: use the flat face
+    // normal from screen-space derivatives of the world position, turned
+    // towards the camera, with a tangent frame built as vertexMain does.
+    // The derivatives are taken unconditionally (uniform control flow).
+    VertexOut in = inRaw;
+    float3 faceNormal = cross(dfdx(inRaw.worldPos), dfdy(inRaw.worldPos));
+    if (dot(inRaw.worldNormal, inRaw.worldNormal) < 1e-8) {
+        float3 N = length(faceNormal) > 1e-20 ? normalize(faceNormal) : float3(0.0, 0.0, 1.0);
+        if (dot(N, camera.cameraPos.xyz - inRaw.worldPos) < 0.0) {
+            N = -N;
+        }
+        float3 T = abs(N.y) < 0.999 ? normalize(cross(float3(0, 1, 0), N)) : normalize(cross(float3(1, 0, 0), N));
+        in.worldNormal    = N;
+        in.worldTangent   = T;
+        in.worldBitangent = cross(N, T);
+    }
+
+    // Clip planes (Renderer::setClipPlanes()): discard the clipped side. With
+    // section caps on, back faces of single-sided surfaces (the inside of a
+    // cut solid, visible through the cut) take the cap colour.
+    for (uint i = 0; i < camera.clipInfo.x; ++i) {
+        if (dot(camera.clipPlanes[i].xyz, inRaw.worldPos) + camera.clipPlanes[i].w < 0.0) {
+            discard_fragment();
+        }
+    }
+    if (camera.clipInfo.y != 0 && !frontFacing && mat.doubleSided < 0.5) {
+        return float4(camera.capColor.rgb, 1.0);
+    }
+
     // uv is the shared TEXCOORD_0-based fallback every other texture below
     // reads unless it opts into texCoord=1 via its own selectUV() call.
     float2 uv = in.texcoord0;
