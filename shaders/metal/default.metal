@@ -1731,8 +1731,9 @@ inline float3 iblPrefilterEnvironment(float3 N, float roughness, texturecube<flo
 // porting the same fix here for consistency even though it's unverified on
 // Metal. A single uint-indexed loop matching this file's other two integrals
 // sidesteps whatever miscompiled. With cosine-weighted sampling the pdf
-// (cosTheta/PI) exactly cancels the integrand's own cosTheta factor, leaving
-// a plain PI * average(L).
+// (cosTheta/PI) exactly cancels the integrand's own cosTheta factor. Stored
+// as the plain average(L), not PI * average(L): shaders multiply it by the
+// albedo directly (as glTF-Sample-Viewer's Lambertian map).
 inline float3 iblConvolveIrradiance(float3 N, texturecube<float> srcEnvMap, sampler srcEnvSampler) {
     float3 up = (abs(N.z) < 0.999) ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
     float3 tangent = normalize(cross(up, N));
@@ -1749,7 +1750,7 @@ inline float3 iblConvolveIrradiance(float3 N, texturecube<float> srcEnvMap, samp
         float3 sampleDir = localDir.x * tangent + localDir.y * bitangent + localDir.z * N;
         irradiance += srcEnvMap.sample(srcEnvSampler, sampleDir, level(0.0)).rgb;
     }
-    return M_PI_F * irradiance / float(SAMPLE_COUNT);
+    return irradiance / float(SAMPLE_COUNT); // the average radiance (as glTF-Sample-Viewer): diffuse = albedo x it; with pi it was pi times too bright
 }
 
 fragment float4 iblBakeFragment(

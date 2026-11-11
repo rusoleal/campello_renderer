@@ -381,6 +381,10 @@ struct RenderSystemOptions {
     float minPixelRadius = 0.0f;
     /// Height of the target in pixels, for size culling.
     uint32_t viewportHeight = 0;
+    /// List every opaque mesh in RenderScene::shadowCasters even without a
+    /// shadow-casting light (for PathTracer: geometry off screen still
+    /// shadows and reflects).
+    bool listAllCasters = false;
 };
 
 // ------------------------------------------------------------------
@@ -400,10 +404,11 @@ struct RenderSystemOptions {
 // bind-pose bounds don't follow the animation). With `options`, draws that
 // are too small on screen can be skipped too. `stats`, if given, reports how
 // many draws were submitted and culled.
-inline void render_system(
+/// The RenderScene render_system() draws (camera, lights, culled draws,
+/// shadow casters), without drawing it: e.g. for PathTracer.
+inline RenderScene build_render_scene(
     campello::core::World& world,
     Renderer& renderer,
-    std::shared_ptr<systems::leal::campello_gpu::TextureView> target,
     uint32_t renderWidth = 0,
     uint32_t renderHeight = 0,
     const CameraData* cameraOverride = nullptr,
@@ -453,7 +458,7 @@ inline void render_system(
     // Sun shadow casters don't depend on the camera: off-screen geometry
     // still shadows what's on screen (and the shadow map can be reused while
     // the camera moves). Clipped-away geometry doesn't cast.
-    bool castersWanted = false;
+    bool castersWanted = options && options->listAllCasters;
     if (renderer.getShadowsEnabled() && renderer.supportsShadows()) {
         for (const auto& light : scene.lights) {
             castersWanted = castersWanted || (light.type == 0 && light.castShadows);
@@ -511,8 +516,20 @@ inline void render_system(
 
     // 4. Sort transparent back-to-front
     sortTransparentBackToFront(scene.transparent, scene.camera.position);
+    return scene;
+}
 
-    // 5. Submit
+inline void render_system(
+    campello::core::World& world,
+    Renderer& renderer,
+    std::shared_ptr<systems::leal::campello_gpu::TextureView> target,
+    uint32_t renderWidth = 0,
+    uint32_t renderHeight = 0,
+    const CameraData* cameraOverride = nullptr,
+    RenderSystemStats* stats = nullptr,
+    const RenderSystemOptions* options = nullptr)
+{
+    const RenderScene scene = build_render_scene(world, renderer, renderWidth, renderHeight, cameraOverride, stats, options);
     renderer.render(scene, target);
 }
 
