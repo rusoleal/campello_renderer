@@ -152,6 +152,14 @@ namespace systems::leal::campello_renderer {
                                                false}}};
             return layout;
         }
+
+        /// Wide lines (GpuMesh::wideLines, Renderer::expandLines()): no
+        /// vertex attributes; the vertex stage reads each segment from the
+        /// mesh's POSITION buffer by vertex index (4 vertices per segment).
+        static const VertexLayout& wideLine() {
+            static const VertexLayout layout{};
+            return layout;
+        }
     };
 
 } // namespace systems::leal::campello_renderer

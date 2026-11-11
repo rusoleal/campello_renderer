@@ -3067,6 +3067,153 @@ TEST_F(OffscreenRenderTest, LinesDrawOnTopOfTheirFaces) {
     EXPECT_GT(pixels[quadPixel], 40) << "lit red quad";
 }
 
+// Wide lines (GpuMesh::wideLines): Renderer::expandLines() stores each
+// segment once (start + half width, end) and indexes one quad over it.
+TEST(WideLines, ExpandLinesStoresSegmentsAndQuads) {
+    const float positions[] = {0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0};
+    const uint32_t indices[] = {0, 1, 1, 2, 2, 3};  // the last segment is degenerate
+    const auto lines = Renderer::expandLines(positions, 4, indices, 6, 3.0f);
+    ASSERT_EQ(lines.segments.size(), 2u * 8);
+    ASSERT_EQ(lines.indices.size(), 2u * 6);
+    EXPECT_EQ(lines.vertexCount(), 8u);
+    // First segment: (0,0,0) -> (1,0,0), half width 1.5.
+    const std::vector<float> first(lines.segments.begin(), lines.segments.begin() + 8);
+    EXPECT_EQ(first, (std::vector<float>{0, 0, 0, 1.5f, 1, 0, 0, 0}));
+    EXPECT_EQ(std::vector<uint32_t>(lines.indices.begin(), lines.indices.begin() + 6), (std::vector<uint32_t>{0, 1, 3, 0, 3, 2}));
+    EXPECT_EQ(lines.indices[6], 4u);  // the second quad's vertices start at 4
+}
+
+// A 3 px wide line (green: it darkens the red channel) across a lit red quad
+// in the same plane: drawn over its face along its whole length, with soft
+// edges (partial darkening), and as wide at SSAA 1, 2 and 4 (width in output
+// pixels, unlike hardware lines).
+TEST_F(OffscreenRenderTest, WideLinesKeepTheirWidthAndSoftEdgesAtAnySsaa) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsWideLines()) GTEST_SKIP() << "No wide line stage on this backend";
+    GpuMaterial* green = renderer->uploadMaterial((*asset->materials)[0], *asset);
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(green, nullptr);
+    ASSERT_NE(red, nullptr);
+
+    float quadPositions[] = {-0.6f, -0.6f, 0.0f, 0.6f, -0.6f, 0.0f, 0.6f, 0.6f, 0.0f, -0.6f, 0.6f, 0.0f};
+    uint32_t quadIndices[] = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(sizeof(quadPositions), GPU::BufferUsage::vertex, quadPositions);
+    quad.indexBuffer = device->createBuffer(sizeof(quadIndices), GPU::BufferUsage::index, quadIndices);
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = &VertexLayout::positionOnly();
+
+    // A shallow diagonal (about 18 degrees), where hardware lines stair-step.
+    const float linePositions[] = {-0.6f, -0.2f, 0.0f, 0.6f, 0.2f, 0.0f};
+    const uint32_t lineIndices[] = {0, 1};
+    auto lines = Renderer::expandLines(linePositions, 2, lineIndices, 2, 3.0f);
+    GpuMesh line;
+    line.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(lines.segments.size() * 4, GPU::BufferUsage::vertex, lines.segments.data());
+    line.indexBuffer = device->createBuffer(lines.indices.size() * 4, GPU::BufferUsage::index, lines.indices.data());
+    line.indexCount = (uint32_t)lines.indices.size();
+    line.indexFormat = GPU::IndexFormat::uint32;
+    line.vertexCount = lines.vertexCount();
+    line.layout = &VertexLayout::wideLine();
+    line.wideLines = true;
+
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                    VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection =
+        VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+    // The line first: wide lines are drawn after opaque geometry anyway.
+    for (auto [mesh, material] : {std::pair{&line, green}, std::pair{&quad, red}}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+
+    std::vector<double> widths;
+    for (const float ssaa : {1.0f, 2.0f, 4.0f}) {
+        renderer->setSsaaScale(ssaa);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        const auto pixels = readBackPixels(tex);
+        // "Darkest wins" blending: the line darkens the quad's red channel,
+        // measured against the brightest pixel of the quad in that column.
+        const auto red = [&](int x, int y) { return double(pixels[(size_t(y) * 64 + size_t(x)) * 4]); };
+        const auto greenness = [&](int x, int y) {
+            double background = 0.0;
+            for (int row = 24; row <= 40; ++row) background = std::max(background, red(x, row));
+            return background > 0.0 ? std::clamp((background - red(x, y)) / background, 0.0, 1.0) : 0.0;
+        };
+        // Down each column the line crosses: some full-strength pixels, some
+        // partial ones (soft edges), and the coverage sums to the line's
+        // vertical thickness (3 px / cos(18 deg) ~ 3.2 px).
+        int partial = 0;
+        double total = 0.0;
+        int columns = 0;
+        for (int x = 24; x <= 39; ++x) {
+            double sum = 0.0;
+            double peak = 0.0;
+            for (int y = 24; y <= 40; ++y) {  // inside the quad
+                const double g = greenness(x, y);
+                sum += g;
+                peak = std::max(peak, g);
+                if (g > 0.15 && g < 0.85) ++partial;
+            }
+            EXPECT_GT(peak, 0.8) << "ssaa " << ssaa << ": line missing at column " << x;
+            total += sum;
+            ++columns;
+        }
+        EXPECT_GT(partial, columns / 2) << "ssaa " << ssaa << ": hard edges";
+        widths.push_back(total / columns);
+    }
+    renderer->setSsaaScale(1.0f);
+
+    // Overlapping lines don't stack ("darkest wins"): the same line drawn
+    // twice looks exactly like once (edges of two elements that coincide,
+    // crowded edges far away).
+    const auto renderOnce = [&] {
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        return readBackPixels(tex);
+    };
+    const auto single = renderOnce();
+    DrawCall again;
+    again.mesh = &line;
+    again.material = green;
+    again.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(again);
+    EXPECT_EQ(renderOnce(), single) << "overlapping wide lines stack";
+
+    // About 3 px / cos(18 deg) ~ 3.2 px; the darkening measure reads a little
+    // high (the lit quad isn't perfectly even down a column). What matters:
+    // the same at every SSAA scale.
+    for (const double w : widths) {
+        EXPECT_GT(w, 2.5);
+        EXPECT_LT(w, 4.5);
+    }
+    EXPECT_NEAR(widths[0], widths[1], 0.2) << "width changes with SSAA";
+    EXPECT_NEAR(widths[0], widths[2], 0.2) << "width changes with SSAA";
+}
+
 // Sun shadows: a plate floating over a lit ground plane, the sun straight
 // above. With shadows on, the ground under the plate (the image centre: the
 // camera looks at it past the plate) is darker; ground away from it isn't.
