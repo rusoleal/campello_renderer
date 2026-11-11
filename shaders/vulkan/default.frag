@@ -724,7 +724,8 @@ void main() {
 
         for (int ch = 0; ch < 3; ch++) {
             if (uvValid[ch]) {
-                transmitted[ch] = textureLod(sampler2D(sceneColorTexture, sceneColorSampler), sampleUV[ch], lod)[ch];
+                // Stored display-encoded (tone mapped, sRGB): back to linear.
+                transmitted[ch] = pow(max(textureLod(sampler2D(sceneColorTexture, sceneColorSampler), sampleUV[ch], lod)[ch], 0.0), 2.2);
             } else {
                 transmitted[ch] = texture(samplerCube(environmentMap, environmentSampler), Trefr)[ch];
             }

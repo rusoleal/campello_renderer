@@ -1298,7 +1298,11 @@ fragment float4 fragmentMain_textured(
         // Sample background per-channel (dispersion splits R/G/B refracted UVs).
         for (int ch = 0; ch < 3; ch++) {
             if (uvValid[ch]) {
-                transmitted[ch] = sceneColorTexture.sample(scSampler, sampleUV[ch], level(lod))[ch];
+                // The opaque scene is stored display-encoded (tone mapped,
+                // sRGB): back to (approximately) linear light before it's
+                // lit and encoded again, or what's seen through glass would
+                // come out brighter and washed out.
+                transmitted[ch] = pow(max(sceneColorTexture.sample(scSampler, sampleUV[ch], level(lod))[ch], 0.0), 2.2);
             } else {
                 transmitted[ch] = environmentMap.sample(baseColorSampler, T)[ch];
             }

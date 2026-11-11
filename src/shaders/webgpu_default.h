@@ -134,6 +134,8 @@ struct LightsUniform {
 @group(1) @binding(1)  var<uniform> camera: CameraUniforms;
 @group(1) @binding(2)  var environmentMap: texture_cube<f32>;   // GGX-prefiltered specular
 @group(1) @binding(3)  var environmentSampler: sampler;
+@group(1) @binding(4)  var sceneColorTexture: texture_2d<f32>;  // the opaque scene (transmission)
+@group(1) @binding(5)  var sceneColorSampler: sampler;
 @group(1) @binding(6)  var irradianceMap: texture_cube<f32>;
 @group(1) @binding(7)  var brdfLutTexture: texture_2d<f32>;
 @group(1) @binding(8)  var brdfLutSampler: sampler;
@@ -577,8 +579,24 @@ fn fs_main(vIn: VertexOut, @builtin(front_facing) frontFacing: bool) -> @locatio
     if (mat.iblEnabled > 0.5) {
         ambientColor = vec3f(0.0);
     }
-    var finalColor = ambientColor + totalDiffuse + totalSpecular
-                   + iblDiffuse * occlusion + iblSpecular * occlusion + emissive;
+    // KHR_materials_transmission, thin-walled (no refraction offset; volume
+    // isn't on WebGPU): the opaque scene behind, at this fragment's screen
+    // position, blurred by roughness and decoded back to linear light (it's
+    // stored display-encoded). It replaces diffuse light by its share.
+    var transmitted = vec3f(0.0);
+    var transmittance = 0.0;
+    if (mat.transmissionFactor > 0.0 && metallic < 0.99) {
+        let suv = v.clipPosition.xy / camera.screenSize;
+        let lod = log2(camera.screenSize.x) * roughness * clamp(mat.ior * 2.0 - 2.0, 0.0, 1.0);
+        let behind = textureSampleLevel(sceneColorTexture, sceneColorSampler, suv, lod).rgb;
+        transmitted = pow(max(behind, vec3f(0.0)), vec3f(2.2)) * baseColor.rgb;
+        var t0 = (mat.ior - 1.0) / (mat.ior + 1.0);
+        t0 *= t0;
+        let fresnel = t0 + (1.0 - t0) * pow(1.0 - NdotV, 5.0);
+        transmittance = mat.transmissionFactor * (1.0 - fresnel) * (1.0 - metallic);
+    }
+    var finalColor = (ambientColor + totalDiffuse + iblDiffuse * occlusion) * (1.0 - transmittance)
+                   + totalSpecular + iblSpecular * occlusion + emissive + transmitted * transmittance;
     finalColor *= exp2(camera.viewParams.x);  // exposure
     finalColor = linearToSRGBFast(toneMapKhronosPbrNeutral(finalColor));
 
@@ -910,6 +928,37 @@ fn fs_ibl_bake(@builtin(position) position: vec4f) -> @location(0) vec4f {
         return vec4f(iblPrefilterEnvironment(dir, bake.roughness), 1.0);
     }
     return vec4f(iblConvolveIrradiance(dir), 1.0);
+}
+)WGSL";
+
+// Copy / SSAA downsample (WGSL): vs_copy, fs_copy.
+static const char kCopyWebGpuShader[] = R"WGSL(// Copy / downsample for WebGPU (Metal's downsampleFragment): // a texture onto the target, bilinear (SSAA downsample: the texture is
+// ssaaScale x the target; also the copy of the opaque scene before
+// transmissive draws). Its own group 0 (texture, sampler), so as Metal's
+// downsampleFragment.
+
+@group(0) @binding(0) var copySource: texture_2d<f32>;
+@group(0) @binding(1) var copySampler: sampler;
+
+struct CopyOut {
+    @builtin(position) position: vec4f,
+    @location(0) uv: vec2f,  // (0, 0) = top-left
+}
+
+@vertex
+fn vs_copy(@builtin(vertex_index) index: u32) -> CopyOut {
+    var pos = vec2f(-1.0, -1.0);
+    if (index == 1u) { pos = vec2f(3.0, -1.0); }
+    if (index == 2u) { pos = vec2f(-1.0, 3.0); }
+    var o: CopyOut;
+    o.position = vec4f(pos, 0.0, 1.0);
+    o.uv = vec2f((pos.x + 1.0) * 0.5, (1.0 - pos.y) * 0.5);
+    return o;
+}
+
+@fragment
+fn fs_copy(v: CopyOut) -> @location(0) vec4f {
+    return textureSampleLevel(copySource, copySampler, v.uv, 0.0);
 }
 )WGSL";
 

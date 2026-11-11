@@ -128,6 +128,8 @@ struct LightsUniform {
 @group(1) @binding(1)  var<uniform> camera: CameraUniforms;
 @group(1) @binding(2)  var environmentMap: texture_cube<f32>;   // GGX-prefiltered specular
 @group(1) @binding(3)  var environmentSampler: sampler;
+@group(1) @binding(4)  var sceneColorTexture: texture_2d<f32>;  // the opaque scene (transmission)
+@group(1) @binding(5)  var sceneColorSampler: sampler;
 @group(1) @binding(6)  var irradianceMap: texture_cube<f32>;
 @group(1) @binding(7)  var brdfLutTexture: texture_2d<f32>;
 @group(1) @binding(8)  var brdfLutSampler: sampler;
@@ -571,8 +573,24 @@ fn fs_main(vIn: VertexOut, @builtin(front_facing) frontFacing: bool) -> @locatio
     if (mat.iblEnabled > 0.5) {
         ambientColor = vec3f(0.0);
     }
-    var finalColor = ambientColor + totalDiffuse + totalSpecular
-                   + iblDiffuse * occlusion + iblSpecular * occlusion + emissive;
+    // KHR_materials_transmission, thin-walled (no refraction offset; volume
+    // isn't on WebGPU): the opaque scene behind, at this fragment's screen
+    // position, blurred by roughness and decoded back to linear light (it's
+    // stored display-encoded). It replaces diffuse light by its share.
+    var transmitted = vec3f(0.0);
+    var transmittance = 0.0;
+    if (mat.transmissionFactor > 0.0 && metallic < 0.99) {
+        let suv = v.clipPosition.xy / camera.screenSize;
+        let lod = log2(camera.screenSize.x) * roughness * clamp(mat.ior * 2.0 - 2.0, 0.0, 1.0);
+        let behind = textureSampleLevel(sceneColorTexture, sceneColorSampler, suv, lod).rgb;
+        transmitted = pow(max(behind, vec3f(0.0)), vec3f(2.2)) * baseColor.rgb;
+        var t0 = (mat.ior - 1.0) / (mat.ior + 1.0);
+        t0 *= t0;
+        let fresnel = t0 + (1.0 - t0) * pow(1.0 - NdotV, 5.0);
+        transmittance = mat.transmissionFactor * (1.0 - fresnel) * (1.0 - metallic);
+    }
+    var finalColor = (ambientColor + totalDiffuse + iblDiffuse * occlusion) * (1.0 - transmittance)
+                   + totalSpecular + iblSpecular * occlusion + emissive + transmitted * transmittance;
     finalColor *= exp2(camera.viewParams.x);  // exposure
     finalColor = linearToSRGBFast(toneMapKhronosPbrNeutral(finalColor));
 

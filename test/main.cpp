@@ -3299,6 +3299,86 @@ TEST_F(OffscreenRenderTest, WorldMappingTexturesMeshesWithoutUVs) {
     EXPECT_GT(mappedDark, 400) << "black cells";
 }
 
+// Thin glass (KHR_materials_transmission, blended) in front of an unlit
+// background at 128 (display value), rendered at SSAA 2x: through the glass
+// the background shows, slightly darker (Fresnel, tint), not washed out (the
+// opaque scene is display-encoded and must be decoded before it's lit and
+// encoded again: ~179 if not) and not missed (texture coordinates of the
+// opaque scene at its SSAA size: the sky fallback, no red, if not).
+TEST_F(OffscreenRenderTest, ThinGlassShowsTheBackgroundAtItsBrightness) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.0f);
+    renderer->setDefaultLightEnabled(false);
+    renderer->setSsaaScale(2.0f);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"},
+        "extensionsUsed": ["KHR_materials_unlit", "KHR_materials_transmission"],
+        "materials": [
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.5, 0.0, 0.0, 1]}, "extensions": {"KHR_materials_unlit": {}}},
+            {"alphaMode": "BLEND", "pbrMetallicRoughness": {"baseColorFactor": [0.95, 0.95, 0.95, 1], "metallicFactor": 0,
+             "roughnessFactor": 0.05}, "extensions": {"KHR_materials_transmission": {"transmissionFactor": 1.0}}}]})",
+                                    kNoOpLoader);
+    ASSERT_NE(materials, nullptr);
+    GpuMaterial* background = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    GpuMaterial* glass = renderer->uploadMaterial((*materials->materials)[1], *materials);
+    ASSERT_NE(background, nullptr);
+    ASSERT_NE(glass, nullptr);
+    ASSERT_TRUE(glass->transmission);
+
+    const auto quad = [&](float half, float z) {
+        std::vector<float> positions = {-half, -half, z, half, -half, z, half, half, z, -half, half, z};
+        std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+        auto mesh = std::make_unique<GpuMesh>();
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh->indexCount = 6;
+        mesh->indexFormat = GPU::IndexFormat::uint32;
+        mesh->vertexCount = 4;
+        mesh->layout = &VertexLayout::positionOnly();
+        return mesh;
+    };
+    auto back = quad(0.95f, 0.6f);
+    auto pane = quad(0.5f, 0.3f);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::identity();
+    scene.camera.projection = VM::Matrix4<double>::identity();
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, -1.0);
+    DrawCall backDraw;
+    backDraw.mesh = back.get();
+    backDraw.material = background;
+    backDraw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(backDraw);
+    DrawCall paneDraw;
+    paneDraw.mesh = pane.get();
+    paneDraw.material = glass;
+    paneDraw.worldTransform = VM::Matrix4<double>::identity();
+    scene.transparent.push_back(paneDraw);
+
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    renderer->render(scene, view);
+    renderer->render(scene, view);
+    const auto pixels = readBackPixels(tex);
+    renderer->setSsaaScale(1.0f);
+    renderer->setEnvironmentIntensity(1.0f);
+    renderer->setDefaultLightEnabled(true);
+    const auto at = [&](int x, int y, int c) { return int(pixels[(size_t(y) * 64 + size_t(x)) * 4 + size_t(c)]); };
+    EXPECT_NEAR(at(4, 32, 0), 128, 3) << "background beside the glass";
+    EXPECT_GE(at(32, 32, 0), 96) << "through the glass";
+    EXPECT_LE(at(32, 32, 0), 132) << "through the glass: washed out";
+    EXPECT_LT(at(32, 32, 1), 20);
+    EXPECT_LT(at(32, 32, 2), 20);
+}
+
 // Ambient occlusion and exposure: a floor meeting a wall. With AO on, the
 // crease darkens and open floor doesn't; nothing gets brighter. -1 EV of
 // exposure darkens a lit pixel.

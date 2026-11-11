@@ -4865,7 +4865,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         colorFormat);
 #endif
 
-#if !defined(__EMSCRIPTEN__)  // FXAA and SSAA downsample: no WGSL versions yet
+#if !defined(__EMSCRIPTEN__)  // FXAA and the Vulkan downsample (WebGPU's is below)
     // --- FXAA post-process pipeline (Vulkan) ---
     {
         if (!fxaaBindGroupLayout) {
@@ -4984,6 +4984,53 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     }
 
 #endif  // !__EMSCRIPTEN__ (post-processing)
+
+#if defined(__EMSCRIPTEN__)
+    // --- Copy / SSAA downsample pipeline (WebGPU): the same layout as
+    // Vulkan's (texture 0, sampler 1); copies the opaque scene before
+    // transmissive draws and downsamples SSAA.
+    {
+        if (!downsampleBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor dglDesc{};
+            GPU::EntryObject dTex{};
+            dTex.binding = 0;
+            dTex.visibility = GPU::ShaderStage::fragment;
+            dTex.type = GPU::EntryObjectType::texture;
+            dTex.data.texture.multisampled = false;
+            dTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            dTex.data.texture.viewDimension = GPU::TextureType::tt2d;
+            dglDesc.entries.push_back(dTex);
+            GPU::EntryObject dSamp{};
+            dSamp.binding = 1;
+            dSamp.visibility = GPU::ShaderStage::fragment;
+            dSamp.type = GPU::EntryObjectType::sampler;
+            dSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            dglDesc.entries.push_back(dSamp);
+            downsampleBindGroupLayout = device->createBindGroupLayout(dglDesc);
+        }
+        auto copyModule = device->createShaderModule(kCopyWebGpuShader);
+        if (copyModule && downsampleBindGroupLayout) {
+            GPU::RenderPipelineDescriptor dsDesc{};
+            dsDesc.vertex.module = copyModule;
+            dsDesc.vertex.entryPoint = "vs_copy";
+            dsDesc.topology = GPU::PrimitiveTopology::triangleList;
+            dsDesc.cullMode = GPU::CullMode::none;
+            dsDesc.frontFace = GPU::FrontFace::ccw;
+            GPU::FragmentDescriptor dsFrag{};
+            dsFrag.module = copyModule;
+            dsFrag.entryPoint = "fs_copy";
+            GPU::ColorState dsCs{};
+            dsCs.format = colorFormat;
+            dsCs.writeMask = GPU::ColorWrite::all;
+            dsFrag.targets.push_back(dsCs);
+            dsDesc.fragment = dsFrag;
+            GPU::PipelineLayoutDescriptor dsPlDesc{};
+            dsPlDesc.bindGroupLayouts = {downsampleBindGroupLayout};
+            dsDesc.layout = device->createPipelineLayout(dsPlDesc);
+            pipelineDownsample = device->createRenderPipeline(dsDesc);
+        }
+    }
+#endif
 
     // --- IBL precompute pipeline (Vulkan, WebGPU) — see bakeIblResources() ---
     // Bakes the BRDF LUT / GGX-prefiltered specular cubemap / diffuse
@@ -6359,8 +6406,10 @@ void Renderer::renderToTarget(
                     camData[20 + col * 4 + row] = (float)proj.data[row * 4 + col];
                 }
             }
-            camData[36] = (float)renderWidth;
-            camData[37] = (float)renderHeight;
+            // The scene's render size (SSAA included): transmission turns fragment
+            // positions into texture coordinates of the opaque scene with it.
+            camData[36] = (float)sceneTargetWidth();
+            camData[37] = (float)sceneTargetHeight();
 
             cameraPositionBuffer->upload(0, 160, camData);
             uploadClipUniforms(cameraPositionBuffer);
@@ -9536,8 +9585,10 @@ void Renderer::render(const RenderScene& scene,
                 camData[20 + col*4 + row] = (float)proj.data[row*4 + col];
             }
         }
-        camData[36] = (float)renderWidth;
-        camData[37] = (float)renderHeight;
+        // The scene's render size (SSAA included): transmission turns fragment
+        // positions into texture coordinates of the opaque scene with it.
+        camData[36] = (float)sceneTargetWidth();
+        camData[37] = (float)sceneTargetHeight();
         cameraPositionBuffer->upload(0, 160, camData);
             uploadClipUniforms(cameraPositionBuffer);
     }
