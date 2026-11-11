@@ -138,7 +138,7 @@ async function main() {
   const proj = perspective(60 * Math.PI / 180, 1, 0.1, 100);
   const view = lookAtFromZ(3);
   const camera = ({ planes = [], caps = 0, capColor = [1, 0, 0, 1] } = {}) => {
-    const buf = new ArrayBuffer(368);  // + shadow block (off)
+    const buf = new ArrayBuffer(384);  // + shadow block (off), view params (exposure 0)
     const f = new Float32Array(buf), u = new Uint32Array(buf);
     f.set([0, 0, 3, 1], 0); f.set(view, 4); f.set(proj, 20); f.set([size, size], 36);
     u[40] = planes.length; u[41] = caps; f.set(capColor, 44);

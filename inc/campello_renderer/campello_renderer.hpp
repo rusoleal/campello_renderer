@@ -129,6 +129,10 @@ namespace systems::leal::campello_renderer {
         std::vector<LightData> lights;
         std::vector<DrawCall> opaque;
         std::vector<DrawCall> transparent;
+        /// Sun shadow casters: every opaque mesh, whatever the camera sees
+        /// (render_system() fills it before culling, when shadows are on).
+        /// Empty: the opaque draws cast.
+        std::vector<DrawCall> shadowCasters;
     };
 
 
@@ -491,7 +495,7 @@ namespace systems::leal::campello_renderer {
         // CameraUniforms: camera (160 bytes), clip block (128), shadow block
         // (shadowViewProj float4x4 + shadowParams float4: 80).
         static constexpr uint64_t kCameraClipEnd = 288;
-        static constexpr uint64_t kCameraUniformSize = 368;
+        static constexpr uint64_t kCameraUniformSize = 384;
         std::shared_ptr<systems::leal::campello_gpu::Texture> programPassDepthTexture;
         std::shared_ptr<systems::leal::campello_gpu::TextureView> programPassDepthView;
 
@@ -696,9 +700,48 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::TextureView> shadowMapView;
         std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapPlaceholder;  // 1x1, bound when off
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> shadowPipeline;
+        // The map is redrawn only when its inputs change (light, resolution,
+        // casters and their transforms): their hash, and the matrix it used.
+        uint64_t shadowMapKey = 0;
+        bool shadowMapValid = false;
+        systems::leal::vector_math::Matrix4<double> shadowLightViewProj;
+        void encodeShadowPass(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
+                              const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+                              const systems::leal::vector_math::Matrix4<double>& lightViewProj,
+                              uint64_t transformsOffset);
         // Vulkan/WebGPU: the comparison sampler of the shadow lookup (frame
         // binding 10). Metal declares its sampler in the shader.
         std::shared_ptr<systems::leal::campello_gpu::Sampler> shadowSampler;
+        // Exposure (setExposure()), EV: colour x 2^EV before tone mapping.
+        float exposureEv = 0.0f;
+        // Screen-space ambient occlusion (setAmbientOcclusion()): AO from the
+        // scene depth at the output size, then blurred and multiplied into
+        // the finished frame (encodeAmbientOcclusion()).
+        bool aoEnabled = false;
+        float aoRadius = 0.5f;
+        float aoIntensity = 1.5f;
+        float aoBias = 0.02f;
+        uint32_t aoSamples = 12;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> aoTexture;
+        std::shared_ptr<systems::leal::campello_gpu::TextureView> aoView;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> aoPipeline;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> aoApplyPipeline;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> aoBindGroupLayout;
+        std::shared_ptr<systems::leal::campello_gpu::Sampler> aoSampler;  // point, binding 3
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> aoUniformBuffer[kMaxFramesInFlight];
+        /// Creates the AO pipelines: a fullscreen vertex stage and the two
+        /// fragment stages (AO, apply) of the backend; `colorFormat` is the frame's.
+        void createAmbientOcclusionPipelines(const std::shared_ptr<systems::leal::campello_gpu::ShaderModule>& vertexModule,
+                                             const char* vertexEntry,
+                                             const std::shared_ptr<systems::leal::campello_gpu::ShaderModule>& aoModule,
+                                             const char* aoEntry,
+                                             const std::shared_ptr<systems::leal::campello_gpu::ShaderModule>& applyModule,
+                                             const char* applyEntry,
+                                             systems::leal::campello_gpu::PixelFormat colorFormat);
+        /// The AO passes into the finished frame `colorView` (after anti-aliasing).
+        void encodeAmbientOcclusion(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
+                                    const std::shared_ptr<systems::leal::campello_gpu::TextureView>& colorView,
+                                    const systems::leal::vector_math::Matrix4<double>& projection);
         // WebGPU: the shadow pipeline's groups 0 and 1 (empty).
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> shadowEmptyBindGroupLayout;
         std::shared_ptr<systems::leal::campello_gpu::BindGroup> shadowEmptyBindGroup;
@@ -1163,6 +1206,27 @@ namespace systems::leal::campello_renderer {
         /// Shadow map width and height in texels (default 2048).
         void setShadowMapResolution(uint32_t texels);
         bool supportsShadows() const { return shadowPipeline != nullptr; }
+        /// The shadow map is redrawn only when the light, its resolution or
+        /// the casters (meshes, their buffers and transforms) change; call
+        /// this after rewriting a mesh's buffers in place.
+        void invalidateShadowMap() { shadowMapValid = false; }
+
+        /// Exposure in EV: colours are multiplied by 2^ev before tone mapping
+        /// (meshes and sky). 0 by default (unchanged).
+        void setExposure(float ev) { exposureEv = ev; }
+        float getExposure() const { return exposureEv; }
+
+        /// Screen-space ambient occlusion: darkens creases, corners and
+        /// contact areas of opaque geometry. Computed from the scene depth at
+        /// the output size and multiplied into the finished frame (after
+        /// anti-aliasing), so it affects direct light too: a viewport effect.
+        /// Off by default. `radius` is in world units (metres for BIM; 0.5),
+        /// `intensity` a power applied to the result (1.5).
+        void setAmbientOcclusion(bool enabled) { aoEnabled = enabled; }
+        bool getAmbientOcclusion() const { return aoEnabled; }
+        void setAmbientOcclusionRadius(float radius) { aoRadius = radius; }
+        void setAmbientOcclusionIntensity(float intensity) { aoIntensity = intensity; }
+        bool supportsAmbientOcclusion() const { return aoPipeline != nullptr && aoApplyPipeline != nullptr; }
         float getSsaaScale() const;
 
         // KHR_texture_procedurals bake controls.

@@ -90,6 +90,7 @@ struct CameraUniforms {
     clipPlanes: array<vec4f, 6>, // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
     shadowViewProj: mat4x4f,     // sun shadows: shadow map clip from world
     shadowParams: vec4f,         // x = on, y = texel size (uv)
+    viewParams: vec4f,           // x = exposure in EV (colour x 2^EV before tone mapping)
 }
 
 struct Light {
@@ -528,6 +529,7 @@ fn fs_main(v: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(
     }
     var finalColor = ambientColor + totalDiffuse + totalSpecular
                    + iblDiffuse * occlusion + iblSpecular * occlusion + emissive;
+    finalColor *= exp2(camera.viewParams.x);  // exposure
     finalColor = linearToSRGBFast(toneMapKhronosPbrNeutral(finalColor));
 
     // OPAQUE and MASK render fully opaque; only BLEND uses baseColor.a.

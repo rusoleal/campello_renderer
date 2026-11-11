@@ -124,6 +124,7 @@ layout(std140, set = 1, binding = 1) uniform CameraUniforms {
     // Sun shadows (Renderer::render()): shadow map clip from world.
     mat4  shadowViewProj;
     vec4  shadowParams;   // x = on, y = texel size (uv)
+    vec4  viewParams;     // x = exposure in EV (colour x 2^EV before tone mapping)
 } camera;
 
 layout(set = 1, binding = 2) uniform textureCube environmentMap;
@@ -830,6 +831,7 @@ void main() {
                        + emissive + transmitted * transmittance) * ccAmbientAtten
                       + totalClearcoat + iblClearcoat;
 
+    finalColor *= exp2(camera.viewParams.x);  // exposure
     finalColor = toneMapKhronosPbrNeutral(finalColor);
     finalColor = linearToSRGBFast(finalColor);
 

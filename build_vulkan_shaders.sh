@@ -66,6 +66,12 @@ echo "Compiled: ibl_bake.frag → ibl_bake_frag.spv"
 "$GLSLC" "$SHADER_DIR/skybox.frag" -o "$SHADER_DIR/skybox_frag.spv"
 echo "Compiled: skybox.frag → skybox_frag.spv"
 
+"$GLSLC" "$SHADER_DIR/ssao.frag" -o "$SHADER_DIR/ssao_frag.spv"
+echo "Compiled: ssao.frag → ssao_frag.spv"
+
+"$GLSLC" "$SHADER_DIR/ssao_apply.frag" -o "$SHADER_DIR/ssao_apply_frag.spv"
+echo "Compiled: ssao_apply.frag → ssao_apply_frag.spv"
+
 # ---------------------------------------------------------------------------
 # Helper: convert a .spv binary into a C hex byte array (12 bytes per line).
 # ---------------------------------------------------------------------------
@@ -96,7 +102,7 @@ spv_to_c_array() {
 # ---------------------------------------------------------------------------
 # Generate the header using Python (available on all host platforms).
 # ---------------------------------------------------------------------------
-python3 - "$SHADER_DIR/default_vert.spv" "$SHADER_DIR/default_frag.spv" "$SHADER_DIR/fxaa_vert.spv" "$SHADER_DIR/fxaa_frag.spv" "$SHADER_DIR/downsample_frag.spv" "$SHADER_DIR/procedural_bake.spv" "$SHADER_DIR/ibl_bake_frag.spv" "$SHADER_DIR/skybox_frag.spv" "$SHADER_DIR/default_lean_vert.spv" "$SHADER_DIR/default_line_vert.spv" "$OUT_HEADER" <<'PYEOF'
+python3 - "$SHADER_DIR/default_vert.spv" "$SHADER_DIR/default_frag.spv" "$SHADER_DIR/fxaa_vert.spv" "$SHADER_DIR/fxaa_frag.spv" "$SHADER_DIR/downsample_frag.spv" "$SHADER_DIR/procedural_bake.spv" "$SHADER_DIR/ibl_bake_frag.spv" "$SHADER_DIR/skybox_frag.spv" "$SHADER_DIR/default_lean_vert.spv" "$SHADER_DIR/default_line_vert.spv" "$SHADER_DIR/ssao_frag.spv" "$SHADER_DIR/ssao_apply_frag.spv" "$OUT_HEADER" <<'PYEOF'
 import sys, os
 
 def spv_to_hex_lines(path):
@@ -107,7 +113,7 @@ def spv_to_hex_lines(path):
         lines.append("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",")
     return "\n".join(lines), len(data)
 
-vert_path, frag_path, fxaa_vert_path, fxaa_frag_path, downsample_frag_path, procedural_bake_path, ibl_bake_frag_path, skybox_frag_path, lean_vert_path, line_vert_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11]
+vert_path, frag_path, fxaa_vert_path, fxaa_frag_path, downsample_frag_path, procedural_bake_path, ibl_bake_frag_path, skybox_frag_path, lean_vert_path, line_vert_path, ssao_frag_path, ssao_apply_frag_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11], sys.argv[12], sys.argv[13]
 
 vert_hex, vert_size = spv_to_hex_lines(vert_path)
 frag_hex, frag_size = spv_to_hex_lines(frag_path)
@@ -117,6 +123,8 @@ downsample_frag_hex, downsample_frag_size = spv_to_hex_lines(downsample_frag_pat
 procedural_bake_hex, procedural_bake_size = spv_to_hex_lines(procedural_bake_path)
 ibl_bake_frag_hex, ibl_bake_frag_size = spv_to_hex_lines(ibl_bake_frag_path)
 skybox_frag_hex, skybox_frag_size = spv_to_hex_lines(skybox_frag_path)
+ssao_frag_hex, ssao_frag_size = spv_to_hex_lines(ssao_frag_path)
+ssao_apply_frag_hex, ssao_apply_frag_size = spv_to_hex_lines(ssao_apply_frag_path)
 lean_vert_hex, lean_vert_size = spv_to_hex_lines(lean_vert_path)
 line_vert_hex, line_vert_size = spv_to_hex_lines(line_vert_path)
 
@@ -180,6 +188,16 @@ static const unsigned char kDefaultVulkanSkyboxFragShader[] = {{
 {skybox_frag_hex}
 }};
 static const unsigned int kDefaultVulkanSkyboxFragShaderSize = {skybox_frag_size};
+
+static const unsigned char kDefaultVulkanSsaoFragShader[] = {{
+{ssao_frag_hex}
+}};
+static const unsigned int kDefaultVulkanSsaoFragShaderSize = {ssao_frag_size};
+
+static const unsigned char kDefaultVulkanSsaoApplyFragShader[] = {{
+{ssao_apply_frag_hex}
+}};
+static const unsigned int kDefaultVulkanSsaoApplyFragShaderSize = {ssao_apply_frag_size};
 
 }} // namespace systems::leal::campello_renderer::shaders
 """

@@ -3145,6 +3145,101 @@ TEST_F(OffscreenRenderTest, SunCastsShadowsOnOpaqueGeometry) {
     EXPECT_NEAR(shadowed(32, 24), lit(32, 24), 4.0) << "the plate shadows itself";
 }
 
+// Ambient occlusion and exposure: a floor meeting a wall. With AO on, the
+// crease darkens and open floor doesn't; nothing gets brighter. -1 EV of
+// exposure darkens a lit pixel.
+TEST_F(OffscreenRenderTest, AmbientOcclusionDarkensCreasesAndExposureScales) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.2f);
+    if (!renderer->supportsAmbientOcclusion()) GTEST_SKIP() << "No ambient occlusion on this backend";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+
+    const auto makeMesh = [&](std::vector<float> positions, std::vector<uint32_t> indices) {
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh.indexCount = (uint32_t)indices.size();
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = (uint32_t)positions.size() / 3;
+        mesh.layout = &VertexLayout::positionOnly();
+        mesh.setBoundsFromPositions(positions.data(), mesh.vertexCount);
+        return mesh;
+    };
+    GpuMesh floor = makeMesh({-1.5f, 0.0f, -1.5f, 1.5f, 0.0f, -1.5f, 1.5f, 0.0f, 1.5f, -1.5f, 0.0f, 1.5f}, {0, 2, 1, 0, 3, 2});
+    GpuMesh wall = makeMesh({-1.5f, 0.0f, -0.2f, 1.5f, 0.0f, -0.2f, 1.5f, 1.5f, -0.2f, -1.5f, 1.5f, -0.2f}, {0, 1, 2, 0, 2, 3});
+
+    RenderScene scene;
+    const VM::Vector3<double> eye(0.0, 1.2, 2.5);
+    scene.camera.view = VM::Matrix4<double>::lookAt(eye, VM::Vector3<double>(0.0, 0.2, -0.2), VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = eye;
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.0, -0.6, -0.8);  // from behind the camera
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 0.5f;  // mid-range, away from the tone mapper's shoulder
+    scene.lights.push_back(sun);
+    for (GpuMesh* mesh : {&floor, &wall}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = red;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    const auto render = [&](bool ao, float exposure) {
+        renderer->setAmbientOcclusion(ao);
+        renderer->setExposure(exposure);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        renderer->render(scene, view);
+        return readBackPixels(tex);
+    };
+    const auto plain = render(false, 0.0f);
+    const auto occluded = render(true, 0.0f);
+    const auto exposed = render(false, -1.0f);
+    renderer->setAmbientOcclusion(false);
+    renderer->setExposure(0.0f);
+    renderer->setEnvironmentIntensity(1.0f);
+
+    // Where a world point lands in the 64x64 image (top-left origin).
+    const auto pixelOf = [&](double x, double y, double z) {
+        const auto vp = scene.camera.projection * scene.camera.view;
+        const double* m = vp.data;
+        const double cx = m[0] * x + m[1] * y + m[2] * z + m[3];
+        const double cy = m[4] * x + m[5] * y + m[6] * z + m[7];
+        const double cw = m[12] * x + m[13] * y + m[14] * z + m[15];
+        return std::pair<int, int>{int((cx / cw * 0.5 + 0.5) * 64.0), int((0.5 - cy / cw * 0.5) * 64.0)};
+    };
+    const auto red8 = [](const std::vector<uint8_t>& pixels, std::pair<int, int> p) {
+        return double(pixels[(size_t(p.second) * 64 + size_t(p.first)) * 4]);
+    };
+    const auto crease = pixelOf(0.0, 0.03, -0.12);   // floor just in front of the wall
+    const auto openFloor = pixelOf(0.0, 0.0, 1.0);   // floor near the camera
+    ASSERT_GT(red8(plain, crease), 30.0) << "the crease is lit without AO";
+    EXPECT_LT(red8(occluded, crease), red8(plain, crease) * 0.9) << "AO didn't darken the crease";
+    EXPECT_NEAR(red8(occluded, openFloor), red8(plain, openFloor), 3.0) << "AO darkened open floor";
+    int brighter = 0;
+    for (size_t i = 0; i < plain.size(); i += 4) {
+        if (occluded[i] > plain[i] + 2) ++brighter;
+    }
+    EXPECT_EQ(brighter, 0) << "AO only darkens";
+    EXPECT_LT(red8(exposed, openFloor), red8(plain, openFloor) - 10.0) << "-1 EV didn't darken";
+}
+
 // App shader programs (program.hpp): an element-id program compiled by
 // campello_renderer_add_shader_program() writes each quad's per-vertex id
 // (custom0) into an r32uint target through renderProgramPass().

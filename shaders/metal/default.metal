@@ -250,6 +250,7 @@ struct CameraUniforms {
     // Shadow block (Renderer: sun shadows).
     float4x4 shadowViewProj;  // world -> the shadow map's clip space
     float4   shadowParams;    // x = on, y = one texel in uv
+    float4   viewParams;      // x = exposure in EV (0: unchanged; colour x 2^EV before tone mapping)
 };
 
 constant float VIEW_MODE_NORMAL       = 0.0;
@@ -1472,6 +1473,7 @@ fragment float4 fragmentMain_textured(
                          + emissive + transmitted * transmittance) * ccAmbientAtten
                         + totalClearcoat + iblClearcoat;
 
+    finalColor *= exp2(camera.viewParams.x);  // exposure
     finalColor = toneMapKhronosPbrNeutral(finalColor);
     finalColor = linearToSRGBFast(finalColor);
 
@@ -1501,7 +1503,7 @@ vertex SkyboxOut skyboxVertex(uint vertexID [[vertex_id]]) {
 struct SkyboxUniforms {
     float4x4 invVP;
     float2   screenSize;
-    float2   _pad;
+    float2   _pad;        // x = exposure in EV (as CameraUniforms::viewParams.x)
     float4   cameraPos;  // w ignored — float3 would pad to 16 bytes anyway
 };
 
@@ -1526,6 +1528,7 @@ fragment float4 skyboxFragment(SkyboxOut in [[stage_in]],
     // raw here hard-clips to solid white/saturated colors at the output
     // format instead of compressing smoothly like every reflection of the
     // same environment does.
+    color *= exp2(u._pad.x);  // exposure
     color = toneMapKhronosPbrNeutral(color);
     color = linearToSRGBFast(color);
 
@@ -1815,6 +1818,122 @@ fragment float4 fxaaFragment(FxaaOut in [[stage_in]],
         return float4(rgbA, 1.0);
     }
     return float4(rgbB, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Screen-space ambient occlusion (setAmbientOcclusion()). Two passes over the
+// finished frame, both with fxaaVertex's fullscreen triangle:
+//   ssaoFragment      scene depth -> AO (r) at the output size: hemisphere
+//                     samples around the view-space position, normal from
+//                     the depth, rotated per pixel (interleaved noise).
+//   ssaoApplyFragment AO blurred 4x4 (depth-aware, which also removes the
+//                     noise pattern), multiplied into the frame by blending.
+// The depth texture may be larger than the output (SSAA); it's read by texel.
+// ---------------------------------------------------------------------------
+struct AoUniforms {
+    float4x4 proj;     // view -> clip
+    float4x4 invProj;  // clip -> view
+    float4   params;   // x = radius (view units), y = intensity (power), z = bias (view units), w = samples
+    float4   size;     // depth texture width, height; output width, height
+};
+
+inline float aoDepthAt(depth2d<float> depthTex, constant AoUniforms &u, float2 uv) {
+    const uint2 texel = uint2(clamp(uv * u.size.xy, float2(0.0), u.size.xy - 1.0));
+    return depthTex.read(texel);
+}
+
+inline float3 aoViewPos(constant AoUniforms &u, float2 uv, float depth) {
+    const float4 p = u.invProj * float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    return p.xyz / p.w;
+}
+
+fragment float4 ssaoFragment(FxaaOut in [[stage_in]],
+                             constant AoUniforms &u [[buffer(2)]],
+                             depth2d<float> depthTex [[texture(0)]])
+{
+    const float depth = aoDepthAt(depthTex, u, in.uv);
+    if (depth >= 1.0) {
+        return float4(1.0);  // sky
+    }
+    const float3 P = aoViewPos(u, in.uv, depth);
+    // Normal from the neighbours on the side with the smaller depth step
+    // (no smearing across silhouettes), turned towards the camera.
+    const float2 px = 1.0 / u.size.zw;
+    const float3 R = aoViewPos(u, in.uv + float2(px.x, 0.0), aoDepthAt(depthTex, u, in.uv + float2(px.x, 0.0)));
+    const float3 L = aoViewPos(u, in.uv - float2(px.x, 0.0), aoDepthAt(depthTex, u, in.uv - float2(px.x, 0.0)));
+    const float3 D = aoViewPos(u, in.uv + float2(0.0, px.y), aoDepthAt(depthTex, u, in.uv + float2(0.0, px.y)));
+    const float3 U = aoViewPos(u, in.uv - float2(0.0, px.y), aoDepthAt(depthTex, u, in.uv - float2(0.0, px.y)));
+    const float3 dx = abs(R.z - P.z) < abs(P.z - L.z) ? R - P : P - L;
+    const float3 dy = abs(D.z - P.z) < abs(P.z - U.z) ? D - P : P - U;
+    float3 N = normalize(cross(dx, dy));
+    if (dot(N, -P) < 0.0) N = -N;
+
+    const float radius = u.params.x;
+    const float bias = u.params.z;
+    const int samples = int(u.params.w);
+    // Per-pixel rotation of the kernel (interleaved gradient noise).
+    const float noise = fract(52.9829189 * fract(dot(in.position.xy, float2(0.06711056, 0.00583715))));
+    const float angle = noise * 6.28318530718;
+    const float3 helper = abs(N.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 T = normalize(cross(helper, N));
+    float3 B = cross(N, T);
+    const float ca = cos(angle), sa = sin(angle);
+    const float3 Tr = T * ca + B * sa;
+    const float3 Br = cross(N, Tr);
+
+    float occlusion = 0.0;
+    for (int i = 0; i < samples; ++i) {
+        // Hemisphere kernel: a spiral, denser near the centre.
+        const float t = (float(i) + 0.5) / float(samples);
+        const float phi = float(i) * 2.39996323;  // golden angle
+        const float cosTheta = sqrt(1.0 - t * 0.9);
+        const float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+        const float scale = mix(0.15, 1.0, t * t);
+        const float3 k = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta) * scale;
+        const float3 S = P + (Tr * k.x + Br * k.y + N * k.z) * radius;
+        const float4 c = u.proj * float4(S, 1.0);
+        const float2 suv = float2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+        if (any(suv < float2(0.0)) || any(suv > float2(1.0))) continue;
+        const float sceneDepth = aoDepthAt(depthTex, u, suv);
+        if (sceneDepth >= 1.0) continue;
+        const float3 Q = aoViewPos(u, suv, sceneDepth);
+        // Occluded when the surface there is nearer the camera than the
+        // sample (either handedness of view space); far-away occluders fade out.
+        const float range = smoothstep(0.0, 1.0, radius / max(abs(P.z - Q.z), 1e-4));
+        occlusion += (abs(Q.z) <= abs(S.z) - bias ? 1.0 : 0.0) * range;
+    }
+    const float ao = pow(saturate(1.0 - occlusion / float(max(samples, 1))), u.params.y);
+    return float4(ao, ao, ao, 1.0);
+}
+
+fragment float4 ssaoApplyFragment(FxaaOut in [[stage_in]],
+                                  constant AoUniforms &u [[buffer(2)]],
+                                  depth2d<float> depthTex [[texture(0)]],
+                                  texture2d<float> aoTex [[texture(1)]])
+{
+    const float depth = aoDepthAt(depthTex, u, in.uv);
+    if (depth >= 1.0) {
+        return float4(1.0);
+    }
+    const float z = aoViewPos(u, in.uv, depth).z;
+    const int2 centre = int2(in.uv * u.size.zw);
+    const int2 limit = int2(u.size.zw) - 1;
+    const float2 px = 1.0 / u.size.zw;
+    float sum = 0.0;
+    float weight = 0.0;
+    for (int y = -2; y < 2; ++y) {
+        for (int x = -2; x < 2; ++x) {
+            const int2 at = clamp(centre + int2(x, y), int2(0), limit);
+            const float2 uv = (float2(at) + 0.5) * px;
+            const float d = aoDepthAt(depthTex, u, uv);
+            const float sz = aoViewPos(u, uv, d).z;
+            const float w = (d < 1.0 && abs(sz - z) < 0.05 * abs(z) + u.params.z) ? 1.0 : 0.0;
+            sum += aoTex.read(uint2(at)).r * w;
+            weight += w;
+        }
+    }
+    const float ao = weight > 0.0 ? sum / weight : 1.0;
+    return float4(ao, ao, ao, 1.0);  // blended: frame x ao
 }
 
 // ---------------------------------------------------------------------------

@@ -3558,6 +3558,242 @@ bool Renderer::ensureShadowMap() {
     return shadowMapView != nullptr;
 }
 
+void Renderer::createAmbientOcclusionPipelines(const std::shared_ptr<systems::leal::campello_gpu::ShaderModule>& vertexModule,
+                                               const char* vertexEntry,
+                                               const std::shared_ptr<systems::leal::campello_gpu::ShaderModule>& aoModule,
+                                               const char* aoEntry,
+                                               const std::shared_ptr<systems::leal::campello_gpu::ShaderModule>& applyModule,
+                                               const char* applyEntry,
+                                               systems::leal::campello_gpu::PixelFormat colorFormat) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!vertexModule || !aoModule || !applyModule) return;
+    if (!aoBindGroupLayout) {
+        GPU::BindGroupLayoutDescriptor desc{};
+        GPU::EntryObject depth{};
+        depth.binding = 0;
+        depth.visibility = GPU::ShaderStage::fragment;
+        depth.type = GPU::EntryObjectType::texture;
+        depth.data.texture.multisampled = false;
+        depth.data.texture.sampleType = GPU::EntryObjectTextureType::ttDepth;
+        depth.data.texture.viewDimension = GPU::TextureType::tt2d;
+        desc.entries.push_back(depth);
+        GPU::EntryObject ao{};
+        ao.binding = 1;
+        ao.visibility = GPU::ShaderStage::fragment;
+        ao.type = GPU::EntryObjectType::texture;
+        ao.data.texture.multisampled = false;
+        ao.data.texture.sampleType = GPU::EntryObjectTextureType::ttUnfilterableFloat;
+        ao.data.texture.viewDimension = GPU::TextureType::tt2d;
+        desc.entries.push_back(ao);
+        GPU::EntryObject uniforms{};
+        uniforms.binding = 2;
+        uniforms.visibility = GPU::ShaderStage::fragment;
+        uniforms.type = GPU::EntryObjectType::buffer;
+        uniforms.data.buffer.hasDinamicOffaset = false;
+        uniforms.data.buffer.minBindingSize = 160;
+        uniforms.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+        desc.entries.push_back(uniforms);
+        GPU::EntryObject sampler{};  // texel reads in GLSL need one; the others ignore it
+        sampler.binding = 3;
+        sampler.visibility = GPU::ShaderStage::fragment;
+        sampler.type = GPU::EntryObjectType::sampler;
+        sampler.data.sampler.type = GPU::EntryObjectSamplerType::nonFiltering;
+        desc.entries.push_back(sampler);
+        aoBindGroupLayout = device->createBindGroupLayout(desc);
+    }
+    if (!aoBindGroupLayout) return;
+    GPU::PipelineLayoutDescriptor plDesc{};
+    plDesc.bindGroupLayouts = {aoBindGroupLayout};
+    const auto layout = device->createPipelineLayout(plDesc);
+
+    const auto make = [&](const std::shared_ptr<GPU::ShaderModule>& module, const char* entry, GPU::PixelFormat format,
+                          bool multiply) {
+        GPU::RenderPipelineDescriptor desc{};
+        desc.layout = layout;
+        desc.vertex.module = vertexModule;
+        desc.vertex.entryPoint = vertexEntry;
+        desc.topology = GPU::PrimitiveTopology::triangleList;
+        desc.cullMode = GPU::CullMode::none;
+        desc.frontFace = GPU::FrontFace::ccw;
+        GPU::FragmentDescriptor frag{};
+        frag.module = module;
+        frag.entryPoint = entry;
+        GPU::ColorState cs{};
+        cs.format = format;
+        cs.writeMask = GPU::ColorWrite::all;
+        if (multiply) {
+            // frame x AO; the frame's alpha stays.
+            GPU::BlendState blend{};
+            blend.color = {GPU::BlendFactor::dstColor, GPU::BlendFactor::zero, GPU::BlendOperation::add};
+            blend.alpha = {GPU::BlendFactor::zero, GPU::BlendFactor::one, GPU::BlendOperation::add};
+            cs.blend = blend;
+        }
+        frag.targets.push_back(cs);
+        desc.fragment = frag;
+        return device->createRenderPipeline(desc);
+    };
+    aoPipeline = make(aoModule, aoEntry, GPU::PixelFormat::rgba8unorm, false);
+    aoApplyPipeline = make(applyModule, applyEntry, colorFormat, true);
+}
+
+void Renderer::encodeAmbientOcclusion(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
+                                      const std::shared_ptr<systems::leal::campello_gpu::TextureView>& colorView,
+                                      const systems::leal::vector_math::Matrix4<double>& projection) {
+    namespace GPU = systems::leal::campello_gpu;
+    using TU = GPU::TextureUsage;
+    if (!aoEnabled || activeProgramPass || !aoPipeline || !aoApplyPipeline || !aoBindGroupLayout || !depthTexture ||
+        !colorView || renderWidth == 0 || renderHeight == 0 || !defaultTexture) {
+        return;
+    }
+    if (!aoTexture || aoTexture->getWidth() != renderWidth || aoTexture->getHeight() != renderHeight) {
+        aoTexture = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm, renderWidth, renderHeight, 1, 1, 1,
+                                          (TU)(uint32_t(TU::renderTarget) | uint32_t(TU::textureBinding)));
+        aoView = aoTexture ? aoTexture->createView(GPU::PixelFormat::rgba8unorm, 1) : nullptr;
+    }
+    if (!aoView) return;
+    if (!aoSampler) {
+        GPU::SamplerDescriptor sd{};
+        sd.magFilter = GPU::FilterMode::fmNearest;
+        sd.minFilter = GPU::FilterMode::fmNearest;
+        sd.lodMinClamp = 0.0;
+        sd.lodMaxClamp = 0.0;
+        sd.maxAnisotropy = 1.0;
+        aoSampler = device->createSampler(sd);
+    }
+    if (!aoSampler) return;
+    auto& uniforms = aoUniformBuffer[currentFrameIndex];
+    if (!uniforms) uniforms = device->createBuffer(160, GPU::BufferUsage::uniform);
+    if (!uniforms) return;
+    float data[40] = {0};
+    const auto inverse = projection.inverted();
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            data[col * 4 + row] = (float)projection.data[row * 4 + col];
+            data[16 + col * 4 + row] = (float)inverse.data[row * 4 + col];
+        }
+    }
+    data[32] = aoRadius;
+    data[33] = aoIntensity;
+    data[34] = aoBias;
+    data[35] = (float)aoSamples;
+    data[36] = (float)depthTexture->getWidth();
+    data[37] = (float)depthTexture->getHeight();
+    data[38] = (float)renderWidth;
+    data[39] = (float)renderHeight;
+    uniforms->upload(0, sizeof(data), data);
+
+    GPU::BindGroupDescriptor aoDesc{};
+    aoDesc.layout = aoBindGroupLayout;
+    aoDesc.entries = {{0, depthTexture}, {1, defaultTexture}, {2, GPU::BufferBinding{uniforms, 0, 160}}, {3, aoSampler}};
+    const auto aoGroup = device->createBindGroup(aoDesc);
+    GPU::BindGroupDescriptor applyDesc{};
+    applyDesc.layout = aoBindGroupLayout;
+    applyDesc.entries = {{0, depthTexture}, {1, aoTexture}, {2, GPU::BufferBinding{uniforms, 0, 160}}, {3, aoSampler}};
+    const auto applyGroup = device->createBindGroup(applyDesc);
+    if (!aoGroup || !applyGroup) return;
+
+    const auto pass = [&](const std::shared_ptr<GPU::TextureView>& target, GPU::LoadOp load,
+                          const std::shared_ptr<GPU::RenderPipeline>& pipeline,
+                          const std::shared_ptr<GPU::BindGroup>& group) {
+        GPU::ColorAttachment ca{};
+        ca.view = target;
+        ca.clearValue[0] = ca.clearValue[1] = ca.clearValue[2] = ca.clearValue[3] = 1.0f;
+        ca.loadOp = load;
+        ca.storeOp = GPU::StoreOp::store;
+        ca.depthSlice = 0;
+        GPU::BeginRenderPassDescriptor desc{};
+        desc.colorAttachments = {ca};
+        if (auto rpe = encoder->beginRenderPass(desc)) {
+            rpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
+            rpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+            rpe->setPipeline(pipeline);
+            rpe->setBindGroup(0, group);
+            rpe->draw(3);
+            rpe->end();
+        }
+    };
+    pass(aoView, GPU::LoadOp::clear, aoPipeline, aoGroup);
+    pass(colorView, GPU::LoadOp::load, aoApplyPipeline, applyGroup);
+}
+
+void Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
+                                const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+                                const systems::leal::vector_math::Matrix4<double>& lightViewProj,
+                                uint64_t transformsOffset) {
+    namespace GPU = systems::leal::campello_gpu;
+    GPU::DepthStencilAttachment shadowDepth{};
+    shadowDepth.view = shadowMapView;
+    shadowDepth.depthClearValue = 1.0f;
+    shadowDepth.depthLoadOp = GPU::LoadOp::clear;
+    shadowDepth.depthStoreOp = GPU::StoreOp::store;
+    shadowDepth.depthReadOnly = false;
+    shadowDepth.stencilClearValue = 0;
+    shadowDepth.stencilLoadOp = GPU::LoadOp::clear;
+    shadowDepth.stencilStoreOp = GPU::StoreOp::discard;
+    shadowDepth.stencilReadOnly = false;
+    GPU::BeginRenderPassDescriptor shadowDesc{};
+    shadowDesc.depthStencilAttachment = shadowDepth;
+    auto rpe = encoder->beginRenderPass(shadowDesc);
+    if (!rpe) return;
+    const float size = (float)shadowMapResolution;
+    rpe->setViewport(0.0f, 0.0f, size, size, 0.0f, 1.0f);
+    rpe->setScissorRect(0.0f, 0.0f, size, size);
+    rpe->setPipeline(shadowPipeline);
+#if defined(__EMSCRIPTEN__)
+    rpe->setBindGroup(0, shadowEmptyBindGroup);
+    rpe->setBindGroup(1, shadowEmptyBindGroup);
+    webgpuBoundDrawGroup = nullptr;
+#elif !CAMPELLO_RENDERER_VK_BINDINGS
+    rpe->setVertexBuffer(18, cameraPositionBuffer, 0);  // vertexShadow: the shadow block
+#endif
+    // Per caster: the light's clip from local (the lean stage on Vulkan and
+    // WebGPU) and the model matrix (Metal's vertexShadow), after the draws'
+    // own transforms.
+    uint64_t offset = transformsOffset;
+    for (const auto& draw : casters) {
+        if (!draw.mesh || !draw.material || draw.material->alphaBlend ||
+            draw.mesh->topology != GPU::PrimitiveTopology::triangleList) {
+            continue;
+        }
+        const auto& positions = draw.mesh->vertexBuffers[VERTEX_SLOT_POSITION];
+        const VertexAttributeFormat* format = draw.mesh->layout ? draw.mesh->layout->find(VertexSemantic::position) : nullptr;
+        const bool floatPositions = !draw.mesh->layout || (format && format->componentType == GPU::ComponentType::ctFloat &&
+                                                           format->accessorType == GPU::AccessorType::acVec3);
+        if (!positions || !floatPositions) continue;
+        if (offset + 128 > transformBuffer->getLength()) break;
+        float matrices[32];
+        const auto lightMvp = lightViewProj * draw.worldTransform;
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 4; ++col) {
+                matrices[col * 4 + row] = (float)lightMvp.data[row * 4 + col];
+                matrices[16 + col * 4 + row] = (float)draw.worldTransform.data[row * 4 + col];
+            }
+        }
+        transformBuffer->upload(offset, 128, matrices);
+        rpe->setVertexBuffer(0, positions, 0);
+        uint32_t firstInstance = 0;
+#if defined(__EMSCRIPTEN__)
+        bindWebGpuTransforms(rpe, transformBuffer, offset);
+        firstInstance = webgpuFirstInstance;
+#elif CAMPELLO_RENDERER_VK_BINDINGS
+        rpe->setVertexBuffer(1, transformBuffer, offset);
+#else
+        rpe->setVertexBuffer(16, transformBuffer, offset);
+#endif
+        offset += 128;
+        if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
+            rpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
+            rpe->drawIndexed(draw.mesh->indexCount, 1, 0, 0, firstInstance);
+        } else {
+            rpe->draw(draw.mesh->vertexCount, 1, 0, firstInstance);
+        }
+    }
+    rpe->end();
+#if defined(__EMSCRIPTEN__)
+    webgpuBoundDrawGroup = nullptr;  // per pass
+#endif
+}
+
 std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::shadowMapBinding() {
     namespace GPU = systems::leal::campello_gpu;
     if (shadowMap) return shadowMap;
@@ -4133,6 +4369,8 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 
         pipelineDownsample = device->createRenderPipeline(dsDesc);
     }
+    createAmbientOcclusionPipelines(shaderModule, "fxaaVertex", shaderModule, "ssaoFragment", shaderModule,
+                                    "ssaoApplyFragment", colorFormat);
 
     // --- IBL precompute pipeline (Metal) — see bakeIblResources() ---
     // Bakes the BRDF LUT / GGX-prefiltered specular cubemap / diffuse
@@ -4480,6 +4718,21 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             shadowPipeline = device->createRenderPipeline(sd);
         }
     }
+
+    // --- Ambient occlusion (setAmbientOcclusion()) ---
+#if defined(__EMSCRIPTEN__)
+    {
+        auto ssaoModule = device->createShaderModule(kSsaoWebGpuShader);
+        createAmbientOcclusionPipelines(ssaoModule, "vs_fullscreen", ssaoModule, "fs_ssao", ssaoModule, "fs_ssao_apply",
+                                        colorFormat);
+    }
+#else
+    createAmbientOcclusionPipelines(
+        device->createShaderModule(kDefaultVulkanFxaaVertShader, kDefaultVulkanFxaaVertShaderSize), "main",
+        device->createShaderModule(kDefaultVulkanSsaoFragShader, kDefaultVulkanSsaoFragShaderSize), "main",
+        device->createShaderModule(kDefaultVulkanSsaoApplyFragShader, kDefaultVulkanSsaoApplyFragShaderSize), "main",
+        colorFormat);
+#endif
 
 #if !defined(__EMSCRIPTEN__)  // post-processing and bakes: no WGSL versions yet
     // --- FXAA post-process pipeline (Vulkan) ---
@@ -5292,7 +5545,7 @@ void Renderer::ensureDepthTexture() {
         GPU::TextureType::tt2d,
         GPU::PixelFormat::depth32float,
         w, h, 1, 1, 1,
-        (TU)(uint32_t(TU::renderTarget)));
+        (TU)(uint32_t(TU::renderTarget) | uint32_t(TU::textureBinding)));  // sampled by the AO pass
     depthView = nullptr;
     if (depthTexture) {
         depthView = depthTexture->createView(
@@ -5984,6 +6237,7 @@ void Renderer::renderToTarget(
             // screenSize at offset 64 (float2)
             skyboxData[16] = (float)sceneTargetWidth();
             skyboxData[17] = (float)sceneTargetHeight();
+            skyboxData[18] = exposureEv;
             // cameraPos at offset 80 (float3, 16-byte aligned)
             skyboxData[20] = cameraWorldPos[0];
             skyboxData[21] = cameraWorldPos[1];
@@ -9063,9 +9317,9 @@ void Renderer::render(const RenderScene& scene,
 
     // Pre-upload all draw-call transforms sequentially into transformBuffer.
     size_t totalDraws = scene.opaque.size() + scene.transparent.size();
-    // Vulkan/WebGPU: room for the shadow pass's light-space transforms
-    // after the draws' own (one per opaque draw).
-    uint64_t requiredBytes = (uint64_t)(totalDraws + 1 + (CAMPELLO_RENDERER_VK_BINDINGS ? scene.opaque.size() : 0)) * 128;
+    // Room for the shadow casters' transforms after the draws' own
+    // (encodeShadowPass(); the casters, or the opaque draws).
+    uint64_t requiredBytes = (uint64_t)(totalDraws + 1 + scene.opaque.size() + scene.shadowCasters.size()) * 128;
     if (!transformBuffer || transformBuffer->getLength() < requiredBytes) {
         uint64_t newSize = std::max(requiredBytes, (uint64_t)4096 * 128);
         transformBuffer = device->createBuffer(newSize, kTransformBufferUsage);
@@ -9154,7 +9408,8 @@ void Renderer::render(const RenderScene& scene,
     // camera uniforms tells the shaders where it is (x = on).
     // ------------------------------------------------------------------
     {
-        float shadowBlock[20] = {0};
+        float shadowBlock[24] = {0};  // shadowViewProj, shadowParams, viewParams
+        shadowBlock[20] = exposureEv;
         const LightData* sun = nullptr;
         for (const auto& l : scene.lights) {
             if (l.type == 0 && l.castShadows) {
@@ -9162,103 +9417,66 @@ void Renderer::render(const RenderScene& scene,
                 break;
             }
         }
-        M4 lightViewProj = M4::identity();
-        if (sun && shadowsEnabled && shadowPipeline && !activeProgramPass && cameraPositionBuffer &&
-            fitShadowView(sortedOpaque, VM::Vector3<double>(-sun->direction.x(), -sun->direction.y(), -sun->direction.z()),
-                          lightViewProj) &&
-            ensureShadowMap()) {
-            for (int row = 0; row < 4; ++row) {
-                for (int col = 0; col < 4; ++col) {
-                    shadowBlock[col * 4 + row] = (float)lightViewProj.data[row * 4 + col];
+        // Casters: every opaque mesh of the scene whatever the camera sees
+        // (render_system() lists them before culling), else the opaque draws.
+        const auto& casters = scene.shadowCasters.empty() ? sortedOpaque : scene.shadowCasters;
+        if (sun && shadowsEnabled && shadowPipeline && !activeProgramPass && cameraPositionBuffer) {
+            // The map depends on the light, its resolution and the casters,
+            // not on the camera: redrawn only when one of them changes.
+            uint64_t key = 1469598103934665603ull;
+            const auto mix = [&key](const void* data, size_t size) {
+                const auto* bytes = static_cast<const uint8_t*>(data);
+                for (size_t i = 0; i < size; ++i) {
+                    key ^= bytes[i];
+                    key *= 1099511628211ull;
                 }
+            };
+            const double direction[3] = {sun->direction.x(), sun->direction.y(), sun->direction.z()};
+            mix(direction, sizeof(direction));
+            mix(&shadowMapResolution, sizeof(shadowMapResolution));
+            for (const auto& draw : casters) {
+                mix(&draw.mesh, sizeof(draw.mesh));
+                if (draw.mesh) {
+                    const void* positions = draw.mesh->vertexBuffers[VERTEX_SLOT_POSITION].get();
+                    mix(&positions, sizeof(positions));
+                    mix(&draw.mesh->indexCount, sizeof(draw.mesh->indexCount));
+                    mix(&draw.mesh->vertexCount, sizeof(draw.mesh->vertexCount));
+                }
+                const uint8_t blended = draw.material && draw.material->alphaBlend ? 1 : 0;
+                mix(&blended, 1);
+                mix(draw.worldTransform.data, sizeof(double) * 16);
             }
-            shadowBlock[16] = 1.0f;                                    // on
-            shadowBlock[17] = 1.0f / (float)shadowMapResolution;      // texel (uv)
-            cameraPositionBuffer->upload(kCameraClipEnd, sizeof(shadowBlock), shadowBlock);
-
-            GPU::DepthStencilAttachment shadowDepth{};
-            shadowDepth.view = shadowMapView;
-            shadowDepth.depthClearValue = 1.0f;
-            shadowDepth.depthLoadOp = GPU::LoadOp::clear;
-            shadowDepth.depthStoreOp = GPU::StoreOp::store;
-            shadowDepth.depthReadOnly = false;
-            shadowDepth.stencilClearValue = 0;
-            shadowDepth.stencilLoadOp = GPU::LoadOp::clear;
-            shadowDepth.stencilStoreOp = GPU::StoreOp::discard;
-            shadowDepth.stencilReadOnly = false;
-            GPU::BeginRenderPassDescriptor shadowDesc{};
-            shadowDesc.depthStencilAttachment = shadowDepth;
-            if (auto shadowRpe = encoder->beginRenderPass(shadowDesc)) {
-                const float size = (float)shadowMapResolution;
-                shadowRpe->setViewport(0.0f, 0.0f, size, size, 0.0f, 1.0f);
-                shadowRpe->setScissorRect(0.0f, 0.0f, size, size);
-                shadowRpe->setPipeline(shadowPipeline);
-#if CAMPELLO_RENDERER_VK_BINDINGS
-                // Light-space transforms (mvp = light view-projection x model)
-                // after the draws' own, for the lean vertex stage.
-                uint64_t shadowTxOffset = txOffset;
-#if defined(__EMSCRIPTEN__)
-                shadowRpe->setBindGroup(0, shadowEmptyBindGroup);
-                shadowRpe->setBindGroup(1, shadowEmptyBindGroup);
-                webgpuBoundDrawGroup = nullptr;
-#endif
-#else
-                shadowRpe->setVertexBuffer(18, cameraPositionBuffer, 0);
-#endif
-                for (size_t i = 0; i < sortedOpaque.size(); ++i) {
-                    const auto& draw = sortedOpaque[i];
-                    if (!draw.mesh || !draw.material || draw.material->alphaBlend ||
-                        draw.mesh->topology != GPU::PrimitiveTopology::triangleList) {
-                        continue;
-                    }
-                    const auto& positions = draw.mesh->vertexBuffers[VERTEX_SLOT_POSITION];
-                    const VertexAttributeFormat* format =
-                        draw.mesh->layout ? draw.mesh->layout->find(VertexSemantic::position) : nullptr;
-                    const bool floatPositions = !draw.mesh->layout ||
-                                                (format && format->componentType == GPU::ComponentType::ctFloat &&
-                                                 format->accessorType == GPU::AccessorType::acVec3);
-                    if (!positions || !floatPositions || i >= transformOffsets.size()) {
-                        continue;
-                    }
-                    shadowRpe->setVertexBuffer(0, positions, 0);
-                    uint32_t firstInstance = 0;
-#if CAMPELLO_RENDERER_VK_BINDINGS
-                    if (shadowTxOffset + 128 > transformBuffer->getLength()) break;
-                    {
-                        float matrices[32];
-                        const auto lightMvp = lightViewProj * draw.worldTransform;
-                        for (int row = 0; row < 4; ++row) {
-                            for (int col = 0; col < 4; ++col) {
-                                matrices[col * 4 + row] = (float)lightMvp.data[row * 4 + col];
-                                matrices[16 + col * 4 + row] = (float)draw.worldTransform.data[row * 4 + col];
-                            }
+            if (!shadowMap || !shadowMapValid || key != shadowMapKey) {
+                shadowMapValid = false;
+                M4 lightViewProj = M4::identity();
+                if (fitShadowView(casters, VM::Vector3<double>(-sun->direction.x(), -sun->direction.y(), -sun->direction.z()),
+                                  lightViewProj) &&
+                    ensureShadowMap()) {
+                    shadowLightViewProj = lightViewProj;
+                    // The shadow block first: Metal's vertexShadow reads it.
+                    for (int row = 0; row < 4; ++row) {
+                        for (int col = 0; col < 4; ++col) {
+                            shadowBlock[col * 4 + row] = (float)lightViewProj.data[row * 4 + col];
                         }
-                        transformBuffer->upload(shadowTxOffset, 128, matrices);
                     }
-#if defined(__EMSCRIPTEN__)
-                    bindWebGpuTransforms(shadowRpe, transformBuffer, shadowTxOffset);
-                    firstInstance = webgpuFirstInstance;
-#else
-                    shadowRpe->setVertexBuffer(1, transformBuffer, shadowTxOffset);
-#endif
-                    shadowTxOffset += 128;
-#else
-                    shadowRpe->setVertexBuffer(16, transformBuffer, transformOffsets[i]);
-#endif
-                    if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
-                        shadowRpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
-                        shadowRpe->drawIndexed(draw.mesh->indexCount, 1, 0, 0, firstInstance);
-                    } else {
-                        shadowRpe->draw(draw.mesh->vertexCount, 1, 0, firstInstance);
+                    cameraPositionBuffer->upload(kCameraClipEnd, sizeof(shadowBlock), shadowBlock);
+                    encodeShadowPass(encoder, casters, lightViewProj, txOffset);
+                    shadowMapKey = key;
+                    shadowMapValid = true;
+                }
+            }
+            if (shadowMapValid) {
+                for (int row = 0; row < 4; ++row) {
+                    for (int col = 0; col < 4; ++col) {
+                        shadowBlock[col * 4 + row] = (float)shadowLightViewProj.data[row * 4 + col];
                     }
                 }
-                shadowRpe->end();
-#if defined(__EMSCRIPTEN__)
-                webgpuBoundDrawGroup = nullptr;  // per pass
-#endif
+                shadowBlock[16] = 1.0f;                                // on
+                shadowBlock[17] = 1.0f / (float)shadowMapResolution;  // texel (uv)
             }
-        } else if (cameraPositionBuffer) {
-            cameraPositionBuffer->upload(kCameraClipEnd, sizeof(shadowBlock), shadowBlock);  // off
+        }
+        if (cameraPositionBuffer) {
+            cameraPositionBuffer->upload(kCameraClipEnd, sizeof(shadowBlock), shadowBlock);
         }
     }
 
@@ -9370,6 +9588,7 @@ void Renderer::render(const RenderScene& scene,
                 }
                 skyboxData[16] = (float)sceneTargetWidth();
                 skyboxData[17] = (float)sceneTargetHeight();
+                skyboxData[18] = exposureEv;
                 skyboxData[20] = cameraWorldPos[0];
                 skyboxData[21] = cameraWorldPos[1];
                 skyboxData[22] = cameraWorldPos[2];
@@ -9599,7 +9818,7 @@ void Renderer::render(const RenderScene& scene,
                 ds.view              = depthView;
                 ds.depthClearValue   = 1.0f;
                 ds.depthLoadOp       = GPU::LoadOp::load;
-                ds.depthStoreOp      = GPU::StoreOp::discard;
+                ds.depthStoreOp      = aoEnabled ? GPU::StoreOp::store : GPU::StoreOp::discard;  // AO reads it
                 ds.depthReadOnly     = false;
                 ds.stencilClearValue = 0;
                 ds.stencilLoadOp     = GPU::LoadOp::clear;
@@ -9792,6 +10011,8 @@ void Renderer::render(const RenderScene& scene,
             fxaaRpe->end();
         }
     }
+
+    encodeAmbientOcclusion(encoder, colorView, scene.camera.projection);
 
     frame.commandBuffer = encoder->finish();
     device->submit(frame.commandBuffer, frame.fence);

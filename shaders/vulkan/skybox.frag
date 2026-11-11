@@ -20,7 +20,7 @@ layout(set = 0, binding = 1) uniform sampler     envSampler;
 layout(std140, set = 0, binding = 2) uniform SkyboxUniforms {
     mat4 invVP;
     vec2 screenSize;
-    vec2 _pad;
+    vec2 _pad;      // x = exposure in EV (as CameraUniforms.viewParams.x)
     vec4 cameraPos; // xyz used, w unused
 } u;
 
@@ -68,6 +68,7 @@ void main() {
     // Renderer::createBuiltinDefaultEnvironmentMap), so returning it raw here
     // hard-clips to solid white/saturated colors instead of compressing
     // smoothly like every reflection of the same environment does.
+    color *= exp2(u._pad.x);  // exposure
     color = toneMapKhronosPbrNeutral(color);
     color = linearToSRGBFast(color);
 
