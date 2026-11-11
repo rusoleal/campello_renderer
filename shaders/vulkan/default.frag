@@ -125,6 +125,8 @@ layout(std140, set = 1, binding = 1) uniform CameraUniforms {
     mat4  shadowViewProj;
     vec4  shadowParams;   // x = on, y = texel size (uv)
     vec4  viewParams;     // x = exposure in EV (colour x 2^EV before tone mapping)
+    mat4  shadowNearViewProj;  // the near cascade (sun shadows)
+    vec4  shadowNearParams;    // x = near cascade on
 } camera;
 
 layout(set = 1, binding = 2) uniform textureCube environmentMap;
@@ -140,6 +142,7 @@ layout(set = 1, binding = 7) uniform texture2D   brdfLutTexture;
 layout(set = 1, binding = 8) uniform sampler     brdfLutSampler;
 layout(set = 1, binding = 9)  uniform texture2D     shadowMap;     // sun shadows (depth)
 layout(set = 1, binding = 10) uniform samplerShadow shadowSampler; // compare less-or-equal
+layout(set = 1, binding = 11) uniform texture2D     shadowMapNear; // sun shadows, near cascade
 
 // --- Per-material textures/samplers (set 0) -------------------------------------
 layout(set = 0, binding = 0)  uniform texture2D baseColorTexture;
@@ -386,17 +389,10 @@ vec3 linearToSRGBFast(vec3 color) {
     return pow(color, vec3(1.0 / 2.2));
 }
 
-// How lit `worldPos` is by the shadow-casting light: 1 lit .. 0 shadowed.
-// 3x3 percentage-closer filtering (hardware compare, bilinear); outside the
-// map: lit. Receiver bias against self-shadowing, sized to one shadow-map
-// texel in world units (the orthographic scales are the matrix rows'
-// lengths): along the normal, more at grazing light, plus a texel of depth.
-float sunShadow(vec3 P, vec3 N, vec3 L) {
-    if (camera.shadowParams.x < 0.5) {
-        return 1.0;
-    }
-    mat4 M = camera.shadowViewProj;
-    float texel = camera.shadowParams.y;
+// One shadow map's verdict on P: 1 lit .. 0 shadowed, 3x3 percentage-closer
+// filtering; `inside` false where the map doesn't cover P. Receiver bias as
+// shaders/metal/default.metal's shadowLookup().
+float shadowLookup(texture2D map, mat4 M, float texel, vec3 P, vec3 N, vec3 L, out bool inside) {
     float worldTexel = 2.0 * texel / max(length(vec3(M[0][0], M[1][0], M[2][0])), 1e-6);
     float depthPerWorld = length(vec3(M[0][2], M[1][2], M[2][2]));
     float NdotL = clamp(dot(N, L), 0.0, 1.0);
@@ -404,17 +400,34 @@ float sunShadow(vec3 P, vec3 N, vec3 L) {
     vec4 clip = M * vec4(P + N * worldTexel * (1.0 + slope), 1.0);
     vec3 ndc = clip.xyz / clip.w;
     vec2 uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))) || ndc.z > 1.0) {
+    inside = all(greaterThanEqual(uv, vec2(2.0 * texel))) && all(lessThanEqual(uv, vec2(1.0 - 2.0 * texel))) && ndc.z <= 1.0;
+    if (!inside) {
         return 1.0;
     }
     float depth = ndc.z - depthPerWorld * worldTexel;
     float lit = 0.0;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
-            lit += textureLod(sampler2DShadow(shadowMap, shadowSampler), vec3(uv + vec2(x, y) * texel, depth), 0.0);
+            lit += textureLod(sampler2DShadow(map, shadowSampler), vec3(uv + vec2(x, y) * texel, depth), 0.0);
         }
     }
     return lit / 9.0;
+}
+
+// How lit P is by the shadow-casting light: the near cascade where it covers
+// P, else the far one (the whole scene); outside both, lit.
+float sunShadow(vec3 P, vec3 N, vec3 L) {
+    if (camera.shadowParams.x < 0.5) {
+        return 1.0;
+    }
+    bool inside = false;
+    if (camera.shadowNearParams.x > 0.5) {
+        float lit = shadowLookup(shadowMapNear, camera.shadowNearViewProj, camera.shadowParams.y, P, N, L, inside);
+        if (inside) {
+            return lit;
+        }
+    }
+    return shadowLookup(shadowMap, camera.shadowViewProj, camera.shadowParams.y, P, N, L, inside);
 }
 
 void main() {

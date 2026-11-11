@@ -97,6 +97,8 @@ struct CameraUniforms {
     shadowViewProj: mat4x4f,     // sun shadows: shadow map clip from world
     shadowParams: vec4f,         // x = on, y = texel size (uv)
     viewParams: vec4f,           // x = exposure in EV (colour x 2^EV before tone mapping)
+    shadowNearViewProj: mat4x4f, // sun shadows, near cascade
+    shadowNearParams: vec4f,     // x = near cascade on
 }
 
 struct Light {
@@ -135,6 +137,7 @@ struct LightsUniform {
 @group(1) @binding(8)  var brdfLutSampler: sampler;
 @group(1) @binding(9)  var shadowMap: texture_depth_2d;          // sun shadows
 @group(1) @binding(10) var shadowSampler: sampler_comparison;
+@group(1) @binding(11) var shadowMapNear: texture_depth_2d;      // sun shadows, near cascade
 
 struct NodeTransforms {
     mvp: mat4x4f,    // clip from local
@@ -244,18 +247,11 @@ fn vs_line(@location(0) position: vec3f, @builtin(instance_index) instance: u32)
 // Fragment stage
 // ---------------------------------------------------------------------------
 
-// How lit `worldPos` is by the shadow-casting light: 1 lit .. 0 shadowed.
-// 3x3 percentage-closer filtering (hardware compare, bilinear); outside the
-// map: lit. Receiver bias against self-shadowing, sized to one shadow-map
-// texel in world units (the orthographic scales are the matrix rows'
-// lengths): along the normal, more at grazing light, plus a texel of depth.
+// One shadow map's verdict on worldPos: 1 lit .. 0 shadowed, 3x3
+// percentage-closer filtering; .y = 1 where the map covers the point.
+// Receiver bias as shaders/metal/default.metal's shadowLookup().
 // textureSampleCompareLevel: no derivatives, so fine in the light loop.
-fn sunShadow(worldPos: vec3f, N: vec3f, L: vec3f) -> f32 {
-    if (camera.shadowParams.x < 0.5) {
-        return 1.0;
-    }
-    let M = camera.shadowViewProj;
-    let texel = camera.shadowParams.y;
+fn shadowLookup(map: texture_depth_2d, M: mat4x4f, texel: f32, worldPos: vec3f, N: vec3f, L: vec3f) -> vec2f {
     let worldTexel = 2.0 * texel / max(length(vec3f(M[0][0], M[1][0], M[2][0])), 1e-6);
     let depthPerWorld = length(vec3f(M[0][2], M[1][2], M[2][2]));
     let NdotL = clamp(dot(N, L), 0.0, 1.0);
@@ -263,18 +259,35 @@ fn sunShadow(worldPos: vec3f, N: vec3f, L: vec3f) -> f32 {
     let clip = M * vec4f(worldPos + N * worldTexel * (1.0 + slope), 1.0);
     let ndc = clip.xyz / clip.w;
     let uv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || ndc.z > 1.0) {
-        return 1.0;
+    let inside = all(uv >= vec2f(2.0 * texel)) && all(uv <= vec2f(1.0 - 2.0 * texel)) && ndc.z <= 1.0;
+    if (!inside) {
+        return vec2f(1.0, 0.0);
     }
     let depth = ndc.z - depthPerWorld * worldTexel;
     var lit = 0.0;
     for (var y = -1; y <= 1; y++) {
         for (var x = -1; x <= 1; x++) {
-            lit += textureSampleCompareLevel(shadowMap, shadowSampler, uv + vec2f(f32(x), f32(y)) * texel, depth);
+            lit += textureSampleCompareLevel(map, shadowSampler, uv + vec2f(f32(x), f32(y)) * texel, depth);
         }
     }
-    return lit / 9.0;
+    return vec2f(lit / 9.0, 1.0);
 }
+
+// How lit worldPos is by the shadow-casting light: the near cascade where it
+// covers the point, else the far one (the whole scene); outside both, lit.
+fn sunShadow(worldPos: vec3f, N: vec3f, L: vec3f) -> f32 {
+    if (camera.shadowParams.x < 0.5) {
+        return 1.0;
+    }
+    if (camera.shadowNearParams.x > 0.5) {
+        let near = shadowLookup(shadowMapNear, camera.shadowNearViewProj, camera.shadowParams.y, worldPos, N, L);
+        if (near.y > 0.5) {
+            return near.x;
+        }
+    }
+    return shadowLookup(shadowMap, camera.shadowViewProj, camera.shadowParams.y, worldPos, N, L).x;
+}
+
 fn selectUV(uv0: vec2f, uv1: vec2f, packedMask: f32, bit: u32) -> vec2f {
     return select(uv0, uv1, (u32(packedMask) & bit) != 0u);
 }

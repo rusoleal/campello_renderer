@@ -495,7 +495,7 @@ namespace systems::leal::campello_renderer {
         // CameraUniforms: camera (160 bytes), clip block (128), shadow block
         // (shadowViewProj float4x4 + shadowParams float4: 80).
         static constexpr uint64_t kCameraClipEnd = 288;
-        static constexpr uint64_t kCameraUniformSize = 384;
+        static constexpr uint64_t kCameraUniformSize = 464;
         std::shared_ptr<systems::leal::campello_gpu::Texture> programPassDepthTexture;
         std::shared_ptr<systems::leal::campello_gpu::TextureView> programPassDepthView;
 
@@ -705,10 +705,14 @@ namespace systems::leal::campello_renderer {
         uint64_t shadowMapKey = 0;
         bool shadowMapValid = false;
         systems::leal::vector_math::Matrix4<double> shadowLightViewProj;
-        void encodeShadowPass(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
-                              const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
-                              const systems::leal::vector_math::Matrix4<double>& lightViewProj,
-                              uint64_t transformsOffset);
+        /// Draws `casters` into `target` with `lightViewProj`; their
+        /// transforms go into the transform buffer from `transformsOffset`.
+        /// Returns the offset after them.
+        uint64_t encodeShadowPass(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
+                                  const std::shared_ptr<systems::leal::campello_gpu::TextureView>& target,
+                                  const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+                                  const systems::leal::vector_math::Matrix4<double>& lightViewProj,
+                                  uint64_t transformsOffset);
         // Vulkan/WebGPU: the comparison sampler of the shadow lookup (frame
         // binding 10). Metal declares its sampler in the shader.
         std::shared_ptr<systems::leal::campello_gpu::Sampler> shadowSampler;
@@ -754,9 +758,32 @@ namespace systems::leal::campello_renderer {
         bool ensureShadowMap();
         // Light view-projection for the shadow map, fitted to the bounds of
         // `draws` seen from `toLight`; false if there's nothing to fit.
-        bool fitShadowView(const std::vector<systems::leal::campello_renderer::DrawCall>& draws,
-                           const systems::leal::vector_math::Vector3<double>& toLight,
-                           systems::leal::vector_math::Matrix4<double>& lightViewProj) const;
+        // Sun shadow cascades. The light's view is fixed by the casters'
+        // bounds and the light direction (so it doesn't move with the
+        // camera); the far cascade covers all casters (`full`), the near
+        // cascade a rectangle around the part of the view nearest the camera.
+        struct ShadowFit {
+            systems::leal::vector_math::Matrix4<double> lightView;
+            double full[4] = {0, 0, 0, 0};  ///< left, right, bottom, top of the casters in light view
+            double n = 0.0, f = 1.0, sign = 1.0;  ///< depth range along the light, lookAt's z sign
+            double lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};  ///< casters' world bounds
+        };
+        bool fitShadowLight(const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+                            const systems::leal::vector_math::Vector3<double>& toLight, ShadowFit& fit) const;
+        static systems::leal::vector_math::Matrix4<double> shadowProjection(const ShadowFit& fit, const double rect[4]);
+        /// The light-view rectangle of the view's nearest part (from the
+        /// camera to halfway between the logarithmic and uniform split of the
+        /// casters' depth range),
+        /// or false when a near cascade wouldn't be much finer than the far one.
+        static bool nearShadowRect(const ShadowFit& fit, const CameraData& camera, double rect[4]);
+        std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapNear;
+        std::shared_ptr<systems::leal::campello_gpu::TextureView> shadowMapNearView;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapNearBinding();
+        bool shadowCascades = true;
+        bool shadowNearValid = false;
+        uint64_t shadowNearKey = 0;
+        double shadowNearRect[4] = {0, 0, 0, 0};
+        systems::leal::vector_math::Matrix4<double> shadowNearViewProj;
 
         // Per-node matrices uploaded to the GPU at the start of each render().
         // Each node gets 32 floats: 16 for MVP (clip space), 16 for Model (world space).
@@ -1209,7 +1236,13 @@ namespace systems::leal::campello_renderer {
         /// The shadow map is redrawn only when the light, its resolution or
         /// the casters (meshes, their buffers and transforms) change; call
         /// this after rewriting a mesh's buffers in place.
-        void invalidateShadowMap() { shadowMapValid = false; }
+        void invalidateShadowMap() {
+            shadowMapValid = false;
+            shadowNearValid = false;
+        }
+        /// A finer shadow map for the part of the view nearest the camera
+        /// (two cascades; on by default). Off: one map over the whole scene.
+        void setShadowCascades(bool enabled) { shadowCascades = enabled; }
 
         /// Exposure in EV: colours are multiplied by 2^ev before tone mapping
         /// (meshes and sky). 0 by default (unchanged).

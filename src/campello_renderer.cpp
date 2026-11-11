@@ -1254,6 +1254,16 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
             e.data.sampler.type = GPU::EntryObjectSamplerType::comparison;
             frameDesc.entries.push_back(e);
         }
+        {                                                   // shadowMapNear (near cascade, depth)
+            GPU::EntryObject e{};
+            e.binding    = 11;
+            e.visibility = GPU::ShaderStage::fragment;
+            e.type       = GPU::EntryObjectType::texture;
+            e.data.texture.multisampled  = false;
+            e.data.texture.sampleType    = GPU::EntryObjectTextureType::ttDepth;
+            e.data.texture.viewDimension = GPU::TextureType::tt2d;
+            frameDesc.entries.push_back(e);
+        }
         vulkanFrameBindGroupLayout = device->createBindGroupLayout(frameDesc);
     }
 #if defined(__EMSCRIPTEN__)
@@ -2539,6 +2549,7 @@ void Renderer::setScene(uint32_t index) {
                 {8, fxaaSampler},
                 {9, shadowMapBinding()},
                 {10, shadowSamplerBinding()},
+                {11, shadowMapNearBinding()},
             };
             frameBindGroup[f] = device->createBindGroup(bgDesc);
         }
@@ -3542,6 +3553,8 @@ void Renderer::setShadowMapResolution(uint32_t texels) {
         shadowMapResolution = texels;
         shadowMap.reset();
         shadowMapView.reset();
+        shadowMapNear.reset();
+        shadowMapNearView.reset();
     }
 }
 
@@ -3549,13 +3562,23 @@ bool Renderer::ensureShadowMap() {
     namespace GPU = systems::leal::campello_gpu;
     if (shadowMap && shadowMapView) return true;
     if (!device) return false;
+    shadowMapValid = false;
+    shadowNearValid = false;
     shadowMap = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::depth32float, shadowMapResolution,
                                       shadowMapResolution, 1, 1, 1,
                                       (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
                                                           uint32_t(GPU::TextureUsage::textureBinding)));
     if (!shadowMap) return false;
     shadowMapView = shadowMap->createView(GPU::PixelFormat::depth32float, 1, GPU::Aspect::depthOnly, 0, 0, GPU::TextureType::tt2d, 1);
-    return shadowMapView != nullptr;
+    if (!shadowMapView) return false;
+    shadowMapNear = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::depth32float, shadowMapResolution,
+                                          shadowMapResolution, 1, 1, 1,
+                                          (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                                              uint32_t(GPU::TextureUsage::textureBinding)));
+    shadowMapNearView = shadowMapNear ? shadowMapNear->createView(GPU::PixelFormat::depth32float, 1, GPU::Aspect::depthOnly, 0, 0,
+                                                                  GPU::TextureType::tt2d, 1)
+                                      : nullptr;
+    return true;  // the near cascade is optional
 }
 
 void Renderer::createAmbientOcclusionPipelines(const std::shared_ptr<systems::leal::campello_gpu::ShaderModule>& vertexModule,
@@ -3716,13 +3739,14 @@ void Renderer::encodeAmbientOcclusion(const std::shared_ptr<systems::leal::campe
     pass(colorView, GPU::LoadOp::load, aoApplyPipeline, applyGroup);
 }
 
-void Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
-                                const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
-                                const systems::leal::vector_math::Matrix4<double>& lightViewProj,
-                                uint64_t transformsOffset) {
+uint64_t Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
+                                    const std::shared_ptr<systems::leal::campello_gpu::TextureView>& target,
+                                    const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+                                    const systems::leal::vector_math::Matrix4<double>& lightViewProj,
+                                    uint64_t transformsOffset) {
     namespace GPU = systems::leal::campello_gpu;
     GPU::DepthStencilAttachment shadowDepth{};
-    shadowDepth.view = shadowMapView;
+    shadowDepth.view = target;
     shadowDepth.depthClearValue = 1.0f;
     shadowDepth.depthLoadOp = GPU::LoadOp::clear;
     shadowDepth.depthStoreOp = GPU::StoreOp::store;
@@ -3734,7 +3758,7 @@ void Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campello_gp
     GPU::BeginRenderPassDescriptor shadowDesc{};
     shadowDesc.depthStencilAttachment = shadowDepth;
     auto rpe = encoder->beginRenderPass(shadowDesc);
-    if (!rpe) return;
+    if (!rpe) return transformsOffset;
     const float size = (float)shadowMapResolution;
     rpe->setViewport(0.0f, 0.0f, size, size, 0.0f, 1.0f);
     rpe->setScissorRect(0.0f, 0.0f, size, size);
@@ -3743,12 +3767,9 @@ void Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campello_gp
     rpe->setBindGroup(0, shadowEmptyBindGroup);
     rpe->setBindGroup(1, shadowEmptyBindGroup);
     webgpuBoundDrawGroup = nullptr;
-#elif !CAMPELLO_RENDERER_VK_BINDINGS
-    rpe->setVertexBuffer(18, cameraPositionBuffer, 0);  // vertexShadow: the shadow block
 #endif
-    // Per caster: the light's clip from local (the lean stage on Vulkan and
-    // WebGPU) and the model matrix (Metal's vertexShadow), after the draws'
-    // own transforms.
+    // Per caster: the light's clip from local for the lean vertex stage (and
+    // the model matrix), after the draws' own transforms.
     uint64_t offset = transformsOffset;
     for (const auto& draw : casters) {
         if (!draw.mesh || !draw.material || draw.material->alphaBlend ||
@@ -3792,6 +3813,7 @@ void Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campello_gp
 #if defined(__EMSCRIPTEN__)
     webgpuBoundDrawGroup = nullptr;  // per pass
 #endif
+    return offset;
 }
 
 std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::shadowMapBinding() {
@@ -3803,6 +3825,11 @@ std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::shadowMapBinding
                                                                          uint32_t(GPU::TextureUsage::textureBinding)));
     }
     return shadowMapPlaceholder;
+}
+
+std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::shadowMapNearBinding() {
+    if (shadowMapNear) return shadowMapNear;
+    return shadowMapBinding();  // the placeholder (or the far map)
 }
 
 std::shared_ptr<systems::leal::campello_gpu::Sampler> Renderer::shadowSamplerBinding() {
@@ -3823,15 +3850,15 @@ std::shared_ptr<systems::leal::campello_gpu::Sampler> Renderer::shadowSamplerBin
     return shadowSampler;
 }
 
-bool Renderer::fitShadowView(const std::vector<systems::leal::campello_renderer::DrawCall>& draws, const systems::leal::vector_math::Vector3<double>& toLight,
-                             systems::leal::vector_math::Matrix4<double>& lightViewProj) const {
+bool Renderer::fitShadowLight(const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+                              const systems::leal::vector_math::Vector3<double>& toLight, ShadowFit& fit) const {
     namespace VM = systems::leal::vector_math;
     using M4 = VM::Matrix4<double>;
-    // World bounds of the opaque draws that have bounds.
+    // World bounds of the casters that have bounds.
     double lo[3] = {1e300, 1e300, 1e300};
     double hi[3] = {-1e300, -1e300, -1e300};
     bool any = false;
-    for (const auto& draw : draws) {
+    for (const auto& draw : casters) {
         if (!draw.mesh || !draw.mesh->hasBounds ||
             draw.mesh->topology != systems::leal::campello_gpu::PrimitiveTopology::triangleList) continue;
         const auto& m = draw.worldTransform.data;
@@ -3858,14 +3885,14 @@ bool Renderer::fitShadowView(const std::vector<systems::leal::campello_renderer:
                                   centre.z() + dir.z() * radius * 2);
     // Any up that isn't along the light.
     const VM::Vector3<double> up = std::abs(dir.z()) > 0.9 ? VM::Vector3<double>(0, 1, 0) : VM::Vector3<double>(0, 0, 1);
-    const M4 lightView = M4::lookAt(eye, centre, up);
+    fit.lightView = M4::lookAt(eye, centre, up);
     // The bounds' corners in light view space give a tight orthographic box.
     double vlo[3] = {1e300, 1e300, 1e300};
     double vhi[3] = {-1e300, -1e300, -1e300};
+    const auto& v = fit.lightView.data;
     for (int corner = 0; corner < 8; ++corner) {
         const double p[3] = {(corner & 1) ? hi[0] : lo[0], (corner & 2) ? hi[1] : lo[1], (corner & 4) ? hi[2] : lo[2]};
         for (int r = 0; r < 3; ++r) {
-            const auto& v = lightView.data;
             const double w = v[r * 4] * p[0] + v[r * 4 + 1] * p[1] + v[r * 4 + 2] * p[2] + v[r * 4 + 3];
             vlo[r] = std::min(vlo[r], w);
             vhi[r] = std::max(vhi[r], w);
@@ -3873,22 +3900,108 @@ bool Renderer::fitShadowView(const std::vector<systems::leal::campello_renderer:
     }
     // Depth along the view direction, whichever way lookAt() points it: the
     // centre must come out in front (positive), mapped near..far to [0, 1].
-    const auto& v = lightView.data;
     const double centreZ = v[8] * centre.x() + v[9] * centre.y() + v[10] * centre.z() + v[11];
-    const double sign = centreZ < 0.0 ? -1.0 : 1.0;
-    const double l = vlo[0], r = vhi[0], b = vlo[1], t = vhi[1];
-    const double depthLo = sign > 0 ? vlo[2] : -vhi[2];
-    const double depthHi = sign > 0 ? vhi[2] : -vlo[2];
-    const double n = depthLo - 1e-3 * radius, f = depthHi + 1e-3 * radius;
+    fit.sign = centreZ < 0.0 ? -1.0 : 1.0;
+    const double depthLo = fit.sign > 0 ? vlo[2] : -vhi[2];
+    const double depthHi = fit.sign > 0 ? vhi[2] : -vlo[2];
+    fit.n = depthLo - 1e-3 * radius;
+    fit.f = depthHi + 1e-3 * radius;
+    fit.full[0] = vlo[0];
+    fit.full[1] = vhi[0];
+    fit.full[2] = vlo[1];
+    fit.full[3] = vhi[1];
+    for (int k = 0; k < 3; ++k) {
+        fit.lo[k] = lo[k];
+        fit.hi[k] = hi[k];
+    }
+    return true;
+}
+
+systems::leal::vector_math::Matrix4<double> Renderer::shadowProjection(const ShadowFit& fit, const double rect[4]) {
+    using M4 = systems::leal::vector_math::Matrix4<double>;
+    const double l = rect[0], r = rect[1], b = rect[2], t = rect[3];
     M4 ortho = M4::identity();
     ortho.data[0] = 2.0 / (r - l);
     ortho.data[3] = -(r + l) / (r - l);
     ortho.data[5] = 2.0 / (t - b);
     ortho.data[7] = -(t + b) / (t - b);
-    ortho.data[10] = sign / (f - n);
-    ortho.data[11] = -n / (f - n);
-    lightViewProj = ortho * lightView;
-    return true;
+    ortho.data[10] = fit.sign / (fit.f - fit.n);
+    ortho.data[11] = -fit.n / (fit.f - fit.n);
+    return ortho * fit.lightView;
+}
+
+bool Renderer::nearShadowRect(const ShadowFit& fit, const CameraData& camera, double rect[4]) {
+    using M4 = systems::leal::vector_math::Matrix4<double>;
+    const M4& view = camera.view;
+    const M4 invView = view.inverted();
+    const M4 invProj = camera.projection.inverted();
+    const auto unproject = [&](double x, double y, double z, double out[3]) {
+        const double* m = invProj.data;
+        const double w = m[12] * x + m[13] * y + m[14] * z + m[15];
+        if (std::abs(w) < 1e-12) return false;
+        for (int r = 0; r < 3; ++r) out[r] = (m[r * 4] * x + m[r * 4 + 1] * y + m[r * 4 + 2] * z + m[r * 4 + 3]) / w;
+        return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+    };
+    // Forward along view z: the sign of the near plane's z (either handedness).
+    double nearPoint[3];
+    if (!unproject(0.0, 0.0, 0.0, nearPoint) || std::abs(nearPoint[2]) < 1e-12) return false;
+    const double forward = nearPoint[2] < 0.0 ? -1.0 : 1.0;
+    const double cameraNear = forward * nearPoint[2];
+    const bool orthographic = std::abs(camera.projection.data[15] - 1.0) < 1e-9 && std::abs(camera.projection.data[14]) < 1e-9;
+    // The casters' depth range in front of the camera.
+    double dMin = 1e300, dMax = -1e300;
+    for (int corner = 0; corner < 8; ++corner) {
+        const double p[3] = {(corner & 1) ? fit.hi[0] : fit.lo[0], (corner & 2) ? fit.hi[1] : fit.lo[1],
+                             (corner & 4) ? fit.hi[2] : fit.lo[2]};
+        const double* v = view.data;
+        const double d = forward * (v[8] * p[0] + v[9] * p[1] + v[10] * p[2] + v[11]);
+        dMin = std::min(dMin, d);
+        dMax = std::max(dMax, d);
+    }
+    if (dMax <= cameraNear) return false;
+    const double sliceNear = std::max(cameraNear, std::max(dMin, dMax * 0.01));
+    // Halfway between the logarithmic and the uniform split (the usual
+    // "practical" split of cascaded shadow maps).
+    const double sliceFar = 0.5 * (std::sqrt(sliceNear * dMax) + 0.5 * (sliceNear + dMax));
+    if (sliceFar >= 0.6 * dMax) return false;
+    // The slice's corners, world, then light view.
+    double lo[2] = {1e300, 1e300}, hi[2] = {-1e300, -1e300};
+    for (int corner = 0; corner < 8; ++corner) {
+        const double x = (corner & 1) ? 1.0 : -1.0, y = (corner & 2) ? 1.0 : -1.0;
+        const double depth = (corner & 4) ? sliceFar : sliceNear;
+        double q[3];
+        if (!unproject(x, y, 0.5, q)) return false;
+        double pv[3];
+        if (orthographic) {
+            pv[0] = q[0];
+            pv[1] = q[1];
+            pv[2] = forward * depth;
+        } else {
+            const double along = forward * q[2];
+            if (along <= 0.0) return false;
+            const double k = depth / along;
+            pv[0] = q[0] * k;
+            pv[1] = q[1] * k;
+            pv[2] = q[2] * k;
+        }
+        const double* iv = invView.data;
+        double pw[3];
+        for (int r = 0; r < 3; ++r) pw[r] = iv[r * 4] * pv[0] + iv[r * 4 + 1] * pv[1] + iv[r * 4 + 2] * pv[2] + iv[r * 4 + 3];
+        const double* lv = fit.lightView.data;
+        for (int r = 0; r < 2; ++r) {
+            const double w = lv[r * 4] * pw[0] + lv[r * 4 + 1] * pw[1] + lv[r * 4 + 2] * pw[2] + lv[r * 4 + 3];
+            lo[r] = std::min(lo[r], w);
+            hi[r] = std::max(hi[r], w);
+        }
+    }
+    rect[0] = std::max(lo[0], fit.full[0]);
+    rect[1] = std::min(hi[0], fit.full[1]);
+    rect[2] = std::max(lo[1], fit.full[2]);
+    rect[3] = std::min(hi[1], fit.full[3]);
+    if (rect[1] <= rect[0] || rect[3] <= rect[2]) return false;
+    const double area = (rect[1] - rect[0]) * (rect[3] - rect[2]);
+    const double fullArea = (fit.full[1] - fit.full[0]) * (fit.full[3] - fit.full[2]);
+    return area < 0.5 * fullArea;
 }
 
 void Renderer::bindMeshBuffer(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
@@ -4160,7 +4273,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         {
             GPU::RenderPipelineDescriptor sd{};
             sd.vertex.module = shaderModule;
-            sd.vertex.entryPoint = "vertexShadow";
+            sd.vertex.entryPoint = "vertexLean";  // mvp: the light's clip from local (encodeShadowPass())
             GPU::VertexLayout positions{};
             positions.arrayStride = 12;
             positions.stepMode = GPU::StepMode::vertex;
@@ -6563,6 +6676,7 @@ void Renderer::renderToTarget(
             {8, fxaaSampler},
             {9, shadowMapBinding()},
             {10, shadowSamplerBinding()},
+            {11, shadowMapNearBinding()},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
@@ -6581,6 +6695,7 @@ void Renderer::renderToTarget(
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
             {29, shadowMapBinding()},  // sun shadows (fragmentMain_textured)
+            {30, shadowMapNearBinding()},  // its near cascade
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
             // is picked up automatically by this unconditional per-frame
@@ -6850,6 +6965,7 @@ void Renderer::renderToTarget(
                 {8, fxaaSampler},
                 {9, shadowMapBinding()},
                 {10, shadowSamplerBinding()},
+                {11, shadowMapNearBinding()},
             };
             frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
         }
@@ -9228,6 +9344,7 @@ void Renderer::render(const RenderScene& scene,
             {8, fxaaSampler},
             {9, shadowMapBinding()},
             {10, shadowSamplerBinding()},
+            {11, shadowMapNearBinding()},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
@@ -9246,6 +9363,7 @@ void Renderer::render(const RenderScene& scene,
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
             {29, shadowMapBinding()},  // sun shadows (fragmentMain_textured)
+            {30, shadowMapNearBinding()},  // its near cascade
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
             // is picked up automatically by this unconditional per-frame
@@ -9319,7 +9437,8 @@ void Renderer::render(const RenderScene& scene,
     size_t totalDraws = scene.opaque.size() + scene.transparent.size();
     // Room for the shadow casters' transforms after the draws' own
     // (encodeShadowPass(); the casters, or the opaque draws).
-    uint64_t requiredBytes = (uint64_t)(totalDraws + 1 + scene.opaque.size() + scene.shadowCasters.size()) * 128;
+    // (Two shadow cascades: room for the casters twice.)
+    uint64_t requiredBytes = (uint64_t)(totalDraws + 1 + 2 * std::max(scene.opaque.size(), scene.shadowCasters.size())) * 128;
     if (!transformBuffer || transformBuffer->getLength() < requiredBytes) {
         uint64_t newSize = std::max(requiredBytes, (uint64_t)4096 * 128);
         transformBuffer = device->createBuffer(newSize, kTransformBufferUsage);
@@ -9409,6 +9528,8 @@ void Renderer::render(const RenderScene& scene,
     // ------------------------------------------------------------------
     {
         float shadowBlock[24] = {0};  // shadowViewProj, shadowParams, viewParams
+        float nearBlock[20] = {0};    // shadowNearViewProj, shadowNearParams
+        bool nearOn = false;
         shadowBlock[20] = exposureEv;
         const LightData* sun = nullptr;
         for (const auto& l : scene.lights) {
@@ -9446,37 +9567,87 @@ void Renderer::render(const RenderScene& scene,
                 mix(&blended, 1);
                 mix(draw.worldTransform.data, sizeof(double) * 16);
             }
-            if (!shadowMap || !shadowMapValid || key != shadowMapKey) {
-                shadowMapValid = false;
-                M4 lightViewProj = M4::identity();
-                if (fitShadowView(casters, VM::Vector3<double>(-sun->direction.x(), -sun->direction.y(), -sun->direction.z()),
-                                  lightViewProj) &&
-                    ensureShadowMap()) {
-                    shadowLightViewProj = lightViewProj;
-                    // The shadow block first: Metal's vertexShadow reads it.
-                    for (int row = 0; row < 4; ++row) {
-                        for (int col = 0; col < 4; ++col) {
-                            shadowBlock[col * 4 + row] = (float)lightViewProj.data[row * 4 + col];
+            ShadowFit fit;
+            const bool fitted =
+                fitShadowLight(casters, VM::Vector3<double>(-sun->direction.x(), -sun->direction.y(), -sun->direction.z()), fit) &&
+                ensureShadowMap();
+            uint64_t casterOffset = txOffset;
+            // Far cascade: all casters; redrawn when they or the light change.
+            if (fitted && (!shadowMapValid || key != shadowMapKey)) {
+                shadowLightViewProj = shadowProjection(fit, fit.full);
+                casterOffset = encodeShadowPass(encoder, shadowMapView, casters, shadowLightViewProj, casterOffset);
+                shadowMapKey = key;
+                shadowMapValid = true;
+                shadowNearValid = false;
+            }
+            if (!fitted) shadowMapValid = false;
+            // Near cascade: the view's nearest part, finer. Its rectangle has
+            // a margin and is reused while the view stays inside it and it's
+            // not much larger than needed, so small camera moves don't redraw.
+            double needed[4];
+            nearOn = false;
+            if (fitted && shadowMapValid && shadowCascades && shadowMapNearView && nearShadowRect(fit, scene.camera, needed)) {
+                const double neededArea = (needed[1] - needed[0]) * (needed[3] - needed[2]);
+                const double cachedArea = (shadowNearRect[1] - shadowNearRect[0]) * (shadowNearRect[3] - shadowNearRect[2]);
+                const bool reuse = shadowNearValid && shadowNearKey == key && needed[0] >= shadowNearRect[0] &&
+                                   needed[1] <= shadowNearRect[1] && needed[2] >= shadowNearRect[2] &&
+                                   needed[3] <= shadowNearRect[3] && cachedArea <= 4.0 * neededArea;
+                if (!reuse) {
+                    const double mx = 0.25 * (needed[1] - needed[0]), my = 0.25 * (needed[3] - needed[2]);
+                    shadowNearRect[0] = std::max(needed[0] - mx, fit.full[0]);
+                    shadowNearRect[1] = std::min(needed[1] + mx, fit.full[1]);
+                    shadowNearRect[2] = std::max(needed[2] - my, fit.full[2]);
+                    shadowNearRect[3] = std::min(needed[3] + my, fit.full[3]);
+                    shadowNearViewProj = shadowProjection(fit, shadowNearRect);
+                    // Only the casters whose light-view bounds meet the rectangle.
+                    std::vector<systems::leal::campello_renderer::DrawCall> nearCasters;
+                    const double* lv = fit.lightView.data;
+                    for (const auto& draw : casters) {
+                        if (!draw.mesh) continue;
+                        if (!draw.mesh->hasBounds) {
+                            nearCasters.push_back(draw);
+                            continue;
+                        }
+                        double clo[2] = {1e300, 1e300}, chi[2] = {-1e300, -1e300};
+                        const double* m = draw.worldTransform.data;
+                        for (int corner = 0; corner < 8; ++corner) {
+                            const double p[3] = {(corner & 1) ? draw.mesh->boundsMax[0] : draw.mesh->boundsMin[0],
+                                                 (corner & 2) ? draw.mesh->boundsMax[1] : draw.mesh->boundsMin[1],
+                                                 (corner & 4) ? draw.mesh->boundsMax[2] : draw.mesh->boundsMin[2]};
+                            double w[3];
+                            for (int r = 0; r < 3; ++r) w[r] = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3];
+                            for (int r = 0; r < 2; ++r) {
+                                const double l = lv[r * 4] * w[0] + lv[r * 4 + 1] * w[1] + lv[r * 4 + 2] * w[2] + lv[r * 4 + 3];
+                                clo[r] = std::min(clo[r], l);
+                                chi[r] = std::max(chi[r], l);
+                            }
+                        }
+                        if (chi[0] >= shadowNearRect[0] && clo[0] <= shadowNearRect[1] && chi[1] >= shadowNearRect[2] &&
+                            clo[1] <= shadowNearRect[3]) {
+                            nearCasters.push_back(draw);
                         }
                     }
-                    cameraPositionBuffer->upload(kCameraClipEnd, sizeof(shadowBlock), shadowBlock);
-                    encodeShadowPass(encoder, casters, lightViewProj, txOffset);
-                    shadowMapKey = key;
-                    shadowMapValid = true;
+                    encodeShadowPass(encoder, shadowMapNearView, nearCasters, shadowNearViewProj, casterOffset);
+                    shadowNearKey = key;
+                    shadowNearValid = true;
                 }
+                nearOn = true;
             }
             if (shadowMapValid) {
                 for (int row = 0; row < 4; ++row) {
                     for (int col = 0; col < 4; ++col) {
                         shadowBlock[col * 4 + row] = (float)shadowLightViewProj.data[row * 4 + col];
+                        nearBlock[col * 4 + row] = (float)shadowNearViewProj.data[row * 4 + col];
                     }
                 }
                 shadowBlock[16] = 1.0f;                                // on
-                shadowBlock[17] = 1.0f / (float)shadowMapResolution;  // texel (uv)
+                shadowBlock[17] = 1.0f / (float)shadowMapResolution;  // texel (uv), both cascades
+                nearBlock[16] = nearOn ? 1.0f : 0.0f;
             }
         }
         if (cameraPositionBuffer) {
             cameraPositionBuffer->upload(kCameraClipEnd, sizeof(shadowBlock), shadowBlock);
+            cameraPositionBuffer->upload(kCameraClipEnd + sizeof(shadowBlock), sizeof(nearBlock), nearBlock);
         }
     }
 
@@ -9509,6 +9680,7 @@ void Renderer::render(const RenderScene& scene,
             {8, fxaaSampler},
             {9, shadowMapBinding()},
             {10, shadowSamplerBinding()},
+            {11, shadowMapNearBinding()},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
@@ -9522,6 +9694,7 @@ void Renderer::render(const RenderScene& scene,
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
             {29, shadowMapBinding()},  // sun shadows (fragmentMain_textured)
+            {30, shadowMapNearBinding()},  // its near cascade
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
             // is picked up automatically by this unconditional per-frame
@@ -9778,6 +9951,7 @@ void Renderer::render(const RenderScene& scene,
                 {8, fxaaSampler},
                 {9, shadowMapBinding()},
                 {10, shadowSamplerBinding()},
+                {11, shadowMapNearBinding()},
             };
             frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
         }

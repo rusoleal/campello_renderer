@@ -251,6 +251,8 @@ struct CameraUniforms {
     float4x4 shadowViewProj;  // world -> the shadow map's clip space
     float4   shadowParams;    // x = on, y = one texel in uv
     float4   viewParams;      // x = exposure in EV (0: unchanged; colour x 2^EV before tone mapping)
+    float4x4 shadowNearViewProj;  // world -> the near cascade's clip space
+    float4   shadowNearParams;    // x = near cascade on
 };
 
 constant float VIEW_MODE_NORMAL       = 0.0;
@@ -824,42 +826,25 @@ float3 iblGGXFresnel(float NdotV, float roughness, float3 F0,
     return FssEss + FmsEms;
 }
 
-// ---------------------------------------------------------------------------
-// Sun shadows: depth-only vertex stage for the shadow map (positions, the
-// model matrix, the light's view-projection in the camera block).
-// ---------------------------------------------------------------------------
-vertex float4 vertexShadow(
-    VertexInLean                 in             [[stage_in]],
-    device const NodeTransforms *nodeTransforms [[buffer(16)]],
-    constant CameraUniforms     &camera         [[buffer(18)]])
-{
-    return camera.shadowViewProj * (nodeTransforms[0].model * float4(in.position, 1.0));
-}
-
-// How lit `worldPos` is by the shadow-casting light: 1 lit .. 0 shadowed.
-// 3x3 percentage-closer filtering of the shadow map (hardware-compared,
-// bilinear), so shadow edges are soft. Outside the map: lit.
-inline float sunShadow(constant CameraUniforms &camera, depth2d<float> shadowMap, float3 worldPos, float3 N, float3 L) {
-    if (camera.shadowParams.x < 0.5) {
-        return 1.0;
-    }
+// One shadow map's verdict on `worldPos`: 1 lit .. 0 shadowed, 3x3
+// percentage-closer filtering (hardware-compared, bilinear), so soft edges.
+// `inside` is false where the map doesn't cover the point. Receiver bias
+// against self-shadowing ("acne"), sized to one texel of this map in world
+// units (the orthographic scales are the matrix rows' lengths): along the
+// normal, more at grazing light, plus a texel of depth.
+inline float shadowLookup(depth2d<float> shadowMap, float4x4 M, float texel, float3 worldPos, float3 N, float3 L,
+                          thread bool &inside) {
     constexpr sampler shadowSampler(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);
-    // Receiver bias against self-shadowing ("acne"), sized to one shadow-map
-    // texel in world units (the orthographic scales are the matrix rows'
-    // lengths): offset along the normal, more at grazing light, plus a
-    // texel of depth.
-    const float4x4 M = camera.shadowViewProj;
-    const float texel = camera.shadowParams.y;
     const float worldTexel = 2.0 * texel / max(length(float3(M[0][0], M[1][0], M[2][0])), 1e-6);
     const float depthPerWorld = length(float3(M[0][2], M[1][2], M[2][2]));
     const float NdotL = clamp(dot(N, L), 0.0, 1.0);
     const float slope = sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.2);
-    const float3 biased = worldPos + N * worldTexel * (1.0 + slope);
-    const float4 clip = M * float4(biased, 1.0);
+    const float4 clip = M * float4(worldPos + N * worldTexel * (1.0 + slope), 1.0);
     float3 ndc = clip.xyz / clip.w;
     ndc.z -= depthPerWorld * worldTexel;
     const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    if (any(uv < float2(0.0)) || any(uv > float2(1.0)) || ndc.z > 1.0) {
+    inside = all(uv >= float2(2.0 * texel)) && all(uv <= float2(1.0 - 2.0 * texel)) && ndc.z <= 1.0;
+    if (!inside) {
         return 1.0;
     }
     float lit = 0.0;
@@ -869,6 +854,25 @@ inline float sunShadow(constant CameraUniforms &camera, depth2d<float> shadowMap
         }
     }
     return lit / 9.0;
+}
+
+// How lit `worldPos` is by the shadow-casting light: 1 lit .. 0 shadowed.
+// Two cascades: the near map (the part of the view closest to the camera,
+// finer) where it covers the point, else the far map (the whole scene).
+// Outside both: lit.
+inline float sunShadow(constant CameraUniforms &camera, depth2d<float> shadowMap, depth2d<float> shadowMapNear,
+                       float3 worldPos, float3 N, float3 L) {
+    if (camera.shadowParams.x < 0.5) {
+        return 1.0;
+    }
+    bool inside = false;
+    if (camera.shadowNearParams.x > 0.5) {
+        const float lit = shadowLookup(shadowMapNear, camera.shadowNearViewProj, camera.shadowParams.y, worldPos, N, L, inside);
+        if (inside) {
+            return lit;
+        }
+    }
+    return shadowLookup(shadowMap, camera.shadowViewProj, camera.shadowParams.y, worldPos, N, L, inside);
 }
 
 fragment float4 fragmentMain_textured(
@@ -905,6 +909,7 @@ fragment float4 fragmentMain_textured(
     texturecube<float> irradianceEnvironmentMap  [[texture(27)]],
     texture2d<float> brdfLutTexture              [[texture(28)]],
     depth2d<float>   shadowMap                   [[texture(29)]],
+    depth2d<float>   shadowMapNear               [[texture(30)]],
     bool             frontFacing                 [[front_facing]])
 {
     // Position-only meshes (vertexLean) carry no normal: use the flat face
@@ -1363,7 +1368,7 @@ fragment float4 fragmentMain_textured(
 
         float  NdotL      = max(dot(N, lightDir), 0.0);
         // The sun (spotAngles.z): darkened where the shadow map says so.
-        const float shadow = light.spotAngles.z > 0.5 ? sunShadow(camera, shadowMap, in.worldPos, N, lightDir) : 1.0;
+        const float shadow = light.spotAngles.z > 0.5 ? sunShadow(camera, shadowMap, shadowMapNear, in.worldPos, N, lightDir) : 1.0;
         float3 lightColor = light.color.xyz * light.color.w * attenuation * spotFactor * shadow;
 
         float3 halfDir = normalize(lightDir + viewDir);
