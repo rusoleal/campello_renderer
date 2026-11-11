@@ -1459,7 +1459,7 @@ void Renderer::rebuildDirectXCombinedBindGroups(uint32_t frameIndex,
 // convertEquirectangularImageToCubemap). Vulkan-only for now; a no-op on
 // other backends until the Metal port lands.
 void Renderer::bakeIblResources() {
-#if defined(ANDROID) || defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
+#if defined(ANDROID) || defined(__linux__) || defined(__APPLE__) || defined(_WIN32) || defined(__EMSCRIPTEN__)
     namespace GPU = systems::leal::campello_gpu;
 #if CAMPELLO_RENDERER_VK_BINDINGS
     if (!device || !environmentMap || !environmentSampler || !pipelineIblBake ||
@@ -1478,11 +1478,6 @@ void Renderer::bakeIblResources() {
     }
 #endif
 
-    if (!iblBakeUniformBuffer) {
-        iblBakeUniformBuffer = device->createBuffer(16, GPU::BufferUsage::uniform);
-        if (!iblBakeUniformBuffer) return;
-    }
-
     struct IblBakeUboData {
         int32_t mode;       // 0 = BRDF LUT, 1 = GGX prefilter, 2 = irradiance convolution
         int32_t faceIndex;  // 0..5, used for mode 1/2
@@ -1490,66 +1485,18 @@ void Renderer::bakeIblResources() {
         float   outputSize; // resolution (texels, square) of the current render target
     };
 
-    // Runs one bake draw into `targetView`. This whole function runs once per
-    // environment load (not per-frame), so a full submit+wait per draw (safe
-    // reuse of the single shared iblBakeUniformBuffer across draws, no manual
-    // sync needed) is an acceptable cost for baking correctness/simplicity
-    // over throughput — a handful of small submissions, not a hot path.
+    // The bake draws are collected and recorded into one command buffer,
+    // each with its own 256-byte uniform slot, then submitted once and
+    // waited for (a submit and wait per draw was ~66 round trips, slow where
+    // waiting yields to the browser).
+    struct BakeJob {
+        IblBakeUboData data;
+        std::shared_ptr<GPU::TextureView> target;
+    };
+    std::vector<BakeJob> jobs;
     auto bakeDraw = [&](const IblBakeUboData &data,
                          const std::shared_ptr<GPU::TextureView> &targetView) {
-        if (!targetView) return;
-        iblBakeUniformBuffer->upload(0, sizeof(data), const_cast<IblBakeUboData*>(&data));
-
-        GPU::BindGroupDescriptor bgDesc{};
-        bgDesc.layout = iblBakeBindGroupLayout;
-#if defined(__APPLE__) || defined(_WIN32)
-        // Metal and D3D12 both give texture/buffer/sampler independent per-type
-        // argument/register spaces, so binding 0 as both a buffer and a texture
-        // (see iblBakePixel's register(b0)/register(t0) in shaders/directx/
-        // default.hlsl, or iblBakeFragment's [[buffer(0)]]/[[texture(0)]] on
-        // Metal) is valid — same same-number-different-type convention already
-        // used throughout ensureBindGroupLayout() (e.g. binding 17 is both
-        // clearcoatTexture and the MaterialUniforms buffer).
-        bgDesc.entries = {
-            {0, GPU::BufferBinding{iblBakeUniformBuffer, 0, 16}},
-            {0, environmentMap},
-            {1, environmentSampler},
-        };
-#else
-        bgDesc.entries = {
-            {0, GPU::BufferBinding{iblBakeUniformBuffer, 0, 16}},
-            {1, environmentMap},
-            {2, environmentSampler},
-        };
-#endif
-        auto bindGroup = device->createBindGroup(bgDesc);
-        if (!bindGroup) return;
-
-        auto encoder = device->createCommandEncoder();
-        if (!encoder) return;
-
-        GPU::ColorAttachment ca{};
-        ca.clearValue[0] = 0.0f; ca.clearValue[1] = 0.0f;
-        ca.clearValue[2] = 0.0f; ca.clearValue[3] = 1.0f;
-        ca.depthSlice = 0;
-        ca.loadOp  = GPU::LoadOp::clear;
-        ca.storeOp = GPU::StoreOp::store;
-        ca.view = targetView;
-
-        GPU::BeginRenderPassDescriptor rpDesc{};
-        rpDesc.colorAttachments = { ca };
-        auto rpe = encoder->beginRenderPass(rpDesc);
-        if (rpe) {
-            rpe->setViewport(0.0f, 0.0f, data.outputSize, data.outputSize, 0.0f, 1.0f);
-            rpe->setScissorRect(0.0f, 0.0f, data.outputSize, data.outputSize);
-            rpe->setPipeline(pipelineIblBake);
-            rpe->setBindGroup(0, bindGroup);
-            rpe->draw(3);
-            rpe->end();
-        }
-        auto fence = device->createFence();
-        device->submit(encoder->finish(), fence);
-        if (fence) fence->wait();
+        if (targetView) jobs.push_back({data, targetView});
     };
 
     // 1) BRDF LUT — environment-independent (Karis split-sum integral over
@@ -1610,6 +1557,71 @@ void Renderer::bakeIblResources() {
             }
         }
     }
+
+    if (jobs.empty()) return;
+    constexpr uint64_t kSlot = 256;  // uniform buffer offset alignment (WebGPU, D3D12)
+    iblBakeUniformBuffer = device->createBuffer(jobs.size() * kSlot, GPU::BufferUsage::uniform);
+    if (!iblBakeUniformBuffer) return;
+    {
+        std::vector<uint8_t> slots(jobs.size() * kSlot, 0);
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            std::memcpy(slots.data() + i * kSlot, &jobs[i].data, sizeof(IblBakeUboData));
+        }
+        iblBakeUniformBuffer->upload(0, slots.size(), slots.data());
+    }
+    auto encoder = device->createCommandEncoder();
+    if (!encoder) return;
+    std::vector<std::shared_ptr<GPU::BindGroup>> groups;  // alive until the bake has run
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        const auto& job = jobs[i];
+        GPU::BindGroupDescriptor bgDesc{};
+        bgDesc.layout = iblBakeBindGroupLayout;
+        const GPU::BufferBinding uniforms{iblBakeUniformBuffer, i * kSlot, 16};
+#if defined(__APPLE__) || defined(_WIN32)
+        // Metal and D3D12 both give texture/buffer/sampler independent per-type
+        // argument/register spaces, so binding 0 as both a buffer and a texture
+        // (see iblBakePixel's register(b0)/register(t0) in shaders/directx/
+        // default.hlsl, or iblBakeFragment's [[buffer(0)]]/[[texture(0)]] on
+        // Metal) is valid — same same-number-different-type convention already
+        // used throughout ensureBindGroupLayout() (e.g. binding 17 is both
+        // clearcoatTexture and the MaterialUniforms buffer).
+        bgDesc.entries = {
+            {0, uniforms},
+            {0, environmentMap},
+            {1, environmentSampler},
+        };
+#else
+        bgDesc.entries = {
+            {0, uniforms},
+            {1, environmentMap},
+            {2, environmentSampler},
+        };
+#endif
+        auto bindGroup = device->createBindGroup(bgDesc);
+        if (!bindGroup) continue;
+        groups.push_back(bindGroup);
+
+        GPU::ColorAttachment ca{};
+        ca.clearValue[0] = 0.0f; ca.clearValue[1] = 0.0f;
+        ca.clearValue[2] = 0.0f; ca.clearValue[3] = 1.0f;
+        ca.depthSlice = 0;
+        ca.loadOp  = GPU::LoadOp::clear;
+        ca.storeOp = GPU::StoreOp::store;
+        ca.view = job.target;
+        GPU::BeginRenderPassDescriptor rpDesc{};
+        rpDesc.colorAttachments = { ca };
+        if (auto rpe = encoder->beginRenderPass(rpDesc)) {
+            rpe->setViewport(0.0f, 0.0f, job.data.outputSize, job.data.outputSize, 0.0f, 1.0f);
+            rpe->setScissorRect(0.0f, 0.0f, job.data.outputSize, job.data.outputSize);
+            rpe->setPipeline(pipelineIblBake);
+            rpe->setBindGroup(0, bindGroup);
+            rpe->draw(3);
+            rpe->end();
+        }
+    }
+    auto fence = device->createFence();
+    device->submit(encoder->finish(), fence);
+    if (fence) fence->wait();
 #endif
 }
 
@@ -4847,7 +4859,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         colorFormat);
 #endif
 
-#if !defined(__EMSCRIPTEN__)  // post-processing and bakes: no WGSL versions yet
+#if !defined(__EMSCRIPTEN__)  // FXAA and SSAA downsample: no WGSL versions yet
     // --- FXAA post-process pipeline (Vulkan) ---
     {
         if (!fxaaBindGroupLayout) {
@@ -4965,7 +4977,9 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         }
     }
 
-    // --- IBL precompute pipeline (Vulkan) — see bakeIblResources() ---
+#endif  // !__EMSCRIPTEN__ (post-processing)
+
+    // --- IBL precompute pipeline (Vulkan, WebGPU) — see bakeIblResources() ---
     // Bakes the BRDF LUT / GGX-prefiltered specular cubemap / diffuse
     // irradiance cubemap the reference glTF-Sample-Renderer uses for IBL,
     // none of which this renderer previously computed (see shaders/vulkan/
@@ -5004,12 +5018,21 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             iblBakeBindGroupLayout = device->createBindGroupLayout(iglDesc);
         }
 
+#if defined(__EMSCRIPTEN__)
+        auto iblVertModule = device->createShaderModule(kIblBakeWebGpuShader);
+        auto iblFragModule = iblVertModule;
+        const char* iblVertEntry = "vs_sky_fullscreen";
+        const char* iblFragEntry = "fs_ibl_bake";
+#else
         auto iblVertModule = device->createShaderModule(kDefaultVulkanFxaaVertShader, kDefaultVulkanFxaaVertShaderSize);
         auto iblFragModule = device->createShaderModule(kDefaultVulkanIblBakeFragShader, kDefaultVulkanIblBakeFragShaderSize);
+        const char* iblVertEntry = "main";
+        const char* iblFragEntry = "main";
+#endif
         if (iblVertModule && iblFragModule) {
             GPU::RenderPipelineDescriptor iblDesc{};
             iblDesc.vertex.module = iblVertModule;
-            iblDesc.vertex.entryPoint = "main";
+            iblDesc.vertex.entryPoint = iblVertEntry;
 
             iblDesc.topology = GPU::PrimitiveTopology::triangleList;
             iblDesc.cullMode = GPU::CullMode::none;
@@ -5017,7 +5040,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 
             GPU::FragmentDescriptor iblFrag{};
             iblFrag.module = iblFragModule;
-            iblFrag.entryPoint = "main";
+            iblFrag.entryPoint = iblFragEntry;
             GPU::ColorState iblCs{};
             iblCs.format = GPU::PixelFormat::rgba16float;
             iblCs.writeMask = GPU::ColorWrite::all;
@@ -5071,12 +5094,21 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             skyboxBindGroupLayout = device->createBindGroupLayout(sbglDesc);
         }
 
+#if defined(__EMSCRIPTEN__)
+        auto skyboxVertModule = device->createShaderModule(kSkyWebGpuShader);
+        auto skyboxFragModule = skyboxVertModule;
+        const char* skyVertEntry = "vs_sky_fullscreen";
+        const char* skyFragEntry = "fs_skybox";
+#else
         auto skyboxVertModule = device->createShaderModule(kDefaultVulkanFxaaVertShader, kDefaultVulkanFxaaVertShaderSize);
         auto skyboxFragModule = device->createShaderModule(kDefaultVulkanSkyboxFragShader, kDefaultVulkanSkyboxFragShaderSize);
+        const char* skyVertEntry = "main";
+        const char* skyFragEntry = "main";
+#endif
         if (skyboxVertModule && skyboxFragModule) {
             GPU::RenderPipelineDescriptor skyDesc{};
             skyDesc.vertex.module = skyboxVertModule;
-            skyDesc.vertex.entryPoint = "main";
+            skyDesc.vertex.entryPoint = skyVertEntry;
             // No vertex buffers — fullscreen triangle from gl_VertexIndex.
 
             GPU::DepthStencilDescriptor skyDs{};
@@ -5096,7 +5128,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 
             GPU::FragmentDescriptor skyFrag{};
             skyFrag.module = skyboxFragModule;
-            skyFrag.entryPoint = "main";
+            skyFrag.entryPoint = skyFragEntry;
             GPU::ColorState skyCs{};
             skyCs.format = colorFormat;
             skyCs.writeMask = GPU::ColorWrite::all;
@@ -5111,8 +5143,6 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             pipelineSkybox = device->createRenderPipeline(skyDesc);
         }
     }
-
-#endif  // !__EMSCRIPTEN__
 #elif defined(_WIN32)
     using namespace systems::leal::campello_renderer::shaders;
 
