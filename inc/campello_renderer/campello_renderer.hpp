@@ -696,6 +696,16 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::TextureView> shadowMapView;
         std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapPlaceholder;  // 1x1, bound when off
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> shadowPipeline;
+        // Vulkan/WebGPU: the comparison sampler of the shadow lookup (frame
+        // binding 10). Metal declares its sampler in the shader.
+        std::shared_ptr<systems::leal::campello_gpu::Sampler> shadowSampler;
+        // WebGPU: the shadow pipeline's groups 0 and 1 (empty).
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> shadowEmptyBindGroupLayout;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroup> shadowEmptyBindGroup;
+        // The shadow map, or the 1x1 placeholder while there's none (created
+        // on first use), for the frame bind groups.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapBinding();
+        std::shared_ptr<systems::leal::campello_gpu::Sampler> shadowSamplerBinding();
         uint32_t shadowMapResolution = 2048;
         bool shadowsEnabled = true;
         bool ensureShadowMap();

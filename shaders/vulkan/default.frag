@@ -101,7 +101,7 @@ struct Light {
     vec4 position;   // xyz = position/dir, w = type (0=dir, 1=point, 2=spot)
     vec4 color;      // xyz = rgb, w = intensity
     vec4 direction;  // xyz = spot dir, w = range
-    vec4 spotAngles; // x = innerCone, y = outerCone, zw = padding
+    vec4 spotAngles; // x = innerCone, y = outerCone, z = casts the shadow map
 };
 layout(std140, set = 1, binding = 0) uniform LightsUniform {
     uint  lightCount;
@@ -121,6 +121,9 @@ layout(std140, set = 1, binding = 1) uniform CameraUniforms {
     uvec4 clipInfo;       // x = plane count, y = section caps on
     vec4  capColor;
     vec4  clipPlanes[6];  // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
+    // Sun shadows (Renderer::render()): shadow map clip from world.
+    mat4  shadowViewProj;
+    vec4  shadowParams;   // x = on, y = texel size (uv)
 } camera;
 
 layout(set = 1, binding = 2) uniform textureCube environmentMap;
@@ -134,6 +137,8 @@ layout(set = 1, binding = 5) uniform sampler     sceneColorSampler;
 layout(set = 1, binding = 6) uniform textureCube irradianceMap;
 layout(set = 1, binding = 7) uniform texture2D   brdfLutTexture;
 layout(set = 1, binding = 8) uniform sampler     brdfLutSampler;
+layout(set = 1, binding = 9)  uniform texture2D     shadowMap;     // sun shadows (depth)
+layout(set = 1, binding = 10) uniform samplerShadow shadowSampler; // compare less-or-equal
 
 // --- Per-material textures/samplers (set 0) -------------------------------------
 layout(set = 0, binding = 0)  uniform texture2D baseColorTexture;
@@ -378,6 +383,37 @@ vec3 toneMapKhronosPbrNeutral(vec3 color) {
 // rather than relying on the hardware to do it on write.
 vec3 linearToSRGBFast(vec3 color) {
     return pow(color, vec3(1.0 / 2.2));
+}
+
+// How lit `worldPos` is by the shadow-casting light: 1 lit .. 0 shadowed.
+// 3x3 percentage-closer filtering (hardware compare, bilinear); outside the
+// map: lit. Receiver bias against self-shadowing, sized to one shadow-map
+// texel in world units (the orthographic scales are the matrix rows'
+// lengths): along the normal, more at grazing light, plus a texel of depth.
+float sunShadow(vec3 P, vec3 N, vec3 L) {
+    if (camera.shadowParams.x < 0.5) {
+        return 1.0;
+    }
+    mat4 M = camera.shadowViewProj;
+    float texel = camera.shadowParams.y;
+    float worldTexel = 2.0 * texel / max(length(vec3(M[0][0], M[1][0], M[2][0])), 1e-6);
+    float depthPerWorld = length(vec3(M[0][2], M[1][2], M[2][2]));
+    float NdotL = clamp(dot(N, L), 0.0, 1.0);
+    float slope = sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.2);
+    vec4 clip = M * vec4(P + N * worldTexel * (1.0 + slope), 1.0);
+    vec3 ndc = clip.xyz / clip.w;
+    vec2 uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))) || ndc.z > 1.0) {
+        return 1.0;
+    }
+    float depth = ndc.z - depthPerWorld * worldTexel;
+    float lit = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            lit += textureLod(sampler2DShadow(shadowMap, shadowSampler), vec3(uv + vec2(x, y) * texel, depth), 0.0);
+        }
+    }
+    return lit / 9.0;
 }
 
 void main() {
@@ -708,7 +744,9 @@ void main() {
         }
 
         float NdotL      = max(dot(N, lightDir), 0.0);
-        vec3  lightColor = light.color.xyz * light.color.w * attenuation * spotFactor;
+        // The sun (spotAngles.z): darkened where the shadow map says so.
+        float shadow     = light.spotAngles.z > 0.5 ? sunShadow(worldPos, N, lightDir) : 1.0;
+        vec3  lightColor = light.color.xyz * light.color.w * attenuation * spotFactor * shadow;
 
         vec3  halfDir = normalize(lightDir + viewDir);
         float NdotH   = max(dot(N, halfDir), 0.0);

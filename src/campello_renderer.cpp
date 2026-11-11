@@ -1236,6 +1236,24 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
         addTex(frameDesc, 6, GPU::TextureType::ttCube);     // irradianceEnvironmentMap (diffuse IBL — bakeIblResources())
         addTex(frameDesc, 7);                               // brdfLutTexture (2D, IBL specular Fresnel — bakeIblResources())
         addSamp(frameDesc, 8);                              // brdfLutSampler (reuses fxaaSampler, clamp-to-edge)
+        {                                                   // shadowMap (sun shadows, depth)
+            GPU::EntryObject e{};
+            e.binding    = 9;
+            e.visibility = GPU::ShaderStage::fragment;
+            e.type       = GPU::EntryObjectType::texture;
+            e.data.texture.multisampled  = false;
+            e.data.texture.sampleType    = GPU::EntryObjectTextureType::ttDepth;
+            e.data.texture.viewDimension = GPU::TextureType::tt2d;
+            frameDesc.entries.push_back(e);
+        }
+        {                                                   // shadowSampler (comparison)
+            GPU::EntryObject e{};
+            e.binding    = 10;
+            e.visibility = GPU::ShaderStage::fragment;
+            e.type       = GPU::EntryObjectType::sampler;
+            e.data.sampler.type = GPU::EntryObjectSamplerType::comparison;
+            frameDesc.entries.push_back(e);
+        }
         vulkanFrameBindGroupLayout = device->createBindGroupLayout(frameDesc);
     }
 #if defined(__EMSCRIPTEN__)
@@ -2519,6 +2537,8 @@ void Renderer::setScene(uint32_t index) {
                 {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
                 {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
                 {8, fxaaSampler},
+                {9, shadowMapBinding()},
+                {10, shadowSamplerBinding()},
             };
             frameBindGroup[f] = device->createBindGroup(bgDesc);
         }
@@ -3538,6 +3558,35 @@ bool Renderer::ensureShadowMap() {
     return shadowMapView != nullptr;
 }
 
+std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::shadowMapBinding() {
+    namespace GPU = systems::leal::campello_gpu;
+    if (shadowMap) return shadowMap;
+    if (!shadowMapPlaceholder && device) {
+        shadowMapPlaceholder = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::depth32float, 1, 1, 1, 1, 1,
+                                                     (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                                                         uint32_t(GPU::TextureUsage::textureBinding)));
+    }
+    return shadowMapPlaceholder;
+}
+
+std::shared_ptr<systems::leal::campello_gpu::Sampler> Renderer::shadowSamplerBinding() {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!shadowSampler && device) {
+        GPU::SamplerDescriptor sd{};
+        sd.magFilter = GPU::FilterMode::fmLinear;
+        sd.minFilter = GPU::FilterMode::fmLinear;
+        sd.addressModeU = GPU::WrapMode::clampToEdge;
+        sd.addressModeV = GPU::WrapMode::clampToEdge;
+        sd.addressModeW = GPU::WrapMode::clampToEdge;
+        sd.lodMinClamp = 0.0;
+        sd.lodMaxClamp = 1000.0;
+        sd.maxAnisotropy = 1.0;
+        sd.compare = GPU::CompareOp::lessEqual;
+        shadowSampler = device->createSampler(sd);
+    }
+    return shadowSampler;
+}
+
 bool Renderer::fitShadowView(const std::vector<systems::leal::campello_renderer::DrawCall>& draws, const systems::leal::vector_math::Vector3<double>& toLight,
                              systems::leal::vector_math::Matrix4<double>& lightViewProj) const {
     namespace VM = systems::leal::vector_math;
@@ -3895,10 +3944,6 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             sd.cullMode = GPU::CullMode::none;
             sd.frontFace = GPU::FrontFace::ccw;
             shadowPipeline = device->createRenderPipeline(sd);
-            // Bound in the frame bind group while there's no shadow map yet.
-            shadowMapPlaceholder = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::depth32float, 1, 1, 1, 1, 1,
-                                                         (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
-                                                                             uint32_t(GPU::TextureUsage::textureBinding)));
         }
         // The per-draw transforms are also per-instance vertex attributes
         // (locations 16-19 mvp, 24-27 model, the slot after the attributes),
@@ -4380,6 +4425,60 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 #endif
         meshRecipe.ready = true;
         prewarmMeshPipelines();
+    }
+
+    // --- Sun shadows: depth only, with the lean vertex stage ---
+    // The shadow pass binds a second set of per-draw transforms whose "mvp"
+    // is the light's view-projection times the model matrix, so the lean
+    // shader (clip = mvp * position) renders the map unchanged. No culling
+    // (mixed winding), slope-scaled bias; the receiver bias is in the
+    // fragment lookup.
+    {
+        GPU::RenderPipelineDescriptor sd{};
+        GPU::VertexLayout positions{};
+        positions.arrayStride = 12;
+        positions.stepMode = GPU::StepMode::vertex;
+        GPU::VertexAttribute position{};
+        position.componentType = GPU::ComponentType::ctFloat;
+        position.accessorType = GPU::AccessorType::acVec3;
+        position.offset = 0;
+        position.shaderLocation = 0;
+        positions.attributes.push_back(position);
+        sd.vertex.buffers.push_back(positions);
+#if defined(__EMSCRIPTEN__)
+        // vs_lean reads the transforms from the storage buffer at group 2;
+        // groups 0 and 1 are empty here (the frame group holds the shadow
+        // map, which can't be bound while it's the pass's attachment).
+        sd.vertex.module = vertModule;
+        sd.vertex.entryPoint = "vs_lean";
+        if (!shadowEmptyBindGroupLayout) {
+            shadowEmptyBindGroupLayout = device->createBindGroupLayout(GPU::BindGroupLayoutDescriptor{});
+            GPU::BindGroupDescriptor emptyDesc{};
+            emptyDesc.layout = shadowEmptyBindGroupLayout;
+            shadowEmptyBindGroup = device->createBindGroup(emptyDesc, /*persistent=*/true);
+        }
+        GPU::PipelineLayoutDescriptor shadowLayout{};
+        shadowLayout.bindGroupLayouts = {shadowEmptyBindGroupLayout, shadowEmptyBindGroupLayout, webgpuDrawBindGroupLayout};
+        sd.layout = device->createPipelineLayout(shadowLayout);
+#else
+        // default_lean.vert: transforms per instance in the slot after the
+        // position (locations 16-19 mvp, 24-27 model); no descriptors.
+        sd.vertex.module = device->createShaderModule(kDefaultVulkanLeanVertShader, kDefaultVulkanLeanVertShaderSize);
+        sd.vertex.entryPoint = "main";
+        sd.vertex.buffers.push_back(desc.vertex.buffers[VERTEX_SLOT_MVP]);
+        sd.layout = vulkanDefaultPipelineLayout;
+#endif
+        GPU::DepthStencilDescriptor shadowDs = ds;
+        shadowDs.depthBias = 2.0;
+        shadowDs.depthBiasSlopeScale = 2.0;
+        shadowDs.depthBiasClamp = 0.01;
+        sd.depthStencil = shadowDs;
+        sd.topology = GPU::PrimitiveTopology::triangleList;
+        sd.cullMode = GPU::CullMode::none;
+        sd.frontFace = GPU::FrontFace::ccw;
+        if (sd.vertex.module && sd.layout) {
+            shadowPipeline = device->createRenderPipeline(sd);
+        }
     }
 
 #if !defined(__EMSCRIPTEN__)  // post-processing and bakes: no WGSL versions yet
@@ -6208,6 +6307,8 @@ void Renderer::renderToTarget(
             {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
             {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
             {8, fxaaSampler},
+            {9, shadowMapBinding()},
+            {10, shadowSamplerBinding()},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
@@ -6225,7 +6326,7 @@ void Renderer::renderToTarget(
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
-            {29, shadowMap ? shadowMap : shadowMapPlaceholder},  // sun shadows (fragmentMain_textured)
+            {29, shadowMapBinding()},  // sun shadows (fragmentMain_textured)
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
             // is picked up automatically by this unconditional per-frame
@@ -6493,6 +6594,8 @@ void Renderer::renderToTarget(
                 {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
                 {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
                 {8, fxaaSampler},
+                {9, shadowMapBinding()},
+                {10, shadowSamplerBinding()},
             };
             frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
         }
@@ -8869,6 +8972,8 @@ void Renderer::render(const RenderScene& scene,
             {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
             {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
             {8, fxaaSampler},
+            {9, shadowMapBinding()},
+            {10, shadowSamplerBinding()},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
@@ -8886,7 +8991,7 @@ void Renderer::render(const RenderScene& scene,
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
-            {29, shadowMap ? shadowMap : shadowMapPlaceholder},  // sun shadows (fragmentMain_textured)
+            {29, shadowMapBinding()},  // sun shadows (fragmentMain_textured)
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
             // is picked up automatically by this unconditional per-frame
@@ -8958,7 +9063,9 @@ void Renderer::render(const RenderScene& scene,
 
     // Pre-upload all draw-call transforms sequentially into transformBuffer.
     size_t totalDraws = scene.opaque.size() + scene.transparent.size();
-    uint64_t requiredBytes = (uint64_t)(totalDraws + 1) * 128;
+    // Vulkan/WebGPU: room for the shadow pass's light-space transforms
+    // after the draws' own (one per opaque draw).
+    uint64_t requiredBytes = (uint64_t)(totalDraws + 1 + (CAMPELLO_RENDERER_VK_BINDINGS ? scene.opaque.size() : 0)) * 128;
     if (!transformBuffer || transformBuffer->getLength() < requiredBytes) {
         uint64_t newSize = std::max(requiredBytes, (uint64_t)4096 * 128);
         transformBuffer = device->createBuffer(newSize, kTransformBufferUsage);
@@ -9086,7 +9193,18 @@ void Renderer::render(const RenderScene& scene,
                 shadowRpe->setViewport(0.0f, 0.0f, size, size, 0.0f, 1.0f);
                 shadowRpe->setScissorRect(0.0f, 0.0f, size, size);
                 shadowRpe->setPipeline(shadowPipeline);
+#if CAMPELLO_RENDERER_VK_BINDINGS
+                // Light-space transforms (mvp = light view-projection x model)
+                // after the draws' own, for the lean vertex stage.
+                uint64_t shadowTxOffset = txOffset;
+#if defined(__EMSCRIPTEN__)
+                shadowRpe->setBindGroup(0, shadowEmptyBindGroup);
+                shadowRpe->setBindGroup(1, shadowEmptyBindGroup);
+                webgpuBoundDrawGroup = nullptr;
+#endif
+#else
                 shadowRpe->setVertexBuffer(18, cameraPositionBuffer, 0);
+#endif
                 for (size_t i = 0; i < sortedOpaque.size(); ++i) {
                     const auto& draw = sortedOpaque[i];
                     if (!draw.mesh || !draw.material || draw.material->alphaBlend ||
@@ -9103,15 +9221,41 @@ void Renderer::render(const RenderScene& scene,
                         continue;
                     }
                     shadowRpe->setVertexBuffer(0, positions, 0);
+                    uint32_t firstInstance = 0;
+#if CAMPELLO_RENDERER_VK_BINDINGS
+                    if (shadowTxOffset + 128 > transformBuffer->getLength()) break;
+                    {
+                        float matrices[32];
+                        const auto lightMvp = lightViewProj * draw.worldTransform;
+                        for (int row = 0; row < 4; ++row) {
+                            for (int col = 0; col < 4; ++col) {
+                                matrices[col * 4 + row] = (float)lightMvp.data[row * 4 + col];
+                                matrices[16 + col * 4 + row] = (float)draw.worldTransform.data[row * 4 + col];
+                            }
+                        }
+                        transformBuffer->upload(shadowTxOffset, 128, matrices);
+                    }
+#if defined(__EMSCRIPTEN__)
+                    bindWebGpuTransforms(shadowRpe, transformBuffer, shadowTxOffset);
+                    firstInstance = webgpuFirstInstance;
+#else
+                    shadowRpe->setVertexBuffer(1, transformBuffer, shadowTxOffset);
+#endif
+                    shadowTxOffset += 128;
+#else
                     shadowRpe->setVertexBuffer(16, transformBuffer, transformOffsets[i]);
+#endif
                     if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
                         shadowRpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
-                        shadowRpe->drawIndexed(draw.mesh->indexCount, 1, 0, 0, 0);
+                        shadowRpe->drawIndexed(draw.mesh->indexCount, 1, 0, 0, firstInstance);
                     } else {
-                        shadowRpe->draw(draw.mesh->vertexCount, 1, 0, 0);
+                        shadowRpe->draw(draw.mesh->vertexCount, 1, 0, firstInstance);
                     }
                 }
                 shadowRpe->end();
+#if defined(__EMSCRIPTEN__)
+                webgpuBoundDrawGroup = nullptr;  // per pass
+#endif
             }
         } else if (cameraPositionBuffer) {
             cameraPositionBuffer->upload(kCameraClipEnd, sizeof(shadowBlock), shadowBlock);  // off
@@ -9145,6 +9289,8 @@ void Renderer::render(const RenderScene& scene,
             {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
             {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
             {8, fxaaSampler},
+            {9, shadowMapBinding()},
+            {10, shadowSamplerBinding()},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
@@ -9157,7 +9303,7 @@ void Renderer::render(const RenderScene& scene,
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
-            {29, shadowMap ? shadowMap : shadowMapPlaceholder},  // sun shadows (fragmentMain_textured)
+            {29, shadowMapBinding()},  // sun shadows (fragmentMain_textured)
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
             // is picked up automatically by this unconditional per-frame
@@ -9411,6 +9557,8 @@ void Renderer::render(const RenderScene& scene,
                 {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
                 {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
                 {8, fxaaSampler},
+                {9, shadowMapBinding()},
+                {10, shadowSamplerBinding()},
             };
             frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
         }

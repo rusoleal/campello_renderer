@@ -88,13 +88,15 @@ struct CameraUniforms {
     clipInfo: vec4u,           // x = plane count, y = section caps on
     capColor: vec4f,
     clipPlanes: array<vec4f, 6>, // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
+    shadowViewProj: mat4x4f,     // sun shadows: shadow map clip from world
+    shadowParams: vec4f,         // x = on, y = texel size (uv)
 }
 
 struct Light {
     position: vec4f,   // xyz = position/dir, w = type (0 = dir, 1 = point, 2 = spot)
     color: vec4f,      // xyz = rgb, w = intensity
     direction: vec4f,  // xyz = spot dir, w = range
-    spotAngles: vec4f, // x = inner cone, y = outer cone
+    spotAngles: vec4f, // x = inner cone, y = outer cone, z = casts the shadow map
 }
 
 struct LightsUniform {
@@ -124,6 +126,8 @@ struct LightsUniform {
 @group(1) @binding(6)  var irradianceMap: texture_cube<f32>;
 @group(1) @binding(7)  var brdfLutTexture: texture_2d<f32>;
 @group(1) @binding(8)  var brdfLutSampler: sampler;
+@group(1) @binding(9)  var shadowMap: texture_depth_2d;          // sun shadows
+@group(1) @binding(10) var shadowSampler: sampler_comparison;
 
 struct NodeTransforms {
     mvp: mat4x4f,    // clip from local
@@ -232,6 +236,38 @@ fn vs_line(@location(0) position: vec3f, @builtin(instance_index) instance: u32)
 // ---------------------------------------------------------------------------
 // Fragment stage
 // ---------------------------------------------------------------------------
+
+// How lit `worldPos` is by the shadow-casting light: 1 lit .. 0 shadowed.
+// 3x3 percentage-closer filtering (hardware compare, bilinear); outside the
+// map: lit. Receiver bias against self-shadowing, sized to one shadow-map
+// texel in world units (the orthographic scales are the matrix rows'
+// lengths): along the normal, more at grazing light, plus a texel of depth.
+// textureSampleCompareLevel: no derivatives, so fine in the light loop.
+fn sunShadow(worldPos: vec3f, N: vec3f, L: vec3f) -> f32 {
+    if (camera.shadowParams.x < 0.5) {
+        return 1.0;
+    }
+    let M = camera.shadowViewProj;
+    let texel = camera.shadowParams.y;
+    let worldTexel = 2.0 * texel / max(length(vec3f(M[0][0], M[1][0], M[2][0])), 1e-6);
+    let depthPerWorld = length(vec3f(M[0][2], M[1][2], M[2][2]));
+    let NdotL = clamp(dot(N, L), 0.0, 1.0);
+    let slope = sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.2);
+    let clip = M * vec4f(worldPos + N * worldTexel * (1.0 + slope), 1.0);
+    let ndc = clip.xyz / clip.w;
+    let uv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || ndc.z > 1.0) {
+        return 1.0;
+    }
+    let depth = ndc.z - depthPerWorld * worldTexel;
+    var lit = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            lit += textureSampleCompareLevel(shadowMap, shadowSampler, uv + vec2f(f32(x), f32(y)) * texel, depth);
+        }
+    }
+    return lit / 9.0;
+}
 fn selectUV(uv0: vec2f, uv1: vec2f, packedMask: f32, bit: u32) -> vec2f {
     return select(uv0, uv1, (u32(packedMask) & bit) != 0u);
 }
@@ -460,7 +496,12 @@ fn fs_main(v: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(
             }
         }
         let NdotL = max(dot(N, lightDir), 0.0);
-        let lightColor = light.color.xyz * light.color.w * attenuation * spotFactor;
+        // The sun (spotAngles.z): darkened where the shadow map says so.
+        var shadow = 1.0;
+        if (light.spotAngles.z > 0.5) {
+            shadow = sunShadow(v.worldPos, N, lightDir);
+        }
+        let lightColor = light.color.xyz * light.color.w * attenuation * spotFactor * shadow;
         let halfDir = normalize(lightDir + viewDir);
         let NdotH = max(dot(N, halfDir), 0.0);
         let VdotH = max(dot(viewDir, halfDir), 0.0);
