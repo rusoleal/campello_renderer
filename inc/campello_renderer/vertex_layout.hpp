@@ -153,16 +153,11 @@ namespace systems::leal::campello_renderer {
             return layout;
         }
 
-        /// Wide line quads (GpuMesh::wideLines, Renderer::expandLines()):
-        /// POSITION = this end of the segment, NORMAL = the other end,
-        /// TEXCOORD_0 = (side +-1, half width in output pixels; negative at
-        /// the segment's end vertices). All float.
+        /// Wide lines (GpuMesh::wideLines, Renderer::expandLines()): no
+        /// vertex attributes; the vertex stage reads each segment from the
+        /// mesh's POSITION buffer by vertex index (4 vertices per segment).
         static const VertexLayout& wideLine() {
-            using CT = systems::leal::campello_gpu::ComponentType;
-            using AT = systems::leal::campello_gpu::AccessorType;
-            static const VertexLayout layout{{{VertexSemantic::position, CT::ctFloat, AT::acVec3, false},
-                                              {VertexSemantic::normal, CT::ctFloat, AT::acVec3, false},
-                                              {VertexSemantic::texcoord0, CT::ctFloat, AT::acVec2, false}}};
+            static const VertexLayout layout{};
             return layout;
         }
     };

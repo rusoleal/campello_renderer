@@ -56,9 +56,10 @@ namespace systems::leal::campello_renderer {
         // Clip planes apply to them too.
         systems::leal::campello_gpu::PrimitiveTopology topology =
             systems::leal::campello_gpu::PrimitiveTopology::triangleList;
-        // Antialiased wide lines (Renderer::supportsWideLines()): a
-        // triangleList mesh in VertexLayout::wideLine() built by
-        // Renderer::expandLines(), one quad per segment. Drawn after opaque
+        // Antialiased wide lines (Renderer::supportsWideLines()): built by
+        // Renderer::expandLines(): vertexBuffers[POSITION] holds the
+        // segments (two float4 each), the index buffer one quad (4 vertices,
+        // 6 indices) per segment, layout VertexLayout::wideLine(). Drawn after opaque
         // geometry with the material's base colour (unlit), alpha-blended by
         // pixel coverage, the given width in output pixels at any SSAA
         // scale, nudged towards the camera like hardware lines; clip planes
@@ -223,6 +224,7 @@ namespace systems::leal::campello_renderer {
         static constexpr uint32_t VERTEX_SLOT_MORPH_INFO      = 21; // MorphInfo (targetCount, hasNormal, vertexCount, weights[8])
         static constexpr uint32_t VERTEX_SLOT_MORPH_POSITION  = 22; // float3[targetCount * vertexCount] position deltas
         static constexpr uint32_t VERTEX_SLOT_MORPH_NORMAL    = 23; // float3[targetCount * vertexCount] normal deltas
+        static constexpr uint32_t kWideLineSegmentSlot        = 26; // Metal [[buffer(26)]]: wide line segments (GpuMesh::wideLines)
                                                                //   [0..15]  baseColorFactor
                                                                //   [16..31] uvTransformRow0 (.w = hasTransform)
                                                                //   [32..47] uvTransformRow1
@@ -1109,14 +1111,15 @@ namespace systems::leal::campello_renderer {
             return meshRecipe.ready && !programs.empty() && !programs[kPbrProgram].wideLineFragment.empty() &&
                    vertexStageFor(kPbrProgram, VertexLayout::wideLine(), false, true) != nullptr;
         }
-        /// Vertex data for a wide line mesh (GpuMesh::wideLines,
-        /// VertexLayout::wideLine()): one quad (4 vertices, 2 triangles) per
-        /// segment of a line list.
+        /// Data for a wide line mesh (GpuMesh::wideLines,
+        /// VertexLayout::wideLine()).
         struct WideLineVertices {
-            std::vector<float> positions;  ///< xyz: this end of the segment
-            std::vector<float> others;     ///< xyz: the other end
-            std::vector<float> params;     ///< side +-1, half width in pixels (negative at the end vertices)
+            /// Per segment, 8 floats: start xyz, half width in output pixels,
+            /// end xyz, 0. The mesh's POSITION buffer.
+            std::vector<float> segments;
+            /// 6 per segment (two triangles over its 4 vertices 4s..4s+3).
             std::vector<uint32_t> indices;
+            [[nodiscard]] uint32_t vertexCount() const { return (uint32_t)(segments.size() / 8 * 4); }
         };
         /// Expands a line list (xyz `positions`, pairs of `indices`) into
         /// wide line quads `widthPixels` wide (output pixels). Degenerate

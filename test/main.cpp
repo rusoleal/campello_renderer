@@ -3067,24 +3067,20 @@ TEST_F(OffscreenRenderTest, LinesDrawOnTopOfTheirFaces) {
     EXPECT_GT(pixels[quadPixel], 40) << "lit red quad";
 }
 
-// Wide lines (GpuMesh::wideLines): Renderer::expandLines() makes one quad per
-// segment, start vertices with a positive half width, end vertices negative.
-TEST(WideLines, ExpandLinesBuildsAQuadPerSegment) {
+// Wide lines (GpuMesh::wideLines): Renderer::expandLines() stores each
+// segment once (start + half width, end) and indexes one quad over it.
+TEST(WideLines, ExpandLinesStoresSegmentsAndQuads) {
     const float positions[] = {0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0};
     const uint32_t indices[] = {0, 1, 1, 2, 2, 3};  // the last segment is degenerate
-    const auto quads = Renderer::expandLines(positions, 4, indices, 6, 3.0f);
-    ASSERT_EQ(quads.positions.size(), 2u * 4 * 3);
-    ASSERT_EQ(quads.indices.size(), 2u * 6);
-    // First segment: (0,0,0) -> (1,0,0).
-    EXPECT_EQ(quads.positions[0], 0.0f);
-    EXPECT_EQ(quads.others[0], 1.0f);
-    EXPECT_EQ(quads.positions[6], 1.0f);  // third vertex: the end
-    EXPECT_EQ(quads.others[6], 0.0f);
-    EXPECT_EQ(quads.params[0], 1.0f);
-    EXPECT_EQ(quads.params[1], 1.5f);
-    EXPECT_EQ(quads.params[2], -1.0f);
-    EXPECT_EQ(quads.params[5], -1.5f);
-    EXPECT_EQ(quads.indices[6], 4u);  // second quad's vertices start at 4
+    const auto lines = Renderer::expandLines(positions, 4, indices, 6, 3.0f);
+    ASSERT_EQ(lines.segments.size(), 2u * 8);
+    ASSERT_EQ(lines.indices.size(), 2u * 6);
+    EXPECT_EQ(lines.vertexCount(), 8u);
+    // First segment: (0,0,0) -> (1,0,0), half width 1.5.
+    const std::vector<float> first(lines.segments.begin(), lines.segments.begin() + 8);
+    EXPECT_EQ(first, (std::vector<float>{0, 0, 0, 1.5f, 1, 0, 0, 0}));
+    EXPECT_EQ(std::vector<uint32_t>(lines.indices.begin(), lines.indices.begin() + 6), (std::vector<uint32_t>{0, 1, 3, 0, 3, 2}));
+    EXPECT_EQ(lines.indices[6], 4u);  // the second quad's vertices start at 4
 }
 
 // A 3 px wide line (green: it darkens the red channel) across a lit red quad
@@ -3124,18 +3120,14 @@ TEST_F(OffscreenRenderTest, WideLinesKeepTheirWidthAndSoftEdgesAtAnySsaa) {
     // A shallow diagonal (about 18 degrees), where hardware lines stair-step.
     const float linePositions[] = {-0.6f, -0.2f, 0.0f, 0.6f, 0.2f, 0.0f};
     const uint32_t lineIndices[] = {0, 1};
-    auto quads = Renderer::expandLines(linePositions, 2, lineIndices, 2, 3.0f);
+    auto lines = Renderer::expandLines(linePositions, 2, lineIndices, 2, 3.0f);
     GpuMesh line;
     line.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
-        device->createBuffer(quads.positions.size() * 4, GPU::BufferUsage::vertex, quads.positions.data());
-    line.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
-        device->createBuffer(quads.others.size() * 4, GPU::BufferUsage::vertex, quads.others.data());
-    line.vertexBuffers[Renderer::VERTEX_SLOT_TEXCOORD0] =
-        device->createBuffer(quads.params.size() * 4, GPU::BufferUsage::vertex, quads.params.data());
-    line.indexBuffer = device->createBuffer(quads.indices.size() * 4, GPU::BufferUsage::index, quads.indices.data());
-    line.indexCount = (uint32_t)quads.indices.size();
+        device->createBuffer(lines.segments.size() * 4, GPU::BufferUsage::vertex, lines.segments.data());
+    line.indexBuffer = device->createBuffer(lines.indices.size() * 4, GPU::BufferUsage::index, lines.indices.data());
+    line.indexCount = (uint32_t)lines.indices.size();
     line.indexFormat = GPU::IndexFormat::uint32;
-    line.vertexCount = (uint32_t)(quads.positions.size() / 3);
+    line.vertexCount = lines.vertexCount();
     line.layout = &VertexLayout::wideLine();
     line.wideLines = true;
 

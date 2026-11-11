@@ -3543,9 +3543,7 @@ Renderer::WideLineVertices Renderer::expandLines(const float* positions, size_t 
     WideLineVertices out;
     const float half = std::max(0.0f, widthPixels) * 0.5f;
     const size_t segments = indexCount / 2;
-    out.positions.reserve(segments * 12);
-    out.others.reserve(segments * 12);
-    out.params.reserve(segments * 8);
+    out.segments.reserve(segments * 8);
     out.indices.reserve(segments * 6);
     for (size_t s = 0; s < segments; ++s) {
         const uint32_t ia = indices[s * 2];
@@ -3554,18 +3552,9 @@ Renderer::WideLineVertices Renderer::expandLines(const float* positions, size_t 
         const float* a = positions + ia * 3;
         const float* b = positions + ib * 3;
         if (a[0] == b[0] && a[1] == b[1] && a[2] == b[2]) continue;
-        const auto base = static_cast<uint32_t>(out.positions.size() / 3);
-        // Start vertices (positive half width) on sides +1/-1, then end
-        // vertices (negative half width) on the same physical sides: the
-        // shader takes the segment's direction from start to end for both.
-        const float* ends[4][2] = {{a, b}, {a, b}, {b, a}, {b, a}};
-        const float sides[4] = {1.0f, -1.0f, 1.0f, -1.0f};
-        for (int v = 0; v < 4; ++v) {
-            out.positions.insert(out.positions.end(), ends[v][0], ends[v][0] + 3);
-            out.others.insert(out.others.end(), ends[v][1], ends[v][1] + 3);
-            out.params.push_back(sides[v]);
-            out.params.push_back(v < 2 ? half : -half);
-        }
+        const auto base = static_cast<uint32_t>(out.segments.size() / 8 * 4);
+        out.segments.insert(out.segments.end(), {a[0], a[1], a[2], half, b[0], b[1], b[2], 0.0f});
+        // Vertices: 0/1 at the start (sides +1/-1), 2/3 at the end (sides +1/-1).
         for (const uint32_t i : {0u, 1u, 3u, 0u, 3u, 2u}) out.indices.push_back(base + i);
     }
     return out;
@@ -3830,9 +3819,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             {allSemantics, shaderModule, "vertexMain"},
             {semanticBit(VertexSemantic::position), shaderModule, "vertexLean"},
             {semanticBit(VertexSemantic::position), shaderModule, "vertexLine", true},
-            {semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::normal) |
-                 semanticBit(VertexSemantic::texcoord0),
-             shaderModule, "vertexWideLine", false, true},
+            {0u, shaderModule, "vertexWideLine", false, true},  // reads segments at [[buffer(26)]]
         };
         programs[kPbrProgram].wideLineFragment = "fragmentWideLine";
         programs[kPbrProgram].fragmentModule = shaderModule;
@@ -9566,6 +9553,10 @@ void Renderer::renderPrimitive(
     // binds for fragments only.
     if (wideLines && meshRecipe.rawBufferSlots && cameraPositionBuffer) {
         setVertexBufferIfChanged(rpe, 18, cameraPositionBuffer, 0);
+        // The segments, read by vertex index (no vertex attributes).
+        if (draw.mesh->vertexBuffers[VERTEX_SLOT_POSITION]) {
+            setVertexBufferIfChanged(rpe, kWideLineSegmentSlot, draw.mesh->vertexBuffers[VERTEX_SLOT_POSITION], 0);
+        }
     }
 
     // Skip redundant setPipeline() calls: the bound pipeline object is

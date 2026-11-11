@@ -1765,19 +1765,18 @@ fragment float4 fxaaFragment(FxaaOut in [[stage_in]],
 }
 
 // ---------------------------------------------------------------------------
-// Wide lines (GpuMesh::wideLines): one quad per segment, built on the CPU by
-// Renderer::expandLines() (VertexLayout::wideLine()): position = this end,
-// normal = the other end, texcoord0 = (side +-1, half width in output
-// pixels, negative at the segment's end vertices). The quad is expanded in
+// Wide lines (GpuMesh::wideLines): one quad per segment, its 4 vertices
+// read by index from the segment buffer (Renderer::expandLines(); no vertex
+// attributes). The quad is expanded in
 // screen space by the half width plus a fringe, sideways and past both ends,
 // so a line has the same width and antialiasing at any SSAA scale (the
 // camera block's screenSize is the output size). fragmentWideLine fades the
 // fringe by the distance to the centre line. Same depth nudge as vertexLine.
 // ---------------------------------------------------------------------------
-struct VertexInWideLine {
-    float3 position [[attribute(0)]];
-    float3 other    [[attribute(1)]];
-    float2 params   [[attribute(2)]];
+// One segment: start xyz + half width (output pixels), end xyz + 0.
+struct WideLineSegment {
+    float4 start;
+    float4 end;
 };
 
 struct WideLineOut {
@@ -1797,17 +1796,25 @@ constant float kWideLineFullLength  = 4.0;
 constant float kWideLineMinOpacity  = 0.3;
 
 vertex WideLineOut vertexWideLine(
-    VertexInWideLine             in             [[stage_in]],
-    device const NodeTransforms *nodeTransforms [[buffer(16)]],
-    constant CameraUniforms     &camera         [[buffer(18)]])
+    uint                          vid            [[vertex_id]],
+    device const NodeTransforms  *nodeTransforms [[buffer(16)]],
+    constant CameraUniforms      &camera         [[buffer(18)]],
+    device const WideLineSegment *segments       [[buffer(26)]])
 {
-    const bool  isStart   = in.params.y >= 0.0;
-    const float halfWidth = abs(in.params.y);
+    // 4 vertices per segment: 0/1 at the start, 2/3 at the end; even on
+    // side +1, odd on side -1 (Renderer::expandLines()).
+    const WideLineSegment segment = segments[vid / 4];
+    const uint  corner    = vid % 4;
+    const bool  isStart   = corner < 2;
+    const float side      = (corner % 2 == 0) ? 1.0 : -1.0;
+    const float halfWidth = segment.start.w;
+    const float3 position = isStart ? segment.start.xyz : segment.end.xyz;
+    const float3 otherEnd = isStart ? segment.end.xyz : segment.start.xyz;
     // 1 output pixel of fringe, less when supersampled (the downsample
     // smooths the rest): 1/2 px at SSAA 2x.
     const float fringe = 1.0 / max(camera.lineParams.x, 1.0);
-    float4 self  = nodeTransforms[0].mvp * float4(in.position, 1.0);
-    float4 other = nodeTransforms[0].mvp * float4(in.other, 1.0);
+    float4 self  = nodeTransforms[0].mvp * float4(position, 1.0);
+    float4 other = nodeTransforms[0].mvp * float4(otherEnd, 1.0);
     // An end behind the camera: slide it along the segment to just in front
     // of the eye, so the screen direction stays meaningful.
     if (self.w < kWideLineNearW && other.w > kWideLineNearW) {
@@ -1824,14 +1831,14 @@ vertex WideLineOut vertexWideLine(
     const float2 across = float2(-along.y, along.x);
     // Too short to see: a zero-area quad (no fragments).
     const float extent = len < kWideLineMinLength ? 0.0 : halfWidth + fringe;
-    const float2 offsetPx = across * in.params.x * extent + along * (isStart ? -extent : extent);
+    const float2 offsetPx = across * side * extent + along * (isStart ? -extent : extent);
 
     WideLineOut out;
     out.clipPosition = self;
     out.clipPosition.xy += offsetPx / halfScreen * self.w;
     out.clipPosition.z -= kLineDepthOffset * self.w;
-    out.worldPos  = (nodeTransforms[0].model * float4(in.position, 1.0)).xyz;
-    out.distance  = in.params.x * extent;
+    out.worldPos  = (nodeTransforms[0].model * float4(position, 1.0)).xyz;
+    out.distance  = side * extent;
     out.halfWidth = halfWidth;
     out.fringe    = fringe;
     out.opacity   = mix(kWideLineMinOpacity, 1.0, smoothstep(kWideLineMinLength, kWideLineFullLength, len));
