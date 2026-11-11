@@ -838,18 +838,29 @@ vertex float4 vertexShadow(
 // How lit `worldPos` is by the shadow-casting light: 1 lit .. 0 shadowed.
 // 3x3 percentage-closer filtering of the shadow map (hardware-compared,
 // bilinear), so shadow edges are soft. Outside the map: lit.
-inline float sunShadow(constant CameraUniforms &camera, depth2d<float> shadowMap, float3 worldPos) {
+inline float sunShadow(constant CameraUniforms &camera, depth2d<float> shadowMap, float3 worldPos, float3 N, float3 L) {
     if (camera.shadowParams.x < 0.5) {
         return 1.0;
     }
     constexpr sampler shadowSampler(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);
-    const float4 clip = camera.shadowViewProj * float4(worldPos, 1.0);
-    const float3 ndc = clip.xyz / clip.w;
+    // Receiver bias against self-shadowing ("acne"), sized to one shadow-map
+    // texel in world units (the orthographic scales are the matrix rows'
+    // lengths): offset along the normal, more at grazing light, plus a
+    // texel of depth.
+    const float4x4 M = camera.shadowViewProj;
+    const float texel = camera.shadowParams.y;
+    const float worldTexel = 2.0 * texel / max(length(float3(M[0][0], M[1][0], M[2][0])), 1e-6);
+    const float depthPerWorld = length(float3(M[0][2], M[1][2], M[2][2]));
+    const float NdotL = clamp(dot(N, L), 0.0, 1.0);
+    const float slope = sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.2);
+    const float3 biased = worldPos + N * worldTexel * (1.0 + slope);
+    const float4 clip = M * float4(biased, 1.0);
+    float3 ndc = clip.xyz / clip.w;
+    ndc.z -= depthPerWorld * worldTexel;
     const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     if (any(uv < float2(0.0)) || any(uv > float2(1.0)) || ndc.z > 1.0) {
         return 1.0;
     }
-    const float texel = camera.shadowParams.y;
     float lit = 0.0;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
@@ -1351,7 +1362,7 @@ fragment float4 fragmentMain_textured(
 
         float  NdotL      = max(dot(N, lightDir), 0.0);
         // The sun (spotAngles.z): darkened where the shadow map says so.
-        const float shadow = light.spotAngles.z > 0.5 ? sunShadow(camera, shadowMap, in.worldPos) : 1.0;
+        const float shadow = light.spotAngles.z > 0.5 ? sunShadow(camera, shadowMap, in.worldPos, N, lightDir) : 1.0;
         float3 lightColor = light.color.xyz * light.color.w * attenuation * spotFactor * shadow;
 
         float3 halfDir = normalize(lightDir + viewDir);
