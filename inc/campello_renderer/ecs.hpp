@@ -385,6 +385,10 @@ struct RenderSystemOptions {
     /// shadow-casting light (for PathTracer: geometry off screen still
     /// shadows and reflects).
     bool listAllCasters = false;
+    /// List every draw whatever the camera sees: no frustum or size
+    /// culling, and MeshRenderer::visible ignored (for PathTracer: glass
+    /// behind the camera still reflects; panoramas). Clip planes still cut.
+    bool noCulling = false;
 };
 
 // ------------------------------------------------------------------
@@ -477,8 +481,9 @@ inline RenderScene build_render_scene(
             caster.instanceCount = 1;
             scene.shadowCasters.push_back(caster);
         }
-        if (!meshRenderer.visible) continue;
-        if (!skinned && isOutsideFrustum(clipFromWorld, transform.worldMatrix, *meshRenderer.mesh)) {
+        const bool culling = !(options && options->noCulling);
+        if (culling && !meshRenderer.visible) continue;
+        if (culling && !skinned && isOutsideFrustum(clipFromWorld, transform.worldMatrix, *meshRenderer.mesh)) {
             ++counted.culled;
             continue;
         }
@@ -487,7 +492,7 @@ inline RenderScene build_render_scene(
             ++counted.culled;
             continue;
         }
-        if (!skinned && options && options->minPixelRadius > 0.0f &&
+        if (culling && !skinned && options && options->minPixelRadius > 0.0f &&
             projectedRadiusPixels(clipFromWorld, scene.camera.projection.data[5], transform.worldMatrix,
                                   *meshRenderer.mesh, options->viewportHeight) < options->minPixelRadius) {
             ++counted.tooSmall;
