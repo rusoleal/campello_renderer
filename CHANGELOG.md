@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+- **Path tracing** (`PathTracer`, new header `path_tracer.hpp`; Metal, where campello_gpu reports `Feature::raytracing`): progressive, one sample per pixel per `render()`, tone mapped like the raster renderer and restarted when the geometry, materials, lights, settings, camera or size change. One acceleration structure per mesh (cached), a scene structure of the draws (`RenderScene::shadowCasters` when filled, so geometry off screen counts, plus the transparent draws), face normals computed on the GPU from the meshes' own buffers. Diffuse + GGX specular, up to four directional lights sampled directly as soft 0.53-degree discs with shadow rays, the environment as sky light (seen directly at full strength, as the skybox), thin glass (Fresnel reflection or straight through; it doesn't block the sun), emissive and unlit materials, Russian roulette. Base colour textures contribute their average colour (`GpuMaterial::baseColorTextureAverage`); textures, denoising and Vulkan: later. Shaders: `shaders/metal/path_tracer.metal`, embedded by `build_metal_shaders.sh`. Test: a plate over a lit ground plane shadows it; moving the camera restarts the image.
+- **`build_render_scene()`** (ECS): the RenderScene `render_system()` draws, without drawing it; `RenderSystemOptions::listAllCasters` lists every opaque mesh as a caster even without a shadow-casting light.
+- `Renderer::getEnvironmentMap()`, `getSkyboxEnabled()`, `materialUniforms()` (a material's uploaded constants).
+
+### Fixed
+- **Diffuse image-based light was pi times too bright**: the irradiance map was baked as pi x the average radiance and shaders multiply it by the albedo; it's now the average radiance (as glTF-Sample-Viewer's Lambertian map), on every backend. Scenes lit by the environment get darker; raise `setEnvironmentIntensity()` by pi for the previous look.
+
 ## [0.16.0] - 2026-11-11
 
 ### Added

@@ -203,7 +203,7 @@ vec3 convolveIrradiance(vec3 N) {
         vec3 sampleDir = localDir.x * tangent + localDir.y * bitangent + localDir.z * N;
         irradiance += textureLod(samplerCube(srcEnvMap, srcEnvSampler), sampleDir, 0.0).rgb;
     }
-    return PI * irradiance / float(SAMPLE_COUNT);
+    return irradiance / float(SAMPLE_COUNT); // the average radiance (as glTF-Sample-Viewer): diffuse = albedo x it; with pi it was pi times too bright
 }
 
 void main() {

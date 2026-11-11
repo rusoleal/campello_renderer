@@ -101,6 +101,9 @@ namespace systems::leal::campello_renderer {
         bool alphaBlend = false;
         bool alphaMask = false;
         bool transmission = false; // true if KHR_materials_transmission is active
+        // The base colour texture's average colour (linear), white without
+        // one: the path tracer shades with it (PathTracer).
+        std::array<float, 3> baseColorTextureAverage{1.0f, 1.0f, 1.0f};
         // Shader program drawing this material (Renderer::registerProgram());
         // the built-in PBR shaders by default. The material's bind groups and
         // uniforms are bound either way (custom programs may read them).
@@ -284,6 +287,9 @@ namespace systems::leal::campello_renderer {
         void rebindMaterialBuffer();
         std::map<std::pair<const void*, int64_t>, std::shared_ptr<systems::leal::campello_gpu::Texture>> foreignTextures;
         std::map<std::pair<const void*, int64_t>, std::shared_ptr<systems::leal::campello_gpu::Sampler>> foreignSamplers;
+        // Average linear colour of 8-bit images uploaded by uploadMaterial(),
+        // by texture (GpuMaterial::baseColorTextureAverage).
+        std::map<const systems::leal::campello_gpu::Texture*, std::array<float, 3>> textureAverages;
 
         // Minimal bind groups for flat pipeline variants (no textures/samplers).
         // Only contains the material uniform buffer at binding 17 so the fragment
@@ -1200,6 +1206,12 @@ namespace systems::leal::campello_renderer {
         bool isSkyboxEnabled() const;
         bool isIBLEnabled() const;
         float getEnvironmentIntensity() const;
+        /// The environment cube map (before prefiltering), or nullptr.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> getEnvironmentMap() const { return environmentMap; }
+        bool getSkyboxEnabled() const { return skyboxEnabled; }
+        /// A material's constants as uploaded: the 93 floats of its uniform
+        /// slot (layout in buildSlotRaw()), or nullptr. For the path tracer.
+        const float* materialUniforms(const GpuMaterial* material) const;
 
         // Draws on top of the finished frame, for example a stats display. Called once per
         // render() just before the frame is submitted, with the frame's encoder and color

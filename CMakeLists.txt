@@ -44,6 +44,7 @@ set(DEPENDENCIES
 
 add_library(${PROJECT_NAME} SHARED
     src/campello_renderer.cpp
+    src/path_tracer.cpp
     src/animation.cpp
     src/procedural_texture_baker.cpp
 )

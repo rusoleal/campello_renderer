@@ -802,6 +802,7 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         foreignMaterialCache.clear();
         materialBufferBindGroups.clear();
         foreignTextures.clear();
+        textureAverages.clear();
         foreignSamplers.clear();
         nodeInstanceData.clear();
         primitiveBounds.clear();
@@ -9018,6 +9019,13 @@ void Renderer::uploadWithMips(const std::shared_ptr<systems::leal::campello_gpu:
     if (fence) fence->wait();
 }
 
+const float* Renderer::materialUniforms(const GpuMaterial* material) const {
+    if (!material) return nullptr;
+    const uint64_t offset = (uint64_t)material->uniformSlot * kMaterialUniformStride;
+    if (materialUniformShadow.size() < offset + 93 * sizeof(float)) return nullptr;
+    return reinterpret_cast<const float*>(materialUniformShadow.data() + offset);
+}
+
 void Renderer::setMaterialWorldMapping(GpuMaterial* material, float repeatSize) {
     if (!material) return;
     if (repeatSize > 0.0f) {
@@ -9215,6 +9223,21 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
             img->getWidth(), img->getHeight(), 1, mipLevels, 1,
             (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                 (uint32_t)GPU::TextureUsage::copyDst));
+        if (texture && img->getFormat() == systems::leal::campello_image::ImageFormat::rgba8) {
+            // Its average colour in linear light (the path tracer's stand-in).
+            const auto* px = static_cast<const uint8_t*>(img->getData());
+            const size_t count = (size_t)img->getWidth() * img->getHeight();
+            double sum[3] = {0.0, 0.0, 0.0};
+            for (size_t i = 0; i < count; ++i) {
+                for (int c = 0; c < 3; ++c) {
+                    const double v = px[i * 4 + (size_t)c] / 255.0;
+                    sum[c] += srgb ? (v <= 0.04045 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4)) : v;
+                }
+            }
+            if (count > 0) {
+                textureAverages[texture.get()] = {(float)(sum[0] / count), (float)(sum[1] / count), (float)(sum[2] / count)};
+            }
+        }
         if (texture && mipLevels == 1) {
             texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
         } else if (texture) {
@@ -9533,6 +9556,9 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     mat->alphaBlend    = (material.alphaMode == systems::leal::gltf::AlphaMode::blend);
     mat->alphaMask     = (material.alphaMode == systems::leal::gltf::AlphaMode::mask);
     mat->transmission  = (material.khrMaterialsTransmission && material.khrMaterialsTransmission->transmissionFactor > 0.0f);
+    if (const auto it = textureAverages.find(baseColorTex.get()); it != textureAverages.end()) {
+        mat->baseColorTextureAverage = it->second;
+    }
 
 #if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
     // Real scene-color/opaque-scene texture is filled in by

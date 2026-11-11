@@ -3,6 +3,7 @@
 #include <campello_renderer/campello_renderer.hpp>
 #include <campello_renderer/procedural_texture_baker.hpp>
 #include <campello_renderer/culling.hpp>
+#include <campello_renderer/path_tracer.hpp>
 #include <gltf/gltf.hpp>
 #include <future>
 #include <vector>
@@ -3527,6 +3528,80 @@ TEST_F(OffscreenRenderTest, ThinGlassShowsTheBackgroundAtItsBrightness) {
     EXPECT_LE(at(32, 32, 0), 132) << "through the glass: washed out";
     EXPECT_LT(at(32, 32, 1), 20);
     EXPECT_LT(at(32, 32, 2), 20);
+}
+
+// Path tracing (PathTracer): a plate floating over a lit ground plane, the
+// sun straight above. After a few dozen samples the image is lit and the
+// ground under the plate is in shadow; ground away from it isn't.
+TEST_F(OffscreenRenderTest, PathTracerShadowsTheGroundUnderAPlate) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.1f);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+
+    const auto quad = [&](float y, float half) {
+        std::vector<float> positions = {-half, y, -half, half, y, -half, half, y, half, -half, y, half};
+        std::vector<uint32_t> indices = {0, 2, 1, 0, 3, 2};
+        auto mesh = std::make_unique<GpuMesh>();
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh->indexCount = 6;
+        mesh->indexFormat = GPU::IndexFormat::uint32;
+        mesh->vertexCount = 4;
+        mesh->layout = &VertexLayout::positionOnly();
+        mesh->setBoundsFromPositions(positions.data(), 4);
+        return mesh;
+    };
+    auto ground = quad(0.0f, 1.5f);
+    auto plate = quad(0.6f, 0.3f);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 2.5, 2.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 2.5, 2.5);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.0, -1.0, 0.0);
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    scene.lights.push_back(sun);
+    for (GpuMesh* mesh : {ground.get(), plate.get()}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = red;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    for (int i = 0; i < 32; ++i) {
+        ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+    }
+    EXPECT_EQ(tracer.sampleCount(), 32u);
+    const auto pixels = readBackPixels(tracer.output());
+    const auto red8 = [&](int x, int y) { return double(pixels[(size_t(y) * 64 + size_t(x)) * 4]); };
+    EXPECT_GT(red8(10, 40), 60.0) << "the sun lights open ground";
+    // (Light bounced between the ground and the plate's underside fills the
+    // shadow somewhat: no deeper than the raster renderer's threshold.)
+    EXPECT_LT(red8(32, 32), red8(10, 40) * 0.7) << "no shadow under the plate";
+    EXPECT_GT(red8(32, 24), 60.0) << "the plate is lit";
+    // Moving the camera starts the image again.
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 2.6, 2.4), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+    EXPECT_EQ(tracer.sampleCount(), 1u);
+    renderer->setEnvironmentIntensity(1.0f);
 }
 
 // Ambient occlusion and exposure: a floor meeting a wall. With AO on, the

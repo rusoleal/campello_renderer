@@ -124,7 +124,7 @@ fn iblConvolveIrradiance(N: vec3f) -> vec3f {
         let dir = sinTheta * cos(phi) * tangent + sinTheta * sin(phi) * bitangent + cosTheta * N;
         irradiance += textureSampleLevel(srcEnvMap, srcEnvSampler, dir, 0.0).rgb;
     }
-    return PI * irradiance / f32(count);
+    return irradiance / f32(count); // the average radiance (as glTF-Sample-Viewer): diffuse = albedo x it; with pi it was pi times too bright
 }
 
 @fragment
