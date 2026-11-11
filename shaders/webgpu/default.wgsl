@@ -74,6 +74,8 @@ struct MaterialUniforms {
     anisotropyRotation: f32,
     hasAnisotropicTexture: f32,
     dispersion: f32,
+    worldMapping: f32,     // world-space box mapping: world units per repeat (0: off)
+    worldMappingUp: f32,   // 1: z up, 0: y up
     normalUvTransformRow0: vec4f,
     normalUvTransformRow1: vec4f,
     texCoord1Mask: f32,
@@ -88,13 +90,18 @@ struct CameraUniforms {
     clipInfo: vec4u,           // x = plane count, y = section caps on
     capColor: vec4f,
     clipPlanes: array<vec4f, 6>, // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
+    shadowViewProj: mat4x4f,     // sun shadows: shadow map clip from world
+    shadowParams: vec4f,         // x = on, y = texel size (uv)
+    viewParams: vec4f,           // x = exposure in EV (colour x 2^EV before tone mapping)
+    shadowNearViewProj: mat4x4f, // sun shadows, near cascade
+    shadowNearParams: vec4f,     // x = near cascade on
 }
 
 struct Light {
     position: vec4f,   // xyz = position/dir, w = type (0 = dir, 1 = point, 2 = spot)
     color: vec4f,      // xyz = rgb, w = intensity
     direction: vec4f,  // xyz = spot dir, w = range
-    spotAngles: vec4f, // x = inner cone, y = outer cone
+    spotAngles: vec4f, // x = inner cone, y = outer cone, z = casts the shadow map
 }
 
 struct LightsUniform {
@@ -121,9 +128,14 @@ struct LightsUniform {
 @group(1) @binding(1)  var<uniform> camera: CameraUniforms;
 @group(1) @binding(2)  var environmentMap: texture_cube<f32>;   // GGX-prefiltered specular
 @group(1) @binding(3)  var environmentSampler: sampler;
+@group(1) @binding(4)  var sceneColorTexture: texture_2d<f32>;  // the opaque scene (transmission)
+@group(1) @binding(5)  var sceneColorSampler: sampler;
 @group(1) @binding(6)  var irradianceMap: texture_cube<f32>;
 @group(1) @binding(7)  var brdfLutTexture: texture_2d<f32>;
 @group(1) @binding(8)  var brdfLutSampler: sampler;
+@group(1) @binding(9)  var shadowMap: texture_depth_2d;          // sun shadows
+@group(1) @binding(10) var shadowSampler: sampler_comparison;
+@group(1) @binding(11) var shadowMapNear: texture_depth_2d;      // sun shadows, near cascade
 
 struct NodeTransforms {
     mvp: mat4x4f,    // clip from local
@@ -232,6 +244,48 @@ fn vs_line(@location(0) position: vec3f, @builtin(instance_index) instance: u32)
 // ---------------------------------------------------------------------------
 // Fragment stage
 // ---------------------------------------------------------------------------
+
+// One shadow map's verdict on worldPos: 1 lit .. 0 shadowed, 3x3
+// percentage-closer filtering; .y = 1 where the map covers the point.
+// Receiver bias as shaders/metal/default.metal's shadowLookup().
+// textureSampleCompareLevel: no derivatives, so fine in the light loop.
+fn shadowLookup(map: texture_depth_2d, M: mat4x4f, texel: f32, worldPos: vec3f, N: vec3f, L: vec3f) -> vec2f {
+    let worldTexel = 2.0 * texel / max(length(vec3f(M[0][0], M[1][0], M[2][0])), 1e-6);
+    let depthPerWorld = length(vec3f(M[0][2], M[1][2], M[2][2]));
+    let NdotL = clamp(dot(N, L), 0.0, 1.0);
+    let slope = sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.2);
+    let clip = M * vec4f(worldPos + N * worldTexel * (1.0 + slope), 1.0);
+    let ndc = clip.xyz / clip.w;
+    let uv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    let inside = all(uv >= vec2f(2.0 * texel)) && all(uv <= vec2f(1.0 - 2.0 * texel)) && ndc.z <= 1.0;
+    if (!inside) {
+        return vec2f(1.0, 0.0);
+    }
+    let depth = ndc.z - depthPerWorld * worldTexel;
+    var lit = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            lit += textureSampleCompareLevel(map, shadowSampler, uv + vec2f(f32(x), f32(y)) * texel, depth);
+        }
+    }
+    return vec2f(lit / 9.0, 1.0);
+}
+
+// How lit worldPos is by the shadow-casting light: the near cascade where it
+// covers the point, else the far one (the whole scene); outside both, lit.
+fn sunShadow(worldPos: vec3f, N: vec3f, L: vec3f) -> f32 {
+    if (camera.shadowParams.x < 0.5) {
+        return 1.0;
+    }
+    if (camera.shadowNearParams.x > 0.5) {
+        let near = shadowLookup(shadowMapNear, camera.shadowNearViewProj, camera.shadowParams.y, worldPos, N, L);
+        if (near.y > 0.5) {
+            return near.x;
+        }
+    }
+    return shadowLookup(shadowMap, camera.shadowViewProj, camera.shadowParams.y, worldPos, N, L).x;
+}
+
 fn selectUV(uv0: vec2f, uv1: vec2f, packedMask: f32, bit: u32) -> vec2f {
     return select(uv0, uv1, (u32(packedMask) & bit) != 0u);
 }
@@ -290,8 +344,31 @@ fn iblGGXFresnel(NdotV: f32, roughness: f32, F0: vec3f) -> vec3f {
     return FssEss + FmsEms;
 }
 
+// World-space box mapping (Renderer::setMaterialWorldMapping()), for
+// geometry without texture coordinates (CAD, BIM): faces facing up or down
+// take the plan projection (u east, v south), the others a projection along
+// their own horizontal direction (u to the right seen from outside, v down),
+// one repeat per `size` world units, so textures run continuously across
+// elements. T and B are the directions u and v grow in (normal mapping).
+fn worldMappingFrame(P: vec3f, N: vec3f, size: f32, zUp: bool) -> array<vec3f, 3> {
+    let U = select(vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.0, 1.0), zUp);
+    let nu = dot(N, U);
+    var T: vec3f;
+    var B: vec3f;
+    if (abs(nu) > 0.7071) {
+        T = vec3f(1.0, 0.0, 0.0);
+        B = select(vec3f(0.0, 0.0, 1.0), vec3f(0.0, -1.0, 0.0), zUp);
+    } else {
+        let h = normalize(N - U * nu);
+        T = cross(U, h);
+        B = -U;
+    }
+    return array<vec3f, 3>(vec3f(dot(P, T) / size, dot(P, B) / size, 0.0), T, B);
+}
+
 @fragment
-fn fs_main(v: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(0) vec4f {
+fn fs_main(vIn: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(0) vec4f {
+    var v = vIn;  // world mapping replaces its texture coordinates
     // Position-only meshes carry no normal: flat face normal from the
     // derivatives of the world position (taken unconditionally), towards
     // the camera.
@@ -314,6 +391,12 @@ fn fs_main(v: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(
         worldNormal = N;
         worldTangent = T;
         worldBitangent = cross(N, T);
+    }
+    if (mat.worldMapping > 0.0) {
+        let frame = worldMappingFrame(v.worldPos, normalize(worldNormal), mat.worldMapping, mat.worldMappingUp > 0.5);
+        v.texcoord0 = frame[0].xy;
+        worldTangent = frame[1];
+        worldBitangent = frame[2];
     }
 
     // Clip planes: discard the clipped side. The section cap (back faces of
@@ -460,7 +543,12 @@ fn fs_main(v: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(
             }
         }
         let NdotL = max(dot(N, lightDir), 0.0);
-        let lightColor = light.color.xyz * light.color.w * attenuation * spotFactor;
+        // The sun (spotAngles.z): darkened where the shadow map says so.
+        var shadow = 1.0;
+        if (light.spotAngles.z > 0.5) {
+            shadow = sunShadow(v.worldPos, N, lightDir);
+        }
+        let lightColor = light.color.xyz * light.color.w * attenuation * spotFactor * shadow;
         let halfDir = normalize(lightDir + viewDir);
         let NdotH = max(dot(N, halfDir), 0.0);
         let VdotH = max(dot(viewDir, halfDir), 0.0);
@@ -485,8 +573,25 @@ fn fs_main(v: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(
     if (mat.iblEnabled > 0.5) {
         ambientColor = vec3f(0.0);
     }
-    var finalColor = ambientColor + totalDiffuse + totalSpecular
-                   + iblDiffuse * occlusion + iblSpecular * occlusion + emissive;
+    // KHR_materials_transmission, thin-walled (no refraction offset; volume
+    // isn't on WebGPU): the opaque scene behind, at this fragment's screen
+    // position, blurred by roughness and decoded back to linear light (it's
+    // stored display-encoded). It replaces diffuse light by its share.
+    var transmitted = vec3f(0.0);
+    var transmittance = 0.0;
+    if (mat.transmissionFactor > 0.0 && metallic < 0.99) {
+        let suv = v.clipPosition.xy / camera.screenSize;
+        let lod = log2(camera.screenSize.x) * roughness * clamp(mat.ior * 2.0 - 2.0, 0.0, 1.0);
+        let behind = textureSampleLevel(sceneColorTexture, sceneColorSampler, suv, lod).rgb;
+        transmitted = pow(max(behind, vec3f(0.0)), vec3f(2.2)) * baseColor.rgb;
+        var t0 = (mat.ior - 1.0) / (mat.ior + 1.0);
+        t0 *= t0;
+        let fresnel = t0 + (1.0 - t0) * pow(1.0 - NdotV, 5.0);
+        transmittance = mat.transmissionFactor * (1.0 - fresnel) * (1.0 - metallic);
+    }
+    var finalColor = (ambientColor + totalDiffuse + iblDiffuse * occlusion) * (1.0 - transmittance)
+                   + totalSpecular + iblSpecular * occlusion + emissive + transmitted * transmittance;
+    finalColor *= exp2(camera.viewParams.x);  // exposure
     finalColor = linearToSRGBFast(toneMapKhronosPbrNeutral(finalColor));
 
     // OPAQUE and MASK render fully opaque; only BLEND uses baseColor.a.

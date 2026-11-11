@@ -799,6 +799,10 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         materialPool.clear();
         meshCache.clear();
         materialCache.clear();
+        foreignMaterialCache.clear();
+        materialBufferBindGroups.clear();
+        foreignTextures.clear();
+        foreignSamplers.clear();
         nodeInstanceData.clear();
         primitiveBounds.clear();
         nodeMeshLocalBounds.clear();
@@ -1236,6 +1240,34 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
         addTex(frameDesc, 6, GPU::TextureType::ttCube);     // irradianceEnvironmentMap (diffuse IBL — bakeIblResources())
         addTex(frameDesc, 7);                               // brdfLutTexture (2D, IBL specular Fresnel — bakeIblResources())
         addSamp(frameDesc, 8);                              // brdfLutSampler (reuses fxaaSampler, clamp-to-edge)
+        {                                                   // shadowMap (sun shadows, depth)
+            GPU::EntryObject e{};
+            e.binding    = 9;
+            e.visibility = GPU::ShaderStage::fragment;
+            e.type       = GPU::EntryObjectType::texture;
+            e.data.texture.multisampled  = false;
+            e.data.texture.sampleType    = GPU::EntryObjectTextureType::ttDepth;
+            e.data.texture.viewDimension = GPU::TextureType::tt2d;
+            frameDesc.entries.push_back(e);
+        }
+        {                                                   // shadowSampler (comparison)
+            GPU::EntryObject e{};
+            e.binding    = 10;
+            e.visibility = GPU::ShaderStage::fragment;
+            e.type       = GPU::EntryObjectType::sampler;
+            e.data.sampler.type = GPU::EntryObjectSamplerType::comparison;
+            frameDesc.entries.push_back(e);
+        }
+        {                                                   // shadowMapNear (near cascade, depth)
+            GPU::EntryObject e{};
+            e.binding    = 11;
+            e.visibility = GPU::ShaderStage::fragment;
+            e.type       = GPU::EntryObjectType::texture;
+            e.data.texture.multisampled  = false;
+            e.data.texture.sampleType    = GPU::EntryObjectTextureType::ttDepth;
+            e.data.texture.viewDimension = GPU::TextureType::tt2d;
+            frameDesc.entries.push_back(e);
+        }
         vulkanFrameBindGroupLayout = device->createBindGroupLayout(frameDesc);
     }
 #if defined(__EMSCRIPTEN__)
@@ -1431,7 +1463,7 @@ void Renderer::rebuildDirectXCombinedBindGroups(uint32_t frameIndex,
 // convertEquirectangularImageToCubemap). Vulkan-only for now; a no-op on
 // other backends until the Metal port lands.
 void Renderer::bakeIblResources() {
-#if defined(ANDROID) || defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
+#if defined(ANDROID) || defined(__linux__) || defined(__APPLE__) || defined(_WIN32) || defined(__EMSCRIPTEN__)
     namespace GPU = systems::leal::campello_gpu;
 #if CAMPELLO_RENDERER_VK_BINDINGS
     if (!device || !environmentMap || !environmentSampler || !pipelineIblBake ||
@@ -1450,11 +1482,6 @@ void Renderer::bakeIblResources() {
     }
 #endif
 
-    if (!iblBakeUniformBuffer) {
-        iblBakeUniformBuffer = device->createBuffer(16, GPU::BufferUsage::uniform);
-        if (!iblBakeUniformBuffer) return;
-    }
-
     struct IblBakeUboData {
         int32_t mode;       // 0 = BRDF LUT, 1 = GGX prefilter, 2 = irradiance convolution
         int32_t faceIndex;  // 0..5, used for mode 1/2
@@ -1462,66 +1489,18 @@ void Renderer::bakeIblResources() {
         float   outputSize; // resolution (texels, square) of the current render target
     };
 
-    // Runs one bake draw into `targetView`. This whole function runs once per
-    // environment load (not per-frame), so a full submit+wait per draw (safe
-    // reuse of the single shared iblBakeUniformBuffer across draws, no manual
-    // sync needed) is an acceptable cost for baking correctness/simplicity
-    // over throughput — a handful of small submissions, not a hot path.
+    // The bake draws are collected and recorded into one command buffer,
+    // each with its own 256-byte uniform slot, then submitted once and
+    // waited for (a submit and wait per draw was ~66 round trips, slow where
+    // waiting yields to the browser).
+    struct BakeJob {
+        IblBakeUboData data;
+        std::shared_ptr<GPU::TextureView> target;
+    };
+    std::vector<BakeJob> jobs;
     auto bakeDraw = [&](const IblBakeUboData &data,
                          const std::shared_ptr<GPU::TextureView> &targetView) {
-        if (!targetView) return;
-        iblBakeUniformBuffer->upload(0, sizeof(data), const_cast<IblBakeUboData*>(&data));
-
-        GPU::BindGroupDescriptor bgDesc{};
-        bgDesc.layout = iblBakeBindGroupLayout;
-#if defined(__APPLE__) || defined(_WIN32)
-        // Metal and D3D12 both give texture/buffer/sampler independent per-type
-        // argument/register spaces, so binding 0 as both a buffer and a texture
-        // (see iblBakePixel's register(b0)/register(t0) in shaders/directx/
-        // default.hlsl, or iblBakeFragment's [[buffer(0)]]/[[texture(0)]] on
-        // Metal) is valid — same same-number-different-type convention already
-        // used throughout ensureBindGroupLayout() (e.g. binding 17 is both
-        // clearcoatTexture and the MaterialUniforms buffer).
-        bgDesc.entries = {
-            {0, GPU::BufferBinding{iblBakeUniformBuffer, 0, 16}},
-            {0, environmentMap},
-            {1, environmentSampler},
-        };
-#else
-        bgDesc.entries = {
-            {0, GPU::BufferBinding{iblBakeUniformBuffer, 0, 16}},
-            {1, environmentMap},
-            {2, environmentSampler},
-        };
-#endif
-        auto bindGroup = device->createBindGroup(bgDesc);
-        if (!bindGroup) return;
-
-        auto encoder = device->createCommandEncoder();
-        if (!encoder) return;
-
-        GPU::ColorAttachment ca{};
-        ca.clearValue[0] = 0.0f; ca.clearValue[1] = 0.0f;
-        ca.clearValue[2] = 0.0f; ca.clearValue[3] = 1.0f;
-        ca.depthSlice = 0;
-        ca.loadOp  = GPU::LoadOp::clear;
-        ca.storeOp = GPU::StoreOp::store;
-        ca.view = targetView;
-
-        GPU::BeginRenderPassDescriptor rpDesc{};
-        rpDesc.colorAttachments = { ca };
-        auto rpe = encoder->beginRenderPass(rpDesc);
-        if (rpe) {
-            rpe->setViewport(0.0f, 0.0f, data.outputSize, data.outputSize, 0.0f, 1.0f);
-            rpe->setScissorRect(0.0f, 0.0f, data.outputSize, data.outputSize);
-            rpe->setPipeline(pipelineIblBake);
-            rpe->setBindGroup(0, bindGroup);
-            rpe->draw(3);
-            rpe->end();
-        }
-        auto fence = device->createFence();
-        device->submit(encoder->finish(), fence);
-        if (fence) fence->wait();
+        if (targetView) jobs.push_back({data, targetView});
     };
 
     // 1) BRDF LUT — environment-independent (Karis split-sum integral over
@@ -1582,6 +1561,71 @@ void Renderer::bakeIblResources() {
             }
         }
     }
+
+    if (jobs.empty()) return;
+    constexpr uint64_t kSlot = 256;  // uniform buffer offset alignment (WebGPU, D3D12)
+    iblBakeUniformBuffer = device->createBuffer(jobs.size() * kSlot, GPU::BufferUsage::uniform);
+    if (!iblBakeUniformBuffer) return;
+    {
+        std::vector<uint8_t> slots(jobs.size() * kSlot, 0);
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            std::memcpy(slots.data() + i * kSlot, &jobs[i].data, sizeof(IblBakeUboData));
+        }
+        iblBakeUniformBuffer->upload(0, slots.size(), slots.data());
+    }
+    auto encoder = device->createCommandEncoder();
+    if (!encoder) return;
+    std::vector<std::shared_ptr<GPU::BindGroup>> groups;  // alive until the bake has run
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        const auto& job = jobs[i];
+        GPU::BindGroupDescriptor bgDesc{};
+        bgDesc.layout = iblBakeBindGroupLayout;
+        const GPU::BufferBinding uniforms{iblBakeUniformBuffer, i * kSlot, 16};
+#if defined(__APPLE__) || defined(_WIN32)
+        // Metal and D3D12 both give texture/buffer/sampler independent per-type
+        // argument/register spaces, so binding 0 as both a buffer and a texture
+        // (see iblBakePixel's register(b0)/register(t0) in shaders/directx/
+        // default.hlsl, or iblBakeFragment's [[buffer(0)]]/[[texture(0)]] on
+        // Metal) is valid — same same-number-different-type convention already
+        // used throughout ensureBindGroupLayout() (e.g. binding 17 is both
+        // clearcoatTexture and the MaterialUniforms buffer).
+        bgDesc.entries = {
+            {0, uniforms},
+            {0, environmentMap},
+            {1, environmentSampler},
+        };
+#else
+        bgDesc.entries = {
+            {0, uniforms},
+            {1, environmentMap},
+            {2, environmentSampler},
+        };
+#endif
+        auto bindGroup = device->createBindGroup(bgDesc);
+        if (!bindGroup) continue;
+        groups.push_back(bindGroup);
+
+        GPU::ColorAttachment ca{};
+        ca.clearValue[0] = 0.0f; ca.clearValue[1] = 0.0f;
+        ca.clearValue[2] = 0.0f; ca.clearValue[3] = 1.0f;
+        ca.depthSlice = 0;
+        ca.loadOp  = GPU::LoadOp::clear;
+        ca.storeOp = GPU::StoreOp::store;
+        ca.view = job.target;
+        GPU::BeginRenderPassDescriptor rpDesc{};
+        rpDesc.colorAttachments = { ca };
+        if (auto rpe = encoder->beginRenderPass(rpDesc)) {
+            rpe->setViewport(0.0f, 0.0f, job.data.outputSize, job.data.outputSize, 0.0f, 1.0f);
+            rpe->setScissorRect(0.0f, 0.0f, job.data.outputSize, job.data.outputSize);
+            rpe->setPipeline(pipelineIblBake);
+            rpe->setBindGroup(0, bindGroup);
+            rpe->draw(3);
+            rpe->end();
+        }
+    }
+    auto fence = device->createFence();
+    device->submit(encoder->finish(), fence);
+    if (fence) fence->wait();
 #endif
 }
 
@@ -2393,6 +2437,7 @@ void Renderer::setScene(uint32_t index) {
         // No separate flat shader on Vulkan (pipelineFlat aliases pipelineTextured) —
         // reuse the same fully-populated bind group for both.
         defaultFlatBindGroup = defaultBindGroup;
+        rememberMaterialBufferBindGroup("default", bgDesc, defaultBindGroup);
     }
 #elif defined(_WIN32)
     ensureDirectXPbrBindGroupLayout();
@@ -2519,6 +2564,9 @@ void Renderer::setScene(uint32_t index) {
                 {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
                 {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
                 {8, fxaaSampler},
+                {9, shadowMapBinding()},
+                {10, shadowSamplerBinding()},
+                {11, shadowMapNearBinding()},
             };
             frameBindGroup[f] = device->createBindGroup(bgDesc);
         }
@@ -2842,6 +2890,7 @@ void Renderer::setScene(uint32_t index) {
             materialBindGroups[m] = device->createBindGroup(bgDesc, /*persistent=*/true);
             // No separate flat shader on Vulkan — reuse the same bind group.
             flatMaterialBindGroups[m] = materialBindGroups[m];
+            rememberMaterialBufferBindGroup("scene:" + std::to_string(m), bgDesc, materialBindGroups[m]);
 #elif defined(_WIN32)
             ensureDirectXPbrBindGroupLayout();
             DirectXMaterialResources& res = directxMaterialResources[m];
@@ -3408,7 +3457,8 @@ void Renderer::detectQuantizedLayout() {
 #endif
 }
 
-const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines) const {
+const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines,
+                                                          bool wide) const {
     if (program >= programs.size()) return nullptr;
     // The stage that reads the most attributes among those reading only
     // attributes the layout has (the full shader for glTF meshes, the lean
@@ -3416,7 +3466,7 @@ const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program,
     const uint32_t has = layout.semanticMask();
     const MeshVertexStage* best = nullptr;
     for (const auto& stage : programs[program].vertexStages) {
-        if (stage.lines != lines) continue;
+        if (stage.lines != lines || stage.wide != wide) continue;
         if ((stage.readMask & ~has) != 0) continue;
         if (!best || std::popcount(stage.readMask) > std::popcount(best->readMask)) best = &stage;
     }
@@ -3425,10 +3475,20 @@ const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program,
 
 const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     ProgramHandle programHandle, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
-    systems::leal::campello_gpu::PixelFormat colorFormat, systems::leal::campello_gpu::PrimitiveTopology topology) {
+    systems::leal::campello_gpu::PixelFormat colorFormat, systems::leal::campello_gpu::PrimitiveTopology topology,
+    bool wideLines) {
     namespace GPU = systems::leal::campello_gpu;
     if (!meshRecipe.ready || !device || programHandle >= programs.size()) return nullptr;
     const ProgramState& program = programs[programHandle];
+    // Wide lines: their own vertex and fragment stages, always blended
+    // (coverage antialiasing) and double-sided.
+    if (wideLines) {
+        if (program.wideLineFragment.empty()) return nullptr;
+        blend = true;
+        doubleSided = true;
+        topology = GPU::PrimitiveTopology::triangleList;
+        variant = MeshProgram::textured;
+    }
     // Normalise to what this program/backend distinguishes, so equivalent
     // requests share one pipeline (Vulkan/DirectX PBR: one fragment shader,
     // no blending; app programs: one fragment shader).
@@ -3439,7 +3499,7 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     const bool lines = topology != GPU::PrimitiveTopology::triangleList &&
                        topology != GPU::PrimitiveTopology::triangleStrip;
     if (lines) doubleSided = true;  // no faces to cull
-    const MeshVertexStage* stage = vertexStageFor(programHandle, layout, lines);
+    const MeshVertexStage* stage = vertexStageFor(programHandle, layout, lines, wideLines);
     if (!stage) return nullptr;
 
     // Only the attributes the stage reads shape the pipeline.
@@ -3458,6 +3518,7 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     mix((uint64_t)topology);
     mix(doubleSided ? 1u : 0u);
     mix(blend ? 1u : 0u);
+    mix(wideLines ? 1u : 0u);
     if (auto it = meshPipelineCache.find(key); it != meshPipelineCache.end()) {
         return it->second.pipeline ? &it->second : nullptr;
     }
@@ -3504,9 +3565,19 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
         color.blend = meshRecipe.alphaBlend;
         d.depthStencil = meshRecipe.blendDepthStencil;
     }
+    if (wideLines) {
+        // "Darkest wins": overlapping lines (crowded edges far away, the
+        // same edge from two elements) don't stack into a heavier line.
+        // fragmentWideLine outputs white blended towards the line colour by
+        // coverage, so min() keeps whichever is darker.
+        GPU::BlendState darkest{};
+        darkest.color = {GPU::BlendFactor::one, GPU::BlendFactor::one, GPU::BlendOperation::min};
+        darkest.alpha = {GPU::BlendFactor::one, GPU::BlendFactor::one, GPU::BlendOperation::max};
+        color.blend = darkest;
+    }
     GPU::FragmentDescriptor frag{};
     frag.module     = program.fragmentModule;
-    frag.entryPoint = program.fragmentEntries[(size_t)variant];
+    frag.entryPoint = wideLines ? program.wideLineFragment : program.fragmentEntries[(size_t)variant];
     frag.targets.push_back(color);
     d.fragment = frag;
 
@@ -3514,6 +3585,485 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     // A failed creation (null pipeline) is cached too, so it isn't retried every draw.
     auto& stored = meshPipelineCache[key] = entry;
     return stored.pipeline ? &stored : nullptr;
+}
+
+void Renderer::setShadowMapResolution(uint32_t texels) {
+    texels = std::clamp(texels, 256u, 8192u);
+    if (texels != shadowMapResolution) {
+        shadowMapResolution = texels;
+        shadowMap.reset();
+        shadowMapView.reset();
+        shadowMapNear.reset();
+        shadowMapNearView.reset();
+    }
+}
+
+bool Renderer::ensureShadowMap() {
+    namespace GPU = systems::leal::campello_gpu;
+    if (shadowMap && shadowMapView) return true;
+    if (!device) return false;
+    shadowMapValid = false;
+    shadowNearValid = false;
+    shadowMap = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::depth32float, shadowMapResolution,
+                                      shadowMapResolution, 1, 1, 1,
+                                      (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                                          uint32_t(GPU::TextureUsage::textureBinding)));
+    if (!shadowMap) return false;
+    shadowMapView = shadowMap->createView(GPU::PixelFormat::depth32float, 1, GPU::Aspect::depthOnly, 0, 0, GPU::TextureType::tt2d, 1);
+    if (!shadowMapView) return false;
+    shadowMapNear = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::depth32float, shadowMapResolution,
+                                          shadowMapResolution, 1, 1, 1,
+                                          (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                                              uint32_t(GPU::TextureUsage::textureBinding)));
+    shadowMapNearView = shadowMapNear ? shadowMapNear->createView(GPU::PixelFormat::depth32float, 1, GPU::Aspect::depthOnly, 0, 0,
+                                                                  GPU::TextureType::tt2d, 1)
+                                      : nullptr;
+    return true;  // the near cascade is optional
+}
+
+void Renderer::createAmbientOcclusionPipelines(const std::shared_ptr<systems::leal::campello_gpu::ShaderModule>& vertexModule,
+                                               const char* vertexEntry,
+                                               const std::shared_ptr<systems::leal::campello_gpu::ShaderModule>& aoModule,
+                                               const char* aoEntry,
+                                               const std::shared_ptr<systems::leal::campello_gpu::ShaderModule>& applyModule,
+                                               const char* applyEntry,
+                                               systems::leal::campello_gpu::PixelFormat colorFormat) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!vertexModule || !aoModule || !applyModule) return;
+    if (!aoBindGroupLayout) {
+        GPU::BindGroupLayoutDescriptor desc{};
+        GPU::EntryObject depth{};
+        depth.binding = 0;
+        depth.visibility = GPU::ShaderStage::fragment;
+        depth.type = GPU::EntryObjectType::texture;
+        depth.data.texture.multisampled = false;
+        depth.data.texture.sampleType = GPU::EntryObjectTextureType::ttDepth;
+        depth.data.texture.viewDimension = GPU::TextureType::tt2d;
+        desc.entries.push_back(depth);
+        GPU::EntryObject ao{};
+        ao.binding = 1;
+        ao.visibility = GPU::ShaderStage::fragment;
+        ao.type = GPU::EntryObjectType::texture;
+        ao.data.texture.multisampled = false;
+        ao.data.texture.sampleType = GPU::EntryObjectTextureType::ttUnfilterableFloat;
+        ao.data.texture.viewDimension = GPU::TextureType::tt2d;
+        desc.entries.push_back(ao);
+        GPU::EntryObject uniforms{};
+        uniforms.binding = 2;
+        uniforms.visibility = GPU::ShaderStage::fragment;
+        uniforms.type = GPU::EntryObjectType::buffer;
+        uniforms.data.buffer.hasDinamicOffaset = false;
+        uniforms.data.buffer.minBindingSize = 160;
+        uniforms.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+        desc.entries.push_back(uniforms);
+        GPU::EntryObject sampler{};  // texel reads in GLSL need one; the others ignore it
+        sampler.binding = 3;
+        sampler.visibility = GPU::ShaderStage::fragment;
+        sampler.type = GPU::EntryObjectType::sampler;
+        sampler.data.sampler.type = GPU::EntryObjectSamplerType::nonFiltering;
+        desc.entries.push_back(sampler);
+        aoBindGroupLayout = device->createBindGroupLayout(desc);
+    }
+    if (!aoBindGroupLayout) return;
+    GPU::PipelineLayoutDescriptor plDesc{};
+    plDesc.bindGroupLayouts = {aoBindGroupLayout};
+    const auto layout = device->createPipelineLayout(plDesc);
+
+    const auto make = [&](const std::shared_ptr<GPU::ShaderModule>& module, const char* entry, GPU::PixelFormat format,
+                          bool multiply) {
+        GPU::RenderPipelineDescriptor desc{};
+        desc.layout = layout;
+        desc.vertex.module = vertexModule;
+        desc.vertex.entryPoint = vertexEntry;
+        desc.topology = GPU::PrimitiveTopology::triangleList;
+        desc.cullMode = GPU::CullMode::none;
+        desc.frontFace = GPU::FrontFace::ccw;
+        GPU::FragmentDescriptor frag{};
+        frag.module = module;
+        frag.entryPoint = entry;
+        GPU::ColorState cs{};
+        cs.format = format;
+        cs.writeMask = GPU::ColorWrite::all;
+        if (multiply) {
+            // frame x AO; the frame's alpha stays.
+            GPU::BlendState blend{};
+            blend.color = {GPU::BlendFactor::dstColor, GPU::BlendFactor::zero, GPU::BlendOperation::add};
+            blend.alpha = {GPU::BlendFactor::zero, GPU::BlendFactor::one, GPU::BlendOperation::add};
+            cs.blend = blend;
+        }
+        frag.targets.push_back(cs);
+        desc.fragment = frag;
+        return device->createRenderPipeline(desc);
+    };
+    aoPipeline = make(aoModule, aoEntry, GPU::PixelFormat::rgba8unorm, false);
+    aoApplyPipeline = make(applyModule, applyEntry, colorFormat, true);
+}
+
+void Renderer::encodeAmbientOcclusion(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
+                                      const std::shared_ptr<systems::leal::campello_gpu::TextureView>& colorView,
+                                      const systems::leal::vector_math::Matrix4<double>& projection) {
+    namespace GPU = systems::leal::campello_gpu;
+    using TU = GPU::TextureUsage;
+    if (!aoEnabled || activeProgramPass || !aoPipeline || !aoApplyPipeline || !aoBindGroupLayout || !depthTexture ||
+        !colorView || renderWidth == 0 || renderHeight == 0 || !defaultTexture) {
+        return;
+    }
+    if (!aoTexture || aoTexture->getWidth() != renderWidth || aoTexture->getHeight() != renderHeight) {
+        aoTexture = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm, renderWidth, renderHeight, 1, 1, 1,
+                                          (TU)(uint32_t(TU::renderTarget) | uint32_t(TU::textureBinding)));
+        aoView = aoTexture ? aoTexture->createView(GPU::PixelFormat::rgba8unorm, 1) : nullptr;
+    }
+    if (!aoView) return;
+    if (!aoSampler) {
+        GPU::SamplerDescriptor sd{};
+        sd.magFilter = GPU::FilterMode::fmNearest;
+        sd.minFilter = GPU::FilterMode::fmNearest;
+        sd.lodMinClamp = 0.0;
+        sd.lodMaxClamp = 0.0;
+        sd.maxAnisotropy = 1.0;
+        aoSampler = device->createSampler(sd);
+    }
+    if (!aoSampler) return;
+    auto& uniforms = aoUniformBuffer[currentFrameIndex];
+    if (!uniforms) uniforms = device->createBuffer(160, GPU::BufferUsage::uniform);
+    if (!uniforms) return;
+    float data[40] = {0};
+    const auto inverse = projection.inverted();
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            data[col * 4 + row] = (float)projection.data[row * 4 + col];
+            data[16 + col * 4 + row] = (float)inverse.data[row * 4 + col];
+        }
+    }
+    data[32] = aoRadius;
+    data[33] = aoIntensity;
+    data[34] = aoBias;
+    data[35] = (float)aoSamples;
+    data[36] = (float)depthTexture->getWidth();
+    data[37] = (float)depthTexture->getHeight();
+    data[38] = (float)renderWidth;
+    data[39] = (float)renderHeight;
+    uniforms->upload(0, sizeof(data), data);
+
+    GPU::BindGroupDescriptor aoDesc{};
+    aoDesc.layout = aoBindGroupLayout;
+    aoDesc.entries = {{0, depthTexture}, {1, defaultTexture}, {2, GPU::BufferBinding{uniforms, 0, 160}}, {3, aoSampler}};
+    const auto aoGroup = device->createBindGroup(aoDesc);
+    GPU::BindGroupDescriptor applyDesc{};
+    applyDesc.layout = aoBindGroupLayout;
+    applyDesc.entries = {{0, depthTexture}, {1, aoTexture}, {2, GPU::BufferBinding{uniforms, 0, 160}}, {3, aoSampler}};
+    const auto applyGroup = device->createBindGroup(applyDesc);
+    if (!aoGroup || !applyGroup) return;
+
+    const auto pass = [&](const std::shared_ptr<GPU::TextureView>& target, GPU::LoadOp load,
+                          const std::shared_ptr<GPU::RenderPipeline>& pipeline,
+                          const std::shared_ptr<GPU::BindGroup>& group) {
+        GPU::ColorAttachment ca{};
+        ca.view = target;
+        ca.clearValue[0] = ca.clearValue[1] = ca.clearValue[2] = ca.clearValue[3] = 1.0f;
+        ca.loadOp = load;
+        ca.storeOp = GPU::StoreOp::store;
+        ca.depthSlice = 0;
+        GPU::BeginRenderPassDescriptor desc{};
+        desc.colorAttachments = {ca};
+        if (auto rpe = encoder->beginRenderPass(desc)) {
+            rpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
+            rpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+            rpe->setPipeline(pipeline);
+            rpe->setBindGroup(0, group);
+            rpe->draw(3);
+            rpe->end();
+        }
+    };
+    pass(aoView, GPU::LoadOp::clear, aoPipeline, aoGroup);
+    pass(colorView, GPU::LoadOp::load, aoApplyPipeline, applyGroup);
+}
+
+uint64_t Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
+                                    const std::shared_ptr<systems::leal::campello_gpu::TextureView>& target,
+                                    const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+                                    const systems::leal::vector_math::Matrix4<double>& lightViewProj,
+                                    uint64_t transformsOffset) {
+    namespace GPU = systems::leal::campello_gpu;
+    GPU::DepthStencilAttachment shadowDepth{};
+    shadowDepth.view = target;
+    shadowDepth.depthClearValue = 1.0f;
+    shadowDepth.depthLoadOp = GPU::LoadOp::clear;
+    shadowDepth.depthStoreOp = GPU::StoreOp::store;
+    shadowDepth.depthReadOnly = false;
+    shadowDepth.stencilClearValue = 0;
+    shadowDepth.stencilLoadOp = GPU::LoadOp::clear;
+    shadowDepth.stencilStoreOp = GPU::StoreOp::discard;
+    shadowDepth.stencilReadOnly = false;
+    GPU::BeginRenderPassDescriptor shadowDesc{};
+    shadowDesc.depthStencilAttachment = shadowDepth;
+    auto rpe = encoder->beginRenderPass(shadowDesc);
+    if (!rpe) return transformsOffset;
+    const float size = (float)shadowMapResolution;
+    rpe->setViewport(0.0f, 0.0f, size, size, 0.0f, 1.0f);
+    rpe->setScissorRect(0.0f, 0.0f, size, size);
+    rpe->setPipeline(shadowPipeline);
+#if defined(__EMSCRIPTEN__)
+    rpe->setBindGroup(0, shadowEmptyBindGroup);
+    rpe->setBindGroup(1, shadowEmptyBindGroup);
+    webgpuBoundDrawGroup = nullptr;
+#endif
+    // Per caster: the light's clip from local for the lean vertex stage (and
+    // the model matrix), after the draws' own transforms.
+    uint64_t offset = transformsOffset;
+    for (const auto& draw : casters) {
+        if (!draw.mesh || !draw.material || draw.material->alphaBlend ||
+            draw.mesh->topology != GPU::PrimitiveTopology::triangleList) {
+            continue;
+        }
+        const auto& positions = draw.mesh->vertexBuffers[VERTEX_SLOT_POSITION];
+        const VertexAttributeFormat* format = draw.mesh->layout ? draw.mesh->layout->find(VertexSemantic::position) : nullptr;
+        const bool floatPositions = !draw.mesh->layout || (format && format->componentType == GPU::ComponentType::ctFloat &&
+                                                           format->accessorType == GPU::AccessorType::acVec3);
+        if (!positions || !floatPositions) continue;
+        if (offset + 128 > transformBuffer->getLength()) break;
+        float matrices[32];
+        const auto lightMvp = lightViewProj * draw.worldTransform;
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 4; ++col) {
+                matrices[col * 4 + row] = (float)lightMvp.data[row * 4 + col];
+                matrices[16 + col * 4 + row] = (float)draw.worldTransform.data[row * 4 + col];
+            }
+        }
+        transformBuffer->upload(offset, 128, matrices);
+        rpe->setVertexBuffer(0, positions, 0);
+        uint32_t firstInstance = 0;
+#if defined(__EMSCRIPTEN__)
+        bindWebGpuTransforms(rpe, transformBuffer, offset);
+        firstInstance = webgpuFirstInstance;
+#elif CAMPELLO_RENDERER_VK_BINDINGS
+        rpe->setVertexBuffer(1, transformBuffer, offset);
+#else
+        rpe->setVertexBuffer(16, transformBuffer, offset);
+#endif
+        offset += 128;
+        if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
+            rpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
+            rpe->drawIndexed(draw.mesh->indexCount, 1, 0, 0, firstInstance);
+        } else {
+            rpe->draw(draw.mesh->vertexCount, 1, 0, firstInstance);
+        }
+    }
+    rpe->end();
+#if defined(__EMSCRIPTEN__)
+    webgpuBoundDrawGroup = nullptr;  // per pass
+#endif
+    return offset;
+}
+
+std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::shadowMapBinding() {
+    namespace GPU = systems::leal::campello_gpu;
+    if (shadowMap) return shadowMap;
+    if (!shadowMapPlaceholder && device) {
+        shadowMapPlaceholder = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::depth32float, 1, 1, 1, 1, 1,
+                                                     (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                                                         uint32_t(GPU::TextureUsage::textureBinding)));
+    }
+    return shadowMapPlaceholder;
+}
+
+std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::shadowMapNearBinding() {
+    if (shadowMapNear) return shadowMapNear;
+    return shadowMapBinding();  // the placeholder (or the far map)
+}
+
+std::shared_ptr<systems::leal::campello_gpu::Sampler> Renderer::shadowSamplerBinding() {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!shadowSampler && device) {
+        GPU::SamplerDescriptor sd{};
+        sd.magFilter = GPU::FilterMode::fmLinear;
+        sd.minFilter = GPU::FilterMode::fmLinear;
+        sd.addressModeU = GPU::WrapMode::clampToEdge;
+        sd.addressModeV = GPU::WrapMode::clampToEdge;
+        sd.addressModeW = GPU::WrapMode::clampToEdge;
+        sd.lodMinClamp = 0.0;
+        sd.lodMaxClamp = 1000.0;
+        sd.maxAnisotropy = 1.0;
+        sd.compare = GPU::CompareOp::lessEqual;
+        shadowSampler = device->createSampler(sd);
+    }
+    return shadowSampler;
+}
+
+bool Renderer::fitShadowLight(const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+                              const systems::leal::vector_math::Vector3<double>& toLight, ShadowFit& fit) const {
+    namespace VM = systems::leal::vector_math;
+    using M4 = VM::Matrix4<double>;
+    // World bounds of the casters that have bounds.
+    double lo[3] = {1e300, 1e300, 1e300};
+    double hi[3] = {-1e300, -1e300, -1e300};
+    bool any = false;
+    for (const auto& draw : casters) {
+        if (!draw.mesh || !draw.mesh->hasBounds ||
+            draw.mesh->topology != systems::leal::campello_gpu::PrimitiveTopology::triangleList) continue;
+        const auto& m = draw.worldTransform.data;
+        for (int corner = 0; corner < 8; ++corner) {
+            const double p[3] = {(corner & 1) ? draw.mesh->boundsMax[0] : draw.mesh->boundsMin[0],
+                                 (corner & 2) ? draw.mesh->boundsMax[1] : draw.mesh->boundsMin[1],
+                                 (corner & 4) ? draw.mesh->boundsMax[2] : draw.mesh->boundsMin[2]};
+            for (int r = 0; r < 3; ++r) {
+                const double w = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3];
+                lo[r] = std::min(lo[r], w);
+                hi[r] = std::max(hi[r], w);
+            }
+        }
+        any = true;
+    }
+    const double len = std::sqrt(toLight.x() * toLight.x() + toLight.y() * toLight.y() + toLight.z() * toLight.z());
+    if (!any || len < 1e-9) return false;
+    const VM::Vector3<double> dir(toLight.x() / len, toLight.y() / len, toLight.z() / len);
+    const VM::Vector3<double> centre((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2);
+    const double radius = std::max(0.5 * std::sqrt((hi[0] - lo[0]) * (hi[0] - lo[0]) + (hi[1] - lo[1]) * (hi[1] - lo[1]) +
+                                                   (hi[2] - lo[2]) * (hi[2] - lo[2])),
+                                   1e-3);
+    const VM::Vector3<double> eye(centre.x() + dir.x() * radius * 2, centre.y() + dir.y() * radius * 2,
+                                  centre.z() + dir.z() * radius * 2);
+    // Any up that isn't along the light.
+    const VM::Vector3<double> up = std::abs(dir.z()) > 0.9 ? VM::Vector3<double>(0, 1, 0) : VM::Vector3<double>(0, 0, 1);
+    fit.lightView = M4::lookAt(eye, centre, up);
+    // The bounds' corners in light view space give a tight orthographic box.
+    double vlo[3] = {1e300, 1e300, 1e300};
+    double vhi[3] = {-1e300, -1e300, -1e300};
+    const auto& v = fit.lightView.data;
+    for (int corner = 0; corner < 8; ++corner) {
+        const double p[3] = {(corner & 1) ? hi[0] : lo[0], (corner & 2) ? hi[1] : lo[1], (corner & 4) ? hi[2] : lo[2]};
+        for (int r = 0; r < 3; ++r) {
+            const double w = v[r * 4] * p[0] + v[r * 4 + 1] * p[1] + v[r * 4 + 2] * p[2] + v[r * 4 + 3];
+            vlo[r] = std::min(vlo[r], w);
+            vhi[r] = std::max(vhi[r], w);
+        }
+    }
+    // Depth along the view direction, whichever way lookAt() points it: the
+    // centre must come out in front (positive), mapped near..far to [0, 1].
+    const double centreZ = v[8] * centre.x() + v[9] * centre.y() + v[10] * centre.z() + v[11];
+    fit.sign = centreZ < 0.0 ? -1.0 : 1.0;
+    const double depthLo = fit.sign > 0 ? vlo[2] : -vhi[2];
+    const double depthHi = fit.sign > 0 ? vhi[2] : -vlo[2];
+    fit.n = depthLo - 1e-3 * radius;
+    fit.f = depthHi + 1e-3 * radius;
+    fit.full[0] = vlo[0];
+    fit.full[1] = vhi[0];
+    fit.full[2] = vlo[1];
+    fit.full[3] = vhi[1];
+    for (int k = 0; k < 3; ++k) {
+        fit.lo[k] = lo[k];
+        fit.hi[k] = hi[k];
+    }
+    return true;
+}
+
+systems::leal::vector_math::Matrix4<double> Renderer::shadowProjection(const ShadowFit& fit, const double rect[4]) {
+    using M4 = systems::leal::vector_math::Matrix4<double>;
+    const double l = rect[0], r = rect[1], b = rect[2], t = rect[3];
+    M4 ortho = M4::identity();
+    ortho.data[0] = 2.0 / (r - l);
+    ortho.data[3] = -(r + l) / (r - l);
+    ortho.data[5] = 2.0 / (t - b);
+    ortho.data[7] = -(t + b) / (t - b);
+    ortho.data[10] = fit.sign / (fit.f - fit.n);
+    ortho.data[11] = -fit.n / (fit.f - fit.n);
+    return ortho * fit.lightView;
+}
+
+bool Renderer::nearShadowRect(const ShadowFit& fit, const CameraData& camera, double rect[4]) {
+    using M4 = systems::leal::vector_math::Matrix4<double>;
+    const M4& view = camera.view;
+    const M4 invView = view.inverted();
+    const M4 invProj = camera.projection.inverted();
+    const auto unproject = [&](double x, double y, double z, double out[3]) {
+        const double* m = invProj.data;
+        const double w = m[12] * x + m[13] * y + m[14] * z + m[15];
+        if (std::abs(w) < 1e-12) return false;
+        for (int r = 0; r < 3; ++r) out[r] = (m[r * 4] * x + m[r * 4 + 1] * y + m[r * 4 + 2] * z + m[r * 4 + 3]) / w;
+        return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+    };
+    // Forward along view z: the sign of the near plane's z (either handedness).
+    double nearPoint[3];
+    if (!unproject(0.0, 0.0, 0.0, nearPoint) || std::abs(nearPoint[2]) < 1e-12) return false;
+    const double forward = nearPoint[2] < 0.0 ? -1.0 : 1.0;
+    const double cameraNear = forward * nearPoint[2];
+    const bool orthographic = std::abs(camera.projection.data[15] - 1.0) < 1e-9 && std::abs(camera.projection.data[14]) < 1e-9;
+    // The casters' depth range in front of the camera.
+    double dMin = 1e300, dMax = -1e300;
+    for (int corner = 0; corner < 8; ++corner) {
+        const double p[3] = {(corner & 1) ? fit.hi[0] : fit.lo[0], (corner & 2) ? fit.hi[1] : fit.lo[1],
+                             (corner & 4) ? fit.hi[2] : fit.lo[2]};
+        const double* v = view.data;
+        const double d = forward * (v[8] * p[0] + v[9] * p[1] + v[10] * p[2] + v[11]);
+        dMin = std::min(dMin, d);
+        dMax = std::max(dMax, d);
+    }
+    if (dMax <= cameraNear) return false;
+    const double sliceNear = std::max(cameraNear, std::max(dMin, dMax * 0.01));
+    // Halfway between the logarithmic and the uniform split (the usual
+    // "practical" split of cascaded shadow maps).
+    const double sliceFar = 0.5 * (std::sqrt(sliceNear * dMax) + 0.5 * (sliceNear + dMax));
+    if (sliceFar >= 0.6 * dMax) return false;
+    // The slice's corners, world, then light view.
+    double lo[2] = {1e300, 1e300}, hi[2] = {-1e300, -1e300};
+    for (int corner = 0; corner < 8; ++corner) {
+        const double x = (corner & 1) ? 1.0 : -1.0, y = (corner & 2) ? 1.0 : -1.0;
+        const double depth = (corner & 4) ? sliceFar : sliceNear;
+        double q[3];
+        if (!unproject(x, y, 0.5, q)) return false;
+        double pv[3];
+        if (orthographic) {
+            pv[0] = q[0];
+            pv[1] = q[1];
+            pv[2] = forward * depth;
+        } else {
+            const double along = forward * q[2];
+            if (along <= 0.0) return false;
+            const double k = depth / along;
+            pv[0] = q[0] * k;
+            pv[1] = q[1] * k;
+            pv[2] = q[2] * k;
+        }
+        const double* iv = invView.data;
+        double pw[3];
+        for (int r = 0; r < 3; ++r) pw[r] = iv[r * 4] * pv[0] + iv[r * 4 + 1] * pv[1] + iv[r * 4 + 2] * pv[2] + iv[r * 4 + 3];
+        const double* lv = fit.lightView.data;
+        for (int r = 0; r < 2; ++r) {
+            const double w = lv[r * 4] * pw[0] + lv[r * 4 + 1] * pw[1] + lv[r * 4 + 2] * pw[2] + lv[r * 4 + 3];
+            lo[r] = std::min(lo[r], w);
+            hi[r] = std::max(hi[r], w);
+        }
+    }
+    rect[0] = std::max(lo[0], fit.full[0]);
+    rect[1] = std::min(hi[0], fit.full[1]);
+    rect[2] = std::max(lo[1], fit.full[2]);
+    rect[3] = std::min(hi[1], fit.full[3]);
+    if (rect[1] <= rect[0] || rect[3] <= rect[2]) return false;
+    const double area = (rect[1] - rect[0]) * (rect[3] - rect[2]);
+    const double fullArea = (fit.full[1] - fit.full[0]) * (fit.full[3] - fit.full[2]);
+    return area < 0.5 * fullArea;
+}
+
+Renderer::WideLineVertices Renderer::expandLines(const float* positions, size_t vertexCount, const uint32_t* indices,
+                                                  size_t indexCount, float widthPixels) {
+    WideLineVertices out;
+    const float half = std::max(0.0f, widthPixels) * 0.5f;
+    const size_t segments = indexCount / 2;
+    out.segments.reserve(segments * 8);
+    out.indices.reserve(segments * 6);
+    for (size_t s = 0; s < segments; ++s) {
+        const uint32_t ia = indices[s * 2];
+        const uint32_t ib = indices[s * 2 + 1];
+        if (ia >= vertexCount || ib >= vertexCount) continue;
+        const float* a = positions + ia * 3;
+        const float* b = positions + ib * 3;
+        if (a[0] == b[0] && a[1] == b[1] && a[2] == b[2]) continue;
+        const auto base = static_cast<uint32_t>(out.segments.size() / 8 * 4);
+        out.segments.insert(out.segments.end(), {a[0], a[1], a[2], half, b[0], b[1], b[2], 0.0f});
+        // Vertices: 0/1 at the start (sides +1/-1), 2/3 at the end (sides +1/-1).
+        for (const uint32_t i : {0u, 1u, 3u, 0u, 3u, 2u}) out.indices.push_back(base + i);
+    }
+    return out;
 }
 
 void Renderer::bindMeshBuffer(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
@@ -3629,7 +4179,7 @@ void Renderer::uploadClipUniforms(const std::shared_ptr<systems::leal::campello_
     for (size_t i = 0; i < clipPlanes.size(); ++i) {
         for (int c = 0; c < 4; ++c) block.planes[i][c] = (float)clipPlanes[i][(size_t)c];
     }
-    static_assert(sizeof(block) == kCameraUniformSize - 160, "clip block size");
+    static_assert(sizeof(block) == kCameraClipEnd - 160, "clip block size");
     buffer->upload(160, sizeof(block), &block);
 }
 
@@ -3775,10 +4325,39 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             {allSemantics, shaderModule, "vertexMain"},
             {semanticBit(VertexSemantic::position), shaderModule, "vertexLean"},
             {semanticBit(VertexSemantic::position), shaderModule, "vertexLine", true},
+            {0u, shaderModule, "vertexWideLine", false, true},  // reads segments at [[buffer(26)]]
         };
+        programs[kPbrProgram].wideLineFragment = "fragmentWideLine";
         programs[kPbrProgram].fragmentModule = shaderModule;
         programs[kPbrProgram].fragmentEntries = {"fragmentMain_flat", "fragmentMain_textured", "fragmentMain_debug"};
         meshRecipe.rawBufferSlots = true;  // [[buffer(15..23)]]: lights, transforms, material, ...
+        // Sun shadows: depth only, float3 positions at buffer 0, the model
+        // matrix at [[buffer(16)]], the light's view-projection in the camera
+        // block at [[buffer(18)]]. No culling (mixed winding), slope bias.
+        {
+            GPU::RenderPipelineDescriptor sd{};
+            sd.vertex.module = shaderModule;
+            sd.vertex.entryPoint = "vertexLean";  // mvp: the light's clip from local (encodeShadowPass())
+            GPU::VertexLayout positions{};
+            positions.arrayStride = 12;
+            positions.stepMode = GPU::StepMode::vertex;
+            GPU::VertexAttribute position{};
+            position.componentType = GPU::ComponentType::ctFloat;
+            position.accessorType = GPU::AccessorType::acVec3;
+            position.offset = 0;
+            position.shaderLocation = 0;
+            positions.attributes.push_back(position);
+            sd.vertex.buffers.push_back(positions);
+            GPU::DepthStencilDescriptor shadowDs = ds;
+            shadowDs.depthBias = 2.0;
+            shadowDs.depthBiasSlopeScale = 2.0;
+            shadowDs.depthBiasClamp = 0.01;
+            sd.depthStencil = shadowDs;
+            sd.topology = GPU::PrimitiveTopology::triangleList;
+            sd.cullMode = GPU::CullMode::none;
+            sd.frontFace = GPU::FrontFace::ccw;
+            shadowPipeline = device->createRenderPipeline(sd);
+        }
         // The per-draw transforms are also per-instance vertex attributes
         // (locations 16-19 mvp, 24-27 model, the slot after the attributes),
         // as on Vulkan/DirectX, so one program source (e.g. Slang) works on
@@ -3967,6 +4546,8 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 
         pipelineDownsample = device->createRenderPipeline(dsDesc);
     }
+    createAmbientOcclusionPipelines(shaderModule, "fxaaVertex", shaderModule, "ssaoFragment", shaderModule,
+                                    "ssaoApplyFragment", colorFormat);
 
     // --- IBL precompute pipeline (Metal) — see bakeIblResources() ---
     // Bakes the BRDF LUT / GGX-prefiltered specular cubemap / diffuse
@@ -4261,7 +4842,76 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         prewarmMeshPipelines();
     }
 
-#if !defined(__EMSCRIPTEN__)  // post-processing and bakes: no WGSL versions yet
+    // --- Sun shadows: depth only, with the lean vertex stage ---
+    // The shadow pass binds a second set of per-draw transforms whose "mvp"
+    // is the light's view-projection times the model matrix, so the lean
+    // shader (clip = mvp * position) renders the map unchanged. No culling
+    // (mixed winding), slope-scaled bias; the receiver bias is in the
+    // fragment lookup.
+    {
+        GPU::RenderPipelineDescriptor sd{};
+        GPU::VertexLayout positions{};
+        positions.arrayStride = 12;
+        positions.stepMode = GPU::StepMode::vertex;
+        GPU::VertexAttribute position{};
+        position.componentType = GPU::ComponentType::ctFloat;
+        position.accessorType = GPU::AccessorType::acVec3;
+        position.offset = 0;
+        position.shaderLocation = 0;
+        positions.attributes.push_back(position);
+        sd.vertex.buffers.push_back(positions);
+#if defined(__EMSCRIPTEN__)
+        // vs_lean reads the transforms from the storage buffer at group 2;
+        // groups 0 and 1 are empty here (the frame group holds the shadow
+        // map, which can't be bound while it's the pass's attachment).
+        sd.vertex.module = vertModule;
+        sd.vertex.entryPoint = "vs_lean";
+        if (!shadowEmptyBindGroupLayout) {
+            shadowEmptyBindGroupLayout = device->createBindGroupLayout(GPU::BindGroupLayoutDescriptor{});
+            GPU::BindGroupDescriptor emptyDesc{};
+            emptyDesc.layout = shadowEmptyBindGroupLayout;
+            shadowEmptyBindGroup = device->createBindGroup(emptyDesc, /*persistent=*/true);
+        }
+        GPU::PipelineLayoutDescriptor shadowLayout{};
+        shadowLayout.bindGroupLayouts = {shadowEmptyBindGroupLayout, shadowEmptyBindGroupLayout, webgpuDrawBindGroupLayout};
+        sd.layout = device->createPipelineLayout(shadowLayout);
+#else
+        // default_lean.vert: transforms per instance in the slot after the
+        // position (locations 16-19 mvp, 24-27 model); no descriptors.
+        sd.vertex.module = device->createShaderModule(kDefaultVulkanLeanVertShader, kDefaultVulkanLeanVertShaderSize);
+        sd.vertex.entryPoint = "main";
+        sd.vertex.buffers.push_back(desc.vertex.buffers[VERTEX_SLOT_MVP]);
+        sd.layout = vulkanDefaultPipelineLayout;
+#endif
+        GPU::DepthStencilDescriptor shadowDs = ds;
+        shadowDs.depthBias = 2.0;
+        shadowDs.depthBiasSlopeScale = 2.0;
+        shadowDs.depthBiasClamp = 0.01;
+        sd.depthStencil = shadowDs;
+        sd.topology = GPU::PrimitiveTopology::triangleList;
+        sd.cullMode = GPU::CullMode::none;
+        sd.frontFace = GPU::FrontFace::ccw;
+        if (sd.vertex.module && sd.layout) {
+            shadowPipeline = device->createRenderPipeline(sd);
+        }
+    }
+
+    // --- Ambient occlusion (setAmbientOcclusion()) ---
+#if defined(__EMSCRIPTEN__)
+    {
+        auto ssaoModule = device->createShaderModule(kSsaoWebGpuShader);
+        createAmbientOcclusionPipelines(ssaoModule, "vs_fullscreen", ssaoModule, "fs_ssao", ssaoModule, "fs_ssao_apply",
+                                        colorFormat);
+    }
+#else
+    createAmbientOcclusionPipelines(
+        device->createShaderModule(kDefaultVulkanFxaaVertShader, kDefaultVulkanFxaaVertShaderSize), "main",
+        device->createShaderModule(kDefaultVulkanSsaoFragShader, kDefaultVulkanSsaoFragShaderSize), "main",
+        device->createShaderModule(kDefaultVulkanSsaoApplyFragShader, kDefaultVulkanSsaoApplyFragShaderSize), "main",
+        colorFormat);
+#endif
+
+#if !defined(__EMSCRIPTEN__)  // FXAA and the Vulkan downsample (WebGPU's is below)
     // --- FXAA post-process pipeline (Vulkan) ---
     {
         if (!fxaaBindGroupLayout) {
@@ -4379,7 +5029,56 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         }
     }
 
-    // --- IBL precompute pipeline (Vulkan) — see bakeIblResources() ---
+#endif  // !__EMSCRIPTEN__ (post-processing)
+
+#if defined(__EMSCRIPTEN__)
+    // --- Copy / SSAA downsample pipeline (WebGPU): the same layout as
+    // Vulkan's (texture 0, sampler 1); copies the opaque scene before
+    // transmissive draws and downsamples SSAA.
+    {
+        if (!downsampleBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor dglDesc{};
+            GPU::EntryObject dTex{};
+            dTex.binding = 0;
+            dTex.visibility = GPU::ShaderStage::fragment;
+            dTex.type = GPU::EntryObjectType::texture;
+            dTex.data.texture.multisampled = false;
+            dTex.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+            dTex.data.texture.viewDimension = GPU::TextureType::tt2d;
+            dglDesc.entries.push_back(dTex);
+            GPU::EntryObject dSamp{};
+            dSamp.binding = 1;
+            dSamp.visibility = GPU::ShaderStage::fragment;
+            dSamp.type = GPU::EntryObjectType::sampler;
+            dSamp.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            dglDesc.entries.push_back(dSamp);
+            downsampleBindGroupLayout = device->createBindGroupLayout(dglDesc);
+        }
+        auto copyModule = device->createShaderModule(kCopyWebGpuShader);
+        if (copyModule && downsampleBindGroupLayout) {
+            GPU::RenderPipelineDescriptor dsDesc{};
+            dsDesc.vertex.module = copyModule;
+            dsDesc.vertex.entryPoint = "vs_copy";
+            dsDesc.topology = GPU::PrimitiveTopology::triangleList;
+            dsDesc.cullMode = GPU::CullMode::none;
+            dsDesc.frontFace = GPU::FrontFace::ccw;
+            GPU::FragmentDescriptor dsFrag{};
+            dsFrag.module = copyModule;
+            dsFrag.entryPoint = "fs_copy";
+            GPU::ColorState dsCs{};
+            dsCs.format = colorFormat;
+            dsCs.writeMask = GPU::ColorWrite::all;
+            dsFrag.targets.push_back(dsCs);
+            dsDesc.fragment = dsFrag;
+            GPU::PipelineLayoutDescriptor dsPlDesc{};
+            dsPlDesc.bindGroupLayouts = {downsampleBindGroupLayout};
+            dsDesc.layout = device->createPipelineLayout(dsPlDesc);
+            pipelineDownsample = device->createRenderPipeline(dsDesc);
+        }
+    }
+#endif
+
+    // --- IBL precompute pipeline (Vulkan, WebGPU) — see bakeIblResources() ---
     // Bakes the BRDF LUT / GGX-prefiltered specular cubemap / diffuse
     // irradiance cubemap the reference glTF-Sample-Renderer uses for IBL,
     // none of which this renderer previously computed (see shaders/vulkan/
@@ -4418,12 +5117,21 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             iblBakeBindGroupLayout = device->createBindGroupLayout(iglDesc);
         }
 
+#if defined(__EMSCRIPTEN__)
+        auto iblVertModule = device->createShaderModule(kIblBakeWebGpuShader);
+        auto iblFragModule = iblVertModule;
+        const char* iblVertEntry = "vs_sky_fullscreen";
+        const char* iblFragEntry = "fs_ibl_bake";
+#else
         auto iblVertModule = device->createShaderModule(kDefaultVulkanFxaaVertShader, kDefaultVulkanFxaaVertShaderSize);
         auto iblFragModule = device->createShaderModule(kDefaultVulkanIblBakeFragShader, kDefaultVulkanIblBakeFragShaderSize);
+        const char* iblVertEntry = "main";
+        const char* iblFragEntry = "main";
+#endif
         if (iblVertModule && iblFragModule) {
             GPU::RenderPipelineDescriptor iblDesc{};
             iblDesc.vertex.module = iblVertModule;
-            iblDesc.vertex.entryPoint = "main";
+            iblDesc.vertex.entryPoint = iblVertEntry;
 
             iblDesc.topology = GPU::PrimitiveTopology::triangleList;
             iblDesc.cullMode = GPU::CullMode::none;
@@ -4431,7 +5139,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 
             GPU::FragmentDescriptor iblFrag{};
             iblFrag.module = iblFragModule;
-            iblFrag.entryPoint = "main";
+            iblFrag.entryPoint = iblFragEntry;
             GPU::ColorState iblCs{};
             iblCs.format = GPU::PixelFormat::rgba16float;
             iblCs.writeMask = GPU::ColorWrite::all;
@@ -4485,12 +5193,21 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             skyboxBindGroupLayout = device->createBindGroupLayout(sbglDesc);
         }
 
+#if defined(__EMSCRIPTEN__)
+        auto skyboxVertModule = device->createShaderModule(kSkyWebGpuShader);
+        auto skyboxFragModule = skyboxVertModule;
+        const char* skyVertEntry = "vs_sky_fullscreen";
+        const char* skyFragEntry = "fs_skybox";
+#else
         auto skyboxVertModule = device->createShaderModule(kDefaultVulkanFxaaVertShader, kDefaultVulkanFxaaVertShaderSize);
         auto skyboxFragModule = device->createShaderModule(kDefaultVulkanSkyboxFragShader, kDefaultVulkanSkyboxFragShaderSize);
+        const char* skyVertEntry = "main";
+        const char* skyFragEntry = "main";
+#endif
         if (skyboxVertModule && skyboxFragModule) {
             GPU::RenderPipelineDescriptor skyDesc{};
             skyDesc.vertex.module = skyboxVertModule;
-            skyDesc.vertex.entryPoint = "main";
+            skyDesc.vertex.entryPoint = skyVertEntry;
             // No vertex buffers — fullscreen triangle from gl_VertexIndex.
 
             GPU::DepthStencilDescriptor skyDs{};
@@ -4510,7 +5227,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 
             GPU::FragmentDescriptor skyFrag{};
             skyFrag.module = skyboxFragModule;
-            skyFrag.entryPoint = "main";
+            skyFrag.entryPoint = skyFragEntry;
             GPU::ColorState skyCs{};
             skyCs.format = colorFormat;
             skyCs.writeMask = GPU::ColorWrite::all;
@@ -4525,8 +5242,6 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             pipelineSkybox = device->createRenderPipeline(skyDesc);
         }
     }
-
-#endif  // !__EMSCRIPTEN__
 #elif defined(_WIN32)
     using namespace systems::leal::campello_renderer::shaders;
 
@@ -5072,7 +5787,7 @@ void Renderer::ensureDepthTexture() {
         GPU::TextureType::tt2d,
         GPU::PixelFormat::depth32float,
         w, h, 1, 1, 1,
-        (TU)(uint32_t(TU::renderTarget)));
+        (TU)(uint32_t(TU::renderTarget) | uint32_t(TU::textureBinding)));  // sampled by the AO pass
     depthView = nullptr;
     if (depthTexture) {
         depthView = depthTexture->createView(
@@ -5737,8 +6452,14 @@ void Renderer::renderToTarget(
                     camData[20 + col * 4 + row] = (float)proj.data[row * 4 + col];
                 }
             }
-            camData[36] = (float)renderWidth;
-            camData[37] = (float)renderHeight;
+            // The scene's render size (SSAA included): transmission turns fragment
+            // positions into texture coordinates of the opaque scene with it.
+            camData[36] = (float)sceneTargetWidth();
+            camData[37] = (float)sceneTargetHeight();
+            // lineParams.x: the SSAA scale the scene is drawn at (wide lines
+            // work in output pixels: render size / scale, and narrow their
+            // antialiasing fringe by it, the downsample smooths too).
+            camData[38] = (ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout) ? ssaaScale : 1.0f;
 
             cameraPositionBuffer->upload(0, 160, camData);
             uploadClipUniforms(cameraPositionBuffer);
@@ -5764,6 +6485,7 @@ void Renderer::renderToTarget(
             // screenSize at offset 64 (float2)
             skyboxData[16] = (float)sceneTargetWidth();
             skyboxData[17] = (float)sceneTargetHeight();
+            skyboxData[18] = exposureEv;
             // cameraPos at offset 80 (float3, 16-byte aligned)
             skyboxData[20] = cameraWorldPos[0];
             skyboxData[21] = cameraWorldPos[1];
@@ -6087,6 +6809,9 @@ void Renderer::renderToTarget(
             {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
             {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
             {8, fxaaSampler},
+            {9, shadowMapBinding()},
+            {10, shadowSamplerBinding()},
+            {11, shadowMapNearBinding()},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
@@ -6104,6 +6829,8 @@ void Renderer::renderToTarget(
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
+            {29, shadowMapBinding()},  // sun shadows (fragmentMain_textured)
+            {30, shadowMapNearBinding()},  // its near cascade
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
             // is picked up automatically by this unconditional per-frame
@@ -6371,6 +7098,9 @@ void Renderer::renderToTarget(
                 {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
                 {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
                 {8, fxaaSampler},
+                {9, shadowMapBinding()},
+                {10, shadowSamplerBinding()},
+                {11, shadowMapNearBinding()},
             };
             frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
         }
@@ -8154,12 +8884,155 @@ GpuMesh* Renderer::uploadMesh(const systems::leal::gltf::Primitive& primitive,
 
 // Writes one material's 93 floats at `offset` into the material uniform
 // buffer and its CPU shadow (the shadow refills the buffer when it grows).
-void Renderer::writeMaterialUniform(uint64_t offset, const float* slot) {
+void Renderer::rememberMaterialBufferBindGroup(const std::string& key,
+                                               const systems::leal::campello_gpu::BindGroupDescriptor& descriptor,
+                                               const std::shared_ptr<systems::leal::campello_gpu::BindGroup>& group) {
+    if (!group) return;
+    materialBufferBindGroups[key] = {descriptor, group};
+}
+
+void Renderer::rebindMaterialBuffer() {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!materialUniformBuffer) return;
+    for (auto& [key, record] : materialBufferBindGroups) {
+        GPU::BindGroupDescriptor descriptor = record.descriptor;
+        for (auto& entry : descriptor.entries) {
+            if (auto* binding = std::get_if<GPU::BufferBinding>(&entry.resource)) {
+                binding->buffer = materialUniformBuffer;
+            }
+        }
+        auto fresh = device->createBindGroup(descriptor, /*persistent=*/true);
+        if (!fresh) continue;
+        const auto old = record.group;
+        const auto swap = [&](std::shared_ptr<GPU::BindGroup>& ref) {
+            if (ref == old) ref = fresh;
+        };
+        swap(defaultBindGroup);
+        swap(defaultFlatBindGroup);
+        for (auto& group : materialBindGroups) swap(group);
+        for (auto& group : flatMaterialBindGroups) swap(group);
+        for (auto& material : materialPool) {
+            swap(material->bindGroup);
+            swap(material->flatBindGroup);
+        }
+        record.descriptor = descriptor;
+        record.group = fresh;
+    }
+}
+
+void Renderer::writeMaterialUniform(uint64_t offset, const float* slotIn) {
     constexpr uint64_t size = 93 * sizeof(float);
     if (!materialUniformBuffer) return;
-    materialUniformBuffer->upload(offset, size, const_cast<float*>(slot));
+    float slot[93];
+    std::memcpy(slot, slotIn, size);
+    // World mapping (floats 81-82, the padding after dispersion) isn't part
+    // of the glTF material: re-applied whenever the slot is (re)written.
+    if (const auto it = materialWorldMappings.find((uint32_t)(offset / kMaterialUniformStride));
+        it != materialWorldMappings.end()) {
+        slot[81] = it->second;
+        slot[82] = environmentUpAxis == UpAxis::z ? 1.0f : 0.0f;
+    }
+    materialUniformBuffer->upload(offset, size, slot);
     if (materialUniformShadow.size() < offset + size) materialUniformShadow.resize(offset + size, 0);
     std::memcpy(materialUniformShadow.data() + offset, slot, size);
+}
+
+void Renderer::uploadWithMips(const std::shared_ptr<systems::leal::campello_gpu::Texture>& texture, const uint8_t* rgba,
+                              uint32_t width, uint32_t height, uint32_t mipLevels, bool srgb) {
+    namespace GPU = systems::leal::campello_gpu;
+    static const std::array<float, 256> toLinear = [] {
+        std::array<float, 256> table{};
+        for (int i = 0; i < 256; ++i) {
+            const float c = (float)i / 255.0f;
+            table[(size_t)i] = c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+        }
+        return table;
+    }();
+    const auto encode = [srgb](float v) {
+        v = std::clamp(v, 0.0f, 1.0f);
+        if (srgb) v = v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
+        return (uint8_t)std::lround(v * 255.0f);
+    };
+    // The chain, level by level (each from the previous one).
+    std::vector<std::vector<uint8_t>> levels;
+    levels.emplace_back(rgba, rgba + (size_t)width * height * 4);
+    uint32_t w = width, h = height;
+    for (uint32_t level = 1; level < mipLevels; ++level) {
+        const uint32_t nw = std::max(1u, w / 2), nh = std::max(1u, h / 2);
+        const auto& src = levels.back();
+        std::vector<uint8_t> dst((size_t)nw * nh * 4);
+        for (uint32_t y = 0; y < nh; ++y) {
+            for (uint32_t x = 0; x < nw; ++x) {
+                for (int c = 0; c < 4; ++c) {
+                    float sum = 0.0f;
+                    for (uint32_t dy = 0; dy < 2; ++dy) {
+                        for (uint32_t dx = 0; dx < 2; ++dx) {
+                            const uint32_t sx = std::min(w - 1, x * 2 + dx), sy = std::min(h - 1, y * 2 + dy);
+                            const uint8_t v = src[((size_t)sy * w + sx) * 4 + (size_t)c];
+                            sum += (srgb && c < 3) ? toLinear[v] : (float)v / 255.0f;
+                        }
+                    }
+                    dst[((size_t)y * nw + x) * 4 + (size_t)c] = (srgb && c < 3) ? encode(sum / 4.0f)
+                                                                                 : (uint8_t)std::lround(sum / 4.0f * 255.0f);
+                }
+            }
+        }
+        levels.push_back(std::move(dst));
+        w = nw;
+        h = nh;
+    }
+    // One staging buffer, rows padded to 256 bytes (WebGPU's copy alignment).
+    std::vector<uint64_t> offsets, rowBytes;
+    uint64_t total = 0;
+    w = width;
+    h = height;
+    for (uint32_t level = 0; level < mipLevels; ++level) {
+        const uint64_t row = ((uint64_t)w * 4 + 255) / 256 * 256;
+        offsets.push_back(total);
+        rowBytes.push_back(row);
+        total += row * h;
+        w = std::max(1u, w / 2);
+        h = std::max(1u, h / 2);
+    }
+    std::vector<uint8_t> staged(total, 0);
+    w = width;
+    h = height;
+    for (uint32_t level = 0; level < mipLevels; ++level) {
+        for (uint32_t y = 0; y < h; ++y) {
+            std::memcpy(staged.data() + offsets[level] + rowBytes[level] * y, levels[level].data() + (size_t)y * w * 4,
+                        (size_t)w * 4);
+        }
+        w = std::max(1u, w / 2);
+        h = std::max(1u, h / 2);
+    }
+    auto staging = device->createBuffer(total, GPU::BufferUsage::copySrc);
+    if (!staging) return;
+    staging->upload(0, total, staged.data());
+    auto encoder = device->createCommandEncoder();
+    if (!encoder) return;
+    for (uint32_t level = 0; level < mipLevels; ++level) {
+        encoder->copyBufferToTexture(staging, offsets[level], rowBytes[level], texture, level, 0);
+    }
+    auto fence = device->createFence();
+    device->submit(encoder->finish(), fence);
+    if (fence) fence->wait();
+}
+
+void Renderer::setMaterialWorldMapping(GpuMaterial* material, float repeatSize) {
+    if (!material) return;
+    if (repeatSize > 0.0f) {
+        materialWorldMappings[material->uniformSlot] = repeatSize;
+    } else {
+        materialWorldMappings.erase(material->uniformSlot);
+    }
+    const uint64_t offset = (uint64_t)material->uniformSlot * kMaterialUniformStride;
+    constexpr uint64_t size = 93 * sizeof(float);
+    if (materialUniformShadow.size() < offset + size) return;
+    float slot[93];
+    std::memcpy(slot, materialUniformShadow.data() + offset, size);
+    slot[81] = 0.0f;  // set again by writeMaterialUniform() when on
+    slot[82] = 0.0f;
+    writeMaterialUniform(offset, slot);
 }
 
 GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& material,
@@ -8176,7 +9049,16 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
             }
         }
     }
-    if (materialIndex >= 0) {
+    // A glTF other than the scene's (setAsset()) has its own indices: its
+    // materials, textures and samplers are cached by (asset, index) and get
+    // their own uniform slots. (Keyed by index alone, every such asset's
+    // material 0 came back as the scene's material 0.)
+    const bool sceneAsset = this->asset && this->asset.get() == &asset;
+    if (!sceneAsset && materialIndex >= 0) {
+        const auto it = foreignMaterialCache.find({&asset, materialIndex});
+        if (it != foreignMaterialCache.end()) return it->second;
+    }
+    if (sceneAsset && materialIndex >= 0) {
         auto cacheIt = materialCache.find(materialIndex);
         if (cacheIt != materialCache.end()) {
             return cacheIt->second;
@@ -8184,7 +9066,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     }
 
     // Reuse existing bind groups if this material was already processed by setScene().
-    if (materialIndex >= 0 &&
+    if (sceneAsset && materialIndex >= 0 &&
         (size_t)materialIndex < materialBindGroups.size() &&
         materialBindGroups[materialIndex]) {
         auto mat = std::make_unique<GpuMaterial>();
@@ -8233,8 +9115,14 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     // is safe to trust per-call rather than re-deriving it here.
     auto ensureTexture = [&](int64_t imageIndex, bool srgb, bool isBasisu) -> std::shared_ptr<GPU::Texture> {
         if (imageIndex < 0 || !asset.images) return nullptr;
-        if ((size_t)imageIndex >= gpuTextures.size()) gpuTextures.resize(imageIndex + 1);
-        if (gpuTextures[(size_t)imageIndex]) return gpuTextures[(size_t)imageIndex];
+        std::shared_ptr<GPU::Texture>* cached = nullptr;
+        if (sceneAsset) {
+            if ((size_t)imageIndex >= gpuTextures.size()) gpuTextures.resize(imageIndex + 1);
+            cached = &gpuTextures[(size_t)imageIndex];
+        } else {
+            cached = &foreignTextures[{&asset, imageIndex}];
+        }
+        if (*cached) return *cached;
 
         auto& image = (*asset.images)[(size_t)imageIndex];
 
@@ -8278,7 +9166,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
             if (texture && !uploadTextureDataWithMips(device, texture, *texData)) {
                 texture = nullptr;
             }
-            gpuTextures[(size_t)imageIndex] = texture;
+            *cached = texture;
             return texture;
         }
 
@@ -8314,15 +9202,26 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                 fmt = GPU::PixelFormat::rgba32float;
                 break;
         }
+        // 8-bit images get a mip chain (box filter, in linear light when
+        // sRGB): without one, fine repeating patterns (brick, tiles) shimmer
+        // and moire in the distance.
+        const bool mipmapped = img->getFormat() == systems::leal::campello_image::ImageFormat::rgba8 &&
+                               img->getWidth() > 1 && img->getHeight() > 1;
+        const uint32_t mipLevels = mipmapped
+            ? 1u + (uint32_t)std::floor(std::log2((double)std::max(img->getWidth(), img->getHeight())))
+            : 1u;
         auto texture = device->createTexture(
             GPU::TextureType::tt2d, fmt,
-            img->getWidth(), img->getHeight(), 1, 1, 1,
+            img->getWidth(), img->getHeight(), 1, mipLevels, 1,
             (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                 (uint32_t)GPU::TextureUsage::copyDst));
-        if (texture) {
+        if (texture && mipLevels == 1) {
             texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
+        } else if (texture) {
+            uploadWithMips(texture, static_cast<const uint8_t*>(img->getData()), img->getWidth(), img->getHeight(),
+                           mipLevels, srgb);
         }
-        gpuTextures[(size_t)imageIndex] = texture;
+        *cached = texture;
         return texture;
     };
 
@@ -8342,8 +9241,14 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
         }
         if (gt.sampler >= 0 && asset.samplers &&
             (size_t)gt.sampler < asset.samplers->size()) {
-            if ((size_t)gt.sampler >= gpuSamplers.size()) gpuSamplers.resize(gt.sampler + 1);
-            if (!gpuSamplers[(size_t)gt.sampler]) {
+            std::shared_ptr<GPU::Sampler>* cachedSampler = nullptr;
+            if (sceneAsset) {
+                if ((size_t)gt.sampler >= gpuSamplers.size()) gpuSamplers.resize(gt.sampler + 1);
+                cachedSampler = &gpuSamplers[(size_t)gt.sampler];
+            } else {
+                cachedSampler = &foreignSamplers[{&asset, (int64_t)gt.sampler}];
+            }
+            if (!*cachedSampler) {
                 auto& gs = (*asset.samplers)[(size_t)gt.sampler];
                 GPU::SamplerDescriptor sd{};
                 sd.addressModeU  = static_cast<GPU::WrapMode>(gs.wrapS);
@@ -8354,9 +9259,9 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                 sd.lodMinClamp   = 0.0;
                 sd.lodMaxClamp   = 1000.0;
                 sd.maxAnisotropy = 8.0;
-                gpuSamplers[(size_t)gt.sampler] = device->createSampler(sd);
+                *cachedSampler = device->createSampler(sd);
             }
-            outSamp = gpuSamplers[(size_t)gt.sampler];
+            outSamp = *cachedSampler;
         }
     };
 
@@ -8470,7 +9375,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
 
     // --- Determine uniform slot ---
     uint32_t uniformSlot = 0;
-    if (materialIndex >= 0) {
+    if (sceneAsset && materialIndex >= 0) {
         uniformSlot = (uint32_t)(materialIndex + 1);
     } else {
         // Standalone upload — find next free slot.
@@ -8495,6 +9400,9 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
             materialUniformBuffer->upload(0, std::min<uint64_t>(materialUniformShadow.size(), newSize),
                                           materialUniformShadow.data());
         }
+        // Vulkan/WebGPU material bind groups hold the buffer itself (Metal
+        // binds the current one per draw): point them at the new one.
+        rebindMaterialBuffer();
     }
 
     // --- Upload material uniform data ---
@@ -8541,6 +9449,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     auto bindGroup = device->createBindGroup(bgDesc, /*persistent=*/true);
     // No separate flat shader on Vulkan — reuse the same bind group.
     auto flatBindGroup = bindGroup;
+    rememberMaterialBufferBindGroup("slot:" + std::to_string(uniformSlot), bgDesc, bindGroup);
 #elif defined(_WIN32)
     ensureDirectXPbrBindGroupLayout();
     DirectXMaterialResources dxRes{};
@@ -8635,8 +9544,10 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
 #endif
 
     GpuMaterial* result = mat.get();
-    if (materialIndex >= 0) {
+    if (sceneAsset && materialIndex >= 0) {
         materialCache[materialIndex] = result;
+    } else if (materialIndex >= 0) {
+        foreignMaterialCache[{&asset, materialIndex}] = result;
     }
     materialPool.push_back(std::move(mat));
     return result;
@@ -8724,8 +9635,12 @@ void Renderer::render(const RenderScene& scene,
                 camData[20 + col*4 + row] = (float)proj.data[row*4 + col];
             }
         }
-        camData[36] = (float)renderWidth;
-        camData[37] = (float)renderHeight;
+        // The scene's render size (SSAA included): transmission turns fragment
+        // positions into texture coordinates of the opaque scene with it.
+        camData[36] = (float)sceneTargetWidth();
+        camData[37] = (float)sceneTargetHeight();
+        // lineParams.x: the SSAA scale (wide lines, as in renderToTarget()).
+        camData[38] = (ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout) ? ssaaScale : 1.0f;
         cameraPositionBuffer->upload(0, 160, camData);
             uploadClipUniforms(cameraPositionBuffer);
     }
@@ -8747,6 +9662,9 @@ void Renderer::render(const RenderScene& scene,
             {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
             {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
             {8, fxaaSampler},
+            {9, shadowMapBinding()},
+            {10, shadowSamplerBinding()},
+            {11, shadowMapNearBinding()},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
@@ -8764,6 +9682,8 @@ void Renderer::render(const RenderScene& scene,
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
+            {29, shadowMapBinding()},  // sun shadows (fragmentMain_textured)
+            {30, shadowMapNearBinding()},  // its near cascade
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
             // is picked up automatically by this unconditional per-frame
@@ -8792,11 +9712,21 @@ void Renderer::render(const RenderScene& scene,
         };
         LightsUniformGPU lightsData = {};
         lightsData.count = (uint32_t)std::min(scene.lights.size(), size_t(4));
+        bool shadowAssigned = false;
         for (size_t i = 0; i < lightsData.count; ++i) {
             auto &l = scene.lights[i];
-            lightsData.lights[i].position[0] = (float)l.position.x();
-            lightsData.lights[i].position[1] = (float)l.position.y();
-            lightsData.lights[i].position[2] = (float)l.position.z();
+            // Directional lights: the shaders read the direction towards the
+            // light from `position` (as the glTF path uploads it).
+            const bool directional = l.type == 0;
+            lightsData.lights[i].position[0] = (float)(directional ? -l.direction.x() : l.position.x());
+            lightsData.lights[i].position[1] = (float)(directional ? -l.direction.y() : l.position.y());
+            lightsData.lights[i].position[2] = (float)(directional ? -l.direction.z() : l.position.z());
+            // spotAngles.z: this light casts the shadow map (the first
+            // shadow-casting directional light, when shadows are on).
+            if (directional && l.castShadows && shadowsEnabled && shadowPipeline && !shadowAssigned) {
+                lightsData.lights[i].spotAngles[2] = 1.0f;
+                shadowAssigned = true;
+            }
             lightsData.lights[i].position[3] = (float)l.type;
             lightsData.lights[i].color[0] = (float)l.color.x();
             lightsData.lights[i].color[1] = (float)l.color.y();
@@ -8825,7 +9755,10 @@ void Renderer::render(const RenderScene& scene,
 
     // Pre-upload all draw-call transforms sequentially into transformBuffer.
     size_t totalDraws = scene.opaque.size() + scene.transparent.size();
-    uint64_t requiredBytes = (uint64_t)(totalDraws + 1) * 128;
+    // Room for the shadow casters' transforms after the draws' own
+    // (encodeShadowPass(); the casters, or the opaque draws).
+    // (Two shadow cascades: room for the casters twice.)
+    uint64_t requiredBytes = (uint64_t)(totalDraws + 1 + 2 * std::max(scene.opaque.size(), scene.shadowCasters.size())) * 128;
     if (!transformBuffer || transformBuffer->getLength() < requiredBytes) {
         uint64_t newSize = std::max(requiredBytes, (uint64_t)4096 * 128);
         transformBuffer = device->createBuffer(newSize, kTransformBufferUsage);
@@ -8878,7 +9811,9 @@ void Renderer::render(const RenderScene& scene,
             }
             order[i] = {d2, i};
         }
+        // Opaque, then blended, then wide lines (blended over everything opaque).
         const auto rank = [](const systems::leal::campello_renderer::DrawCall &d) {
+            if (d.mesh && d.mesh->wideLines) return 4;
             return !d.material ? 0 : (d.material->alphaBlend ? 2 : 0) + (d.material->doubleSided ? 1 : 0);
         };
         std::sort(order.begin(), order.end(), [&](const auto &a, const auto &b) {
@@ -8896,6 +9831,9 @@ void Renderer::render(const RenderScene& scene,
     std::sort(sortedOpaque.begin(), sortedOpaque.end(),
         [](const systems::leal::campello_renderer::DrawCall &a,
            const systems::leal::campello_renderer::DrawCall &b) {
+            const bool wideA = a.mesh && a.mesh->wideLines;
+            const bool wideB = b.mesh && b.mesh->wideLines;
+            if (wideA != wideB) return !wideA;  // wide lines after everything opaque
             if (!a.material || !b.material) return a.material < b.material;
             if (a.material->alphaBlend != b.material->alphaBlend)
                 return !a.material->alphaBlend;
@@ -8907,6 +9845,136 @@ void Renderer::render(const RenderScene& scene,
     }
     for (auto &draw : sortedOpaque)      uploadOneTransform(draw);
     for (auto &draw : scene.transparent) uploadOneTransform(draw);
+
+    // ------------------------------------------------------------------
+    // Sun shadows: the first shadow-casting directional light renders the
+    // opaque triangle draws into the shadow map; the shadow block of the
+    // camera uniforms tells the shaders where it is (x = on).
+    // ------------------------------------------------------------------
+    {
+        float shadowBlock[24] = {0};  // shadowViewProj, shadowParams, viewParams
+        float nearBlock[20] = {0};    // shadowNearViewProj, shadowNearParams
+        bool nearOn = false;
+        shadowBlock[20] = exposureEv;
+        const LightData* sun = nullptr;
+        for (const auto& l : scene.lights) {
+            if (l.type == 0 && l.castShadows) {
+                sun = &l;
+                break;
+            }
+        }
+        // Casters: every opaque mesh of the scene whatever the camera sees
+        // (render_system() lists them before culling), else the opaque draws.
+        const auto& casters = scene.shadowCasters.empty() ? sortedOpaque : scene.shadowCasters;
+        if (sun && shadowsEnabled && shadowPipeline && !activeProgramPass && cameraPositionBuffer) {
+            // The map depends on the light, its resolution and the casters,
+            // not on the camera: redrawn only when one of them changes.
+            uint64_t key = 1469598103934665603ull;
+            const auto mix = [&key](const void* data, size_t size) {
+                const auto* bytes = static_cast<const uint8_t*>(data);
+                for (size_t i = 0; i < size; ++i) {
+                    key ^= bytes[i];
+                    key *= 1099511628211ull;
+                }
+            };
+            const double direction[3] = {sun->direction.x(), sun->direction.y(), sun->direction.z()};
+            mix(direction, sizeof(direction));
+            mix(&shadowMapResolution, sizeof(shadowMapResolution));
+            for (const auto& draw : casters) {
+                mix(&draw.mesh, sizeof(draw.mesh));
+                if (draw.mesh) {
+                    const void* positions = draw.mesh->vertexBuffers[VERTEX_SLOT_POSITION].get();
+                    mix(&positions, sizeof(positions));
+                    mix(&draw.mesh->indexCount, sizeof(draw.mesh->indexCount));
+                    mix(&draw.mesh->vertexCount, sizeof(draw.mesh->vertexCount));
+                }
+                const uint8_t blended = draw.material && draw.material->alphaBlend ? 1 : 0;
+                mix(&blended, 1);
+                mix(draw.worldTransform.data, sizeof(double) * 16);
+            }
+            ShadowFit fit;
+            const bool fitted =
+                fitShadowLight(casters, VM::Vector3<double>(-sun->direction.x(), -sun->direction.y(), -sun->direction.z()), fit) &&
+                ensureShadowMap();
+            uint64_t casterOffset = txOffset;
+            // Far cascade: all casters; redrawn when they or the light change.
+            if (fitted && (!shadowMapValid || key != shadowMapKey)) {
+                shadowLightViewProj = shadowProjection(fit, fit.full);
+                casterOffset = encodeShadowPass(encoder, shadowMapView, casters, shadowLightViewProj, casterOffset);
+                shadowMapKey = key;
+                shadowMapValid = true;
+                shadowNearValid = false;
+            }
+            if (!fitted) shadowMapValid = false;
+            // Near cascade: the view's nearest part, finer. Its rectangle has
+            // a margin and is reused while the view stays inside it and it's
+            // not much larger than needed, so small camera moves don't redraw.
+            double needed[4];
+            nearOn = false;
+            if (fitted && shadowMapValid && shadowCascades && shadowMapNearView && nearShadowRect(fit, scene.camera, needed)) {
+                const double neededArea = (needed[1] - needed[0]) * (needed[3] - needed[2]);
+                const double cachedArea = (shadowNearRect[1] - shadowNearRect[0]) * (shadowNearRect[3] - shadowNearRect[2]);
+                const bool reuse = shadowNearValid && shadowNearKey == key && needed[0] >= shadowNearRect[0] &&
+                                   needed[1] <= shadowNearRect[1] && needed[2] >= shadowNearRect[2] &&
+                                   needed[3] <= shadowNearRect[3] && cachedArea <= 4.0 * neededArea;
+                if (!reuse) {
+                    const double mx = 0.25 * (needed[1] - needed[0]), my = 0.25 * (needed[3] - needed[2]);
+                    shadowNearRect[0] = std::max(needed[0] - mx, fit.full[0]);
+                    shadowNearRect[1] = std::min(needed[1] + mx, fit.full[1]);
+                    shadowNearRect[2] = std::max(needed[2] - my, fit.full[2]);
+                    shadowNearRect[3] = std::min(needed[3] + my, fit.full[3]);
+                    shadowNearViewProj = shadowProjection(fit, shadowNearRect);
+                    // Only the casters whose light-view bounds meet the rectangle.
+                    std::vector<systems::leal::campello_renderer::DrawCall> nearCasters;
+                    const double* lv = fit.lightView.data;
+                    for (const auto& draw : casters) {
+                        if (!draw.mesh) continue;
+                        if (!draw.mesh->hasBounds) {
+                            nearCasters.push_back(draw);
+                            continue;
+                        }
+                        double clo[2] = {1e300, 1e300}, chi[2] = {-1e300, -1e300};
+                        const double* m = draw.worldTransform.data;
+                        for (int corner = 0; corner < 8; ++corner) {
+                            const double p[3] = {(corner & 1) ? draw.mesh->boundsMax[0] : draw.mesh->boundsMin[0],
+                                                 (corner & 2) ? draw.mesh->boundsMax[1] : draw.mesh->boundsMin[1],
+                                                 (corner & 4) ? draw.mesh->boundsMax[2] : draw.mesh->boundsMin[2]};
+                            double w[3];
+                            for (int r = 0; r < 3; ++r) w[r] = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3];
+                            for (int r = 0; r < 2; ++r) {
+                                const double l = lv[r * 4] * w[0] + lv[r * 4 + 1] * w[1] + lv[r * 4 + 2] * w[2] + lv[r * 4 + 3];
+                                clo[r] = std::min(clo[r], l);
+                                chi[r] = std::max(chi[r], l);
+                            }
+                        }
+                        if (chi[0] >= shadowNearRect[0] && clo[0] <= shadowNearRect[1] && chi[1] >= shadowNearRect[2] &&
+                            clo[1] <= shadowNearRect[3]) {
+                            nearCasters.push_back(draw);
+                        }
+                    }
+                    encodeShadowPass(encoder, shadowMapNearView, nearCasters, shadowNearViewProj, casterOffset);
+                    shadowNearKey = key;
+                    shadowNearValid = true;
+                }
+                nearOn = true;
+            }
+            if (shadowMapValid) {
+                for (int row = 0; row < 4; ++row) {
+                    for (int col = 0; col < 4; ++col) {
+                        shadowBlock[col * 4 + row] = (float)shadowLightViewProj.data[row * 4 + col];
+                        nearBlock[col * 4 + row] = (float)shadowNearViewProj.data[row * 4 + col];
+                    }
+                }
+                shadowBlock[16] = 1.0f;                                // on
+                shadowBlock[17] = 1.0f / (float)shadowMapResolution;  // texel (uv), both cascades
+                nearBlock[16] = nearOn ? 1.0f : 0.0f;
+            }
+        }
+        if (cameraPositionBuffer) {
+            cameraPositionBuffer->upload(kCameraClipEnd, sizeof(shadowBlock), shadowBlock);
+            cameraPositionBuffer->upload(kCameraClipEnd + sizeof(shadowBlock), sizeof(nearBlock), nearBlock);
+        }
+    }
 
     // ------------------------------------------------------------------
     // Render pass with FXAA / SSAA support.
@@ -8935,6 +10003,9 @@ void Renderer::render(const RenderScene& scene,
             {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
             {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
             {8, fxaaSampler},
+            {9, shadowMapBinding()},
+            {10, shadowSamplerBinding()},
+            {11, shadowMapNearBinding()},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
     }
@@ -8947,6 +10018,8 @@ void Renderer::render(const RenderScene& scene,
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
+            {29, shadowMapBinding()},  // sun shadows (fragmentMain_textured)
+            {30, shadowMapNearBinding()},  // its near cascade
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
             // is picked up automatically by this unconditional per-frame
@@ -9013,6 +10086,7 @@ void Renderer::render(const RenderScene& scene,
                 }
                 skyboxData[16] = (float)sceneTargetWidth();
                 skyboxData[17] = (float)sceneTargetHeight();
+                skyboxData[18] = exposureEv;
                 skyboxData[20] = cameraWorldPos[0];
                 skyboxData[21] = cameraWorldPos[1];
                 skyboxData[22] = cameraWorldPos[2];
@@ -9200,6 +10274,9 @@ void Renderer::render(const RenderScene& scene,
                 {6, irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap},
                 {7, brdfLutTexture ? brdfLutTexture : defaultTexture},
                 {8, fxaaSampler},
+                {9, shadowMapBinding()},
+                {10, shadowSamplerBinding()},
+                {11, shadowMapNearBinding()},
             };
             frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
         }
@@ -9240,7 +10317,7 @@ void Renderer::render(const RenderScene& scene,
                 ds.view              = depthView;
                 ds.depthClearValue   = 1.0f;
                 ds.depthLoadOp       = GPU::LoadOp::load;
-                ds.depthStoreOp      = GPU::StoreOp::discard;
+                ds.depthStoreOp      = aoEnabled ? GPU::StoreOp::store : GPU::StoreOp::discard;  // AO reads it
                 ds.depthReadOnly     = false;
                 ds.stencilClearValue = 0;
                 ds.stencilLoadOp     = GPU::LoadOp::clear;
@@ -9434,6 +10511,8 @@ void Renderer::render(const RenderScene& scene,
         }
     }
 
+    encodeAmbientOcclusion(encoder, colorView, scene.camera.projection);
+
     frame.commandBuffer = encoder->finish();
     device->submit(frame.commandBuffer, frame.fence);
 #if defined(__EMSCRIPTEN__)
@@ -9485,12 +10564,25 @@ void Renderer::renderPrimitive(
     const auto colorFormat = activeProgramPass ? activeProgramPass->colorFormat : GPU::PixelFormat::invalid;
     bool debugView = program == kPbrProgram && viewMode == ViewMode::worldNormal && !customLayout &&
                      draw.mesh->topology == GPU::PrimitiveTopology::triangleList;
-    const MeshPipelineEntry* entry = debugView
+    const bool wideLines = draw.mesh->wideLines;
+    const MeshPipelineEntry* entry = wideLines
+        ? meshPipeline(program, MeshProgram::textured, layout, true, true, colorFormat, draw.mesh->topology, true)
+        : debugView
         ? meshPipeline(program, MeshProgram::debug, layout, false, false, colorFormat)
         : meshPipeline(program, MeshProgram::textured, layout, doubleSided || (program == kPbrProgram && clippingActive()),
                        useBlend, colorFormat, draw.mesh->topology);
     if (!entry) return;
     activeMeshSlots = &entry->slots;
+    // Wide lines expand in screen space: their vertex stage reads the camera
+    // block (screen size) at [[buffer(18)]], which the frame bind group
+    // binds for fragments only.
+    if (wideLines && meshRecipe.rawBufferSlots && cameraPositionBuffer) {
+        setVertexBufferIfChanged(rpe, 18, cameraPositionBuffer, 0);
+        // The segments, read by vertex index (no vertex attributes).
+        if (draw.mesh->vertexBuffers[VERTEX_SLOT_POSITION]) {
+            setVertexBufferIfChanged(rpe, kWideLineSegmentSlot, draw.mesh->vertexBuffers[VERTEX_SLOT_POSITION], 0);
+        }
+    }
 
     // Skip redundant setPipeline() calls: the bound pipeline object is
     // tracked (reset with currentPipelineVariant between passes).

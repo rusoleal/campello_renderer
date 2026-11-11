@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <atomic>
+#include <map>
 #include <memory>
 #include <optional>
 #include <array>
@@ -56,6 +57,15 @@ namespace systems::leal::campello_renderer {
         // Clip planes apply to them too.
         systems::leal::campello_gpu::PrimitiveTopology topology =
             systems::leal::campello_gpu::PrimitiveTopology::triangleList;
+        // Antialiased wide lines (Renderer::supportsWideLines()): built by
+        // Renderer::expandLines(): vertexBuffers[POSITION] holds the
+        // segments (two float4 each), the index buffer one quad (4 vertices,
+        // 6 indices) per segment, layout VertexLayout::wideLine(). Drawn after opaque
+        // geometry with the material's base colour (unlit), alpha-blended by
+        // pixel coverage, the given width in output pixels at any SSAA
+        // scale, nudged towards the camera like hardware lines; clip planes
+        // apply.
+        bool wideLines = false;
 
         bool hasBounds = false;
         std::array<float, 3> boundsMin{0.0f, 0.0f, 0.0f};
@@ -121,6 +131,7 @@ namespace systems::leal::campello_renderer {
         float innerConeAngle = 0.0f;
         float outerConeAngle = 0.0f;
         int type = 0; // 0 = directional, 1 = point, 2 = spot
+        bool castShadows = false;  // directional: the first one casts the shadow map (setShadowsEnabled())
     };
 
     struct RenderScene {
@@ -128,6 +139,10 @@ namespace systems::leal::campello_renderer {
         std::vector<LightData> lights;
         std::vector<DrawCall> opaque;
         std::vector<DrawCall> transparent;
+        /// Sun shadow casters: every opaque mesh, whatever the camera sees
+        /// (render_system() fills it before culling, when shadows are on).
+        /// Empty: the opaque draws cast.
+        std::vector<DrawCall> shadowCasters;
     };
 
 
@@ -215,6 +230,7 @@ namespace systems::leal::campello_renderer {
         static constexpr uint32_t VERTEX_SLOT_MORPH_INFO      = 21; // MorphInfo (targetCount, hasNormal, vertexCount, weights[8])
         static constexpr uint32_t VERTEX_SLOT_MORPH_POSITION  = 22; // float3[targetCount * vertexCount] position deltas
         static constexpr uint32_t VERTEX_SLOT_MORPH_NORMAL    = 23; // float3[targetCount * vertexCount] normal deltas
+        static constexpr uint32_t kWideLineSegmentSlot        = 26; // Metal [[buffer(26)]]: wide line segments (GpuMesh::wideLines)
                                                                //   [0..15]  baseColorFactor
                                                                //   [16..31] uvTransformRow0 (.w = hasTransform)
                                                                //   [32..47] uvTransformRow1
@@ -248,6 +264,26 @@ namespace systems::leal::campello_renderer {
         // Look-up caches from glTF indices/handles to engine-native handles.
         std::unordered_map<const systems::leal::gltf::Primitive*, GpuMesh*>     meshCache;
         std::unordered_map<int64_t, GpuMaterial*>                               materialCache;
+        // uploadMaterial() of glTFs other than the scene's: by (asset, index).
+        // The assets must outlive their materials (as for the scene's).
+        std::map<std::pair<const void*, int64_t>, GpuMaterial*> foreignMaterialCache;
+        // setMaterialWorldMapping(): world units per repeat, by uniform slot
+        // (applied whenever the slot is written).
+        std::map<uint32_t, float> materialWorldMappings;
+        // Vulkan/WebGPU bind groups that hold materialUniformBuffer (binding
+        // 24), by owner ("default", "scene:<m>", "slot:<n>"): rebuilt when the
+        // buffer grows (rebindMaterialBuffer()).
+        struct MaterialBufferBindGroup {
+            systems::leal::campello_gpu::BindGroupDescriptor descriptor;
+            std::shared_ptr<systems::leal::campello_gpu::BindGroup> group;
+        };
+        std::map<std::string, MaterialBufferBindGroup> materialBufferBindGroups;
+        void rememberMaterialBufferBindGroup(const std::string& key,
+                                             const systems::leal::campello_gpu::BindGroupDescriptor& descriptor,
+                                             const std::shared_ptr<systems::leal::campello_gpu::BindGroup>& group);
+        void rebindMaterialBuffer();
+        std::map<std::pair<const void*, int64_t>, std::shared_ptr<systems::leal::campello_gpu::Texture>> foreignTextures;
+        std::map<std::pair<const void*, int64_t>, std::shared_ptr<systems::leal::campello_gpu::Sampler>> foreignSamplers;
 
         // Minimal bind groups for flat pipeline variants (no textures/samplers).
         // Only contains the material uniform buffer at binding 17 so the fragment
@@ -405,6 +441,7 @@ namespace systems::leal::campello_renderer {
             std::shared_ptr<systems::leal::campello_gpu::ShaderModule> module;
             std::string entryPoint;
             bool lines = false;     // stage for line/point topologies (vs triangles)
+            bool wide = false;      // stage for wide line quads (GpuMesh::wideLines)
         };
         // One registered program: its shaders (index = ProgramHandle;
         // 0 = built-in PBR, rebuilt by createDefaultPipelines(), app programs
@@ -417,6 +454,7 @@ namespace systems::leal::campello_renderer {
             // separate shader for that variant (the textured one is used).
             std::array<std::string, 3> fragmentEntries;
             bool supportsBlend = false;  // false: blend draws use the opaque state
+            std::string wideLineFragment;  // fragment entry for wide lines; empty: none
         };
         std::vector<ProgramState> programs;
         // Shared by all programs on this backend.
@@ -463,13 +501,15 @@ namespace systems::leal::campello_renderer {
         bool quantizedLayoutDetected = false;
         VertexLayout standardLayout = VertexLayout::standard();
 
-        const MeshVertexStage* vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines = false) const;
+        const MeshVertexStage* vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines = false,
+                                              bool wide = false) const;
         // colorFormat: invalid = the recipe's (createDefaultPipelines()) format.
         const MeshPipelineEntry* meshPipeline(
             ProgramHandle program, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
             systems::leal::campello_gpu::PixelFormat colorFormat = systems::leal::campello_gpu::PixelFormat::invalid,
             systems::leal::campello_gpu::PrimitiveTopology topology =
-                systems::leal::campello_gpu::PrimitiveTopology::triangleList);
+                systems::leal::campello_gpu::PrimitiveTopology::triangleList,
+            bool wideLines = false);
         const MeshPipelineEntry* meshPipeline(
             MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend) {
             return meshPipeline(kPbrProgram, variant, layout, doubleSided, blend);
@@ -487,7 +527,10 @@ namespace systems::leal::campello_renderer {
         bool clippingActive() const { return !clipPlanes.empty() && supportsClipPlanes(); }
         void uploadClipUniforms(const std::shared_ptr<systems::leal::campello_gpu::Buffer>& buffer) const;
         // CameraUniforms (160 bytes) + clip block (128 bytes).
-        static constexpr uint64_t kCameraUniformSize = 288;
+        // CameraUniforms: camera (160 bytes), clip block (128), shadow block
+        // (shadowViewProj float4x4 + shadowParams float4: 80).
+        static constexpr uint64_t kCameraClipEnd = 288;
+        static constexpr uint64_t kCameraUniformSize = 464;
         std::shared_ptr<systems::leal::campello_gpu::Texture> programPassDepthTexture;
         std::shared_ptr<systems::leal::campello_gpu::TextureView> programPassDepthView;
 
@@ -686,6 +729,100 @@ namespace systems::leal::campello_renderer {
         // Depth buffer — recreated in resize().
         std::shared_ptr<systems::leal::campello_gpu::Texture>     depthTexture;
         std::shared_ptr<systems::leal::campello_gpu::TextureView> depthView;
+        // Sun shadows (setShadowsEnabled()): a depth map rendered from the
+        // first shadow-casting directional light, fitted to the opaque draws.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMap;
+        std::shared_ptr<systems::leal::campello_gpu::TextureView> shadowMapView;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapPlaceholder;  // 1x1, bound when off
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> shadowPipeline;
+        // The map is redrawn only when its inputs change (light, resolution,
+        // casters and their transforms): their hash, and the matrix it used.
+        uint64_t shadowMapKey = 0;
+        bool shadowMapValid = false;
+        systems::leal::vector_math::Matrix4<double> shadowLightViewProj;
+        /// Draws `casters` into `target` with `lightViewProj`; their
+        /// transforms go into the transform buffer from `transformsOffset`.
+        /// Returns the offset after them.
+        uint64_t encodeShadowPass(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
+                                  const std::shared_ptr<systems::leal::campello_gpu::TextureView>& target,
+                                  const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+                                  const systems::leal::vector_math::Matrix4<double>& lightViewProj,
+                                  uint64_t transformsOffset);
+        // Vulkan/WebGPU: the comparison sampler of the shadow lookup (frame
+        // binding 10). Metal declares its sampler in the shader.
+        std::shared_ptr<systems::leal::campello_gpu::Sampler> shadowSampler;
+        // Exposure (setExposure()), EV: colour x 2^EV before tone mapping.
+        float exposureEv = 0.0f;
+        // Screen-space ambient occlusion (setAmbientOcclusion()): AO from the
+        // scene depth at the output size, then blurred and multiplied into
+        // the finished frame (encodeAmbientOcclusion()).
+        bool aoEnabled = false;
+        float aoRadius = 0.5f;
+        float aoIntensity = 1.5f;
+        float aoBias = 0.02f;
+        uint32_t aoSamples = 12;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> aoTexture;
+        std::shared_ptr<systems::leal::campello_gpu::TextureView> aoView;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> aoPipeline;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> aoApplyPipeline;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> aoBindGroupLayout;
+        std::shared_ptr<systems::leal::campello_gpu::Sampler> aoSampler;  // point, binding 3
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> aoUniformBuffer[kMaxFramesInFlight];
+        /// Creates the AO pipelines: a fullscreen vertex stage and the two
+        /// fragment stages (AO, apply) of the backend; `colorFormat` is the frame's.
+        void createAmbientOcclusionPipelines(const std::shared_ptr<systems::leal::campello_gpu::ShaderModule>& vertexModule,
+                                             const char* vertexEntry,
+                                             const std::shared_ptr<systems::leal::campello_gpu::ShaderModule>& aoModule,
+                                             const char* aoEntry,
+                                             const std::shared_ptr<systems::leal::campello_gpu::ShaderModule>& applyModule,
+                                             const char* applyEntry,
+                                             systems::leal::campello_gpu::PixelFormat colorFormat);
+        /// The AO passes into the finished frame `colorView` (after anti-aliasing).
+        /// Uploads an RGBA8 image with a box-filtered mip chain (linear light
+        /// when `srgb`).
+        void uploadWithMips(const std::shared_ptr<systems::leal::campello_gpu::Texture>& texture, const uint8_t* rgba,
+                            uint32_t width, uint32_t height, uint32_t mipLevels, bool srgb);
+        void encodeAmbientOcclusion(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
+                                    const std::shared_ptr<systems::leal::campello_gpu::TextureView>& colorView,
+                                    const systems::leal::vector_math::Matrix4<double>& projection);
+        // WebGPU: the shadow pipeline's groups 0 and 1 (empty).
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> shadowEmptyBindGroupLayout;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroup> shadowEmptyBindGroup;
+        // The shadow map, or the 1x1 placeholder while there's none (created
+        // on first use), for the frame bind groups.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapBinding();
+        std::shared_ptr<systems::leal::campello_gpu::Sampler> shadowSamplerBinding();
+        uint32_t shadowMapResolution = 2048;
+        bool shadowsEnabled = true;
+        bool ensureShadowMap();
+        // Light view-projection for the shadow map, fitted to the bounds of
+        // `draws` seen from `toLight`; false if there's nothing to fit.
+        // Sun shadow cascades. The light's view is fixed by the casters'
+        // bounds and the light direction (so it doesn't move with the
+        // camera); the far cascade covers all casters (`full`), the near
+        // cascade a rectangle around the part of the view nearest the camera.
+        struct ShadowFit {
+            systems::leal::vector_math::Matrix4<double> lightView;
+            double full[4] = {0, 0, 0, 0};  ///< left, right, bottom, top of the casters in light view
+            double n = 0.0, f = 1.0, sign = 1.0;  ///< depth range along the light, lookAt's z sign
+            double lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};  ///< casters' world bounds
+        };
+        bool fitShadowLight(const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+                            const systems::leal::vector_math::Vector3<double>& toLight, ShadowFit& fit) const;
+        static systems::leal::vector_math::Matrix4<double> shadowProjection(const ShadowFit& fit, const double rect[4]);
+        /// The light-view rectangle of the view's nearest part (from the
+        /// camera to halfway between the logarithmic and uniform split of the
+        /// casters' depth range),
+        /// or false when a near cascade wouldn't be much finer than the far one.
+        static bool nearShadowRect(const ShadowFit& fit, const CameraData& camera, double rect[4]);
+        std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapNear;
+        std::shared_ptr<systems::leal::campello_gpu::TextureView> shadowMapNearView;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapNearBinding();
+        bool shadowCascades = true;
+        bool shadowNearValid = false;
+        uint64_t shadowNearKey = 0;
+        double shadowNearRect[4] = {0, 0, 0, 0};
+        systems::leal::vector_math::Matrix4<double> shadowNearViewProj;
 
         // Per-node matrices uploaded to the GPU at the start of each render().
         // Each node gets 32 floats: 16 for MVP (clip space), 16 for Model (world space).
@@ -1091,6 +1228,27 @@ namespace systems::leal::campello_renderer {
         bool supportsProgram(ProgramHandle program, const VertexLayout& layout) const {
             return meshRecipe.ready && program < programs.size() && vertexStageFor(program, layout) != nullptr;
         }
+        /// True when wide line meshes (GpuMesh::wideLines) can be drawn
+        /// (Metal). Elsewhere, draw the lines as a lineList instead.
+        bool supportsWideLines() const {
+            return meshRecipe.ready && !programs.empty() && !programs[kPbrProgram].wideLineFragment.empty() &&
+                   vertexStageFor(kPbrProgram, VertexLayout::wideLine(), false, true) != nullptr;
+        }
+        /// Data for a wide line mesh (GpuMesh::wideLines,
+        /// VertexLayout::wideLine()).
+        struct WideLineVertices {
+            /// Per segment, 8 floats: start xyz, half width in output pixels,
+            /// end xyz, 0. The mesh's POSITION buffer.
+            std::vector<float> segments;
+            /// 6 per segment (two triangles over its 4 vertices 4s..4s+3).
+            std::vector<uint32_t> indices;
+            [[nodiscard]] uint32_t vertexCount() const { return (uint32_t)(segments.size() / 8 * 4); }
+        };
+        /// Expands a line list (xyz `positions`, pairs of `indices`) into
+        /// wide line quads `widthPixels` wide (output pixels). Degenerate
+        /// segments are dropped.
+        static WideLineVertices expandLines(const float* positions, size_t vertexCount, const uint32_t* indices,
+                                            size_t indexCount, float widthPixels);
         /// True when line meshes (GpuMesh::topology lineList/lineStrip) with
         /// this layout can be drawn by the built-in program (Metal, Vulkan).
         bool supportsLines(const VertexLayout& layout = VertexLayout::positionOnly()) const {
@@ -1127,6 +1285,50 @@ namespace systems::leal::campello_renderer {
         bool isFxaaEnabled() const;
 
         void setSsaaScale(float scale);
+        /// Sun shadows: the first directional light with castShadows casts a
+        /// shadow map over the opaque draws (Metal for now; supportsShadows()).
+        /// On by default.
+        void setShadowsEnabled(bool enabled) { shadowsEnabled = enabled; }
+        bool getShadowsEnabled() const { return shadowsEnabled; }
+        /// Shadow map width and height in texels (default 2048).
+        void setShadowMapResolution(uint32_t texels);
+        bool supportsShadows() const { return shadowPipeline != nullptr; }
+        /// The shadow map is redrawn only when the light, its resolution or
+        /// the casters (meshes, their buffers and transforms) change; call
+        /// this after rewriting a mesh's buffers in place.
+        void invalidateShadowMap() {
+            shadowMapValid = false;
+            shadowNearValid = false;
+        }
+        /// A finer shadow map for the part of the view nearest the camera
+        /// (two cascades; on by default). Off: one map over the whole scene.
+        void setShadowCascades(bool enabled) { shadowCascades = enabled; }
+
+        /// World-space box mapping for `material`'s textures (base colour,
+        /// normal, metallic-roughness, occlusion, emissive), for geometry
+        /// without texture coordinates: faces facing up or down use the plan
+        /// projection, the others a projection along their own horizontal
+        /// direction (v down), one repeat per `repeatSize` world units, so
+        /// textures run on across separate meshes. The up axis is the
+        /// environment's (setEnvironmentUpAxis()). 0 turns it off.
+        void setMaterialWorldMapping(GpuMaterial* material, float repeatSize);
+
+        /// Exposure in EV: colours are multiplied by 2^ev before tone mapping
+        /// (meshes and sky). 0 by default (unchanged).
+        void setExposure(float ev) { exposureEv = ev; }
+        float getExposure() const { return exposureEv; }
+
+        /// Screen-space ambient occlusion: darkens creases, corners and
+        /// contact areas of opaque geometry. Computed from the scene depth at
+        /// the output size and multiplied into the finished frame (after
+        /// anti-aliasing), so it affects direct light too: a viewport effect.
+        /// Off by default. `radius` is in world units (metres for BIM; 0.5),
+        /// `intensity` a power applied to the result (1.5).
+        void setAmbientOcclusion(bool enabled) { aoEnabled = enabled; }
+        bool getAmbientOcclusion() const { return aoEnabled; }
+        void setAmbientOcclusionRadius(float radius) { aoRadius = radius; }
+        void setAmbientOcclusionIntensity(float intensity) { aoIntensity = intensity; }
+        bool supportsAmbientOcclusion() const { return aoPipeline != nullptr && aoApplyPipeline != nullptr; }
         float getSsaaScale() const;
 
         // KHR_texture_procedurals bake controls.

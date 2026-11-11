@@ -88,8 +88,8 @@ layout(std140, set = 0, binding = 24) uniform MaterialUniforms {
     float anisotropyRotation;        // 312
     float hasAnisotropicTexture;     // 316
     float dispersion;                // 320
-    float _pad12;                    // 324
-    float _pad13;                    // 328
+    float worldMapping;              // 324  world-space box mapping: world units per repeat (0: off)
+    float worldMappingUp;            // 328  1: z up, 0: y up
     float _pad14;                    // 332
     vec4  normalUvTransformRow0;     // 336  independent KHR_texture_transform for normalTexture
     vec4  normalUvTransformRow1;     // 352
@@ -101,7 +101,7 @@ struct Light {
     vec4 position;   // xyz = position/dir, w = type (0=dir, 1=point, 2=spot)
     vec4 color;      // xyz = rgb, w = intensity
     vec4 direction;  // xyz = spot dir, w = range
-    vec4 spotAngles; // x = innerCone, y = outerCone, zw = padding
+    vec4 spotAngles; // x = innerCone, y = outerCone, z = casts the shadow map
 };
 layout(std140, set = 1, binding = 0) uniform LightsUniform {
     uint  lightCount;
@@ -121,6 +121,12 @@ layout(std140, set = 1, binding = 1) uniform CameraUniforms {
     uvec4 clipInfo;       // x = plane count, y = section caps on
     vec4  capColor;
     vec4  clipPlanes[6];  // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
+    // Sun shadows (Renderer::render()): shadow map clip from world.
+    mat4  shadowViewProj;
+    vec4  shadowParams;   // x = on, y = texel size (uv)
+    vec4  viewParams;     // x = exposure in EV (colour x 2^EV before tone mapping)
+    mat4  shadowNearViewProj;  // the near cascade (sun shadows)
+    vec4  shadowNearParams;    // x = near cascade on
 } camera;
 
 layout(set = 1, binding = 2) uniform textureCube environmentMap;
@@ -134,6 +140,9 @@ layout(set = 1, binding = 5) uniform sampler     sceneColorSampler;
 layout(set = 1, binding = 6) uniform textureCube irradianceMap;
 layout(set = 1, binding = 7) uniform texture2D   brdfLutTexture;
 layout(set = 1, binding = 8) uniform sampler     brdfLutSampler;
+layout(set = 1, binding = 9)  uniform texture2D     shadowMap;     // sun shadows (depth)
+layout(set = 1, binding = 10) uniform samplerShadow shadowSampler; // compare less-or-equal
+layout(set = 1, binding = 11) uniform texture2D     shadowMapNear; // sun shadows, near cascade
 
 // --- Per-material textures/samplers (set 0) -------------------------------------
 layout(set = 0, binding = 0)  uniform texture2D baseColorTexture;
@@ -380,7 +389,69 @@ vec3 linearToSRGBFast(vec3 color) {
     return pow(color, vec3(1.0 / 2.2));
 }
 
+// One shadow map's verdict on P: 1 lit .. 0 shadowed, 3x3 percentage-closer
+// filtering; `inside` false where the map doesn't cover P. Receiver bias as
+// shaders/metal/default.metal's shadowLookup().
+float shadowLookup(texture2D map, mat4 M, float texel, vec3 P, vec3 N, vec3 L, out bool inside) {
+    float worldTexel = 2.0 * texel / max(length(vec3(M[0][0], M[1][0], M[2][0])), 1e-6);
+    float depthPerWorld = length(vec3(M[0][2], M[1][2], M[2][2]));
+    float NdotL = clamp(dot(N, L), 0.0, 1.0);
+    float slope = sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.2);
+    vec4 clip = M * vec4(P + N * worldTexel * (1.0 + slope), 1.0);
+    vec3 ndc = clip.xyz / clip.w;
+    vec2 uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    inside = all(greaterThanEqual(uv, vec2(2.0 * texel))) && all(lessThanEqual(uv, vec2(1.0 - 2.0 * texel))) && ndc.z <= 1.0;
+    if (!inside) {
+        return 1.0;
+    }
+    float depth = ndc.z - depthPerWorld * worldTexel;
+    float lit = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            lit += textureLod(sampler2DShadow(map, shadowSampler), vec3(uv + vec2(x, y) * texel, depth), 0.0);
+        }
+    }
+    return lit / 9.0;
+}
+
+// How lit P is by the shadow-casting light: the near cascade where it covers
+// P, else the far one (the whole scene); outside both, lit.
+float sunShadow(vec3 P, vec3 N, vec3 L) {
+    if (camera.shadowParams.x < 0.5) {
+        return 1.0;
+    }
+    bool inside = false;
+    if (camera.shadowNearParams.x > 0.5) {
+        float lit = shadowLookup(shadowMapNear, camera.shadowNearViewProj, camera.shadowParams.y, P, N, L, inside);
+        if (inside) {
+            return lit;
+        }
+    }
+    return shadowLookup(shadowMap, camera.shadowViewProj, camera.shadowParams.y, P, N, L, inside);
+}
+
+// World-space box mapping (Renderer::setMaterialWorldMapping()), for
+// geometry without texture coordinates (CAD, BIM): faces facing up or down
+// take the plan projection (u east, v south), the others a projection along
+// their own horizontal direction (u to the right seen from outside, v down),
+// one repeat per `size` world units, so textures run continuously across
+// elements. T and B are the directions u and v grow in (normal mapping).
+void worldMappingFrame(vec3 P, vec3 N, float size, bool zUp, out vec2 uv, out vec3 T, out vec3 B) {
+    vec3 U = zUp ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+    float nu = dot(N, U);
+    if (abs(nu) > 0.7071) {
+        T = vec3(1.0, 0.0, 0.0);
+        B = zUp ? vec3(0.0, -1.0, 0.0) : vec3(0.0, 0.0, 1.0);
+    } else {
+        vec3 h = normalize(N - U * nu);
+        T = cross(U, h);
+        B = -U;
+    }
+    uv = vec2(dot(P, T), dot(P, B)) / size;
+}
+
 void main() {
+    vec2 texcoord0In = fragTexcoord0;  // world mapping replaces it
     // Derivatives are taken unconditionally (uniform control flow).
     vec3 faceNormal = cross(dFdx(worldPos), dFdy(worldPos));
     worldNormalIn    = worldNormalRaw;
@@ -396,6 +467,12 @@ void main() {
         worldTangentIn   = T;
         worldBitangentIn = cross(N, T);
     }
+    if (mat.worldMapping > 0.0) {
+        vec3 T, B;
+        worldMappingFrame(worldPos, normalize(worldNormalIn), mat.worldMapping, mat.worldMappingUp > 0.5, texcoord0In, T, B);
+        worldTangentIn   = T;
+        worldBitangentIn = B;
+    }
 
     // Clip planes (Renderer::setClipPlanes()): discard the clipped side. With
     // section caps on, back faces of single-sided surfaces (the inside of a
@@ -410,9 +487,9 @@ void main() {
         return;
     }
 
-    vec2 uv0 = fragTexcoord0;
+    vec2 uv0 = texcoord0In;
     if (mat.uvTransformRow0.w > 0.5) {
-        uv0 = applyUvTransform(fragTexcoord0, mat.uvTransformRow0, mat.uvTransformRow1);
+        uv0 = applyUvTransform(texcoord0In, mat.uvTransformRow0, mat.uvTransformRow1);
     }
     vec2 baseColorUV = (mat.uvTransformRow0.w > 0.5)
         ? uv0 : selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1BaseColor);
@@ -449,8 +526,8 @@ void main() {
     vec3 N;
     if (mat.hasNormalTexture > 0.5) {
         vec2 normalUV = (mat.normalUvTransformRow0.w > 0.5)
-            ? applyUvTransform(fragTexcoord0, mat.normalUvTransformRow0, mat.normalUvTransformRow1)
-            : selectUV(fragTexcoord0, fragTexcoord1, mat.texCoord1Mask, kUV1Normal);
+            ? applyUvTransform(texcoord0In, mat.normalUvTransformRow0, mat.normalUvTransformRow1)
+            : selectUV(texcoord0In, fragTexcoord1, mat.texCoord1Mask, kUV1Normal);
         vec3 ns = texture(sampler2D(normalTexture, normalSampler), normalUV).rgb * 2.0 - 1.0;
         ns.xy *= mat.normalScale;
         vec3 Nbase = normalize(worldNormalIn);
@@ -647,7 +724,8 @@ void main() {
 
         for (int ch = 0; ch < 3; ch++) {
             if (uvValid[ch]) {
-                transmitted[ch] = textureLod(sampler2D(sceneColorTexture, sceneColorSampler), sampleUV[ch], lod)[ch];
+                // Stored display-encoded (tone mapped, sRGB): back to linear.
+                transmitted[ch] = pow(max(textureLod(sampler2D(sceneColorTexture, sceneColorSampler), sampleUV[ch], lod)[ch], 0.0), 2.2);
             } else {
                 transmitted[ch] = texture(samplerCube(environmentMap, environmentSampler), Trefr)[ch];
             }
@@ -708,7 +786,9 @@ void main() {
         }
 
         float NdotL      = max(dot(N, lightDir), 0.0);
-        vec3  lightColor = light.color.xyz * light.color.w * attenuation * spotFactor;
+        // The sun (spotAngles.z): darkened where the shadow map says so.
+        float shadow     = light.spotAngles.z > 0.5 ? sunShadow(worldPos, N, lightDir) : 1.0;
+        vec3  lightColor = light.color.xyz * light.color.w * attenuation * spotFactor * shadow;
 
         vec3  halfDir = normalize(lightDir + viewDir);
         float NdotH   = max(dot(N, halfDir), 0.0);
@@ -792,6 +872,7 @@ void main() {
                        + emissive + transmitted * transmittance) * ccAmbientAtten
                       + totalClearcoat + iblClearcoat;
 
+    finalColor *= exp2(camera.viewParams.x);  // exposure
     finalColor = toneMapKhronosPbrNeutral(finalColor);
     finalColor = linearToSRGBFast(finalColor);
 

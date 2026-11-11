@@ -170,6 +170,9 @@ struct MaterialUniforms {
     float  anisotropyRotation;
     float  hasAnisotropicTexture;
     float  dispersion;            // KHR_materials_dispersion (default 0.0)
+    float  worldMapping;          // world-space box mapping: world units per repeat (0: off)
+    float  worldMappingUp;        // 1: z up, 0: y up
+    float  _pad14;
     float4 normalUvTransformRow0; // independent KHR_texture_transform for normalTexture
     float4 normalUvTransformRow1;
     // KHR spec: each texture reference has its own texCoord index (which
@@ -242,11 +245,17 @@ struct CameraUniforms {
     float4x4 viewMatrix;
     float4x4 projMatrix;
     float2   screenSize;
-    float2   _pad;
+    float2   lineParams;     // x: the SSAA scale the scene is drawn at (wide lines); y: unused
     // Clip block (Renderer::uploadClipUniforms()).
     uint4    clipInfo;       // x = plane count, y = section caps on
     float4   capColor;
     float4   clipPlanes[6];  // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
+    // Shadow block (Renderer: sun shadows).
+    float4x4 shadowViewProj;  // world -> the shadow map's clip space
+    float4   shadowParams;    // x = on, y = one texel in uv
+    float4   viewParams;      // x = exposure in EV (0: unchanged; colour x 2^EV before tone mapping)
+    float4x4 shadowNearViewProj;  // world -> the near cascade's clip space
+    float4   shadowNearParams;    // x = near cascade on
 };
 
 constant float VIEW_MODE_NORMAL       = 0.0;
@@ -820,6 +829,75 @@ float3 iblGGXFresnel(float NdotV, float roughness, float3 F0,
     return FssEss + FmsEms;
 }
 
+// One shadow map's verdict on `worldPos`: 1 lit .. 0 shadowed, 3x3
+// percentage-closer filtering (hardware-compared, bilinear), so soft edges.
+// `inside` is false where the map doesn't cover the point. Receiver bias
+// against self-shadowing ("acne"), sized to one texel of this map in world
+// units (the orthographic scales are the matrix rows' lengths): along the
+// normal, more at grazing light, plus a texel of depth.
+inline float shadowLookup(depth2d<float> shadowMap, float4x4 M, float texel, float3 worldPos, float3 N, float3 L,
+                          thread bool &inside) {
+    constexpr sampler shadowSampler(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);
+    const float worldTexel = 2.0 * texel / max(length(float3(M[0][0], M[1][0], M[2][0])), 1e-6);
+    const float depthPerWorld = length(float3(M[0][2], M[1][2], M[2][2]));
+    const float NdotL = clamp(dot(N, L), 0.0, 1.0);
+    const float slope = sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.2);
+    const float4 clip = M * float4(worldPos + N * worldTexel * (1.0 + slope), 1.0);
+    float3 ndc = clip.xyz / clip.w;
+    ndc.z -= depthPerWorld * worldTexel;
+    const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    inside = all(uv >= float2(2.0 * texel)) && all(uv <= float2(1.0 - 2.0 * texel)) && ndc.z <= 1.0;
+    if (!inside) {
+        return 1.0;
+    }
+    float lit = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            lit += shadowMap.sample_compare(shadowSampler, uv + float2(x, y) * texel, ndc.z);
+        }
+    }
+    return lit / 9.0;
+}
+
+// How lit `worldPos` is by the shadow-casting light: 1 lit .. 0 shadowed.
+// Two cascades: the near map (the part of the view closest to the camera,
+// finer) where it covers the point, else the far map (the whole scene).
+// Outside both: lit.
+inline float sunShadow(constant CameraUniforms &camera, depth2d<float> shadowMap, depth2d<float> shadowMapNear,
+                       float3 worldPos, float3 N, float3 L) {
+    if (camera.shadowParams.x < 0.5) {
+        return 1.0;
+    }
+    bool inside = false;
+    if (camera.shadowNearParams.x > 0.5) {
+        const float lit = shadowLookup(shadowMapNear, camera.shadowNearViewProj, camera.shadowParams.y, worldPos, N, L, inside);
+        if (inside) {
+            return lit;
+        }
+    }
+    return shadowLookup(shadowMap, camera.shadowViewProj, camera.shadowParams.y, worldPos, N, L, inside);
+}
+
+// World-space box mapping (Renderer::setMaterialWorldMapping()), for
+// geometry without texture coordinates (CAD, BIM): faces facing up or down
+// take the plan projection (u east, v south), the others a projection along
+// their own horizontal direction (u to the right seen from outside, v down),
+// one repeat per `size` world units, so textures run continuously across
+// elements. T and B are the directions u and v grow in (normal mapping).
+inline void worldMappingFrame(float3 P, float3 N, float size, bool zUp, thread float2 &uv, thread float3 &T, thread float3 &B) {
+    const float3 U = zUp ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
+    const float nu = dot(N, U);
+    if (abs(nu) > 0.7071) {
+        T = float3(1.0, 0.0, 0.0);
+        B = zUp ? float3(0.0, -1.0, 0.0) : float3(0.0, 0.0, 1.0);
+    } else {
+        const float3 h = normalize(N - U * nu);
+        T = cross(U, h);
+        B = -U;
+    }
+    uv = float2(dot(P, T), dot(P, B)) / size;
+}
+
 fragment float4 fragmentMain_textured(
     VertexOut        inRaw                     [[stage_in]],
     constant MaterialUniforms &mat             [[buffer(17)]],
@@ -853,6 +931,8 @@ fragment float4 fragmentMain_textured(
     texture2d<float> anisotropicTexture          [[texture(26)]],
     texturecube<float> irradianceEnvironmentMap  [[texture(27)]],
     texture2d<float> brdfLutTexture              [[texture(28)]],
+    depth2d<float>   shadowMap                   [[texture(29)]],
+    depth2d<float>   shadowMapNear               [[texture(30)]],
     bool             frontFacing                 [[front_facing]])
 {
     // Position-only meshes (vertexLean) carry no normal: use the flat face
@@ -870,6 +950,15 @@ fragment float4 fragmentMain_textured(
         in.worldNormal    = N;
         in.worldTangent   = T;
         in.worldBitangent = cross(N, T);
+    }
+    if (mat.worldMapping > 0.0) {
+        float2 wuv;
+        float3 T, B;
+        worldMappingFrame(inRaw.worldPos, normalize(in.worldNormal), mat.worldMapping, mat.worldMappingUp > 0.5, wuv, T, B);
+        in.texcoord0      = wuv;
+        in.normalUV       = wuv;
+        in.worldTangent   = T;
+        in.worldBitangent = B;
     }
 
     // Clip planes (Renderer::setClipPlanes()): discard the clipped side. With
@@ -1209,7 +1298,11 @@ fragment float4 fragmentMain_textured(
         // Sample background per-channel (dispersion splits R/G/B refracted UVs).
         for (int ch = 0; ch < 3; ch++) {
             if (uvValid[ch]) {
-                transmitted[ch] = sceneColorTexture.sample(scSampler, sampleUV[ch], level(lod))[ch];
+                // The opaque scene is stored display-encoded (tone mapped,
+                // sRGB): back to (approximately) linear light before it's
+                // lit and encoded again, or what's seen through glass would
+                // come out brighter and washed out.
+                transmitted[ch] = pow(max(sceneColorTexture.sample(scSampler, sampleUV[ch], level(lod))[ch], 0.0), 2.2);
             } else {
                 transmitted[ch] = environmentMap.sample(baseColorSampler, T)[ch];
             }
@@ -1310,7 +1403,9 @@ fragment float4 fragmentMain_textured(
         }
 
         float  NdotL      = max(dot(N, lightDir), 0.0);
-        float3 lightColor = light.color.xyz * light.color.w * attenuation * spotFactor;
+        // The sun (spotAngles.z): darkened where the shadow map says so.
+        const float shadow = light.spotAngles.z > 0.5 ? sunShadow(camera, shadowMap, shadowMapNear, in.worldPos, N, lightDir) : 1.0;
+        float3 lightColor = light.color.xyz * light.color.w * attenuation * spotFactor * shadow;
 
         float3 halfDir = normalize(lightDir + viewDir);
         float  NdotH   = max(dot(N, halfDir), 0.0);
@@ -1419,6 +1514,7 @@ fragment float4 fragmentMain_textured(
                          + emissive + transmitted * transmittance) * ccAmbientAtten
                         + totalClearcoat + iblClearcoat;
 
+    finalColor *= exp2(camera.viewParams.x);  // exposure
     finalColor = toneMapKhronosPbrNeutral(finalColor);
     finalColor = linearToSRGBFast(finalColor);
 
@@ -1448,7 +1544,7 @@ vertex SkyboxOut skyboxVertex(uint vertexID [[vertex_id]]) {
 struct SkyboxUniforms {
     float4x4 invVP;
     float2   screenSize;
-    float2   _pad;
+    float2   _pad;        // x = exposure in EV (as CameraUniforms::viewParams.x)
     float4   cameraPos;  // w ignored — float3 would pad to 16 bytes anyway
 };
 
@@ -1473,6 +1569,7 @@ fragment float4 skyboxFragment(SkyboxOut in [[stage_in]],
     // raw here hard-clips to solid white/saturated colors at the output
     // format instead of compressing smoothly like every reflection of the
     // same environment does.
+    color *= exp2(u._pad.x);  // exposure
     color = toneMapKhronosPbrNeutral(color);
     color = linearToSRGBFast(color);
 
@@ -1762,6 +1859,226 @@ fragment float4 fxaaFragment(FxaaOut in [[stage_in]],
         return float4(rgbA, 1.0);
     }
     return float4(rgbB, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Screen-space ambient occlusion (setAmbientOcclusion()). Two passes over the
+// finished frame, both with fxaaVertex's fullscreen triangle:
+//   ssaoFragment      scene depth -> AO (r) at the output size: hemisphere
+//                     samples around the view-space position, normal from
+//                     the depth, rotated per pixel (interleaved noise).
+//   ssaoApplyFragment AO blurred 4x4 (depth-aware, which also removes the
+//                     noise pattern), multiplied into the frame by blending.
+// The depth texture may be larger than the output (SSAA); it's read by texel.
+// ---------------------------------------------------------------------------
+struct AoUniforms {
+    float4x4 proj;     // view -> clip
+    float4x4 invProj;  // clip -> view
+    float4   params;   // x = radius (view units), y = intensity (power), z = bias (view units), w = samples
+    float4   size;     // depth texture width, height; output width, height
+};
+
+inline float aoDepthAt(depth2d<float> depthTex, constant AoUniforms &u, float2 uv) {
+    const uint2 texel = uint2(clamp(uv * u.size.xy, float2(0.0), u.size.xy - 1.0));
+    return depthTex.read(texel);
+}
+
+inline float3 aoViewPos(constant AoUniforms &u, float2 uv, float depth) {
+    const float4 p = u.invProj * float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    return p.xyz / p.w;
+}
+
+fragment float4 ssaoFragment(FxaaOut in [[stage_in]],
+                             constant AoUniforms &u [[buffer(2)]],
+                             depth2d<float> depthTex [[texture(0)]])
+{
+    const float depth = aoDepthAt(depthTex, u, in.uv);
+    if (depth >= 1.0) {
+        return float4(1.0);  // sky
+    }
+    const float3 P = aoViewPos(u, in.uv, depth);
+    // Normal from the neighbours on the side with the smaller depth step
+    // (no smearing across silhouettes), turned towards the camera.
+    const float2 px = 1.0 / u.size.zw;
+    const float3 R = aoViewPos(u, in.uv + float2(px.x, 0.0), aoDepthAt(depthTex, u, in.uv + float2(px.x, 0.0)));
+    const float3 L = aoViewPos(u, in.uv - float2(px.x, 0.0), aoDepthAt(depthTex, u, in.uv - float2(px.x, 0.0)));
+    const float3 D = aoViewPos(u, in.uv + float2(0.0, px.y), aoDepthAt(depthTex, u, in.uv + float2(0.0, px.y)));
+    const float3 U = aoViewPos(u, in.uv - float2(0.0, px.y), aoDepthAt(depthTex, u, in.uv - float2(0.0, px.y)));
+    const float3 dx = abs(R.z - P.z) < abs(P.z - L.z) ? R - P : P - L;
+    const float3 dy = abs(D.z - P.z) < abs(P.z - U.z) ? D - P : P - U;
+    float3 N = normalize(cross(dx, dy));
+    if (dot(N, -P) < 0.0) N = -N;
+
+    const float radius = u.params.x;
+    const float bias = u.params.z;
+    const int samples = int(u.params.w);
+    // Per-pixel rotation of the kernel (interleaved gradient noise).
+    const float noise = fract(52.9829189 * fract(dot(in.position.xy, float2(0.06711056, 0.00583715))));
+    const float angle = noise * 6.28318530718;
+    const float3 helper = abs(N.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 T = normalize(cross(helper, N));
+    float3 B = cross(N, T);
+    const float ca = cos(angle), sa = sin(angle);
+    const float3 Tr = T * ca + B * sa;
+    const float3 Br = cross(N, Tr);
+
+    float occlusion = 0.0;
+    for (int i = 0; i < samples; ++i) {
+        // Hemisphere kernel: a spiral, denser near the centre.
+        const float t = (float(i) + 0.5) / float(samples);
+        const float phi = float(i) * 2.39996323;  // golden angle
+        const float cosTheta = sqrt(1.0 - t * 0.9);
+        const float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+        const float scale = mix(0.15, 1.0, t * t);
+        const float3 k = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta) * scale;
+        const float3 S = P + (Tr * k.x + Br * k.y + N * k.z) * radius;
+        const float4 c = u.proj * float4(S, 1.0);
+        const float2 suv = float2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+        if (any(suv < float2(0.0)) || any(suv > float2(1.0))) continue;
+        const float sceneDepth = aoDepthAt(depthTex, u, suv);
+        if (sceneDepth >= 1.0) continue;
+        const float3 Q = aoViewPos(u, suv, sceneDepth);
+        // Occluded when the surface there is nearer the camera than the
+        // sample (either handedness of view space); far-away occluders fade out.
+        const float range = smoothstep(0.0, 1.0, radius / max(abs(P.z - Q.z), 1e-4));
+        occlusion += (abs(Q.z) <= abs(S.z) - bias ? 1.0 : 0.0) * range;
+    }
+    const float ao = pow(saturate(1.0 - occlusion / float(max(samples, 1))), u.params.y);
+    return float4(ao, ao, ao, 1.0);
+}
+
+fragment float4 ssaoApplyFragment(FxaaOut in [[stage_in]],
+                                  constant AoUniforms &u [[buffer(2)]],
+                                  depth2d<float> depthTex [[texture(0)]],
+                                  texture2d<float> aoTex [[texture(1)]])
+{
+    const float depth = aoDepthAt(depthTex, u, in.uv);
+    if (depth >= 1.0) {
+        return float4(1.0);
+    }
+    const float z = aoViewPos(u, in.uv, depth).z;
+    const int2 centre = int2(in.uv * u.size.zw);
+    const int2 limit = int2(u.size.zw) - 1;
+    const float2 px = 1.0 / u.size.zw;
+    float sum = 0.0;
+    float weight = 0.0;
+    for (int y = -2; y < 2; ++y) {
+        for (int x = -2; x < 2; ++x) {
+            const int2 at = clamp(centre + int2(x, y), int2(0), limit);
+            const float2 uv = (float2(at) + 0.5) * px;
+            const float d = aoDepthAt(depthTex, u, uv);
+            const float sz = aoViewPos(u, uv, d).z;
+            const float w = (d < 1.0 && abs(sz - z) < 0.05 * abs(z) + u.params.z) ? 1.0 : 0.0;
+            sum += aoTex.read(uint2(at)).r * w;
+            weight += w;
+        }
+    }
+    const float ao = weight > 0.0 ? sum / weight : 1.0;
+    return float4(ao, ao, ao, 1.0);  // blended: frame x ao
+}
+
+// ---------------------------------------------------------------------------
+// Wide lines (GpuMesh::wideLines): one quad per segment, its 4 vertices
+// read by index from the segment buffer (Renderer::expandLines(); no vertex
+// attributes). The quad is expanded in
+// screen space by the half width plus a fringe, sideways and past both ends,
+// so a line has the same width and antialiasing at any SSAA scale (the
+// camera block's screenSize over lineParams.x is the output size). fragmentWideLine fades the
+// fringe by the distance to the centre line. Same depth nudge as vertexLine.
+// ---------------------------------------------------------------------------
+// One segment: start xyz + half width (output pixels), end xyz + 0.
+struct WideLineSegment {
+    float4 start;
+    float4 end;
+};
+
+struct WideLineOut {
+    float4 clipPosition [[position]];
+    float3 worldPos;
+    float  distance;               // signed, output pixels from the centre line
+    float  halfWidth [[flat]];     // output pixels
+    float  fringe    [[flat]];     // output pixels of fade beyond the half width
+    float  opacity   [[flat]];     // fades segments a few pixels long
+};
+
+constant float kWideLineNearW = 1.0e-4;
+// Segments shorter than this on screen aren't drawn; up to kWideLineFullLength
+// they fade from kWideLineMinOpacity (small, crowded detail far away).
+constant float kWideLineMinLength   = 0.75;
+constant float kWideLineFullLength  = 4.0;
+constant float kWideLineMinOpacity  = 0.3;
+
+vertex WideLineOut vertexWideLine(
+    uint                          vid            [[vertex_id]],
+    device const NodeTransforms  *nodeTransforms [[buffer(16)]],
+    constant CameraUniforms      &camera         [[buffer(18)]],
+    device const WideLineSegment *segments       [[buffer(26)]])
+{
+    // 4 vertices per segment: 0/1 at the start, 2/3 at the end; even on
+    // side +1, odd on side -1 (Renderer::expandLines()).
+    const WideLineSegment segment = segments[vid / 4];
+    const uint  corner    = vid % 4;
+    const bool  isStart   = corner < 2;
+    const float side      = (corner % 2 == 0) ? 1.0 : -1.0;
+    const float halfWidth = segment.start.w;
+    const float3 position = isStart ? segment.start.xyz : segment.end.xyz;
+    const float3 otherEnd = isStart ? segment.end.xyz : segment.start.xyz;
+    // 1 output pixel of fringe, less when supersampled (the downsample
+    // smooths the rest): 1/2 px at SSAA 2x.
+    const float fringe = 1.0 / max(camera.lineParams.x, 1.0);
+    float4 self  = nodeTransforms[0].mvp * float4(position, 1.0);
+    float4 other = nodeTransforms[0].mvp * float4(otherEnd, 1.0);
+    // An end behind the camera: slide it along the segment to just in front
+    // of the eye, so the screen direction stays meaningful.
+    if (self.w < kWideLineNearW && other.w > kWideLineNearW) {
+        self = mix(self, other, (kWideLineNearW - self.w) / (other.w - self.w));
+    } else if (other.w < kWideLineNearW && self.w > kWideLineNearW) {
+        other = mix(other, self, (kWideLineNearW - other.w) / (self.w - other.w));
+    }
+    // screenSize is the render size (SSAA included): output pixels are it
+    // divided by the SSAA scale.
+    const float2 halfScreen = 0.5 * max(camera.screenSize / max(camera.lineParams.x, 1.0), float2(1.0));
+    const float2 selfPx  = self.xy / self.w * halfScreen;
+    const float2 otherPx = other.xy / other.w * halfScreen;
+    float2 along = isStart ? otherPx - selfPx : selfPx - otherPx;  // start -> end
+    const float len = length(along);
+    along = len > 1.0e-6 ? along / len : float2(1.0, 0.0);
+    const float2 across = float2(-along.y, along.x);
+    // Too short to see: a zero-area quad (no fragments).
+    const float extent = len < kWideLineMinLength ? 0.0 : halfWidth + fringe;
+    const float2 offsetPx = across * side * extent + along * (isStart ? -extent : extent);
+
+    WideLineOut out;
+    out.clipPosition = self;
+    out.clipPosition.xy += offsetPx / halfScreen * self.w;
+    out.clipPosition.z -= kLineDepthOffset * self.w;
+    out.worldPos  = (nodeTransforms[0].model * float4(position, 1.0)).xyz;
+    out.distance  = side * extent;
+    out.halfWidth = halfWidth;
+    out.fringe    = fringe;
+    out.opacity   = mix(kWideLineMinOpacity, 1.0, smoothstep(kWideLineMinLength, kWideLineFullLength, len));
+    return out;
+}
+
+// Output for "darkest wins" blending (min): white moved towards the line
+// colour by coverage x opacity, so overlapping lines don't darken further.
+fragment float4 fragmentWideLine(
+    WideLineOut                in     [[stage_in]],
+    constant MaterialUniforms &mat    [[buffer(17)]],
+    constant CameraUniforms   &camera [[buffer(18)]])
+{
+    for (uint i = 0; i < camera.clipInfo.x; ++i) {
+        if (dot(camera.clipPlanes[i].xyz, in.worldPos) + camera.clipPlanes[i].w < 0.0) {
+            discard_fragment();
+        }
+    }
+    // Full colour within the half width, fading to nothing over the fringe.
+    const float coverage = saturate((in.halfWidth + 0.5 * in.fringe - abs(in.distance)) / in.fringe);
+    const float strength = coverage * in.opacity * mat.baseColorFactor.a;
+    if (strength <= 0.0) {
+        discard_fragment();
+    }
+    return float4(mix(float3(1.0), mat.baseColorFactor.rgb, strength), 1.0);
 }
 
 // ---------------------------------------------------------------------------

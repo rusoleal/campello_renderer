@@ -32,6 +32,10 @@ struct Transform {
 struct MeshRenderer {
     GpuMesh* mesh = nullptr;
     GpuMaterial* material = nullptr;
+    // Not drawn when false (e.g. occlusion-culled by the app), but still a
+    // sun shadow caster: what's hidden from the camera can still shadow
+    // what isn't, and the shadow map needn't be redrawn.
+    bool visible = true;
     // Optional skinning data. If jointMatrixBuffer is non-null and jointCount > 0,
     // the renderer will bind it to the joint matrix palette slot.
     std::shared_ptr<systems::leal::campello_gpu::Buffer> jointMatrixBuffer;
@@ -146,6 +150,7 @@ inline LightData buildLightData(const Transform& transform,
     data.innerConeAngle = 0.0f;
     data.outerConeAngle = 0.0f;
     data.type = 0; // directional
+    data.castShadows = light.castShadows;
     return data;
 }
 
@@ -445,9 +450,29 @@ inline void render_system(
     const auto clipFromWorld = scene.camera.projection * scene.camera.view;
     RenderSystemStats counted;
     const bool clipping = !renderer.getClipPlanes().empty() && renderer.supportsClipPlanes();
+    // Sun shadow casters don't depend on the camera: off-screen geometry
+    // still shadows what's on screen (and the shadow map can be reused while
+    // the camera moves). Clipped-away geometry doesn't cast.
+    bool castersWanted = false;
+    if (renderer.getShadowsEnabled() && renderer.supportsShadows()) {
+        for (const auto& light : scene.lights) {
+            castersWanted = castersWanted || (light.type == 0 && light.castShadows);
+        }
+    }
     for (auto [transform, meshRenderer] : world.query<Transform, MeshRenderer>()) {
         if (!meshRenderer.mesh || !meshRenderer.material) continue;
         const bool skinned = meshRenderer.jointMatrixBuffer && meshRenderer.jointCount > 0;
+        if (castersWanted && !skinned && !meshRenderer.material->alphaBlend &&
+            meshRenderer.mesh->topology == systems::leal::campello_gpu::PrimitiveTopology::triangleList &&
+            !(clipping && isClippedAway(renderer.getClipPlanes(), transform.worldMatrix, *meshRenderer.mesh))) {
+            DrawCall caster;
+            caster.mesh = meshRenderer.mesh;
+            caster.material = meshRenderer.material;
+            caster.worldTransform = transform.worldMatrix;
+            caster.instanceCount = 1;
+            scene.shadowCasters.push_back(caster);
+        }
+        if (!meshRenderer.visible) continue;
         if (!skinned && isOutsideFrustum(clipFromWorld, transform.worldMatrix, *meshRenderer.mesh)) {
             ++counted.culled;
             continue;

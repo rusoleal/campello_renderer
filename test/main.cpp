@@ -3067,6 +3067,563 @@ TEST_F(OffscreenRenderTest, LinesDrawOnTopOfTheirFaces) {
     EXPECT_GT(pixels[quadPixel], 40) << "lit red quad";
 }
 
+// Wide lines (GpuMesh::wideLines): Renderer::expandLines() stores each
+// segment once (start + half width, end) and indexes one quad over it.
+TEST(WideLines, ExpandLinesStoresSegmentsAndQuads) {
+    const float positions[] = {0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0};
+    const uint32_t indices[] = {0, 1, 1, 2, 2, 3};  // the last segment is degenerate
+    const auto lines = Renderer::expandLines(positions, 4, indices, 6, 3.0f);
+    ASSERT_EQ(lines.segments.size(), 2u * 8);
+    ASSERT_EQ(lines.indices.size(), 2u * 6);
+    EXPECT_EQ(lines.vertexCount(), 8u);
+    // First segment: (0,0,0) -> (1,0,0), half width 1.5.
+    const std::vector<float> first(lines.segments.begin(), lines.segments.begin() + 8);
+    EXPECT_EQ(first, (std::vector<float>{0, 0, 0, 1.5f, 1, 0, 0, 0}));
+    EXPECT_EQ(std::vector<uint32_t>(lines.indices.begin(), lines.indices.begin() + 6), (std::vector<uint32_t>{0, 1, 3, 0, 3, 2}));
+    EXPECT_EQ(lines.indices[6], 4u);  // the second quad's vertices start at 4
+}
+
+// A 3 px wide line (green: it darkens the red channel) across a lit red quad
+// in the same plane: drawn over its face along its whole length, with soft
+// edges (partial darkening), and as wide at SSAA 1, 2 and 4 (width in output
+// pixels, unlike hardware lines).
+TEST_F(OffscreenRenderTest, WideLinesKeepTheirWidthAndSoftEdgesAtAnySsaa) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsWideLines()) GTEST_SKIP() << "No wide line stage on this backend";
+    GpuMaterial* green = renderer->uploadMaterial((*asset->materials)[0], *asset);
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(green, nullptr);
+    ASSERT_NE(red, nullptr);
+
+    float quadPositions[] = {-0.6f, -0.6f, 0.0f, 0.6f, -0.6f, 0.0f, 0.6f, 0.6f, 0.0f, -0.6f, 0.6f, 0.0f};
+    uint32_t quadIndices[] = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(sizeof(quadPositions), GPU::BufferUsage::vertex, quadPositions);
+    quad.indexBuffer = device->createBuffer(sizeof(quadIndices), GPU::BufferUsage::index, quadIndices);
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = &VertexLayout::positionOnly();
+
+    // A shallow diagonal (about 18 degrees), where hardware lines stair-step.
+    const float linePositions[] = {-0.6f, -0.2f, 0.0f, 0.6f, 0.2f, 0.0f};
+    const uint32_t lineIndices[] = {0, 1};
+    auto lines = Renderer::expandLines(linePositions, 2, lineIndices, 2, 3.0f);
+    GpuMesh line;
+    line.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(lines.segments.size() * 4, GPU::BufferUsage::vertex, lines.segments.data());
+    line.indexBuffer = device->createBuffer(lines.indices.size() * 4, GPU::BufferUsage::index, lines.indices.data());
+    line.indexCount = (uint32_t)lines.indices.size();
+    line.indexFormat = GPU::IndexFormat::uint32;
+    line.vertexCount = lines.vertexCount();
+    line.layout = &VertexLayout::wideLine();
+    line.wideLines = true;
+
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                    VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection =
+        VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+    // The line first: wide lines are drawn after opaque geometry anyway.
+    for (auto [mesh, material] : {std::pair{&line, green}, std::pair{&quad, red}}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+
+    std::vector<double> widths;
+    for (const float ssaa : {1.0f, 2.0f, 4.0f}) {
+        renderer->setSsaaScale(ssaa);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        const auto pixels = readBackPixels(tex);
+        // "Darkest wins" blending: the line darkens the quad's red channel,
+        // measured against the brightest pixel of the quad in that column.
+        const auto red = [&](int x, int y) { return double(pixels[(size_t(y) * 64 + size_t(x)) * 4]); };
+        const auto greenness = [&](int x, int y) {
+            double background = 0.0;
+            for (int row = 24; row <= 40; ++row) background = std::max(background, red(x, row));
+            return background > 0.0 ? std::clamp((background - red(x, y)) / background, 0.0, 1.0) : 0.0;
+        };
+        // Down each column the line crosses: some full-strength pixels, some
+        // partial ones (soft edges), and the coverage sums to the line's
+        // vertical thickness (3 px / cos(18 deg) ~ 3.2 px).
+        int partial = 0;
+        double total = 0.0;
+        int columns = 0;
+        for (int x = 24; x <= 39; ++x) {
+            double sum = 0.0;
+            double peak = 0.0;
+            for (int y = 24; y <= 40; ++y) {  // inside the quad
+                const double g = greenness(x, y);
+                sum += g;
+                peak = std::max(peak, g);
+                if (g > 0.15 && g < 0.85) ++partial;
+            }
+            EXPECT_GT(peak, 0.8) << "ssaa " << ssaa << ": line missing at column " << x;
+            total += sum;
+            ++columns;
+        }
+        EXPECT_GT(partial, columns / 2) << "ssaa " << ssaa << ": hard edges";
+        widths.push_back(total / columns);
+    }
+    renderer->setSsaaScale(1.0f);
+
+    // Overlapping lines don't stack ("darkest wins"): the same line drawn
+    // twice looks exactly like once (edges of two elements that coincide,
+    // crowded edges far away).
+    const auto renderOnce = [&] {
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        return readBackPixels(tex);
+    };
+    const auto single = renderOnce();
+    DrawCall again;
+    again.mesh = &line;
+    again.material = green;
+    again.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(again);
+    EXPECT_EQ(renderOnce(), single) << "overlapping wide lines stack";
+
+    // About 3 px / cos(18 deg) ~ 3.2 px; the darkening measure reads a little
+    // high (the lit quad isn't perfectly even down a column). What matters:
+    // the same at every SSAA scale.
+    for (const double w : widths) {
+        EXPECT_GT(w, 2.5);
+        EXPECT_LT(w, 4.5);
+    }
+    EXPECT_NEAR(widths[0], widths[1], 0.2) << "width changes with SSAA";
+    EXPECT_NEAR(widths[0], widths[2], 0.2) << "width changes with SSAA";
+}
+
+// Sun shadows: a plate floating over a lit ground plane, the sun straight
+// above. With shadows on, the ground under the plate (the image centre: the
+// camera looks at it past the plate) is darker; ground away from it isn't.
+TEST_F(OffscreenRenderTest, SunCastsShadowsOnOpaqueGeometry) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsShadows()) GTEST_SKIP() << "No shadow maps on this backend";
+    renderer->setEnvironmentIntensity(0.1f);  // the sun, not the sky, lights the ground
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+
+    const auto makeQuad = [&](float y, float half, std::vector<float>& positions, std::vector<uint32_t>& indices) {
+        positions = {-half, y, -half, half, y, -half, half, y, half, -half, y, half};
+        indices = {0, 2, 1, 0, 3, 2};
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh.indexCount = 6;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = 4;
+        mesh.layout = &VertexLayout::positionOnly();
+        mesh.setBoundsFromPositions(positions.data(), 4);
+        return mesh;
+    };
+    std::vector<float> groundPositions, platePositions;
+    std::vector<uint32_t> groundIndices, plateIndices;
+    GpuMesh ground = makeQuad(0.0f, 1.5f, groundPositions, groundIndices);
+    GpuMesh plate = makeQuad(0.6f, 0.3f, platePositions, plateIndices);
+
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 2.5, 2.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 2.5, 2.5);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.0, -1.0, 0.0);  // travelling straight down
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    sun.castShadows = true;
+    scene.lights.push_back(sun);
+    for (GpuMesh* mesh : {&ground, &plate}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = red;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    const auto renderRed = [&](bool shadows) {
+        renderer->setShadowsEnabled(shadows);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        renderer->render(scene, view);  // the first frame may bind the placeholder map
+        const auto pixels = readBackPixels(tex);
+        return [pixels](int x, int y) { return double(pixels[(size_t(y) * 64 + size_t(x)) * 4]); };
+    };
+    const auto lit = renderRed(false);
+    const auto shadowed = renderRed(true);
+    renderer->setShadowsEnabled(true);
+    renderer->setEnvironmentIntensity(1.0f);
+    EXPECT_GT(lit(32, 32), 40.0) << "the sun lights the ground";
+    EXPECT_LT(shadowed(32, 32), lit(32, 32) * 0.7) << "no shadow under the plate";
+    EXPECT_NEAR(shadowed(10, 40), lit(10, 40), 4.0) << "ground away from the plate darkened too";
+    EXPECT_NEAR(shadowed(32, 24), lit(32, 24), 4.0) << "the plate shadows itself";
+}
+
+// Materials of glTFs other than the scene's are their own: two assets with
+// a different material at index 0 (unlit green, unlit blue) give two
+// materials that draw in their own colours, not the first one twice.
+TEST_F(OffscreenRenderTest, MaterialsOfSeparateAssetsDontShareTheirIndex) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsVertexLayout(VertexLayout::positionOnly())) GTEST_SKIP() << "No lean pipelines on this backend";
+    const auto unlit = [](const char* color) {
+        return std::string(R"({"asset": {"version": "2.0"}, "extensionsUsed": ["KHR_materials_unlit"], "materials": [)"
+                           R"({"pbrMetallicRoughness": {"baseColorFactor": )") +
+               color + R"(}, "extensions": {"KHR_materials_unlit": {}}}]})";
+    };
+    auto green = GLTF::loadGLTF(unlit("[0, 1, 0, 1]").c_str(), kNoOpLoader);
+    auto blue = GLTF::loadGLTF(unlit("[0, 0, 1, 1]").c_str(), kNoOpLoader);
+    ASSERT_NE(green, nullptr);
+    ASSERT_NE(blue, nullptr);
+    GpuMaterial* greenMaterial = renderer->uploadMaterial((*green->materials)[0], *green);
+    GpuMaterial* blueMaterial = renderer->uploadMaterial((*blue->materials)[0], *blue);
+    ASSERT_NE(greenMaterial, nullptr);
+    ASSERT_NE(blueMaterial, nullptr);
+    EXPECT_NE(greenMaterial, blueMaterial);
+    EXPECT_NE(greenMaterial->uniformSlot, blueMaterial->uniformSlot);
+    EXPECT_EQ(renderer->uploadMaterial((*blue->materials)[0], *blue), blueMaterial) << "not cached per asset";
+
+    std::vector<float> positions = {-0.9f, -0.9f, 0.0f, 0.9f, -0.9f, 0.0f, 0.9f, 0.9f, 0.0f, -0.9f, 0.9f, 0.0f};
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    quad.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = &VertexLayout::positionOnly();
+    const auto draw = [&](GpuMaterial* material) {
+        RenderScene scene;
+        scene.camera.view = VM::Matrix4<double>::identity();
+        scene.camera.projection = VM::Matrix4<double>::identity();
+        DrawCall call;
+        call.mesh = &quad;
+        call.material = material;
+        call.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(call);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        const auto pixels = readBackPixels(tex);
+        const size_t centre = (size_t(32) * 64 + 32) * 4;
+        return std::array<int, 3>{pixels[centre], pixels[centre + 1], pixels[centre + 2]};
+    };
+    const auto g = draw(greenMaterial);
+    const auto b = draw(blueMaterial);
+    EXPECT_GT(g[1], 200);
+    EXPECT_LT(g[2], 40);
+    EXPECT_GT(b[2], 200) << "the blue asset's material drew as " << b[0] << "," << b[1] << "," << b[2];
+    EXPECT_LT(b[1], 40);
+}
+
+// World-space box mapping: a quad without texture coordinates and an unlit
+// material with a 2x2 black/white checker (nearest filtering). Without world
+// mapping every pixel samples the same texel; with one repeat per world unit
+// over the 1.8-unit quad, both colours show, in cells of half a unit.
+TEST_F(OffscreenRenderTest, WorldMappingTexturesMeshesWithoutUVs) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsVertexLayout(VertexLayout::positionOnly())) GTEST_SKIP() << "No lean pipelines on this backend";
+
+    // 2x2 TGA (uncompressed true colour, 32 bits, top-left origin): white,
+    // black / black, white.
+    std::vector<uint8_t> tga = {0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 32, 0x28};
+    const uint8_t white[4] = {255, 255, 255, 255}, black[4] = {0, 0, 0, 255};
+    for (const uint8_t* px : {white, black, black, white}) tga.insert(tga.end(), px, px + 4);
+    static const char* kBase64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded;
+    for (size_t i = 0; i < tga.size(); i += 3) {
+        const uint32_t n = (uint32_t(tga[i]) << 16) | (i + 1 < tga.size() ? uint32_t(tga[i + 1]) << 8 : 0) |
+                           (i + 2 < tga.size() ? uint32_t(tga[i + 2]) : 0);
+        encoded += kBase64[(n >> 18) & 63];
+        encoded += kBase64[(n >> 12) & 63];
+        encoded += i + 1 < tga.size() ? kBase64[(n >> 6) & 63] : '=';
+        encoded += i + 2 < tga.size() ? kBase64[n & 63] : '=';
+    }
+    const std::string json =
+        std::string(R"({"asset": {"version": "2.0"}, "extensionsUsed": ["KHR_materials_unlit"],)"
+                    R"("images": [{"uri": "data:image/x-tga;base64,)") + encoded +
+        R"("}], "samplers": [{"magFilter": 9728, "minFilter": 9728}], "textures": [{"source": 0, "sampler": 0}],)"
+        R"("materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}},)"
+        R"("extensions": {"KHR_materials_unlit": {}}}]})";
+    auto checker = GLTF::loadGLTF(json.c_str(), kNoOpLoader);
+    ASSERT_NE(checker, nullptr);
+    GpuMaterial* material = renderer->uploadMaterial((*checker->materials)[0], *checker);
+    ASSERT_NE(material, nullptr);
+
+    std::vector<float> positions = {-0.9f, -0.9f, 0.0f, 0.9f, -0.9f, 0.0f, 0.9f, 0.9f, 0.0f, -0.9f, 0.9f, 0.0f};
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    quad.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = &VertexLayout::positionOnly();
+    std::string lastRow;  // red along the middle row, for failure messages
+    const auto render = [&]() {
+        RenderScene scene;
+        scene.camera.view = VM::Matrix4<double>::identity();
+        scene.camera.projection = VM::Matrix4<double>::identity();
+        scene.camera.position = VM::Vector3<double>(0.0, 0.0, -1.0);
+        DrawCall call;
+        call.mesh = &quad;
+        call.material = material;
+        call.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(call);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        const auto pixels = readBackPixels(tex);
+        int bright = 0, dark = 0;
+        lastRow.clear();
+        for (int x = 0; x < 64; x += 4) lastRow += std::to_string(pixels[(size_t(32) * 64 + size_t(x)) * 4]) + " ";
+        for (int y = 8; y < 56; ++y) {
+            for (int x = 8; x < 56; ++x) {
+                const uint8_t r = pixels[(size_t(y) * 64 + size_t(x)) * 4];
+                if (r > 200) ++bright;
+                if (r < 50) ++dark;
+            }
+        }
+        return std::pair<int, int>{bright, dark};
+    };
+    const auto [plainBright, plainDark] = render();
+    const std::string plainRow = lastRow;
+    EXPECT_TRUE(plainBright == 0 || plainDark == 0) << "without world mapping the quad is one texel: " << plainRow;
+    renderer->setMaterialWorldMapping(material, 1.0f);
+    const auto [mappedBright, mappedDark] = render();
+    renderer->setMaterialWorldMapping(material, 0.0f);
+    EXPECT_GT(mappedBright, 400) << "white cells; middle row: " << lastRow << " (without mapping: " << plainRow << ")";
+    EXPECT_GT(mappedDark, 400) << "black cells";
+}
+
+// Thin glass (KHR_materials_transmission, blended) in front of an unlit
+// background at 128 (display value), rendered at SSAA 2x: through the glass
+// the background shows, slightly darker (Fresnel, tint), not washed out (the
+// opaque scene is display-encoded and must be decoded before it's lit and
+// encoded again: ~179 if not) and not missed (texture coordinates of the
+// opaque scene at its SSAA size: the sky fallback, no red, if not).
+TEST_F(OffscreenRenderTest, ThinGlassShowsTheBackgroundAtItsBrightness) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsVertexLayout(VertexLayout::positionOnly())) GTEST_SKIP() << "No lean pipelines on this backend";
+    renderer->setEnvironmentIntensity(0.0f);
+    renderer->setDefaultLightEnabled(false);
+    renderer->setSsaaScale(2.0f);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"},
+        "extensionsUsed": ["KHR_materials_unlit", "KHR_materials_transmission"],
+        "materials": [
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.5, 0.0, 0.0, 1]}, "extensions": {"KHR_materials_unlit": {}}},
+            {"alphaMode": "BLEND", "pbrMetallicRoughness": {"baseColorFactor": [0.95, 0.95, 0.95, 1], "metallicFactor": 0,
+             "roughnessFactor": 0.05}, "extensions": {"KHR_materials_transmission": {"transmissionFactor": 1.0}}}]})",
+                                    kNoOpLoader);
+    ASSERT_NE(materials, nullptr);
+    GpuMaterial* background = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    GpuMaterial* glass = renderer->uploadMaterial((*materials->materials)[1], *materials);
+    ASSERT_NE(background, nullptr);
+    ASSERT_NE(glass, nullptr);
+    ASSERT_TRUE(glass->transmission);
+
+    const auto quad = [&](float half, float z) {
+        std::vector<float> positions = {-half, -half, z, half, -half, z, half, half, z, -half, half, z};
+        std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+        auto mesh = std::make_unique<GpuMesh>();
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh->indexCount = 6;
+        mesh->indexFormat = GPU::IndexFormat::uint32;
+        mesh->vertexCount = 4;
+        mesh->layout = &VertexLayout::positionOnly();
+        return mesh;
+    };
+    auto back = quad(0.95f, 0.6f);
+    auto pane = quad(0.5f, 0.3f);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::identity();
+    scene.camera.projection = VM::Matrix4<double>::identity();
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, -1.0);
+    DrawCall backDraw;
+    backDraw.mesh = back.get();
+    backDraw.material = background;
+    backDraw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(backDraw);
+    DrawCall paneDraw;
+    paneDraw.mesh = pane.get();
+    paneDraw.material = glass;
+    paneDraw.worldTransform = VM::Matrix4<double>::identity();
+    scene.transparent.push_back(paneDraw);
+
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    renderer->render(scene, view);
+    renderer->render(scene, view);
+    const auto pixels = readBackPixels(tex);
+    renderer->setSsaaScale(1.0f);
+    renderer->setEnvironmentIntensity(1.0f);
+    renderer->setDefaultLightEnabled(true);
+    const auto at = [&](int x, int y, int c) { return int(pixels[(size_t(y) * 64 + size_t(x)) * 4 + size_t(c)]); };
+    EXPECT_NEAR(at(4, 32, 0), 128, 3) << "background beside the glass";
+    EXPECT_GE(at(32, 32, 0), 96) << "through the glass";
+    EXPECT_LE(at(32, 32, 0), 132) << "through the glass: washed out";
+    EXPECT_LT(at(32, 32, 1), 20);
+    EXPECT_LT(at(32, 32, 2), 20);
+}
+
+// Ambient occlusion and exposure: a floor meeting a wall. With AO on, the
+// crease darkens and open floor doesn't; nothing gets brighter. -1 EV of
+// exposure darkens a lit pixel.
+TEST_F(OffscreenRenderTest, AmbientOcclusionDarkensCreasesAndExposureScales) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.2f);
+    if (!renderer->supportsAmbientOcclusion()) GTEST_SKIP() << "No ambient occlusion on this backend";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+
+    const auto makeMesh = [&](std::vector<float> positions, std::vector<uint32_t> indices) {
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh.indexCount = (uint32_t)indices.size();
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = (uint32_t)positions.size() / 3;
+        mesh.layout = &VertexLayout::positionOnly();
+        mesh.setBoundsFromPositions(positions.data(), mesh.vertexCount);
+        return mesh;
+    };
+    GpuMesh floor = makeMesh({-1.5f, 0.0f, -1.5f, 1.5f, 0.0f, -1.5f, 1.5f, 0.0f, 1.5f, -1.5f, 0.0f, 1.5f}, {0, 2, 1, 0, 3, 2});
+    GpuMesh wall = makeMesh({-1.5f, 0.0f, -0.2f, 1.5f, 0.0f, -0.2f, 1.5f, 1.5f, -0.2f, -1.5f, 1.5f, -0.2f}, {0, 1, 2, 0, 2, 3});
+
+    RenderScene scene;
+    const VM::Vector3<double> eye(0.0, 1.2, 2.5);
+    scene.camera.view = VM::Matrix4<double>::lookAt(eye, VM::Vector3<double>(0.0, 0.2, -0.2), VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = eye;
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.0, -0.6, -0.8);  // from behind the camera
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 0.5f;  // mid-range, away from the tone mapper's shoulder
+    scene.lights.push_back(sun);
+    for (GpuMesh* mesh : {&floor, &wall}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = red;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    const auto render = [&](bool ao, float exposure) {
+        renderer->setAmbientOcclusion(ao);
+        renderer->setExposure(exposure);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        renderer->render(scene, view);
+        return readBackPixels(tex);
+    };
+    const auto plain = render(false, 0.0f);
+    const auto occluded = render(true, 0.0f);
+    const auto exposed = render(false, -1.0f);
+    renderer->setAmbientOcclusion(false);
+    renderer->setExposure(0.0f);
+    renderer->setEnvironmentIntensity(1.0f);
+
+    // Where a world point lands in the 64x64 image (top-left origin).
+    const auto pixelOf = [&](double x, double y, double z) {
+        const auto vp = scene.camera.projection * scene.camera.view;
+        const double* m = vp.data;
+        const double cx = m[0] * x + m[1] * y + m[2] * z + m[3];
+        const double cy = m[4] * x + m[5] * y + m[6] * z + m[7];
+        const double cw = m[12] * x + m[13] * y + m[14] * z + m[15];
+        return std::pair<int, int>{int((cx / cw * 0.5 + 0.5) * 64.0), int((0.5 - cy / cw * 0.5) * 64.0)};
+    };
+    const auto red8 = [](const std::vector<uint8_t>& pixels, std::pair<int, int> p) {
+        return double(pixels[(size_t(p.second) * 64 + size_t(p.first)) * 4]);
+    };
+    const auto crease = pixelOf(0.0, 0.03, -0.12);   // floor just in front of the wall
+    const auto openFloor = pixelOf(0.0, 0.0, 1.0);   // floor near the camera
+    ASSERT_GT(red8(plain, crease), 30.0) << "the crease is lit without AO";
+    EXPECT_LT(red8(occluded, crease), red8(plain, crease) * 0.9) << "AO didn't darken the crease";
+    EXPECT_NEAR(red8(occluded, openFloor), red8(plain, openFloor), 3.0) << "AO darkened open floor";
+    int brighter = 0;
+    for (size_t i = 0; i < plain.size(); i += 4) {
+        if (occluded[i] > plain[i] + 2) ++brighter;
+    }
+    EXPECT_EQ(brighter, 0) << "AO only darkens";
+    EXPECT_LT(red8(exposed, openFloor), red8(plain, openFloor) - 10.0) << "-1 EV didn't darken";
+}
+
 // App shader programs (program.hpp): an element-id program compiled by
 // campello_renderer_add_shader_program() writes each quad's per-vertex id
 // (custom0) into an r32uint target through renderProgramPass().
