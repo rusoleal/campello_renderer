@@ -3087,9 +3087,10 @@ TEST(WideLines, ExpandLinesBuildsAQuadPerSegment) {
     EXPECT_EQ(quads.indices[6], 4u);  // second quad's vertices start at 4
 }
 
-// A green 3 px wide line across a lit red quad in the same plane: drawn over
-// its face along its whole length, with soft edges (partial coverage), and
-// as wide at SSAA 1, 2 and 4 (width in output pixels, unlike hardware lines).
+// A 3 px wide line (green: it darkens the red channel) across a lit red quad
+// in the same plane: drawn over its face along its whole length, with soft
+// edges (partial darkening), and as wide at SSAA 1, 2 and 4 (width in output
+// pixels, unlike hardware lines).
 TEST_F(OffscreenRenderTest, WideLinesKeepTheirWidthAndSoftEdgesAtAnySsaa) {
     if (!device) GTEST_SKIP() << "No GPU device available";
     namespace GPU = systems::leal::campello_gpu;
@@ -3161,9 +3162,13 @@ TEST_F(OffscreenRenderTest, WideLinesKeepTheirWidthAndSoftEdgesAtAnySsaa) {
         auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
         renderer->render(scene, view);
         const auto pixels = readBackPixels(tex);
+        // "Darkest wins" blending: the line darkens the quad's red channel,
+        // measured against the brightest pixel of the quad in that column.
+        const auto red = [&](int x, int y) { return double(pixels[(size_t(y) * 64 + size_t(x)) * 4]); };
         const auto greenness = [&](int x, int y) {
-            const size_t i = (size_t(y) * 64 + size_t(x)) * 4;
-            return std::clamp((double(pixels[i + 1]) - double(pixels[i])) / 255.0, 0.0, 1.0);
+            double background = 0.0;
+            for (int row = 24; row <= 40; ++row) background = std::max(background, red(x, row));
+            return background > 0.0 ? std::clamp((background - red(x, y)) / background, 0.0, 1.0) : 0.0;
         };
         // Down each column the line crosses: some full-strength pixels, some
         // partial ones (soft edges), and the coverage sums to the line's
@@ -3174,7 +3179,7 @@ TEST_F(OffscreenRenderTest, WideLinesKeepTheirWidthAndSoftEdgesAtAnySsaa) {
         for (int x = 24; x <= 39; ++x) {
             double sum = 0.0;
             double peak = 0.0;
-            for (int y = 16; y < 48; ++y) {
+            for (int y = 24; y <= 40; ++y) {  // inside the quad
                 const double g = greenness(x, y);
                 sum += g;
                 peak = std::max(peak, g);
@@ -3188,10 +3193,33 @@ TEST_F(OffscreenRenderTest, WideLinesKeepTheirWidthAndSoftEdgesAtAnySsaa) {
         widths.push_back(total / columns);
     }
     renderer->setSsaaScale(1.0f);
+
+    // Overlapping lines don't stack ("darkest wins"): the same line drawn
+    // twice looks exactly like once (edges of two elements that coincide,
+    // crowded edges far away).
+    const auto renderOnce = [&] {
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        return readBackPixels(tex);
+    };
+    const auto single = renderOnce();
+    DrawCall again;
+    again.mesh = &line;
+    again.material = green;
+    again.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(again);
+    EXPECT_EQ(renderOnce(), single) << "overlapping wide lines stack";
+
+    // About 3 px / cos(18 deg) ~ 3.2 px; the darkening measure reads a little
+    // high (the lit quad isn't perfectly even down a column). What matters:
+    // the same at every SSAA scale.
     for (const double w : widths) {
-        EXPECT_NEAR(w, 3.15, 0.6);
+        EXPECT_GT(w, 2.5);
+        EXPECT_LT(w, 4.5);
     }
-    EXPECT_NEAR(widths[0], widths[2], 0.4) << "width changes with SSAA";
+    EXPECT_NEAR(widths[0], widths[1], 0.2) << "width changes with SSAA";
+    EXPECT_NEAR(widths[0], widths[2], 0.2) << "width changes with SSAA";
 }
 
 // App shader programs (program.hpp): an element-id program compiled by

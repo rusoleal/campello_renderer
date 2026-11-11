@@ -3516,6 +3516,16 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
         color.blend = meshRecipe.alphaBlend;
         d.depthStencil = meshRecipe.blendDepthStencil;
     }
+    if (wideLines) {
+        // "Darkest wins": overlapping lines (crowded edges far away, the
+        // same edge from two elements) don't stack into a heavier line.
+        // fragmentWideLine outputs white blended towards the line colour by
+        // coverage, so min() keeps whichever is darker.
+        GPU::BlendState darkest{};
+        darkest.color = {GPU::BlendFactor::one, GPU::BlendFactor::one, GPU::BlendOperation::min};
+        darkest.alpha = {GPU::BlendFactor::one, GPU::BlendFactor::one, GPU::BlendOperation::max};
+        color.blend = darkest;
+    }
     GPU::FragmentDescriptor frag{};
     frag.module     = program.fragmentModule;
     frag.entryPoint = wideLines ? program.wideLineFragment : program.fragmentEntries[(size_t)variant];
@@ -5788,6 +5798,9 @@ void Renderer::renderToTarget(
             }
             camData[36] = (float)renderWidth;
             camData[37] = (float)renderHeight;
+            // _pad.x: the SSAA scale the scene is drawn at (wide lines narrow
+            // their antialiasing fringe by it: the downsample smooths too).
+            camData[38] = (ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout) ? ssaaScale : 1.0f;
 
             cameraPositionBuffer->upload(0, 160, camData);
             uploadClipUniforms(cameraPositionBuffer);

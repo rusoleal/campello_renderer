@@ -242,7 +242,7 @@ struct CameraUniforms {
     float4x4 viewMatrix;
     float4x4 projMatrix;
     float2   screenSize;
-    float2   _pad;
+    float2   lineParams;     // x: the SSAA scale the scene is drawn at (wide lines); y: unused
     // Clip block (Renderer::uploadClipUniforms()).
     uint4    clipInfo;       // x = plane count, y = section caps on
     float4   capColor;
@@ -1785,10 +1785,16 @@ struct WideLineOut {
     float3 worldPos;
     float  distance;               // signed, output pixels from the centre line
     float  halfWidth [[flat]];     // output pixels
+    float  fringe    [[flat]];     // output pixels of fade beyond the half width
+    float  opacity   [[flat]];     // fades segments a few pixels long
 };
 
-constant float kWideLineFringe = 1.0;   // output pixels of fade beyond the half width
-constant float kWideLineNearW  = 1.0e-4;
+constant float kWideLineNearW = 1.0e-4;
+// Segments shorter than this on screen aren't drawn; up to kWideLineFullLength
+// they fade from kWideLineMinOpacity (small, crowded detail far away).
+constant float kWideLineMinLength   = 0.75;
+constant float kWideLineFullLength  = 4.0;
+constant float kWideLineMinOpacity  = 0.3;
 
 vertex WideLineOut vertexWideLine(
     VertexInWideLine             in             [[stage_in]],
@@ -1797,6 +1803,9 @@ vertex WideLineOut vertexWideLine(
 {
     const bool  isStart   = in.params.y >= 0.0;
     const float halfWidth = abs(in.params.y);
+    // 1 output pixel of fringe, less when supersampled (the downsample
+    // smooths the rest): 1/2 px at SSAA 2x.
+    const float fringe = 1.0 / max(camera.lineParams.x, 1.0);
     float4 self  = nodeTransforms[0].mvp * float4(in.position, 1.0);
     float4 other = nodeTransforms[0].mvp * float4(in.other, 1.0);
     // An end behind the camera: slide it along the segment to just in front
@@ -1813,7 +1822,8 @@ vertex WideLineOut vertexWideLine(
     const float len = length(along);
     along = len > 1.0e-6 ? along / len : float2(1.0, 0.0);
     const float2 across = float2(-along.y, along.x);
-    const float extent = halfWidth + kWideLineFringe;
+    // Too short to see: a zero-area quad (no fragments).
+    const float extent = len < kWideLineMinLength ? 0.0 : halfWidth + fringe;
     const float2 offsetPx = across * in.params.x * extent + along * (isStart ? -extent : extent);
 
     WideLineOut out;
@@ -1823,9 +1833,13 @@ vertex WideLineOut vertexWideLine(
     out.worldPos  = (nodeTransforms[0].model * float4(in.position, 1.0)).xyz;
     out.distance  = in.params.x * extent;
     out.halfWidth = halfWidth;
+    out.fringe    = fringe;
+    out.opacity   = mix(kWideLineMinOpacity, 1.0, smoothstep(kWideLineMinLength, kWideLineFullLength, len));
     return out;
 }
 
+// Output for "darkest wins" blending (min): white moved towards the line
+// colour by coverage x opacity, so overlapping lines don't darken further.
 fragment float4 fragmentWideLine(
     WideLineOut                in     [[stage_in]],
     constant MaterialUniforms &mat    [[buffer(17)]],
@@ -1837,12 +1851,12 @@ fragment float4 fragmentWideLine(
         }
     }
     // Full colour within the half width, fading to nothing over the fringe.
-    const float coverage = saturate(in.halfWidth + 0.5 * kWideLineFringe - abs(in.distance));
-    if (coverage <= 0.0) {
+    const float coverage = saturate((in.halfWidth + 0.5 * in.fringe - abs(in.distance)) / in.fringe);
+    const float strength = coverage * in.opacity * mat.baseColorFactor.a;
+    if (strength <= 0.0) {
         discard_fragment();
     }
-    const float4 color = mat.baseColorFactor;
-    return float4(color.rgb, color.a * coverage);
+    return float4(mix(float3(1.0), mat.baseColorFactor.rgb, strength), 1.0);
 }
 
 // ---------------------------------------------------------------------------
