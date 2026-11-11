@@ -3306,6 +3306,7 @@ TEST_F(OffscreenRenderTest, MaterialsOfSeparateAssetsDontShareTheirIndex) {
     renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
     renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsVertexLayout(VertexLayout::positionOnly())) GTEST_SKIP() << "No lean pipelines on this backend";
     const auto unlit = [](const char* color) {
         return std::string(R"({"asset": {"version": "2.0"}, "extensionsUsed": ["KHR_materials_unlit"], "materials": [)"
                            R"({"pbrMetallicRoughness": {"baseColorFactor": )") +
@@ -3372,6 +3373,7 @@ TEST_F(OffscreenRenderTest, WorldMappingTexturesMeshesWithoutUVs) {
     renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
     renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsVertexLayout(VertexLayout::positionOnly())) GTEST_SKIP() << "No lean pipelines on this backend";
 
     // 2x2 TGA (uncompressed true colour, 32 bits, top-left origin): white,
     // black / black, white.
@@ -3463,6 +3465,7 @@ TEST_F(OffscreenRenderTest, ThinGlassShowsTheBackgroundAtItsBrightness) {
     renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
     renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsVertexLayout(VertexLayout::positionOnly())) GTEST_SKIP() << "No lean pipelines on this backend";
     renderer->setEnvironmentIntensity(0.0f);
     renderer->setDefaultLightEnabled(false);
     renderer->setSsaaScale(2.0f);
