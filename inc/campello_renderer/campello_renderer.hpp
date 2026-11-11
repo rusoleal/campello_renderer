@@ -121,6 +121,7 @@ namespace systems::leal::campello_renderer {
         float innerConeAngle = 0.0f;
         float outerConeAngle = 0.0f;
         int type = 0; // 0 = directional, 1 = point, 2 = spot
+        bool castShadows = false;  // directional: the first one casts the shadow map (setShadowsEnabled())
     };
 
     struct RenderScene {
@@ -487,7 +488,10 @@ namespace systems::leal::campello_renderer {
         bool clippingActive() const { return !clipPlanes.empty() && supportsClipPlanes(); }
         void uploadClipUniforms(const std::shared_ptr<systems::leal::campello_gpu::Buffer>& buffer) const;
         // CameraUniforms (160 bytes) + clip block (128 bytes).
-        static constexpr uint64_t kCameraUniformSize = 288;
+        // CameraUniforms: camera (160 bytes), clip block (128), shadow block
+        // (shadowViewProj float4x4 + shadowParams float4: 80).
+        static constexpr uint64_t kCameraClipEnd = 288;
+        static constexpr uint64_t kCameraUniformSize = 368;
         std::shared_ptr<systems::leal::campello_gpu::Texture> programPassDepthTexture;
         std::shared_ptr<systems::leal::campello_gpu::TextureView> programPassDepthView;
 
@@ -686,6 +690,20 @@ namespace systems::leal::campello_renderer {
         // Depth buffer — recreated in resize().
         std::shared_ptr<systems::leal::campello_gpu::Texture>     depthTexture;
         std::shared_ptr<systems::leal::campello_gpu::TextureView> depthView;
+        // Sun shadows (setShadowsEnabled()): a depth map rendered from the
+        // first shadow-casting directional light, fitted to the opaque draws.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMap;
+        std::shared_ptr<systems::leal::campello_gpu::TextureView> shadowMapView;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapPlaceholder;  // 1x1, bound when off
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> shadowPipeline;
+        uint32_t shadowMapResolution = 2048;
+        bool shadowsEnabled = true;
+        bool ensureShadowMap();
+        // Light view-projection for the shadow map, fitted to the bounds of
+        // `draws` seen from `toLight`; false if there's nothing to fit.
+        bool fitShadowView(const std::vector<systems::leal::campello_renderer::DrawCall>& draws,
+                           const systems::leal::vector_math::Vector3<double>& toLight,
+                           systems::leal::vector_math::Matrix4<double>& lightViewProj) const;
 
         // Per-node matrices uploaded to the GPU at the start of each render().
         // Each node gets 32 floats: 16 for MVP (clip space), 16 for Model (world space).
@@ -1127,6 +1145,14 @@ namespace systems::leal::campello_renderer {
         bool isFxaaEnabled() const;
 
         void setSsaaScale(float scale);
+        /// Sun shadows: the first directional light with castShadows casts a
+        /// shadow map over the opaque draws (Metal for now; supportsShadows()).
+        /// On by default.
+        void setShadowsEnabled(bool enabled) { shadowsEnabled = enabled; }
+        bool getShadowsEnabled() const { return shadowsEnabled; }
+        /// Shadow map width and height in texels (default 2048).
+        void setShadowMapResolution(uint32_t texels);
+        bool supportsShadows() const { return shadowPipeline != nullptr; }
         float getSsaaScale() const;
 
         // KHR_texture_procedurals bake controls.

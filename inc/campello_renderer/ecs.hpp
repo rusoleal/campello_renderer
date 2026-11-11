@@ -146,6 +146,7 @@ inline LightData buildLightData(const Transform& transform,
     data.innerConeAngle = 0.0f;
     data.outerConeAngle = 0.0f;
     data.type = 0; // directional
+    data.castShadows = light.castShadows;
     return data;
 }
 

@@ -247,6 +247,9 @@ struct CameraUniforms {
     uint4    clipInfo;       // x = plane count, y = section caps on
     float4   capColor;
     float4   clipPlanes[6];  // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
+    // Shadow block (Renderer: sun shadows).
+    float4x4 shadowViewProj;  // world -> the shadow map's clip space
+    float4   shadowParams;    // x = on, y = one texel in uv
 };
 
 constant float VIEW_MODE_NORMAL       = 0.0;
@@ -820,6 +823,42 @@ float3 iblGGXFresnel(float NdotV, float roughness, float3 F0,
     return FssEss + FmsEms;
 }
 
+// ---------------------------------------------------------------------------
+// Sun shadows: depth-only vertex stage for the shadow map (positions, the
+// model matrix, the light's view-projection in the camera block).
+// ---------------------------------------------------------------------------
+vertex float4 vertexShadow(
+    VertexInLean                 in             [[stage_in]],
+    device const NodeTransforms *nodeTransforms [[buffer(16)]],
+    constant CameraUniforms     &camera         [[buffer(18)]])
+{
+    return camera.shadowViewProj * (nodeTransforms[0].model * float4(in.position, 1.0));
+}
+
+// How lit `worldPos` is by the shadow-casting light: 1 lit .. 0 shadowed.
+// 3x3 percentage-closer filtering of the shadow map (hardware-compared,
+// bilinear), so shadow edges are soft. Outside the map: lit.
+inline float sunShadow(constant CameraUniforms &camera, depth2d<float> shadowMap, float3 worldPos) {
+    if (camera.shadowParams.x < 0.5) {
+        return 1.0;
+    }
+    constexpr sampler shadowSampler(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);
+    const float4 clip = camera.shadowViewProj * float4(worldPos, 1.0);
+    const float3 ndc = clip.xyz / clip.w;
+    const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (any(uv < float2(0.0)) || any(uv > float2(1.0)) || ndc.z > 1.0) {
+        return 1.0;
+    }
+    const float texel = camera.shadowParams.y;
+    float lit = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            lit += shadowMap.sample_compare(shadowSampler, uv + float2(x, y) * texel, ndc.z);
+        }
+    }
+    return lit / 9.0;
+}
+
 fragment float4 fragmentMain_textured(
     VertexOut        inRaw                     [[stage_in]],
     constant MaterialUniforms &mat             [[buffer(17)]],
@@ -853,6 +892,7 @@ fragment float4 fragmentMain_textured(
     texture2d<float> anisotropicTexture          [[texture(26)]],
     texturecube<float> irradianceEnvironmentMap  [[texture(27)]],
     texture2d<float> brdfLutTexture              [[texture(28)]],
+    depth2d<float>   shadowMap                   [[texture(29)]],
     bool             frontFacing                 [[front_facing]])
 {
     // Position-only meshes (vertexLean) carry no normal: use the flat face
@@ -1310,7 +1350,9 @@ fragment float4 fragmentMain_textured(
         }
 
         float  NdotL      = max(dot(N, lightDir), 0.0);
-        float3 lightColor = light.color.xyz * light.color.w * attenuation * spotFactor;
+        // The sun (spotAngles.z): darkened where the shadow map says so.
+        const float shadow = light.spotAngles.z > 0.5 ? sunShadow(camera, shadowMap, in.worldPos) : 1.0;
+        float3 lightColor = light.color.xyz * light.color.w * attenuation * spotFactor * shadow;
 
         float3 halfDir = normalize(lightDir + viewDir);
         float  NdotH   = max(dot(N, halfDir), 0.0);

@@ -3516,6 +3516,96 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     return stored.pipeline ? &stored : nullptr;
 }
 
+void Renderer::setShadowMapResolution(uint32_t texels) {
+    texels = std::clamp(texels, 256u, 8192u);
+    if (texels != shadowMapResolution) {
+        shadowMapResolution = texels;
+        shadowMap.reset();
+        shadowMapView.reset();
+    }
+}
+
+bool Renderer::ensureShadowMap() {
+    namespace GPU = systems::leal::campello_gpu;
+    if (shadowMap && shadowMapView) return true;
+    if (!device) return false;
+    shadowMap = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::depth32float, shadowMapResolution,
+                                      shadowMapResolution, 1, 1, 1,
+                                      (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                                          uint32_t(GPU::TextureUsage::textureBinding)));
+    if (!shadowMap) return false;
+    shadowMapView = shadowMap->createView(GPU::PixelFormat::depth32float, 1, GPU::Aspect::depthOnly, 0, 0, GPU::TextureType::tt2d, 1);
+    return shadowMapView != nullptr;
+}
+
+bool Renderer::fitShadowView(const std::vector<systems::leal::campello_renderer::DrawCall>& draws, const systems::leal::vector_math::Vector3<double>& toLight,
+                             systems::leal::vector_math::Matrix4<double>& lightViewProj) const {
+    namespace VM = systems::leal::vector_math;
+    using M4 = VM::Matrix4<double>;
+    // World bounds of the opaque draws that have bounds.
+    double lo[3] = {1e300, 1e300, 1e300};
+    double hi[3] = {-1e300, -1e300, -1e300};
+    bool any = false;
+    for (const auto& draw : draws) {
+        if (!draw.mesh || !draw.mesh->hasBounds ||
+            draw.mesh->topology != systems::leal::campello_gpu::PrimitiveTopology::triangleList) continue;
+        const auto& m = draw.worldTransform.data;
+        for (int corner = 0; corner < 8; ++corner) {
+            const double p[3] = {(corner & 1) ? draw.mesh->boundsMax[0] : draw.mesh->boundsMin[0],
+                                 (corner & 2) ? draw.mesh->boundsMax[1] : draw.mesh->boundsMin[1],
+                                 (corner & 4) ? draw.mesh->boundsMax[2] : draw.mesh->boundsMin[2]};
+            for (int r = 0; r < 3; ++r) {
+                const double w = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3];
+                lo[r] = std::min(lo[r], w);
+                hi[r] = std::max(hi[r], w);
+            }
+        }
+        any = true;
+    }
+    const double len = std::sqrt(toLight.x() * toLight.x() + toLight.y() * toLight.y() + toLight.z() * toLight.z());
+    if (!any || len < 1e-9) return false;
+    const VM::Vector3<double> dir(toLight.x() / len, toLight.y() / len, toLight.z() / len);
+    const VM::Vector3<double> centre((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2);
+    const double radius = std::max(0.5 * std::sqrt((hi[0] - lo[0]) * (hi[0] - lo[0]) + (hi[1] - lo[1]) * (hi[1] - lo[1]) +
+                                                   (hi[2] - lo[2]) * (hi[2] - lo[2])),
+                                   1e-3);
+    const VM::Vector3<double> eye(centre.x() + dir.x() * radius * 2, centre.y() + dir.y() * radius * 2,
+                                  centre.z() + dir.z() * radius * 2);
+    // Any up that isn't along the light.
+    const VM::Vector3<double> up = std::abs(dir.z()) > 0.9 ? VM::Vector3<double>(0, 1, 0) : VM::Vector3<double>(0, 0, 1);
+    const M4 lightView = M4::lookAt(eye, centre, up);
+    // The bounds' corners in light view space give a tight orthographic box.
+    double vlo[3] = {1e300, 1e300, 1e300};
+    double vhi[3] = {-1e300, -1e300, -1e300};
+    for (int corner = 0; corner < 8; ++corner) {
+        const double p[3] = {(corner & 1) ? hi[0] : lo[0], (corner & 2) ? hi[1] : lo[1], (corner & 4) ? hi[2] : lo[2]};
+        for (int r = 0; r < 3; ++r) {
+            const auto& v = lightView.data;
+            const double w = v[r * 4] * p[0] + v[r * 4 + 1] * p[1] + v[r * 4 + 2] * p[2] + v[r * 4 + 3];
+            vlo[r] = std::min(vlo[r], w);
+            vhi[r] = std::max(vhi[r], w);
+        }
+    }
+    // Depth along the view direction, whichever way lookAt() points it: the
+    // centre must come out in front (positive), mapped near..far to [0, 1].
+    const auto& v = lightView.data;
+    const double centreZ = v[8] * centre.x() + v[9] * centre.y() + v[10] * centre.z() + v[11];
+    const double sign = centreZ < 0.0 ? -1.0 : 1.0;
+    const double l = vlo[0], r = vhi[0], b = vlo[1], t = vhi[1];
+    const double depthLo = sign > 0 ? vlo[2] : -vhi[2];
+    const double depthHi = sign > 0 ? vhi[2] : -vlo[2];
+    const double n = depthLo - 1e-3 * radius, f = depthHi + 1e-3 * radius;
+    M4 ortho = M4::identity();
+    ortho.data[0] = 2.0 / (r - l);
+    ortho.data[3] = -(r + l) / (r - l);
+    ortho.data[5] = 2.0 / (t - b);
+    ortho.data[7] = -(t + b) / (t - b);
+    ortho.data[10] = sign / (f - n);
+    ortho.data[11] = -n / (f - n);
+    lightViewProj = ortho * lightView;
+    return true;
+}
+
 void Renderer::bindMeshBuffer(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
                               uint32_t logicalSlot,
                               const std::shared_ptr<systems::leal::campello_gpu::Buffer> &buffer,
@@ -3629,7 +3719,7 @@ void Renderer::uploadClipUniforms(const std::shared_ptr<systems::leal::campello_
     for (size_t i = 0; i < clipPlanes.size(); ++i) {
         for (int c = 0; c < 4; ++c) block.planes[i][c] = (float)clipPlanes[i][(size_t)c];
     }
-    static_assert(sizeof(block) == kCameraUniformSize - 160, "clip block size");
+    static_assert(sizeof(block) == kCameraClipEnd - 160, "clip block size");
     buffer->upload(160, sizeof(block), &block);
 }
 
@@ -3779,6 +3869,37 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         programs[kPbrProgram].fragmentModule = shaderModule;
         programs[kPbrProgram].fragmentEntries = {"fragmentMain_flat", "fragmentMain_textured", "fragmentMain_debug"};
         meshRecipe.rawBufferSlots = true;  // [[buffer(15..23)]]: lights, transforms, material, ...
+        // Sun shadows: depth only, float3 positions at buffer 0, the model
+        // matrix at [[buffer(16)]], the light's view-projection in the camera
+        // block at [[buffer(18)]]. No culling (mixed winding), slope bias.
+        {
+            GPU::RenderPipelineDescriptor sd{};
+            sd.vertex.module = shaderModule;
+            sd.vertex.entryPoint = "vertexShadow";
+            GPU::VertexLayout positions{};
+            positions.arrayStride = 12;
+            positions.stepMode = GPU::StepMode::vertex;
+            GPU::VertexAttribute position{};
+            position.componentType = GPU::ComponentType::ctFloat;
+            position.accessorType = GPU::AccessorType::acVec3;
+            position.offset = 0;
+            position.shaderLocation = 0;
+            positions.attributes.push_back(position);
+            sd.vertex.buffers.push_back(positions);
+            GPU::DepthStencilDescriptor shadowDs = ds;
+            shadowDs.depthBias = 2.0;
+            shadowDs.depthBiasSlopeScale = 2.0;
+            shadowDs.depthBiasClamp = 0.01;
+            sd.depthStencil = shadowDs;
+            sd.topology = GPU::PrimitiveTopology::triangleList;
+            sd.cullMode = GPU::CullMode::none;
+            sd.frontFace = GPU::FrontFace::ccw;
+            shadowPipeline = device->createRenderPipeline(sd);
+            // Bound in the frame bind group while there's no shadow map yet.
+            shadowMapPlaceholder = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::depth32float, 1, 1, 1, 1, 1,
+                                                         (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                                                             uint32_t(GPU::TextureUsage::textureBinding)));
+        }
         // The per-draw transforms are also per-instance vertex attributes
         // (locations 16-19 mvp, 24-27 model, the slot after the attributes),
         // as on Vulkan/DirectX, so one program source (e.g. Slang) works on
@@ -6104,6 +6225,7 @@ void Renderer::renderToTarget(
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
+            {29, shadowMap ? shadowMap : shadowMapPlaceholder},  // sun shadows (fragmentMain_textured)
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
             // is picked up automatically by this unconditional per-frame
@@ -8764,6 +8886,7 @@ void Renderer::render(const RenderScene& scene,
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
+            {29, shadowMap ? shadowMap : shadowMapPlaceholder},  // sun shadows (fragmentMain_textured)
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
             // is picked up automatically by this unconditional per-frame
@@ -8792,11 +8915,21 @@ void Renderer::render(const RenderScene& scene,
         };
         LightsUniformGPU lightsData = {};
         lightsData.count = (uint32_t)std::min(scene.lights.size(), size_t(4));
+        bool shadowAssigned = false;
         for (size_t i = 0; i < lightsData.count; ++i) {
             auto &l = scene.lights[i];
-            lightsData.lights[i].position[0] = (float)l.position.x();
-            lightsData.lights[i].position[1] = (float)l.position.y();
-            lightsData.lights[i].position[2] = (float)l.position.z();
+            // Directional lights: the shaders read the direction towards the
+            // light from `position` (as the glTF path uploads it).
+            const bool directional = l.type == 0;
+            lightsData.lights[i].position[0] = (float)(directional ? -l.direction.x() : l.position.x());
+            lightsData.lights[i].position[1] = (float)(directional ? -l.direction.y() : l.position.y());
+            lightsData.lights[i].position[2] = (float)(directional ? -l.direction.z() : l.position.z());
+            // spotAngles.z: this light casts the shadow map (the first
+            // shadow-casting directional light, when shadows are on).
+            if (directional && l.castShadows && shadowsEnabled && shadowPipeline && !shadowAssigned) {
+                lightsData.lights[i].spotAngles[2] = 1.0f;
+                shadowAssigned = true;
+            }
             lightsData.lights[i].position[3] = (float)l.type;
             lightsData.lights[i].color[0] = (float)l.color.x();
             lightsData.lights[i].color[1] = (float)l.color.y();
@@ -8909,6 +9042,83 @@ void Renderer::render(const RenderScene& scene,
     for (auto &draw : scene.transparent) uploadOneTransform(draw);
 
     // ------------------------------------------------------------------
+    // Sun shadows: the first shadow-casting directional light renders the
+    // opaque triangle draws into the shadow map; the shadow block of the
+    // camera uniforms tells the shaders where it is (x = on).
+    // ------------------------------------------------------------------
+    {
+        float shadowBlock[20] = {0};
+        const LightData* sun = nullptr;
+        for (const auto& l : scene.lights) {
+            if (l.type == 0 && l.castShadows) {
+                sun = &l;
+                break;
+            }
+        }
+        M4 lightViewProj = M4::identity();
+        if (sun && shadowsEnabled && shadowPipeline && !activeProgramPass && cameraPositionBuffer &&
+            fitShadowView(sortedOpaque, VM::Vector3<double>(-sun->direction.x(), -sun->direction.y(), -sun->direction.z()),
+                          lightViewProj) &&
+            ensureShadowMap()) {
+            for (int row = 0; row < 4; ++row) {
+                for (int col = 0; col < 4; ++col) {
+                    shadowBlock[col * 4 + row] = (float)lightViewProj.data[row * 4 + col];
+                }
+            }
+            shadowBlock[16] = 1.0f;                                    // on
+            shadowBlock[17] = 1.0f / (float)shadowMapResolution;      // texel (uv)
+            cameraPositionBuffer->upload(kCameraClipEnd, sizeof(shadowBlock), shadowBlock);
+
+            GPU::DepthStencilAttachment shadowDepth{};
+            shadowDepth.view = shadowMapView;
+            shadowDepth.depthClearValue = 1.0f;
+            shadowDepth.depthLoadOp = GPU::LoadOp::clear;
+            shadowDepth.depthStoreOp = GPU::StoreOp::store;
+            shadowDepth.depthReadOnly = false;
+            shadowDepth.stencilClearValue = 0;
+            shadowDepth.stencilLoadOp = GPU::LoadOp::clear;
+            shadowDepth.stencilStoreOp = GPU::StoreOp::discard;
+            shadowDepth.stencilReadOnly = false;
+            GPU::BeginRenderPassDescriptor shadowDesc{};
+            shadowDesc.depthStencilAttachment = shadowDepth;
+            if (auto shadowRpe = encoder->beginRenderPass(shadowDesc)) {
+                const float size = (float)shadowMapResolution;
+                shadowRpe->setViewport(0.0f, 0.0f, size, size, 0.0f, 1.0f);
+                shadowRpe->setScissorRect(0.0f, 0.0f, size, size);
+                shadowRpe->setPipeline(shadowPipeline);
+                shadowRpe->setVertexBuffer(18, cameraPositionBuffer, 0);
+                for (size_t i = 0; i < sortedOpaque.size(); ++i) {
+                    const auto& draw = sortedOpaque[i];
+                    if (!draw.mesh || !draw.material || draw.material->alphaBlend ||
+                        draw.mesh->topology != GPU::PrimitiveTopology::triangleList) {
+                        continue;
+                    }
+                    const auto& positions = draw.mesh->vertexBuffers[VERTEX_SLOT_POSITION];
+                    const VertexAttributeFormat* format =
+                        draw.mesh->layout ? draw.mesh->layout->find(VertexSemantic::position) : nullptr;
+                    const bool floatPositions = !draw.mesh->layout ||
+                                                (format && format->componentType == GPU::ComponentType::ctFloat &&
+                                                 format->accessorType == GPU::AccessorType::acVec3);
+                    if (!positions || !floatPositions || i >= transformOffsets.size()) {
+                        continue;
+                    }
+                    shadowRpe->setVertexBuffer(0, positions, 0);
+                    shadowRpe->setVertexBuffer(16, transformBuffer, transformOffsets[i]);
+                    if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
+                        shadowRpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
+                        shadowRpe->drawIndexed(draw.mesh->indexCount, 1, 0, 0, 0);
+                    } else {
+                        shadowRpe->draw(draw.mesh->vertexCount, 1, 0, 0);
+                    }
+                }
+                shadowRpe->end();
+            }
+        } else if (cameraPositionBuffer) {
+            cameraPositionBuffer->upload(kCameraClipEnd, sizeof(shadowBlock), shadowBlock);  // off
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Render pass with FXAA / SSAA support.
     // ------------------------------------------------------------------
     ensureSceneColorTexture();
@@ -8947,6 +9157,7 @@ void Renderer::render(const RenderScene& scene,
             {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
+            {29, shadowMap ? shadowMap : shadowMapPlaceholder},  // sun shadows (fragmentMain_textured)
             // Environment-related bindings live in the per-frame bind group
             // (not the per-material one) so a mid-session setEnvironmentMap()
             // is picked up automatically by this unconditional per-frame

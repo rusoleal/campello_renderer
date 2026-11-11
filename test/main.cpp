@@ -3067,6 +3067,84 @@ TEST_F(OffscreenRenderTest, LinesDrawOnTopOfTheirFaces) {
     EXPECT_GT(pixels[quadPixel], 40) << "lit red quad";
 }
 
+// Sun shadows: a plate floating over a lit ground plane, the sun straight
+// above. With shadows on, the ground under the plate (the image centre: the
+// camera looks at it past the plate) is darker; ground away from it isn't.
+TEST_F(OffscreenRenderTest, SunCastsShadowsOnOpaqueGeometry) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsShadows()) GTEST_SKIP() << "No shadow maps on this backend";
+    renderer->setEnvironmentIntensity(0.1f);  // the sun, not the sky, lights the ground
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+
+    const auto makeQuad = [&](float y, float half, std::vector<float>& positions, std::vector<uint32_t>& indices) {
+        positions = {-half, y, -half, half, y, -half, half, y, half, -half, y, half};
+        indices = {0, 2, 1, 0, 3, 2};
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh.indexCount = 6;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = 4;
+        mesh.layout = &VertexLayout::positionOnly();
+        mesh.setBoundsFromPositions(positions.data(), 4);
+        return mesh;
+    };
+    std::vector<float> groundPositions, platePositions;
+    std::vector<uint32_t> groundIndices, plateIndices;
+    GpuMesh ground = makeQuad(0.0f, 1.5f, groundPositions, groundIndices);
+    GpuMesh plate = makeQuad(0.6f, 0.3f, platePositions, plateIndices);
+
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 2.5, 2.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 2.5, 2.5);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.0, -1.0, 0.0);  // travelling straight down
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    sun.castShadows = true;
+    scene.lights.push_back(sun);
+    for (GpuMesh* mesh : {&ground, &plate}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = red;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    const auto renderRed = [&](bool shadows) {
+        renderer->setShadowsEnabled(shadows);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        renderer->render(scene, view);  // the first frame may bind the placeholder map
+        const auto pixels = readBackPixels(tex);
+        return [pixels](int x, int y) { return double(pixels[(size_t(y) * 64 + size_t(x)) * 4]); };
+    };
+    const auto lit = renderRed(false);
+    const auto shadowed = renderRed(true);
+    renderer->setShadowsEnabled(true);
+    renderer->setEnvironmentIntensity(1.0f);
+    EXPECT_GT(lit(32, 32), 40.0) << "the sun lights the ground";
+    EXPECT_LT(shadowed(32, 32), lit(32, 32) * 0.7) << "no shadow under the plate";
+    EXPECT_NEAR(shadowed(10, 40), lit(10, 40), 4.0) << "ground away from the plate darkened too";
+    EXPECT_NEAR(shadowed(32, 24), lit(32, 24), 4.0) << "the plate shadows itself";
+}
+
 // App shader programs (program.hpp): an element-id program compiled by
 // campello_renderer_add_shader_program() writes each quad's per-vertex id
 // (custom0) into an r32uint target through renderProgramPass().

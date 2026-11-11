@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+- **Sun shadows** (Metal): the first directional light with `castShadows` (`LightData::castShadows`, from the ECS `DirectionalLight`) renders the opaque triangle draws into a depth map from its direction (orthographic, fitted to their bounds; slope-scaled bias), and `fragmentMain_textured` darkens that light's contribution by 3x3 PCF of the map, so soft-edged shadows with the sky still filling them. `setShadowsEnabled()` (on by default), `setShadowMapResolution()` (2048), `supportsShadows()`. The camera uniforms gain a shadow block (`kCameraUniformSize` 368). Lines, blended and app-layout draws don't cast. Test: a plate over a lit ground plane shadows the ground under it and nothing else.
+
+### Fixed
+- Directional lights in `render(RenderScene)` lit nothing: the shaders read a directional light's direction from `position`, which the scene path filled with the light's world position (the origin for most lights, giving a zero vector). It now uploads the direction towards the light there, as the glTF path does.
+
 ## [0.15.0] - 2026-11-10
 
 ### Added
