@@ -152,6 +152,19 @@ namespace systems::leal::campello_renderer {
                                                false}}};
             return layout;
         }
+
+        /// Wide line quads (GpuMesh::wideLines, Renderer::expandLines()):
+        /// POSITION = this end of the segment, NORMAL = the other end,
+        /// TEXCOORD_0 = (side +-1, half width in output pixels; negative at
+        /// the segment's end vertices). All float.
+        static const VertexLayout& wideLine() {
+            using CT = systems::leal::campello_gpu::ComponentType;
+            using AT = systems::leal::campello_gpu::AccessorType;
+            static const VertexLayout layout{{{VertexSemantic::position, CT::ctFloat, AT::acVec3, false},
+                                              {VertexSemantic::normal, CT::ctFloat, AT::acVec3, false},
+                                              {VertexSemantic::texcoord0, CT::ctFloat, AT::acVec2, false}}};
+            return layout;
+        }
     };
 
 } // namespace systems::leal::campello_renderer

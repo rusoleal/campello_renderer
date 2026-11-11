@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- **Antialiased wide lines** (`GpuMesh::wideLines`, Metal): `Renderer::expandLines()` turns a line list into one quad per segment (`VertexLayout::wideLine()`: this end, the other end, side and half width); `vertexWideLine` expands it in screen space by a width in output pixels plus a 1 px fringe, sideways and past both ends, and `fragmentWideLine` fades the fringe by distance to the centre line (alpha-blended, the material's base colour, clip planes apply, the same depth nudge as hardware lines). Wide lines keep their width and soft edges at any SSAA scale, unlike hardware lines, which are one pixel of the supersampled target (half a pixel at SSAA 2x, a quarter at 4x: faint and broken). They're drawn after everything opaque. `supportsWideLines()` says whether the backend can draw them (Metal for now; elsewhere use a `lineList`). Found in campello_bim, whose outlines were faint at SSAA 2x and dotted at 4x. Tests: the expansion, and a 3 px diagonal over a coplanar face drawn along its whole length with soft edges and the same width (within 0.1 px) at SSAA 1, 2 and 4.
+
 ## [0.15.0] - 2026-11-10
 
 ### Added

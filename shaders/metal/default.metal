@@ -1765,6 +1765,87 @@ fragment float4 fxaaFragment(FxaaOut in [[stage_in]],
 }
 
 // ---------------------------------------------------------------------------
+// Wide lines (GpuMesh::wideLines): one quad per segment, built on the CPU by
+// Renderer::expandLines() (VertexLayout::wideLine()): position = this end,
+// normal = the other end, texcoord0 = (side +-1, half width in output
+// pixels, negative at the segment's end vertices). The quad is expanded in
+// screen space by the half width plus a fringe, sideways and past both ends,
+// so a line has the same width and antialiasing at any SSAA scale (the
+// camera block's screenSize is the output size). fragmentWideLine fades the
+// fringe by the distance to the centre line. Same depth nudge as vertexLine.
+// ---------------------------------------------------------------------------
+struct VertexInWideLine {
+    float3 position [[attribute(0)]];
+    float3 other    [[attribute(1)]];
+    float2 params   [[attribute(2)]];
+};
+
+struct WideLineOut {
+    float4 clipPosition [[position]];
+    float3 worldPos;
+    float  distance;               // signed, output pixels from the centre line
+    float  halfWidth [[flat]];     // output pixels
+};
+
+constant float kWideLineFringe = 1.0;   // output pixels of fade beyond the half width
+constant float kWideLineNearW  = 1.0e-4;
+
+vertex WideLineOut vertexWideLine(
+    VertexInWideLine             in             [[stage_in]],
+    device const NodeTransforms *nodeTransforms [[buffer(16)]],
+    constant CameraUniforms     &camera         [[buffer(18)]])
+{
+    const bool  isStart   = in.params.y >= 0.0;
+    const float halfWidth = abs(in.params.y);
+    float4 self  = nodeTransforms[0].mvp * float4(in.position, 1.0);
+    float4 other = nodeTransforms[0].mvp * float4(in.other, 1.0);
+    // An end behind the camera: slide it along the segment to just in front
+    // of the eye, so the screen direction stays meaningful.
+    if (self.w < kWideLineNearW && other.w > kWideLineNearW) {
+        self = mix(self, other, (kWideLineNearW - self.w) / (other.w - self.w));
+    } else if (other.w < kWideLineNearW && self.w > kWideLineNearW) {
+        other = mix(other, self, (kWideLineNearW - other.w) / (self.w - other.w));
+    }
+    const float2 halfScreen = 0.5 * max(camera.screenSize, float2(1.0));
+    const float2 selfPx  = self.xy / self.w * halfScreen;
+    const float2 otherPx = other.xy / other.w * halfScreen;
+    float2 along = isStart ? otherPx - selfPx : selfPx - otherPx;  // start -> end
+    const float len = length(along);
+    along = len > 1.0e-6 ? along / len : float2(1.0, 0.0);
+    const float2 across = float2(-along.y, along.x);
+    const float extent = halfWidth + kWideLineFringe;
+    const float2 offsetPx = across * in.params.x * extent + along * (isStart ? -extent : extent);
+
+    WideLineOut out;
+    out.clipPosition = self;
+    out.clipPosition.xy += offsetPx / halfScreen * self.w;
+    out.clipPosition.z -= kLineDepthOffset * self.w;
+    out.worldPos  = (nodeTransforms[0].model * float4(in.position, 1.0)).xyz;
+    out.distance  = in.params.x * extent;
+    out.halfWidth = halfWidth;
+    return out;
+}
+
+fragment float4 fragmentWideLine(
+    WideLineOut                in     [[stage_in]],
+    constant MaterialUniforms &mat    [[buffer(17)]],
+    constant CameraUniforms   &camera [[buffer(18)]])
+{
+    for (uint i = 0; i < camera.clipInfo.x; ++i) {
+        if (dot(camera.clipPlanes[i].xyz, in.worldPos) + camera.clipPlanes[i].w < 0.0) {
+            discard_fragment();
+        }
+    }
+    // Full colour within the half width, fading to nothing over the fringe.
+    const float coverage = saturate(in.halfWidth + 0.5 * kWideLineFringe - abs(in.distance));
+    if (coverage <= 0.0) {
+        discard_fragment();
+    }
+    const float4 color = mat.baseColorFactor;
+    return float4(color.rgb, color.a * coverage);
+}
+
+// ---------------------------------------------------------------------------
 // Downsample shader — bilinear downsample from scaled scene texture to screen.
 // Reuses fxaaVertex for the fullscreen triangle.
 // ---------------------------------------------------------------------------

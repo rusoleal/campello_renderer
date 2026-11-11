@@ -3408,7 +3408,8 @@ void Renderer::detectQuantizedLayout() {
 #endif
 }
 
-const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines) const {
+const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines,
+                                                          bool wide) const {
     if (program >= programs.size()) return nullptr;
     // The stage that reads the most attributes among those reading only
     // attributes the layout has (the full shader for glTF meshes, the lean
@@ -3416,7 +3417,7 @@ const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program,
     const uint32_t has = layout.semanticMask();
     const MeshVertexStage* best = nullptr;
     for (const auto& stage : programs[program].vertexStages) {
-        if (stage.lines != lines) continue;
+        if (stage.lines != lines || stage.wide != wide) continue;
         if ((stage.readMask & ~has) != 0) continue;
         if (!best || std::popcount(stage.readMask) > std::popcount(best->readMask)) best = &stage;
     }
@@ -3425,10 +3426,20 @@ const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program,
 
 const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     ProgramHandle programHandle, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
-    systems::leal::campello_gpu::PixelFormat colorFormat, systems::leal::campello_gpu::PrimitiveTopology topology) {
+    systems::leal::campello_gpu::PixelFormat colorFormat, systems::leal::campello_gpu::PrimitiveTopology topology,
+    bool wideLines) {
     namespace GPU = systems::leal::campello_gpu;
     if (!meshRecipe.ready || !device || programHandle >= programs.size()) return nullptr;
     const ProgramState& program = programs[programHandle];
+    // Wide lines: their own vertex and fragment stages, always blended
+    // (coverage antialiasing) and double-sided.
+    if (wideLines) {
+        if (program.wideLineFragment.empty()) return nullptr;
+        blend = true;
+        doubleSided = true;
+        topology = GPU::PrimitiveTopology::triangleList;
+        variant = MeshProgram::textured;
+    }
     // Normalise to what this program/backend distinguishes, so equivalent
     // requests share one pipeline (Vulkan/DirectX PBR: one fragment shader,
     // no blending; app programs: one fragment shader).
@@ -3439,7 +3450,7 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     const bool lines = topology != GPU::PrimitiveTopology::triangleList &&
                        topology != GPU::PrimitiveTopology::triangleStrip;
     if (lines) doubleSided = true;  // no faces to cull
-    const MeshVertexStage* stage = vertexStageFor(programHandle, layout, lines);
+    const MeshVertexStage* stage = vertexStageFor(programHandle, layout, lines, wideLines);
     if (!stage) return nullptr;
 
     // Only the attributes the stage reads shape the pipeline.
@@ -3458,6 +3469,7 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     mix((uint64_t)topology);
     mix(doubleSided ? 1u : 0u);
     mix(blend ? 1u : 0u);
+    mix(wideLines ? 1u : 0u);
     if (auto it = meshPipelineCache.find(key); it != meshPipelineCache.end()) {
         return it->second.pipeline ? &it->second : nullptr;
     }
@@ -3506,7 +3518,7 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     }
     GPU::FragmentDescriptor frag{};
     frag.module     = program.fragmentModule;
-    frag.entryPoint = program.fragmentEntries[(size_t)variant];
+    frag.entryPoint = wideLines ? program.wideLineFragment : program.fragmentEntries[(size_t)variant];
     frag.targets.push_back(color);
     d.fragment = frag;
 
@@ -3514,6 +3526,39 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     // A failed creation (null pipeline) is cached too, so it isn't retried every draw.
     auto& stored = meshPipelineCache[key] = entry;
     return stored.pipeline ? &stored : nullptr;
+}
+
+Renderer::WideLineVertices Renderer::expandLines(const float* positions, size_t vertexCount, const uint32_t* indices,
+                                                  size_t indexCount, float widthPixels) {
+    WideLineVertices out;
+    const float half = std::max(0.0f, widthPixels) * 0.5f;
+    const size_t segments = indexCount / 2;
+    out.positions.reserve(segments * 12);
+    out.others.reserve(segments * 12);
+    out.params.reserve(segments * 8);
+    out.indices.reserve(segments * 6);
+    for (size_t s = 0; s < segments; ++s) {
+        const uint32_t ia = indices[s * 2];
+        const uint32_t ib = indices[s * 2 + 1];
+        if (ia >= vertexCount || ib >= vertexCount) continue;
+        const float* a = positions + ia * 3;
+        const float* b = positions + ib * 3;
+        if (a[0] == b[0] && a[1] == b[1] && a[2] == b[2]) continue;
+        const auto base = static_cast<uint32_t>(out.positions.size() / 3);
+        // Start vertices (positive half width) on sides +1/-1, then end
+        // vertices (negative half width) on the same physical sides: the
+        // shader takes the segment's direction from start to end for both.
+        const float* ends[4][2] = {{a, b}, {a, b}, {b, a}, {b, a}};
+        const float sides[4] = {1.0f, -1.0f, 1.0f, -1.0f};
+        for (int v = 0; v < 4; ++v) {
+            out.positions.insert(out.positions.end(), ends[v][0], ends[v][0] + 3);
+            out.others.insert(out.others.end(), ends[v][1], ends[v][1] + 3);
+            out.params.push_back(sides[v]);
+            out.params.push_back(v < 2 ? half : -half);
+        }
+        for (const uint32_t i : {0u, 1u, 3u, 0u, 3u, 2u}) out.indices.push_back(base + i);
+    }
+    return out;
 }
 
 void Renderer::bindMeshBuffer(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
@@ -3775,7 +3820,11 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             {allSemantics, shaderModule, "vertexMain"},
             {semanticBit(VertexSemantic::position), shaderModule, "vertexLean"},
             {semanticBit(VertexSemantic::position), shaderModule, "vertexLine", true},
+            {semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::normal) |
+                 semanticBit(VertexSemantic::texcoord0),
+             shaderModule, "vertexWideLine", false, true},
         };
+        programs[kPbrProgram].wideLineFragment = "fragmentWideLine";
         programs[kPbrProgram].fragmentModule = shaderModule;
         programs[kPbrProgram].fragmentEntries = {"fragmentMain_flat", "fragmentMain_textured", "fragmentMain_debug"};
         meshRecipe.rawBufferSlots = true;  // [[buffer(15..23)]]: lights, transforms, material, ...
@@ -8878,7 +8927,9 @@ void Renderer::render(const RenderScene& scene,
             }
             order[i] = {d2, i};
         }
+        // Opaque, then blended, then wide lines (blended over everything opaque).
         const auto rank = [](const systems::leal::campello_renderer::DrawCall &d) {
+            if (d.mesh && d.mesh->wideLines) return 4;
             return !d.material ? 0 : (d.material->alphaBlend ? 2 : 0) + (d.material->doubleSided ? 1 : 0);
         };
         std::sort(order.begin(), order.end(), [&](const auto &a, const auto &b) {
@@ -8896,6 +8947,9 @@ void Renderer::render(const RenderScene& scene,
     std::sort(sortedOpaque.begin(), sortedOpaque.end(),
         [](const systems::leal::campello_renderer::DrawCall &a,
            const systems::leal::campello_renderer::DrawCall &b) {
+            const bool wideA = a.mesh && a.mesh->wideLines;
+            const bool wideB = b.mesh && b.mesh->wideLines;
+            if (wideA != wideB) return !wideA;  // wide lines after everything opaque
             if (!a.material || !b.material) return a.material < b.material;
             if (a.material->alphaBlend != b.material->alphaBlend)
                 return !a.material->alphaBlend;
@@ -9485,12 +9539,21 @@ void Renderer::renderPrimitive(
     const auto colorFormat = activeProgramPass ? activeProgramPass->colorFormat : GPU::PixelFormat::invalid;
     bool debugView = program == kPbrProgram && viewMode == ViewMode::worldNormal && !customLayout &&
                      draw.mesh->topology == GPU::PrimitiveTopology::triangleList;
-    const MeshPipelineEntry* entry = debugView
+    const bool wideLines = draw.mesh->wideLines;
+    const MeshPipelineEntry* entry = wideLines
+        ? meshPipeline(program, MeshProgram::textured, layout, true, true, colorFormat, draw.mesh->topology, true)
+        : debugView
         ? meshPipeline(program, MeshProgram::debug, layout, false, false, colorFormat)
         : meshPipeline(program, MeshProgram::textured, layout, doubleSided || (program == kPbrProgram && clippingActive()),
                        useBlend, colorFormat, draw.mesh->topology);
     if (!entry) return;
     activeMeshSlots = &entry->slots;
+    // Wide lines expand in screen space: their vertex stage reads the camera
+    // block (screen size) at [[buffer(18)]], which the frame bind group
+    // binds for fragments only.
+    if (wideLines && meshRecipe.rawBufferSlots && cameraPositionBuffer) {
+        setVertexBufferIfChanged(rpe, 18, cameraPositionBuffer, 0);
+    }
 
     // Skip redundant setPipeline() calls: the bound pipeline object is
     // tracked (reset with currentPipelineVariant between passes).

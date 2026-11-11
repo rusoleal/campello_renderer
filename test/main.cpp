@@ -3067,6 +3067,133 @@ TEST_F(OffscreenRenderTest, LinesDrawOnTopOfTheirFaces) {
     EXPECT_GT(pixels[quadPixel], 40) << "lit red quad";
 }
 
+// Wide lines (GpuMesh::wideLines): Renderer::expandLines() makes one quad per
+// segment, start vertices with a positive half width, end vertices negative.
+TEST(WideLines, ExpandLinesBuildsAQuadPerSegment) {
+    const float positions[] = {0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0};
+    const uint32_t indices[] = {0, 1, 1, 2, 2, 3};  // the last segment is degenerate
+    const auto quads = Renderer::expandLines(positions, 4, indices, 6, 3.0f);
+    ASSERT_EQ(quads.positions.size(), 2u * 4 * 3);
+    ASSERT_EQ(quads.indices.size(), 2u * 6);
+    // First segment: (0,0,0) -> (1,0,0).
+    EXPECT_EQ(quads.positions[0], 0.0f);
+    EXPECT_EQ(quads.others[0], 1.0f);
+    EXPECT_EQ(quads.positions[6], 1.0f);  // third vertex: the end
+    EXPECT_EQ(quads.others[6], 0.0f);
+    EXPECT_EQ(quads.params[0], 1.0f);
+    EXPECT_EQ(quads.params[1], 1.5f);
+    EXPECT_EQ(quads.params[2], -1.0f);
+    EXPECT_EQ(quads.params[5], -1.5f);
+    EXPECT_EQ(quads.indices[6], 4u);  // second quad's vertices start at 4
+}
+
+// A green 3 px wide line across a lit red quad in the same plane: drawn over
+// its face along its whole length, with soft edges (partial coverage), and
+// as wide at SSAA 1, 2 and 4 (width in output pixels, unlike hardware lines).
+TEST_F(OffscreenRenderTest, WideLinesKeepTheirWidthAndSoftEdgesAtAnySsaa) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsWideLines()) GTEST_SKIP() << "No wide line stage on this backend";
+    GpuMaterial* green = renderer->uploadMaterial((*asset->materials)[0], *asset);
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(green, nullptr);
+    ASSERT_NE(red, nullptr);
+
+    float quadPositions[] = {-0.6f, -0.6f, 0.0f, 0.6f, -0.6f, 0.0f, 0.6f, 0.6f, 0.0f, -0.6f, 0.6f, 0.0f};
+    uint32_t quadIndices[] = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(sizeof(quadPositions), GPU::BufferUsage::vertex, quadPositions);
+    quad.indexBuffer = device->createBuffer(sizeof(quadIndices), GPU::BufferUsage::index, quadIndices);
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = &VertexLayout::positionOnly();
+
+    // A shallow diagonal (about 18 degrees), where hardware lines stair-step.
+    const float linePositions[] = {-0.6f, -0.2f, 0.0f, 0.6f, 0.2f, 0.0f};
+    const uint32_t lineIndices[] = {0, 1};
+    auto quads = Renderer::expandLines(linePositions, 2, lineIndices, 2, 3.0f);
+    GpuMesh line;
+    line.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(quads.positions.size() * 4, GPU::BufferUsage::vertex, quads.positions.data());
+    line.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+        device->createBuffer(quads.others.size() * 4, GPU::BufferUsage::vertex, quads.others.data());
+    line.vertexBuffers[Renderer::VERTEX_SLOT_TEXCOORD0] =
+        device->createBuffer(quads.params.size() * 4, GPU::BufferUsage::vertex, quads.params.data());
+    line.indexBuffer = device->createBuffer(quads.indices.size() * 4, GPU::BufferUsage::index, quads.indices.data());
+    line.indexCount = (uint32_t)quads.indices.size();
+    line.indexFormat = GPU::IndexFormat::uint32;
+    line.vertexCount = (uint32_t)(quads.positions.size() / 3);
+    line.layout = &VertexLayout::wideLine();
+    line.wideLines = true;
+
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0),
+                                                    VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection =
+        VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+    // The line first: wide lines are drawn after opaque geometry anyway.
+    for (auto [mesh, material] : {std::pair{&line, green}, std::pair{&quad, red}}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+
+    std::vector<double> widths;
+    for (const float ssaa : {1.0f, 2.0f, 4.0f}) {
+        renderer->setSsaaScale(ssaa);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        const auto pixels = readBackPixels(tex);
+        const auto greenness = [&](int x, int y) {
+            const size_t i = (size_t(y) * 64 + size_t(x)) * 4;
+            return std::clamp((double(pixels[i + 1]) - double(pixels[i])) / 255.0, 0.0, 1.0);
+        };
+        // Down each column the line crosses: some full-strength pixels, some
+        // partial ones (soft edges), and the coverage sums to the line's
+        // vertical thickness (3 px / cos(18 deg) ~ 3.2 px).
+        int partial = 0;
+        double total = 0.0;
+        int columns = 0;
+        for (int x = 24; x <= 39; ++x) {
+            double sum = 0.0;
+            double peak = 0.0;
+            for (int y = 16; y < 48; ++y) {
+                const double g = greenness(x, y);
+                sum += g;
+                peak = std::max(peak, g);
+                if (g > 0.15 && g < 0.85) ++partial;
+            }
+            EXPECT_GT(peak, 0.8) << "ssaa " << ssaa << ": line missing at column " << x;
+            total += sum;
+            ++columns;
+        }
+        EXPECT_GT(partial, columns / 2) << "ssaa " << ssaa << ": hard edges";
+        widths.push_back(total / columns);
+    }
+    renderer->setSsaaScale(1.0f);
+    for (const double w : widths) {
+        EXPECT_NEAR(w, 3.15, 0.6);
+    }
+    EXPECT_NEAR(widths[0], widths[2], 0.4) << "width changes with SSAA";
+}
+
 // App shader programs (program.hpp): an element-id program compiled by
 // campello_renderer_add_shader_program() writes each quad's per-vertex id
 // (custom0) into an r32uint target through renderProgramPass().

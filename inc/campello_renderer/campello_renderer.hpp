@@ -56,6 +56,14 @@ namespace systems::leal::campello_renderer {
         // Clip planes apply to them too.
         systems::leal::campello_gpu::PrimitiveTopology topology =
             systems::leal::campello_gpu::PrimitiveTopology::triangleList;
+        // Antialiased wide lines (Renderer::supportsWideLines()): a
+        // triangleList mesh in VertexLayout::wideLine() built by
+        // Renderer::expandLines(), one quad per segment. Drawn after opaque
+        // geometry with the material's base colour (unlit), alpha-blended by
+        // pixel coverage, the given width in output pixels at any SSAA
+        // scale, nudged towards the camera like hardware lines; clip planes
+        // apply.
+        bool wideLines = false;
 
         bool hasBounds = false;
         std::array<float, 3> boundsMin{0.0f, 0.0f, 0.0f};
@@ -405,6 +413,7 @@ namespace systems::leal::campello_renderer {
             std::shared_ptr<systems::leal::campello_gpu::ShaderModule> module;
             std::string entryPoint;
             bool lines = false;     // stage for line/point topologies (vs triangles)
+            bool wide = false;      // stage for wide line quads (GpuMesh::wideLines)
         };
         // One registered program: its shaders (index = ProgramHandle;
         // 0 = built-in PBR, rebuilt by createDefaultPipelines(), app programs
@@ -417,6 +426,7 @@ namespace systems::leal::campello_renderer {
             // separate shader for that variant (the textured one is used).
             std::array<std::string, 3> fragmentEntries;
             bool supportsBlend = false;  // false: blend draws use the opaque state
+            std::string wideLineFragment;  // fragment entry for wide lines; empty: none
         };
         std::vector<ProgramState> programs;
         // Shared by all programs on this backend.
@@ -463,13 +473,15 @@ namespace systems::leal::campello_renderer {
         bool quantizedLayoutDetected = false;
         VertexLayout standardLayout = VertexLayout::standard();
 
-        const MeshVertexStage* vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines = false) const;
+        const MeshVertexStage* vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines = false,
+                                              bool wide = false) const;
         // colorFormat: invalid = the recipe's (createDefaultPipelines()) format.
         const MeshPipelineEntry* meshPipeline(
             ProgramHandle program, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
             systems::leal::campello_gpu::PixelFormat colorFormat = systems::leal::campello_gpu::PixelFormat::invalid,
             systems::leal::campello_gpu::PrimitiveTopology topology =
-                systems::leal::campello_gpu::PrimitiveTopology::triangleList);
+                systems::leal::campello_gpu::PrimitiveTopology::triangleList,
+            bool wideLines = false);
         const MeshPipelineEntry* meshPipeline(
             MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend) {
             return meshPipeline(kPbrProgram, variant, layout, doubleSided, blend);
@@ -1091,6 +1103,26 @@ namespace systems::leal::campello_renderer {
         bool supportsProgram(ProgramHandle program, const VertexLayout& layout) const {
             return meshRecipe.ready && program < programs.size() && vertexStageFor(program, layout) != nullptr;
         }
+        /// True when wide line meshes (GpuMesh::wideLines) can be drawn
+        /// (Metal). Elsewhere, draw the lines as a lineList instead.
+        bool supportsWideLines() const {
+            return meshRecipe.ready && !programs.empty() && !programs[kPbrProgram].wideLineFragment.empty() &&
+                   vertexStageFor(kPbrProgram, VertexLayout::wideLine(), false, true) != nullptr;
+        }
+        /// Vertex data for a wide line mesh (GpuMesh::wideLines,
+        /// VertexLayout::wideLine()): one quad (4 vertices, 2 triangles) per
+        /// segment of a line list.
+        struct WideLineVertices {
+            std::vector<float> positions;  ///< xyz: this end of the segment
+            std::vector<float> others;     ///< xyz: the other end
+            std::vector<float> params;     ///< side +-1, half width in pixels (negative at the end vertices)
+            std::vector<uint32_t> indices;
+        };
+        /// Expands a line list (xyz `positions`, pairs of `indices`) into
+        /// wide line quads `widthPixels` wide (output pixels). Degenerate
+        /// segments are dropped.
+        static WideLineVertices expandLines(const float* positions, size_t vertexCount, const uint32_t* indices,
+                                            size_t indexCount, float widthPixels);
         /// True when line meshes (GpuMesh::topology lineList/lineStrip) with
         /// this layout can be drawn by the built-in program (Metal, Vulkan).
         bool supportsLines(const VertexLayout& layout = VertexLayout::positionOnly()) const {
