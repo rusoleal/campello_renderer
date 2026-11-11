@@ -88,8 +88,8 @@ layout(std140, set = 0, binding = 24) uniform MaterialUniforms {
     float anisotropyRotation;        // 312
     float hasAnisotropicTexture;     // 316
     float dispersion;                // 320
-    float _pad12;                    // 324
-    float _pad13;                    // 328
+    float worldMapping;              // 324  world-space box mapping: world units per repeat (0: off)
+    float worldMappingUp;            // 328  1: z up, 0: y up
     float _pad14;                    // 332
     vec4  normalUvTransformRow0;     // 336  independent KHR_texture_transform for normalTexture
     vec4  normalUvTransformRow1;     // 352
@@ -430,7 +430,28 @@ float sunShadow(vec3 P, vec3 N, vec3 L) {
     return shadowLookup(shadowMap, camera.shadowViewProj, camera.shadowParams.y, P, N, L, inside);
 }
 
+// World-space box mapping (Renderer::setMaterialWorldMapping()), for
+// geometry without texture coordinates (CAD, BIM): faces facing up or down
+// take the plan projection (u east, v south), the others a projection along
+// their own horizontal direction (u to the right seen from outside, v down),
+// one repeat per `size` world units, so textures run continuously across
+// elements. T and B are the directions u and v grow in (normal mapping).
+void worldMappingFrame(vec3 P, vec3 N, float size, bool zUp, out vec2 uv, out vec3 T, out vec3 B) {
+    vec3 U = zUp ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+    float nu = dot(N, U);
+    if (abs(nu) > 0.7071) {
+        T = vec3(1.0, 0.0, 0.0);
+        B = zUp ? vec3(0.0, -1.0, 0.0) : vec3(0.0, 0.0, 1.0);
+    } else {
+        vec3 h = normalize(N - U * nu);
+        T = cross(U, h);
+        B = -U;
+    }
+    uv = vec2(dot(P, T), dot(P, B)) / size;
+}
+
 void main() {
+    vec2 texcoord0In = fragTexcoord0;  // world mapping replaces it
     // Derivatives are taken unconditionally (uniform control flow).
     vec3 faceNormal = cross(dFdx(worldPos), dFdy(worldPos));
     worldNormalIn    = worldNormalRaw;
@@ -446,6 +467,12 @@ void main() {
         worldTangentIn   = T;
         worldBitangentIn = cross(N, T);
     }
+    if (mat.worldMapping > 0.0) {
+        vec3 T, B;
+        worldMappingFrame(worldPos, normalize(worldNormalIn), mat.worldMapping, mat.worldMappingUp > 0.5, texcoord0In, T, B);
+        worldTangentIn   = T;
+        worldBitangentIn = B;
+    }
 
     // Clip planes (Renderer::setClipPlanes()): discard the clipped side. With
     // section caps on, back faces of single-sided surfaces (the inside of a
@@ -460,9 +487,9 @@ void main() {
         return;
     }
 
-    vec2 uv0 = fragTexcoord0;
+    vec2 uv0 = texcoord0In;
     if (mat.uvTransformRow0.w > 0.5) {
-        uv0 = applyUvTransform(fragTexcoord0, mat.uvTransformRow0, mat.uvTransformRow1);
+        uv0 = applyUvTransform(texcoord0In, mat.uvTransformRow0, mat.uvTransformRow1);
     }
     vec2 baseColorUV = (mat.uvTransformRow0.w > 0.5)
         ? uv0 : selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1BaseColor);
@@ -499,8 +526,8 @@ void main() {
     vec3 N;
     if (mat.hasNormalTexture > 0.5) {
         vec2 normalUV = (mat.normalUvTransformRow0.w > 0.5)
-            ? applyUvTransform(fragTexcoord0, mat.normalUvTransformRow0, mat.normalUvTransformRow1)
-            : selectUV(fragTexcoord0, fragTexcoord1, mat.texCoord1Mask, kUV1Normal);
+            ? applyUvTransform(texcoord0In, mat.normalUvTransformRow0, mat.normalUvTransformRow1)
+            : selectUV(texcoord0In, fragTexcoord1, mat.texCoord1Mask, kUV1Normal);
         vec3 ns = texture(sampler2D(normalTexture, normalSampler), normalUV).rgb * 2.0 - 1.0;
         ns.xy *= mat.normalScale;
         vec3 Nbase = normalize(worldNormalIn);

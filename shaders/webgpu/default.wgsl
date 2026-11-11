@@ -74,6 +74,8 @@ struct MaterialUniforms {
     anisotropyRotation: f32,
     hasAnisotropicTexture: f32,
     dispersion: f32,
+    worldMapping: f32,     // world-space box mapping: world units per repeat (0: off)
+    worldMappingUp: f32,   // 1: z up, 0: y up
     normalUvTransformRow0: vec4f,
     normalUvTransformRow1: vec4f,
     texCoord1Mask: f32,
@@ -340,8 +342,31 @@ fn iblGGXFresnel(NdotV: f32, roughness: f32, F0: vec3f) -> vec3f {
     return FssEss + FmsEms;
 }
 
+// World-space box mapping (Renderer::setMaterialWorldMapping()), for
+// geometry without texture coordinates (CAD, BIM): faces facing up or down
+// take the plan projection (u east, v south), the others a projection along
+// their own horizontal direction (u to the right seen from outside, v down),
+// one repeat per `size` world units, so textures run continuously across
+// elements. T and B are the directions u and v grow in (normal mapping).
+fn worldMappingFrame(P: vec3f, N: vec3f, size: f32, zUp: bool) -> array<vec3f, 3> {
+    let U = select(vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.0, 1.0), zUp);
+    let nu = dot(N, U);
+    var T: vec3f;
+    var B: vec3f;
+    if (abs(nu) > 0.7071) {
+        T = vec3f(1.0, 0.0, 0.0);
+        B = select(vec3f(0.0, 0.0, 1.0), vec3f(0.0, -1.0, 0.0), zUp);
+    } else {
+        let h = normalize(N - U * nu);
+        T = cross(U, h);
+        B = -U;
+    }
+    return array<vec3f, 3>(vec3f(dot(P, T) / size, dot(P, B) / size, 0.0), T, B);
+}
+
 @fragment
-fn fs_main(v: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(0) vec4f {
+fn fs_main(vIn: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(0) vec4f {
+    var v = vIn;  // world mapping replaces its texture coordinates
     // Position-only meshes carry no normal: flat face normal from the
     // derivatives of the world position (taken unconditionally), towards
     // the camera.
@@ -364,6 +389,12 @@ fn fs_main(v: VertexOut, @builtin(front_facing) frontFacing: bool) -> @location(
         worldNormal = N;
         worldTangent = T;
         worldBitangent = cross(N, T);
+    }
+    if (mat.worldMapping > 0.0) {
+        let frame = worldMappingFrame(v.worldPos, normalize(worldNormal), mat.worldMapping, mat.worldMappingUp > 0.5);
+        v.texcoord0 = frame[0].xy;
+        worldTangent = frame[1];
+        worldBitangent = frame[2];
     }
 
     // Clip planes: discard the clipped side. The section cap (back faces of

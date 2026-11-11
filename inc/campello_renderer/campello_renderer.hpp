@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <atomic>
+#include <map>
 #include <memory>
 #include <optional>
 #include <array>
@@ -253,6 +254,26 @@ namespace systems::leal::campello_renderer {
         // Look-up caches from glTF indices/handles to engine-native handles.
         std::unordered_map<const systems::leal::gltf::Primitive*, GpuMesh*>     meshCache;
         std::unordered_map<int64_t, GpuMaterial*>                               materialCache;
+        // uploadMaterial() of glTFs other than the scene's: by (asset, index).
+        // The assets must outlive their materials (as for the scene's).
+        std::map<std::pair<const void*, int64_t>, GpuMaterial*> foreignMaterialCache;
+        // setMaterialWorldMapping(): world units per repeat, by uniform slot
+        // (applied whenever the slot is written).
+        std::map<uint32_t, float> materialWorldMappings;
+        // Vulkan/WebGPU bind groups that hold materialUniformBuffer (binding
+        // 24), by owner ("default", "scene:<m>", "slot:<n>"): rebuilt when the
+        // buffer grows (rebindMaterialBuffer()).
+        struct MaterialBufferBindGroup {
+            systems::leal::campello_gpu::BindGroupDescriptor descriptor;
+            std::shared_ptr<systems::leal::campello_gpu::BindGroup> group;
+        };
+        std::map<std::string, MaterialBufferBindGroup> materialBufferBindGroups;
+        void rememberMaterialBufferBindGroup(const std::string& key,
+                                             const systems::leal::campello_gpu::BindGroupDescriptor& descriptor,
+                                             const std::shared_ptr<systems::leal::campello_gpu::BindGroup>& group);
+        void rebindMaterialBuffer();
+        std::map<std::pair<const void*, int64_t>, std::shared_ptr<systems::leal::campello_gpu::Texture>> foreignTextures;
+        std::map<std::pair<const void*, int64_t>, std::shared_ptr<systems::leal::campello_gpu::Sampler>> foreignSamplers;
 
         // Minimal bind groups for flat pipeline variants (no textures/samplers).
         // Only contains the material uniform buffer at binding 17 so the fragment
@@ -743,6 +764,10 @@ namespace systems::leal::campello_renderer {
                                              const char* applyEntry,
                                              systems::leal::campello_gpu::PixelFormat colorFormat);
         /// The AO passes into the finished frame `colorView` (after anti-aliasing).
+        /// Uploads an RGBA8 image with a box-filtered mip chain (linear light
+        /// when `srgb`).
+        void uploadWithMips(const std::shared_ptr<systems::leal::campello_gpu::Texture>& texture, const uint8_t* rgba,
+                            uint32_t width, uint32_t height, uint32_t mipLevels, bool srgb);
         void encodeAmbientOcclusion(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
                                     const std::shared_ptr<systems::leal::campello_gpu::TextureView>& colorView,
                                     const systems::leal::vector_math::Matrix4<double>& projection);
@@ -1243,6 +1268,15 @@ namespace systems::leal::campello_renderer {
         /// A finer shadow map for the part of the view nearest the camera
         /// (two cascades; on by default). Off: one map over the whole scene.
         void setShadowCascades(bool enabled) { shadowCascades = enabled; }
+
+        /// World-space box mapping for `material`'s textures (base colour,
+        /// normal, metallic-roughness, occlusion, emissive), for geometry
+        /// without texture coordinates: faces facing up or down use the plan
+        /// projection, the others a projection along their own horizontal
+        /// direction (v down), one repeat per `repeatSize` world units, so
+        /// textures run on across separate meshes. The up axis is the
+        /// environment's (setEnvironmentUpAxis()). 0 turns it off.
+        void setMaterialWorldMapping(GpuMaterial* material, float repeatSize);
 
         /// Exposure in EV: colours are multiplied by 2^ev before tone mapping
         /// (meshes and sky). 0 by default (unchanged).

@@ -799,6 +799,10 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         materialPool.clear();
         meshCache.clear();
         materialCache.clear();
+        foreignMaterialCache.clear();
+        materialBufferBindGroups.clear();
+        foreignTextures.clear();
+        foreignSamplers.clear();
         nodeInstanceData.clear();
         primitiveBounds.clear();
         nodeMeshLocalBounds.clear();
@@ -2433,6 +2437,7 @@ void Renderer::setScene(uint32_t index) {
         // No separate flat shader on Vulkan (pipelineFlat aliases pipelineTextured) —
         // reuse the same fully-populated bind group for both.
         defaultFlatBindGroup = defaultBindGroup;
+        rememberMaterialBufferBindGroup("default", bgDesc, defaultBindGroup);
     }
 #elif defined(_WIN32)
     ensureDirectXPbrBindGroupLayout();
@@ -2885,6 +2890,7 @@ void Renderer::setScene(uint32_t index) {
             materialBindGroups[m] = device->createBindGroup(bgDesc, /*persistent=*/true);
             // No separate flat shader on Vulkan — reuse the same bind group.
             flatMaterialBindGroups[m] = materialBindGroups[m];
+            rememberMaterialBufferBindGroup("scene:" + std::to_string(m), bgDesc, materialBindGroups[m]);
 #elif defined(_WIN32)
             ensureDirectXPbrBindGroupLayout();
             DirectXMaterialResources& res = directxMaterialResources[m];
@@ -8779,12 +8785,155 @@ GpuMesh* Renderer::uploadMesh(const systems::leal::gltf::Primitive& primitive,
 
 // Writes one material's 93 floats at `offset` into the material uniform
 // buffer and its CPU shadow (the shadow refills the buffer when it grows).
-void Renderer::writeMaterialUniform(uint64_t offset, const float* slot) {
+void Renderer::rememberMaterialBufferBindGroup(const std::string& key,
+                                               const systems::leal::campello_gpu::BindGroupDescriptor& descriptor,
+                                               const std::shared_ptr<systems::leal::campello_gpu::BindGroup>& group) {
+    if (!group) return;
+    materialBufferBindGroups[key] = {descriptor, group};
+}
+
+void Renderer::rebindMaterialBuffer() {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!materialUniformBuffer) return;
+    for (auto& [key, record] : materialBufferBindGroups) {
+        GPU::BindGroupDescriptor descriptor = record.descriptor;
+        for (auto& entry : descriptor.entries) {
+            if (auto* binding = std::get_if<GPU::BufferBinding>(&entry.resource)) {
+                binding->buffer = materialUniformBuffer;
+            }
+        }
+        auto fresh = device->createBindGroup(descriptor, /*persistent=*/true);
+        if (!fresh) continue;
+        const auto old = record.group;
+        const auto swap = [&](std::shared_ptr<GPU::BindGroup>& ref) {
+            if (ref == old) ref = fresh;
+        };
+        swap(defaultBindGroup);
+        swap(defaultFlatBindGroup);
+        for (auto& group : materialBindGroups) swap(group);
+        for (auto& group : flatMaterialBindGroups) swap(group);
+        for (auto& material : materialPool) {
+            swap(material->bindGroup);
+            swap(material->flatBindGroup);
+        }
+        record.descriptor = descriptor;
+        record.group = fresh;
+    }
+}
+
+void Renderer::writeMaterialUniform(uint64_t offset, const float* slotIn) {
     constexpr uint64_t size = 93 * sizeof(float);
     if (!materialUniformBuffer) return;
-    materialUniformBuffer->upload(offset, size, const_cast<float*>(slot));
+    float slot[93];
+    std::memcpy(slot, slotIn, size);
+    // World mapping (floats 81-82, the padding after dispersion) isn't part
+    // of the glTF material: re-applied whenever the slot is (re)written.
+    if (const auto it = materialWorldMappings.find((uint32_t)(offset / kMaterialUniformStride));
+        it != materialWorldMappings.end()) {
+        slot[81] = it->second;
+        slot[82] = environmentUpAxis == UpAxis::z ? 1.0f : 0.0f;
+    }
+    materialUniformBuffer->upload(offset, size, slot);
     if (materialUniformShadow.size() < offset + size) materialUniformShadow.resize(offset + size, 0);
     std::memcpy(materialUniformShadow.data() + offset, slot, size);
+}
+
+void Renderer::uploadWithMips(const std::shared_ptr<systems::leal::campello_gpu::Texture>& texture, const uint8_t* rgba,
+                              uint32_t width, uint32_t height, uint32_t mipLevels, bool srgb) {
+    namespace GPU = systems::leal::campello_gpu;
+    static const std::array<float, 256> toLinear = [] {
+        std::array<float, 256> table{};
+        for (int i = 0; i < 256; ++i) {
+            const float c = (float)i / 255.0f;
+            table[(size_t)i] = c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+        }
+        return table;
+    }();
+    const auto encode = [srgb](float v) {
+        v = std::clamp(v, 0.0f, 1.0f);
+        if (srgb) v = v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
+        return (uint8_t)std::lround(v * 255.0f);
+    };
+    // The chain, level by level (each from the previous one).
+    std::vector<std::vector<uint8_t>> levels;
+    levels.emplace_back(rgba, rgba + (size_t)width * height * 4);
+    uint32_t w = width, h = height;
+    for (uint32_t level = 1; level < mipLevels; ++level) {
+        const uint32_t nw = std::max(1u, w / 2), nh = std::max(1u, h / 2);
+        const auto& src = levels.back();
+        std::vector<uint8_t> dst((size_t)nw * nh * 4);
+        for (uint32_t y = 0; y < nh; ++y) {
+            for (uint32_t x = 0; x < nw; ++x) {
+                for (int c = 0; c < 4; ++c) {
+                    float sum = 0.0f;
+                    for (uint32_t dy = 0; dy < 2; ++dy) {
+                        for (uint32_t dx = 0; dx < 2; ++dx) {
+                            const uint32_t sx = std::min(w - 1, x * 2 + dx), sy = std::min(h - 1, y * 2 + dy);
+                            const uint8_t v = src[((size_t)sy * w + sx) * 4 + (size_t)c];
+                            sum += (srgb && c < 3) ? toLinear[v] : (float)v / 255.0f;
+                        }
+                    }
+                    dst[((size_t)y * nw + x) * 4 + (size_t)c] = (srgb && c < 3) ? encode(sum / 4.0f)
+                                                                                 : (uint8_t)std::lround(sum / 4.0f * 255.0f);
+                }
+            }
+        }
+        levels.push_back(std::move(dst));
+        w = nw;
+        h = nh;
+    }
+    // One staging buffer, rows padded to 256 bytes (WebGPU's copy alignment).
+    std::vector<uint64_t> offsets, rowBytes;
+    uint64_t total = 0;
+    w = width;
+    h = height;
+    for (uint32_t level = 0; level < mipLevels; ++level) {
+        const uint64_t row = ((uint64_t)w * 4 + 255) / 256 * 256;
+        offsets.push_back(total);
+        rowBytes.push_back(row);
+        total += row * h;
+        w = std::max(1u, w / 2);
+        h = std::max(1u, h / 2);
+    }
+    std::vector<uint8_t> staged(total, 0);
+    w = width;
+    h = height;
+    for (uint32_t level = 0; level < mipLevels; ++level) {
+        for (uint32_t y = 0; y < h; ++y) {
+            std::memcpy(staged.data() + offsets[level] + rowBytes[level] * y, levels[level].data() + (size_t)y * w * 4,
+                        (size_t)w * 4);
+        }
+        w = std::max(1u, w / 2);
+        h = std::max(1u, h / 2);
+    }
+    auto staging = device->createBuffer(total, GPU::BufferUsage::copySrc);
+    if (!staging) return;
+    staging->upload(0, total, staged.data());
+    auto encoder = device->createCommandEncoder();
+    if (!encoder) return;
+    for (uint32_t level = 0; level < mipLevels; ++level) {
+        encoder->copyBufferToTexture(staging, offsets[level], rowBytes[level], texture, level, 0);
+    }
+    auto fence = device->createFence();
+    device->submit(encoder->finish(), fence);
+    if (fence) fence->wait();
+}
+
+void Renderer::setMaterialWorldMapping(GpuMaterial* material, float repeatSize) {
+    if (!material) return;
+    if (repeatSize > 0.0f) {
+        materialWorldMappings[material->uniformSlot] = repeatSize;
+    } else {
+        materialWorldMappings.erase(material->uniformSlot);
+    }
+    const uint64_t offset = (uint64_t)material->uniformSlot * kMaterialUniformStride;
+    constexpr uint64_t size = 93 * sizeof(float);
+    if (materialUniformShadow.size() < offset + size) return;
+    float slot[93];
+    std::memcpy(slot, materialUniformShadow.data() + offset, size);
+    slot[81] = 0.0f;  // set again by writeMaterialUniform() when on
+    slot[82] = 0.0f;
+    writeMaterialUniform(offset, slot);
 }
 
 GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& material,
@@ -8801,7 +8950,16 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
             }
         }
     }
-    if (materialIndex >= 0) {
+    // A glTF other than the scene's (setAsset()) has its own indices: its
+    // materials, textures and samplers are cached by (asset, index) and get
+    // their own uniform slots. (Keyed by index alone, every such asset's
+    // material 0 came back as the scene's material 0.)
+    const bool sceneAsset = this->asset && this->asset.get() == &asset;
+    if (!sceneAsset && materialIndex >= 0) {
+        const auto it = foreignMaterialCache.find({&asset, materialIndex});
+        if (it != foreignMaterialCache.end()) return it->second;
+    }
+    if (sceneAsset && materialIndex >= 0) {
         auto cacheIt = materialCache.find(materialIndex);
         if (cacheIt != materialCache.end()) {
             return cacheIt->second;
@@ -8809,7 +8967,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     }
 
     // Reuse existing bind groups if this material was already processed by setScene().
-    if (materialIndex >= 0 &&
+    if (sceneAsset && materialIndex >= 0 &&
         (size_t)materialIndex < materialBindGroups.size() &&
         materialBindGroups[materialIndex]) {
         auto mat = std::make_unique<GpuMaterial>();
@@ -8858,8 +9016,14 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     // is safe to trust per-call rather than re-deriving it here.
     auto ensureTexture = [&](int64_t imageIndex, bool srgb, bool isBasisu) -> std::shared_ptr<GPU::Texture> {
         if (imageIndex < 0 || !asset.images) return nullptr;
-        if ((size_t)imageIndex >= gpuTextures.size()) gpuTextures.resize(imageIndex + 1);
-        if (gpuTextures[(size_t)imageIndex]) return gpuTextures[(size_t)imageIndex];
+        std::shared_ptr<GPU::Texture>* cached = nullptr;
+        if (sceneAsset) {
+            if ((size_t)imageIndex >= gpuTextures.size()) gpuTextures.resize(imageIndex + 1);
+            cached = &gpuTextures[(size_t)imageIndex];
+        } else {
+            cached = &foreignTextures[{&asset, imageIndex}];
+        }
+        if (*cached) return *cached;
 
         auto& image = (*asset.images)[(size_t)imageIndex];
 
@@ -8903,7 +9067,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
             if (texture && !uploadTextureDataWithMips(device, texture, *texData)) {
                 texture = nullptr;
             }
-            gpuTextures[(size_t)imageIndex] = texture;
+            *cached = texture;
             return texture;
         }
 
@@ -8939,15 +9103,26 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                 fmt = GPU::PixelFormat::rgba32float;
                 break;
         }
+        // 8-bit images get a mip chain (box filter, in linear light when
+        // sRGB): without one, fine repeating patterns (brick, tiles) shimmer
+        // and moire in the distance.
+        const bool mipmapped = img->getFormat() == systems::leal::campello_image::ImageFormat::rgba8 &&
+                               img->getWidth() > 1 && img->getHeight() > 1;
+        const uint32_t mipLevels = mipmapped
+            ? 1u + (uint32_t)std::floor(std::log2((double)std::max(img->getWidth(), img->getHeight())))
+            : 1u;
         auto texture = device->createTexture(
             GPU::TextureType::tt2d, fmt,
-            img->getWidth(), img->getHeight(), 1, 1, 1,
+            img->getWidth(), img->getHeight(), 1, mipLevels, 1,
             (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                 (uint32_t)GPU::TextureUsage::copyDst));
-        if (texture) {
+        if (texture && mipLevels == 1) {
             texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
+        } else if (texture) {
+            uploadWithMips(texture, static_cast<const uint8_t*>(img->getData()), img->getWidth(), img->getHeight(),
+                           mipLevels, srgb);
         }
-        gpuTextures[(size_t)imageIndex] = texture;
+        *cached = texture;
         return texture;
     };
 
@@ -8967,8 +9142,14 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
         }
         if (gt.sampler >= 0 && asset.samplers &&
             (size_t)gt.sampler < asset.samplers->size()) {
-            if ((size_t)gt.sampler >= gpuSamplers.size()) gpuSamplers.resize(gt.sampler + 1);
-            if (!gpuSamplers[(size_t)gt.sampler]) {
+            std::shared_ptr<GPU::Sampler>* cachedSampler = nullptr;
+            if (sceneAsset) {
+                if ((size_t)gt.sampler >= gpuSamplers.size()) gpuSamplers.resize(gt.sampler + 1);
+                cachedSampler = &gpuSamplers[(size_t)gt.sampler];
+            } else {
+                cachedSampler = &foreignSamplers[{&asset, (int64_t)gt.sampler}];
+            }
+            if (!*cachedSampler) {
                 auto& gs = (*asset.samplers)[(size_t)gt.sampler];
                 GPU::SamplerDescriptor sd{};
                 sd.addressModeU  = static_cast<GPU::WrapMode>(gs.wrapS);
@@ -8979,9 +9160,9 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                 sd.lodMinClamp   = 0.0;
                 sd.lodMaxClamp   = 1000.0;
                 sd.maxAnisotropy = 8.0;
-                gpuSamplers[(size_t)gt.sampler] = device->createSampler(sd);
+                *cachedSampler = device->createSampler(sd);
             }
-            outSamp = gpuSamplers[(size_t)gt.sampler];
+            outSamp = *cachedSampler;
         }
     };
 
@@ -9095,7 +9276,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
 
     // --- Determine uniform slot ---
     uint32_t uniformSlot = 0;
-    if (materialIndex >= 0) {
+    if (sceneAsset && materialIndex >= 0) {
         uniformSlot = (uint32_t)(materialIndex + 1);
     } else {
         // Standalone upload — find next free slot.
@@ -9120,6 +9301,9 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
             materialUniformBuffer->upload(0, std::min<uint64_t>(materialUniformShadow.size(), newSize),
                                           materialUniformShadow.data());
         }
+        // Vulkan/WebGPU material bind groups hold the buffer itself (Metal
+        // binds the current one per draw): point them at the new one.
+        rebindMaterialBuffer();
     }
 
     // --- Upload material uniform data ---
@@ -9166,6 +9350,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     auto bindGroup = device->createBindGroup(bgDesc, /*persistent=*/true);
     // No separate flat shader on Vulkan — reuse the same bind group.
     auto flatBindGroup = bindGroup;
+    rememberMaterialBufferBindGroup("slot:" + std::to_string(uniformSlot), bgDesc, bindGroup);
 #elif defined(_WIN32)
     ensureDirectXPbrBindGroupLayout();
     DirectXMaterialResources dxRes{};
@@ -9260,8 +9445,10 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
 #endif
 
     GpuMaterial* result = mat.get();
-    if (materialIndex >= 0) {
+    if (sceneAsset && materialIndex >= 0) {
         materialCache[materialIndex] = result;
+    } else if (materialIndex >= 0) {
+        foreignMaterialCache[{&asset, materialIndex}] = result;
     }
     materialPool.push_back(std::move(mat));
     return result;

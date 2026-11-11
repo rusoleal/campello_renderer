@@ -3145,6 +3145,160 @@ TEST_F(OffscreenRenderTest, SunCastsShadowsOnOpaqueGeometry) {
     EXPECT_NEAR(shadowed(32, 24), lit(32, 24), 4.0) << "the plate shadows itself";
 }
 
+// Materials of glTFs other than the scene's are their own: two assets with
+// a different material at index 0 (unlit green, unlit blue) give two
+// materials that draw in their own colours, not the first one twice.
+TEST_F(OffscreenRenderTest, MaterialsOfSeparateAssetsDontShareTheirIndex) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    const auto unlit = [](const char* color) {
+        return std::string(R"({"asset": {"version": "2.0"}, "extensionsUsed": ["KHR_materials_unlit"], "materials": [)"
+                           R"({"pbrMetallicRoughness": {"baseColorFactor": )") +
+               color + R"(}, "extensions": {"KHR_materials_unlit": {}}}]})";
+    };
+    auto green = GLTF::loadGLTF(unlit("[0, 1, 0, 1]").c_str(), kNoOpLoader);
+    auto blue = GLTF::loadGLTF(unlit("[0, 0, 1, 1]").c_str(), kNoOpLoader);
+    ASSERT_NE(green, nullptr);
+    ASSERT_NE(blue, nullptr);
+    GpuMaterial* greenMaterial = renderer->uploadMaterial((*green->materials)[0], *green);
+    GpuMaterial* blueMaterial = renderer->uploadMaterial((*blue->materials)[0], *blue);
+    ASSERT_NE(greenMaterial, nullptr);
+    ASSERT_NE(blueMaterial, nullptr);
+    EXPECT_NE(greenMaterial, blueMaterial);
+    EXPECT_NE(greenMaterial->uniformSlot, blueMaterial->uniformSlot);
+    EXPECT_EQ(renderer->uploadMaterial((*blue->materials)[0], *blue), blueMaterial) << "not cached per asset";
+
+    std::vector<float> positions = {-0.9f, -0.9f, 0.0f, 0.9f, -0.9f, 0.0f, 0.9f, 0.9f, 0.0f, -0.9f, 0.9f, 0.0f};
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    quad.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = &VertexLayout::positionOnly();
+    const auto draw = [&](GpuMaterial* material) {
+        RenderScene scene;
+        scene.camera.view = VM::Matrix4<double>::identity();
+        scene.camera.projection = VM::Matrix4<double>::identity();
+        DrawCall call;
+        call.mesh = &quad;
+        call.material = material;
+        call.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(call);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        const auto pixels = readBackPixels(tex);
+        const size_t centre = (size_t(32) * 64 + 32) * 4;
+        return std::array<int, 3>{pixels[centre], pixels[centre + 1], pixels[centre + 2]};
+    };
+    const auto g = draw(greenMaterial);
+    const auto b = draw(blueMaterial);
+    EXPECT_GT(g[1], 200);
+    EXPECT_LT(g[2], 40);
+    EXPECT_GT(b[2], 200) << "the blue asset's material drew as " << b[0] << "," << b[1] << "," << b[2];
+    EXPECT_LT(b[1], 40);
+}
+
+// World-space box mapping: a quad without texture coordinates and an unlit
+// material with a 2x2 black/white checker (nearest filtering). Without world
+// mapping every pixel samples the same texel; with one repeat per world unit
+// over the 1.8-unit quad, both colours show, in cells of half a unit.
+TEST_F(OffscreenRenderTest, WorldMappingTexturesMeshesWithoutUVs) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+
+    // 2x2 TGA (uncompressed true colour, 32 bits, top-left origin): white,
+    // black / black, white.
+    std::vector<uint8_t> tga = {0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 32, 0x28};
+    const uint8_t white[4] = {255, 255, 255, 255}, black[4] = {0, 0, 0, 255};
+    for (const uint8_t* px : {white, black, black, white}) tga.insert(tga.end(), px, px + 4);
+    static const char* kBase64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded;
+    for (size_t i = 0; i < tga.size(); i += 3) {
+        const uint32_t n = (uint32_t(tga[i]) << 16) | (i + 1 < tga.size() ? uint32_t(tga[i + 1]) << 8 : 0) |
+                           (i + 2 < tga.size() ? uint32_t(tga[i + 2]) : 0);
+        encoded += kBase64[(n >> 18) & 63];
+        encoded += kBase64[(n >> 12) & 63];
+        encoded += i + 1 < tga.size() ? kBase64[(n >> 6) & 63] : '=';
+        encoded += i + 2 < tga.size() ? kBase64[n & 63] : '=';
+    }
+    const std::string json =
+        std::string(R"({"asset": {"version": "2.0"}, "extensionsUsed": ["KHR_materials_unlit"],)"
+                    R"("images": [{"uri": "data:image/x-tga;base64,)") + encoded +
+        R"("}], "samplers": [{"magFilter": 9728, "minFilter": 9728}], "textures": [{"source": 0, "sampler": 0}],)"
+        R"("materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}},)"
+        R"("extensions": {"KHR_materials_unlit": {}}}]})";
+    auto checker = GLTF::loadGLTF(json.c_str(), kNoOpLoader);
+    ASSERT_NE(checker, nullptr);
+    GpuMaterial* material = renderer->uploadMaterial((*checker->materials)[0], *checker);
+    ASSERT_NE(material, nullptr);
+
+    std::vector<float> positions = {-0.9f, -0.9f, 0.0f, 0.9f, -0.9f, 0.0f, 0.9f, 0.9f, 0.0f, -0.9f, 0.9f, 0.0f};
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    quad.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = &VertexLayout::positionOnly();
+    std::string lastRow;  // red along the middle row, for failure messages
+    const auto render = [&]() {
+        RenderScene scene;
+        scene.camera.view = VM::Matrix4<double>::identity();
+        scene.camera.projection = VM::Matrix4<double>::identity();
+        scene.camera.position = VM::Vector3<double>(0.0, 0.0, -1.0);
+        DrawCall call;
+        call.mesh = &quad;
+        call.material = material;
+        call.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(call);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        const auto pixels = readBackPixels(tex);
+        int bright = 0, dark = 0;
+        lastRow.clear();
+        for (int x = 0; x < 64; x += 4) lastRow += std::to_string(pixels[(size_t(32) * 64 + size_t(x)) * 4]) + " ";
+        for (int y = 8; y < 56; ++y) {
+            for (int x = 8; x < 56; ++x) {
+                const uint8_t r = pixels[(size_t(y) * 64 + size_t(x)) * 4];
+                if (r > 200) ++bright;
+                if (r < 50) ++dark;
+            }
+        }
+        return std::pair<int, int>{bright, dark};
+    };
+    const auto [plainBright, plainDark] = render();
+    const std::string plainRow = lastRow;
+    EXPECT_TRUE(plainBright == 0 || plainDark == 0) << "without world mapping the quad is one texel: " << plainRow;
+    renderer->setMaterialWorldMapping(material, 1.0f);
+    const auto [mappedBright, mappedDark] = render();
+    renderer->setMaterialWorldMapping(material, 0.0f);
+    EXPECT_GT(mappedBright, 400) << "white cells; middle row: " << lastRow << " (without mapping: " << plainRow << ")";
+    EXPECT_GT(mappedDark, 400) << "black cells";
+}
+
 // Ambient occlusion and exposure: a floor meeting a wall. With AO on, the
 // crease darkens and open floor doesn't; nothing gets brighter. -1 EV of
 // exposure darkens a lit pixel.

@@ -170,6 +170,9 @@ struct MaterialUniforms {
     float  anisotropyRotation;
     float  hasAnisotropicTexture;
     float  dispersion;            // KHR_materials_dispersion (default 0.0)
+    float  worldMapping;          // world-space box mapping: world units per repeat (0: off)
+    float  worldMappingUp;        // 1: z up, 0: y up
+    float  _pad14;
     float4 normalUvTransformRow0; // independent KHR_texture_transform for normalTexture
     float4 normalUvTransformRow1;
     // KHR spec: each texture reference has its own texCoord index (which
@@ -875,6 +878,26 @@ inline float sunShadow(constant CameraUniforms &camera, depth2d<float> shadowMap
     return shadowLookup(shadowMap, camera.shadowViewProj, camera.shadowParams.y, worldPos, N, L, inside);
 }
 
+// World-space box mapping (Renderer::setMaterialWorldMapping()), for
+// geometry without texture coordinates (CAD, BIM): faces facing up or down
+// take the plan projection (u east, v south), the others a projection along
+// their own horizontal direction (u to the right seen from outside, v down),
+// one repeat per `size` world units, so textures run continuously across
+// elements. T and B are the directions u and v grow in (normal mapping).
+inline void worldMappingFrame(float3 P, float3 N, float size, bool zUp, thread float2 &uv, thread float3 &T, thread float3 &B) {
+    const float3 U = zUp ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
+    const float nu = dot(N, U);
+    if (abs(nu) > 0.7071) {
+        T = float3(1.0, 0.0, 0.0);
+        B = zUp ? float3(0.0, -1.0, 0.0) : float3(0.0, 0.0, 1.0);
+    } else {
+        const float3 h = normalize(N - U * nu);
+        T = cross(U, h);
+        B = -U;
+    }
+    uv = float2(dot(P, T), dot(P, B)) / size;
+}
+
 fragment float4 fragmentMain_textured(
     VertexOut        inRaw                     [[stage_in]],
     constant MaterialUniforms &mat             [[buffer(17)]],
@@ -927,6 +950,15 @@ fragment float4 fragmentMain_textured(
         in.worldNormal    = N;
         in.worldTangent   = T;
         in.worldBitangent = cross(N, T);
+    }
+    if (mat.worldMapping > 0.0) {
+        float2 wuv;
+        float3 T, B;
+        worldMappingFrame(inRaw.worldPos, normalize(in.worldNormal), mat.worldMapping, mat.worldMappingUp > 0.5, wuv, T, B);
+        in.texcoord0      = wuv;
+        in.normalUV       = wuv;
+        in.worldTangent   = T;
+        in.worldBitangent = B;
     }
 
     // Clip planes (Renderer::setClipPlanes()): discard the clipped side. With
