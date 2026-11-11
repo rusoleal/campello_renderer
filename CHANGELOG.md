@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-11
+
 ### Added
 - **Antialiased wide lines** (`GpuMesh::wideLines`, Metal): `Renderer::expandLines()` stores each segment of a line list once (two float4: start and half width, end: the mesh's POSITION buffer) with one indexed quad per segment; `vertexWideLine` reads its segment by vertex index (no vertex attributes, `[[buffer(26)]]`) and expands it in screen space by a width in output pixels plus a fringe, sideways and past both ends, and `fragmentWideLine` fades the fringe by distance to the centre line. The fringe is 1 output pixel, narrowed by the SSAA scale (the downsample smooths too; `CameraUniforms::lineParams.x`). "Darkest wins" blending (min): overlapping lines don't stack into a heavier line. Segments shorter than 0.75 px on screen aren't drawn and fade from 30% up to 4 px. The material's base colour, clip planes apply, the same depth nudge as hardware lines; drawn after everything opaque. Wide lines keep their width and soft edges at any SSAA scale, unlike hardware lines (one pixel of the supersampled target: faint at SSAA 2x, dotted at 4x). `supportsWideLines()` says whether the backend can draw them (Metal for now; elsewhere use a `lineList`). Found in campello_bim. Tests: the expansion; a 3 px diagonal over a coplanar face drawn along its whole length with soft edges and the same width (within 0.2 px) at SSAA 1, 2 and 4; the same line drawn twice looks like once.
 - **Transmission on WebGPU** (thin-walled: the opaque scene behind at the fragment's position, blurred by roughness, Fresnel-weighted) and a **WGSL copy/downsample pipeline** (`shaders/webgpu/copy.wgsl`), which the transmission path needs to copy the opaque scene and which also turns on SSAA on the web.
