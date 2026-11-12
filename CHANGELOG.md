@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-11-12
+
 ### Added
 - **Textures in the path tracer**: base colour textures are sampled at each hit (up to 64 distinct 8-bit textures per scene, filtered linearly), through the mesh's TEXCOORD_0 (float, or normalized 16/8-bit) and KHR_texture_transform, or the renderer's world mapping (`setMaterialWorldMapping()`, the raster shader's box mapping), so traced images match the viewport's textures. The denoiser's albedo guide carries them too, so denoising keeps their detail. Meshes without coordinates, and textures beyond 64, shade with the texture's average colour as before. `GpuMaterial::baseColorTexture`.
 
