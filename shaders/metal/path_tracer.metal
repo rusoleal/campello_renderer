@@ -60,7 +60,7 @@ kernel void faceNormals(device const uchar*   positions [[buffer(0)]],
 // ---------------------------------------------------------------------------
 struct TraceUniforms {
     float4x4 invViewProj;   // clip -> world
-    float4   cameraPos;     // xyz
+    float4   cameraPos;     // xyz: the eye (from the view matrix)
     float4   sunDirection[4];  // directional lights: xyz towards the light (unit), w = cos of its angular radius
     float4   sunRadiance[4];   // rgb irradiance (colour x intensity); w = 1 for a light in use
     float4   params;        // x environment intensity, y exposure (EV), z max bounces, w sample index
@@ -209,10 +209,12 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
         direction = normalize(u.cameraForward.xyz * (cos(lat) * cos(lon)) + u.cameraRight.xyz * (cos(lat) * sin(lon)) +
                               u.cameraUp.xyz * sin(lat));
     } else {
-        const float4 far = u.invViewProj * float4(ndc, 1.0, 1.0);
+        // From the eye through the pixel's point on the near plane: the far
+        // plane isn't unprojected (in 32-bit floats it loses its precision
+        // when far / near is large, e.g. 5000 m / 5 cm).
         const float4 near = u.invViewProj * float4(ndc, 0.0, 1.0);
         origin = near.xyz / near.w;
-        direction = normalize(far.xyz / far.w - origin);
+        direction = normalize(origin - u.cameraPos.xyz);
     }
     if (any(isnan(direction))) direction = float3(0.0, 0.0, -1.0);
     // Denoiser guides: the first surface seen (through glass).

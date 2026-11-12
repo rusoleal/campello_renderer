@@ -150,6 +150,7 @@ private:
     float exposure_ = 0.0f;  // of the last render(), for readLinear()
     Projection projection_ = Projection::perspective;
     bool denoised_ = false;
+    std::shared_ptr<void> denoiser_;  // Open Image Denoise device, filter and buffers (path_tracer.cpp)
 };
 
 } // namespace systems::leal::campello_renderer

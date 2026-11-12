@@ -413,9 +413,14 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
     for (int r = 0; r < 4; ++r) {
         for (int c = 0; c < 4; ++c) u.invViewProj[c * 4 + r] = static_cast<float>(invViewProj.data[r * 4 + c]);
     }
-    u.cameraPos[0] = static_cast<float>(scene.camera.position.x());
-    u.cameraPos[1] = static_cast<float>(scene.camera.position.y());
-    u.cameraPos[2] = static_cast<float>(scene.camera.position.z());
+    {
+        // The eye from the view matrix (not CameraData::position, which a
+        // caller may leave unset): camera rays start there.
+        const auto eye = scene.camera.view.inverted() * VM::Vector4<double>(0.0, 0.0, 0.0, 1.0);
+        u.cameraPos[0] = static_cast<float>(eye.x() / eye.w());
+        u.cameraPos[1] = static_cast<float>(eye.y() / eye.w());
+        u.cameraPos[2] = static_cast<float>(eye.z() / eye.w());
+    }
     uint32_t lights = 0;
     for (const auto& light : scene.lights) {
         if (light.type != 0 || lights == 4) continue;  // directional lights, the first four
@@ -573,6 +578,18 @@ void PathTracer::toneMap(const float* rgb, size_t pixels, uint8_t* rgba) {
     }
 }
 
+#if defined(CAMPELLO_RENDERER_DENOISER)
+namespace {
+struct DenoiserState {
+    oidn::DeviceRef device;
+    oidn::FilterRef filter;
+    oidn::BufferRef color, albedo, normal, output;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+} // namespace
+#endif
+
 bool PathTracer::denoiserAvailable() noexcept {
 #if defined(CAMPELLO_RENDERER_DENOISER)
     return true;
@@ -586,30 +603,45 @@ bool PathTracer::denoise() {
     std::vector<float> color, albedo, normal;
     if (!readLinear(color, &albedo, &normal)) return false;
     try {
-        // A CPU device: works everywhere the library does and needs no
-        // sharing with campello_gpu's device.
-        oidn::DeviceRef device = oidn::newDevice(oidn::DeviceType::CPU);
-        device.commit();
+        // A CPU device (works everywhere the library does, no sharing with
+        // campello_gpu's device), its filter and buffers kept for the next
+        // image of the same size: committing a filter loads its weights.
+        auto* state = static_cast<DenoiserState*>(denoiser_.get());
+        if (!state) {
+            auto created = std::make_shared<DenoiserState>();
+            created->device = oidn::newDevice(oidn::DeviceType::CPU);
+            created->device.commit();
+            denoiser_ = created;
+            state = created.get();
+        }
         const size_t bytes = color.size() * sizeof(float);
-        oidn::BufferRef colorBuf = device.newBuffer(bytes);
-        oidn::BufferRef albedoBuf = device.newBuffer(bytes);
-        oidn::BufferRef normalBuf = device.newBuffer(bytes);
-        oidn::BufferRef outBuf = device.newBuffer(bytes);
-        colorBuf.write(0, bytes, color.data());
-        albedoBuf.write(0, bytes, albedo.data());
-        normalBuf.write(0, bytes, normal.data());
-        oidn::FilterRef filter = device.newFilter("RT");
-        filter.setImage("color", colorBuf, oidn::Format::Float3, width_, height_);
-        filter.setImage("albedo", albedoBuf, oidn::Format::Float3, width_, height_);
-        filter.setImage("normal", normalBuf, oidn::Format::Float3, width_, height_);
-        filter.setImage("output", outBuf, oidn::Format::Float3, width_, height_);
-        filter.set("hdr", true);
-        filter.commit();
-        filter.execute();
+        if (state->width != width_ || state->height != height_) {
+            state->color = state->device.newBuffer(bytes);
+            state->albedo = state->device.newBuffer(bytes);
+            state->normal = state->device.newBuffer(bytes);
+            state->output = state->device.newBuffer(bytes);
+            state->filter = state->device.newFilter("RT");
+            state->filter.setImage("color", state->color, oidn::Format::Float3, width_, height_);
+            state->filter.setImage("albedo", state->albedo, oidn::Format::Float3, width_, height_);
+            state->filter.setImage("normal", state->normal, oidn::Format::Float3, width_, height_);
+            state->filter.setImage("output", state->output, oidn::Format::Float3, width_, height_);
+            state->filter.set("hdr", true);
+            state->filter.commit();
+            state->width = width_;
+            state->height = height_;
+        }
+        state->color.write(0, bytes, color.data());
+        state->albedo.write(0, bytes, albedo.data());
+        state->normal.write(0, bytes, normal.data());
+        state->filter.execute();
         const char* message = nullptr;
-        if (device.getError(message) != oidn::Error::None) return false;
-        outBuf.read(0, bytes, color.data());
+        if (state->device.getError(message) != oidn::Error::None) {
+            denoiser_.reset();  // start afresh next time
+            return false;
+        }
+        state->output.read(0, bytes, color.data());
     } catch (...) {
+        denoiser_.reset();
         return false;
     }
     std::vector<uint8_t> rgba((size_t)width_ * height_ * 4);

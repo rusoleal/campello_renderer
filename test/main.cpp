@@ -3601,6 +3601,65 @@ TEST_F(OffscreenRenderTest, PathTracerShadowsTheGroundUnderAPlate) {
                                                     VM::Vector3<double>(0.0, 1.0, 0.0));
     ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
     EXPECT_EQ(tracer.sampleCount(), 1u);
+    // A new scene structure over the same meshes (the draws in another
+    // order) still has them all: reused mesh structures.
+    std::swap(scene.opaque[0], scene.opaque[1]);
+    for (int i = 0; i < 32; ++i) {
+        ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+    }
+    const auto again = readBackPixels(tracer.output());
+    EXPECT_LT(double(again[(size_t(32) * 64 + 32) * 4]), double(again[(size_t(40) * 64 + 10) * 4]) * 0.7)
+        << "the plate's shadow is gone after a rebuild";
+    EXPECT_GT(double(again[(size_t(24) * 64 + 32) * 4]), 60.0) << "the plate is gone after a rebuild";
+    // The scene 10 times bigger, seen from 10 times as far (35 m) with a far
+    // plane 10^5 times the near one (5 cm to 5 km, as an architectural
+    // viewer builds it, right-handed, depth 0..1): the same image.
+    auto bigGround = quad(0.0f, 15.0f);
+    auto bigPlate = quad(6.0f, 3.0f);
+    scene.opaque[0].mesh = bigGround.get();
+    scene.opaque[1].mesh = bigPlate.get();
+    // Right-handed view, depth 0..1 (as campello_bim's camera builds them).
+    {
+        const double eye[3] = {0.0, 25.0, 25.0};
+        double f[3] = {0.0, -25.0, -25.0};
+        const double fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+        for (double& v : f) v /= fl;
+        const double up[3] = {0.0, 1.0, 0.0};
+        double r[3] = {f[1] * up[2] - f[2] * up[1], f[2] * up[0] - f[0] * up[2], f[0] * up[1] - f[1] * up[0]};
+        const double rl = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+        for (double& v : r) v /= rl;
+        const double u[3] = {r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]};
+        const auto dot3 = [](const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+        VM::Matrix4<double> view = VM::Matrix4<double>::identity();
+        double* m = view.data;
+        for (int c = 0; c < 3; ++c) {
+            m[c] = r[c];
+            m[4 + c] = u[c];
+            m[8 + c] = -f[c];
+        }
+        m[3] = -dot3(r, eye);
+        m[7] = -dot3(u, eye);
+        m[11] = dot3(f, eye);
+        VM::Matrix4<double> projection = VM::Matrix4<double>::identity();
+        double* p = projection.data;
+        for (int i = 0; i < 16; ++i) p[i] = 0.0;
+        const double nearPlane = 0.05, farPlane = 5000.0;
+        const double tanHalf = std::tan(60.0 * 3.14159265358979323846 / 360.0);
+        p[0] = 1.0 / tanHalf;
+        p[5] = 1.0 / tanHalf;
+        p[10] = farPlane / (nearPlane - farPlane);
+        p[11] = nearPlane * farPlane / (nearPlane - farPlane);
+        p[14] = -1.0;
+        scene.camera.view = view;
+        scene.camera.projection = projection;
+        scene.camera.position = VM::Vector3<double>(eye[0], eye[1], eye[2]);
+    }
+    for (int i = 0; i < 32; ++i) {
+        ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+    }
+    const auto deep = readBackPixels(tracer.output());
+    EXPECT_GT(double(deep[(size_t(24) * 64 + 32) * 4]), 60.0) << "the plate, with a deep projection";
+    EXPECT_GT(double(deep[(size_t(40) * 64 + 10) * 4]), 60.0) << "open ground, with a deep projection";
     renderer->setEnvironmentIntensity(1.0f);
 }
 
@@ -3746,9 +3805,18 @@ TEST_F(OffscreenRenderTest, PathTracerDenoiseSmoothsANoisyImage) {
     EXPECT_GT(noisyRough, 2.0) << "2 samples should be noisy";
     EXPECT_LT(cleanRough, noisyRough * 0.5) << "denoising should smooth the image";
     EXPECT_NEAR(cleanMean, noisyMean, noisyMean * 0.15 + 3.0) << "and keep its brightness";
-    // The next sample shows the traced image again.
+    // The next sample shows the traced image again, and tracing goes on as
+    // before: a denoised frame, then another view (walkthroughs).
     ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
     EXPECT_FALSE(tracer.denoised());
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 2.0, 0.02), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 0.0, -1.0));
+    for (int i = 0; i < 2; ++i) ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+    std::vector<uint8_t> after;
+    ASSERT_TRUE(tracer.readOutput(after));
+    double afterMean = 0.0;
+    roughness(after, afterMean);
+    EXPECT_NEAR(afterMean, noisyMean, noisyMean * 0.15 + 3.0) << "the ground after denoising and moving the camera";
 }
 
 // Ambient occlusion and exposure: a floor meeting a wall. With AO on, the
