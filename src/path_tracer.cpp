@@ -47,7 +47,14 @@ struct NormalParams {
     uint32_t outOffset;
     uint32_t indexFormat;
     uint32_t vertexStride;
+    uint32_t uvFormat;  // 0 none, 1 float2, 2 unorm16x2, 3 unorm8x2
+    uint32_t uvStride;
+    uint32_t pad0;
+    uint32_t pad1;
 };
+
+constexpr uint32_t MAX_TEXTURES = 64;  // as in path_tracer.metal
+constexpr uint32_t FIRST_TEXTURE = 2;  // texture bindings 2..65
 
 struct TraceUniforms {
     float invViewProj[16];
@@ -78,10 +85,31 @@ struct MaterialInfo {
     float transmission;
     float ior;
     float unlit;
-    float pad0;
-    float pad1;
-    float pad2;
+    float worldMapping;
+    float worldMappingUp;
+    int32_t texture;  // -1 none
+    float uvRow0[4];
+    float uvRow1[4];
+    float average[4];
 };
+static_assert(sizeof(MaterialInfo) == 112, "MaterialInfo must match path_tracer.metal");
+
+/// How a mesh's TEXCOORD_0 is stored, for the faceNormals kernel (0: none or unreadable).
+uint32_t uvFormat(const GpuMesh& mesh, uint32_t& stride) {
+    if (!mesh.vertexBuffers[Renderer::VERTEX_SLOT_TEXCOORD0]) return 0;
+    VertexAttributeFormat format{VertexSemantic::texcoord0, GPU::ComponentType::ctFloat, GPU::AccessorType::acVec2, false};
+    if (mesh.layout) {
+        const VertexAttributeFormat* found = mesh.layout->find(VertexSemantic::texcoord0);
+        if (!found) return 0;
+        format = *found;
+    }
+    if (format.accessorType != GPU::AccessorType::acVec2) return 0;
+    stride = format.stride();
+    if (format.componentType == GPU::ComponentType::ctFloat) return 1;
+    if (format.normalized && format.componentType == GPU::ComponentType::ctUnsignedShort) return 2;
+    if (format.normalized && format.componentType == GPU::ComponentType::ctUnsignedByte) return 3;
+    return 0;
+}
 
 void mix(uint64_t& key, const void* data, size_t size) {
     const auto* bytes = static_cast<const uint8_t*>(data);
@@ -107,8 +135,9 @@ PathTracer::PathTracer(std::shared_ptr<GPU::Device> device)
     if (!module) return;
 
     // Trace: the scene (0), accumulation (1), uniforms (2), instances (3),
-    // materials (4), normals (5), denoiser guides (6); textures: output (0),
-    // environment (1).
+    // materials (4), normals (5), denoiser guides (6), texture coordinates
+    // (7); textures: output (0), environment (1), base colour textures
+    // (2..65).
     {
         GPU::BindGroupLayoutDescriptor desc{};
         GPU::EntryObject scene{};
@@ -116,7 +145,7 @@ PathTracer::PathTracer(std::shared_ptr<GPU::Device> device)
         scene.type = GPU::EntryObjectType::accelerationStructure;
         scene.visibility = GPU::ShaderStage::rayGeneration;
         desc.entries.push_back(scene);
-        for (uint32_t binding = 1; binding <= 6; ++binding) {
+        for (uint32_t binding = 1; binding <= 7; ++binding) {
             GPU::EntryObject buffer{};
             buffer.binding = binding;
             buffer.type = GPU::EntryObjectType::buffer;
@@ -126,20 +155,20 @@ PathTracer::PathTracer(std::shared_ptr<GPU::Device> device)
             buffer.data.buffer.type = binding == 2 ? GPU::EntryObjectBufferType::uniform : GPU::EntryObjectBufferType::storage;
             desc.entries.push_back(buffer);
         }
-        for (uint32_t binding = 0; binding <= 1; ++binding) {
+        for (uint32_t binding = 0; binding < FIRST_TEXTURE + MAX_TEXTURES; ++binding) {
             GPU::EntryObject texture{};
             texture.binding = binding;
             texture.type = GPU::EntryObjectType::texture;
             texture.visibility = GPU::ShaderStage::rayGeneration;
             texture.data.texture = {false, GPU::EntryObjectTextureType::ttFloat,
-                                    binding == 0 ? GPU::TextureType::tt2d : GPU::TextureType::ttCube};
+                                    binding == 1 ? GPU::TextureType::ttCube : GPU::TextureType::tt2d};
             desc.entries.push_back(texture);
         }
         traceLayout_ = device_->createBindGroupLayout(desc);
     }
     {
         GPU::BindGroupLayoutDescriptor desc{};
-        for (uint32_t binding = 0; binding <= 3; ++binding) {
+        for (uint32_t binding = 0; binding <= 5; ++binding) {
             GPU::EntryObject buffer{};
             buffer.binding = binding;
             buffer.type = GPU::EntryObjectType::buffer;
@@ -240,6 +269,8 @@ bool PathTracer::rebuild(const RenderScene& scene, const Renderer& renderer, uin
     }
     std::map<const GpuMaterial*, uint32_t> materialIndex;
     std::vector<MaterialInfo> materials;
+    std::map<const GPU::Texture*, int32_t> textureIndex;
+    textures_.clear();
     std::vector<InstanceInfo> instanceInfo;
     GPU::TopLevelAccelerationStructureDescriptor tlasDesc{};
     tlasDesc.buildFlags = GPU::AccelerationStructureBuildFlag::preferFastTrace;
@@ -252,9 +283,34 @@ bool PathTracer::rebuild(const RenderScene& scene, const Renderer& renderer, uin
             info.baseColor[0] = info.baseColor[1] = info.baseColor[2] = info.baseColor[3] = 1.0f;
             info.roughness = 0.8f;
             info.ior = 1.5f;
+            info.texture = -1;
+            const auto& average = draw.material->baseColorTextureAverage;
+            for (int c = 0; c < 3; ++c) info.average[c] = average[(size_t)c];
+            info.average[3] = 1.0f;
+            // The base colour texture, while there are bindings for it;
+            // beyond that its average colour.
+            if (const auto& texture = draw.material->baseColorTexture) {
+                auto [texIt, newTexture] = textureIndex.emplace(texture.get(), static_cast<int32_t>(textures_.size()));
+                if (newTexture) {
+                    if (textures_.size() < MAX_TEXTURES) {
+                        textures_.push_back(texture);
+                    } else {
+                        texIt->second = -1;
+                    }
+                }
+                info.texture = texIt->second;
+            }
             if (const float* slot = renderer.materialUniforms(draw.material)) {
                 for (int c = 0; c < 4; ++c) info.baseColor[c] = slot[c];
-                for (int c = 0; c < 3; ++c) info.baseColor[c] *= draw.material->baseColorTextureAverage[(size_t)c];
+                if (info.texture < 0) {
+                    for (int c = 0; c < 3; ++c) info.baseColor[c] *= average[(size_t)c];
+                }
+                for (int c = 0; c < 4; ++c) {
+                    info.uvRow0[c] = slot[4 + c];
+                    info.uvRow1[c] = slot[8 + c];
+                }
+                info.worldMapping = slot[81];
+                info.worldMappingUp = slot[82];
                 info.metallic = slot[12];
                 info.roughness = slot[13];
                 info.unlit = slot[17];
@@ -294,10 +350,11 @@ bool PathTracer::rebuild(const RenderScene& scene, const Renderer& renderer, uin
     if (tlasDesc.instances.empty()) return false;
 
     normals_ = device_->createBuffer(std::max<uint64_t>(triangleTotal, 1) * 16, GPU::BufferUsage::storage);
+    uvs_ = device_->createBuffer(std::max<uint64_t>(triangleTotal, 1) * 32, GPU::BufferUsage::storage);
     materials_ = device_->createBuffer(materials.size() * sizeof(MaterialInfo), GPU::BufferUsage::storage, materials.data());
     instances_ = device_->createBuffer(instanceInfo.size() * sizeof(InstanceInfo), GPU::BufferUsage::storage, instanceInfo.data());
     tlas_ = device_->createTopLevelAccelerationStructure(tlasDesc);
-    if (!normals_ || !materials_ || !instances_ || !tlas_) return false;
+    if (!normals_ || !uvs_ || !materials_ || !instances_ || !tlas_) return false;
 
     // Build: new mesh structures, then normals of every mesh, then the scene.
     auto encoder = device_->createCommandEncoder();
@@ -312,21 +369,26 @@ bool PathTracer::rebuild(const RenderScene& scene, const Renderer& renderer, uin
     if (auto pass = encoder->beginComputePass()) {
         pass->setPipeline(normalsPipeline_);
         for (const auto& [mesh, entry] : meshes_) {
+            uint32_t uvStride = 8;
+            const uint32_t uvKind = uvFormat(*mesh, uvStride);
             NormalParams params{entry.triangleCount, normalOffsets[mesh],
                                 !mesh->indexBuffer || mesh->indexCount == 0
                                     ? 0u
                                     : (mesh->indexFormat == GPU::IndexFormat::uint16 ? 1u : 2u),
-                                12u};
+                                12u, uvKind, uvStride, 0u, 0u};
             auto paramsBuffer = device_->createBuffer(sizeof(params), GPU::BufferUsage::uniform, &params);
             keepAlive.push_back(paramsBuffer);
             const auto& positions = mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION];
             const auto& indices = mesh->indexBuffer ? mesh->indexBuffer : positions;
+            const auto& texcoords = uvKind != 0 ? mesh->vertexBuffers[Renderer::VERTEX_SLOT_TEXCOORD0] : positions;
             GPU::BindGroupDescriptor desc{};
             desc.layout = normalsLayout_;
             desc.entries = {{0, GPU::BufferBinding{positions, 0, positions->getLength()}},
                             {1, GPU::BufferBinding{indices, 0, indices->getLength()}},
                             {2, GPU::BufferBinding{normals_, 0, normals_->getLength()}},
-                            {3, GPU::BufferBinding{paramsBuffer, 0, sizeof(params)}}};
+                            {3, GPU::BufferBinding{paramsBuffer, 0, sizeof(params)}},
+                            {4, GPU::BufferBinding{texcoords, 0, texcoords->getLength()}},
+                            {5, GPU::BufferBinding{uvs_, 0, uvs_->getLength()}}};
             auto group = device_->createBindGroup(desc);
             if (!group) continue;
             groups.push_back(group);
@@ -374,6 +436,8 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
         mix(sceneKey, &positions, sizeof(positions));
         mix(sceneKey, &draw.mesh->indexCount, sizeof(draw.mesh->indexCount));
         mix(sceneKey, &draw.material, sizeof(draw.material));
+        const void* texture = draw.material->baseColorTexture.get();
+        mix(sceneKey, &texture, sizeof(texture));
         if (const float* slot = renderer.materialUniforms(draw.material)) mix(sceneKey, slot, 93 * sizeof(float));
         mix(sceneKey, draw.worldTransform.data, sizeof(double) * 16);
     }
@@ -508,8 +572,21 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
                     {4, GPU::BufferBinding{materials_, 0, materials_->getLength()}},
                     {5, GPU::BufferBinding{normals_, 0, normals_->getLength()}},
                     {6, GPU::BufferBinding{aux_, 0, aux_->getLength()}},
+                    {7, GPU::BufferBinding{uvs_, 0, uvs_->getLength()}},
                     {0, output_},
                     {1, environment}};
+    // Base colour textures; the rest of the bindings a 1x1 white texture.
+    if (!blank_) {
+        uint8_t white[4] = {255, 255, 255, 255};
+        blank_ = device_->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm, 1, 1, 1, 1, 1,
+                                        (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
+                                                            uint32_t(GPU::TextureUsage::copyDst)));
+        if (blank_) blank_->upload(0, 4, white);
+    }
+    for (uint32_t i = 0; i < MAX_TEXTURES; ++i) {
+        const auto& texture = i < textures_.size() ? textures_[i] : blank_;
+        if (texture) desc.entries.push_back({FIRST_TEXTURE + i, texture});
+    }
     auto group = device_->createBindGroup(desc);
     auto encoder = device_->createCommandEncoder();
     if (!group || !encoder) return false;

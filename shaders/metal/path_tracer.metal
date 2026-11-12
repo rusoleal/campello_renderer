@@ -3,7 +3,8 @@
 //
 //   faceNormals   one geometric normal per triangle of a mesh (object
 //                 space), from its own vertex and index buffers, into the
-//                 scene's normal buffer at the mesh's offset.
+//                 scene's normal buffer at the mesh's offset; and its three
+//                 texture coordinates (TEXCOORD_0) into the uv buffer.
 //   pathTrace     camera paths through the scene's instance acceleration
 //                 structure: diffuse + GGX specular, the sun sampled
 //                 directly (a soft 0.27 degree disc, shadow rays), the sky
@@ -31,12 +32,25 @@ struct NormalParams {
     uint outOffset;     // first triangle's index in the normal buffer
     uint indexFormat;   // 0 none (triangle soup), 1 uint16, 2 uint32
     uint vertexStride;  // bytes between positions
+    uint uvFormat;      // 0 none, 1 float2, 2 unorm16x2, 3 unorm8x2
+    uint uvStride;      // bytes between texture coordinates
+    uint pad0;
+    uint pad1;
 };
+
+inline float2 readUV(device const uchar* uvs, uint v, constant NormalParams& p) {
+    device const uchar* at = uvs + v * p.uvStride;
+    if (p.uvFormat == 1u) return float2(*(device const packed_float2*)at);
+    if (p.uvFormat == 2u) return float2(((device const ushort*)at)[0], ((device const ushort*)at)[1]) / 65535.0;
+    return float2(float(at[0]), float(at[1])) / 255.0;
+}
 
 kernel void faceNormals(device const uchar*   positions [[buffer(0)]],
                         device const uchar*   indices   [[buffer(1)]],
                         device float4*        normals   [[buffer(2)]],
                         constant NormalParams& p        [[buffer(3)]],
+                        device const uchar*   texcoords [[buffer(4)]],
+                        device float4*        uvs       [[buffer(5)]],
                         uint id [[thread_position_in_grid]])
 {
     if (id >= p.triangleCount) return;
@@ -53,6 +67,17 @@ kernel void faceNormals(device const uchar*   positions [[buffer(0)]],
     const float3 n = cross(b - a, c - a);
     const float len = length(n);
     normals[p.outOffset + id] = float4(len > 1e-20 ? n / len : float3(0.0, 0.0, 1.0), 0.0);
+    // Texture coordinates of the corners (w of the second: 1 when present).
+    if (p.uvFormat != 0u) {
+        const float2 t0 = readUV(texcoords, v[0], p);
+        const float2 t1 = readUV(texcoords, v[1], p);
+        const float2 t2 = readUV(texcoords, v[2], p);
+        uvs[(p.outOffset + id) * 2] = float4(t0, t1);
+        uvs[(p.outOffset + id) * 2 + 1] = float4(t2, 1.0, 0.0);
+    } else {
+        uvs[(p.outOffset + id) * 2] = float4(0.0);
+        uvs[(p.outOffset + id) * 2 + 1] = float4(0.0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -89,10 +114,32 @@ struct MaterialInfo {
     float  transmission;
     float  ior;
     float  unlit;
-    float  pad0;
-    float  pad1;
-    float  pad2;
+    float  worldMapping;    // world units per repeat of a box-mapped texture (0: the mesh's TEXCOORD_0)
+    float  worldMappingUp;  // 1: z up, 0: y up
+    int    texture;         // base colour texture in `textures`, -1 none
+    float4 uvRow0;          // KHR_texture_transform row 0 (a, b, tx, has)
+    float4 uvRow1;          // row 1 (c, d, ty, 0)
+    float4 average;         // rgb: the texture's average colour, for meshes without coordinates
 };
+
+constant uint MAX_TEXTURES = 64;  // base colour textures bound (path_tracer.cpp)
+
+// As worldMappingFrame() in default.metal (the raster renderer's box
+// mapping), so traced and drawn textures line up.
+inline float2 worldMappingUV(float3 P, float3 N, float size, bool zUp) {
+    const float3 U = zUp ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
+    const float nu = dot(N, U);
+    float3 T, B;
+    if (abs(nu) > 0.7071) {
+        T = float3(1.0, 0.0, 0.0);
+        B = zUp ? float3(0.0, -1.0, 0.0) : float3(0.0, 0.0, 1.0);
+    } else {
+        const float3 h = normalize(N - U * nu);
+        T = cross(U, h);
+        B = -U;
+    }
+    return float2(dot(P, T), dot(P, B)) / size;
+}
 
 constant float PI = 3.14159265358979323846;
 
@@ -185,11 +232,14 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
                       device const float4*            normals    [[buffer(5)]],
                       texture2d<float, access::write> output     [[texture(0)]],
                       device float4*                  aux        [[buffer(6)]],
+                      device const float4*            uvs        [[buffer(7)]],
                       texturecube<float>              environment [[texture(1)]],
+                      array<texture2d<float>, MAX_TEXTURES> textures [[texture(2)]],
                       uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.size.x || gid.y >= u.size.y) return;
     constexpr sampler envSampler(filter::linear, mip_filter::linear);
+    constexpr sampler texSampler(filter::linear, mip_filter::linear, address::repeat);
     const uint sampleIndex = uint(u.params.w);
     uint rng = (gid.y * u.size.x + gid.x) * 9781u + sampleIndex * 6271u + 1u;
     pcg(rng);
@@ -267,7 +317,28 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
         if (dot(n, direction) > 0.0) n = -n;  // two-sided: towards the incoming ray
         const float3 p = origin + direction * hit.distance;
         const float3 v = -direction;
-        const float3 albedo = mat.baseColor.rgb;
+        float3 albedo = mat.baseColor.rgb;
+        if (mat.texture >= 0 && uint(mat.texture) < MAX_TEXTURES) {
+            float2 uv;
+            bool mapped = true;
+            if (mat.worldMapping > 0.0) {
+                uv = worldMappingUV(p, n, mat.worldMapping, mat.worldMappingUp > 0.5);
+            } else {
+                const uint tri = inst.normalOffset + hit.primitive_id;
+                const float4 a = uvs[tri * 2];
+                const float4 b = uvs[tri * 2 + 1];
+                mapped = b.z > 0.5;
+                const float2 bary = hit.triangle_barycentric_coord;
+                uv = a.xy * (1.0 - bary.x - bary.y) + a.zw * bary.x + b.xy * bary.y;
+                if (mat.uvRow0.w > 0.5) {
+                    const float3 uv3 = float3(uv, 1.0);
+                    uv = float2(dot(mat.uvRow0.xyz, uv3), dot(mat.uvRow1.xyz, uv3));
+                }
+            }
+            // Meshes without texture coordinates take its average colour.
+            albedo = mapped ? mat.baseColor.rgb * textures[mat.texture].sample(texSampler, uv, level(0.0)).rgb
+                            : mat.baseColor.rgb * mat.average.rgb;
+        }
         if (mat.unlit > 0.5) {
             radiance += throughput * albedo;
             if (!guided) {
