@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-12
+
 ### Changed
 - **`PathTracer::render()` doesn't wait for the GPU** any more: the sample is submitted and the next `render()`, `readOutput()`, `readLinear()` and `denoise()` wait for it; `sampleInFlight()` tells an interactive caller to skip a frame instead of waiting (a live view's UI thread spent each sample's GPU time waiting).
 
