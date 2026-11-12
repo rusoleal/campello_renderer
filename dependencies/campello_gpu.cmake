@@ -13,7 +13,7 @@ include(FetchContent)
 FetchContent_Declare(
         extern_campello_gpu
         GIT_REPOSITORY https://github.com/rusoleal/campello_gpu
-        GIT_TAG        v0.28.1
+        GIT_TAG        v0.28.2
 )
 
 if(NOT extern_campello_gpu_POPULATED)
