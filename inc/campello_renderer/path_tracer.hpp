@@ -16,8 +16,10 @@
 // filled, so geometry off screen still shadows and reflects) and its
 // transparent draws, triangle meshes with float positions. Materials use
 // their constants (base colour, roughness, metallic, emissive, transmission
-// as thin glass, unlit); a base colour texture contributes its average
-// colour (textures in the path tracer: later). Light: up to four directional
+// as thin glass, unlit) and base colour textures (up to 64 distinct ones;
+// through TEXCOORD_0 and KHR_texture_transform, or the renderer's world
+// mapping; meshes without coordinates, and textures beyond 64, shade with
+// the texture's average colour). Light: up to four directional
 // lights (soft discs 0.53 degrees across, as the sun) and the environment
 // map times the renderer's environment intensity (seen directly at full
 // strength, as the skybox); the renderer's exposure applies.
@@ -146,6 +148,9 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::Buffer> instances_;
     std::shared_ptr<systems::leal::campello_gpu::Buffer> materials_;
     std::shared_ptr<systems::leal::campello_gpu::Buffer> normals_;
+    std::shared_ptr<systems::leal::campello_gpu::Buffer> uvs_;  // texture coordinates per triangle
+    std::vector<std::shared_ptr<systems::leal::campello_gpu::Texture>> textures_;  // base colour textures bound
+    std::shared_ptr<systems::leal::campello_gpu::Texture> blank_;  // the unused texture bindings
     std::shared_ptr<systems::leal::campello_gpu::Buffer> uniforms_;
     std::shared_ptr<systems::leal::campello_gpu::Buffer> accum_;
     std::shared_ptr<systems::leal::campello_gpu::Buffer> aux_;  // albedo, then normal sums

@@ -104,6 +104,9 @@ namespace systems::leal::campello_renderer {
         // The base colour texture's average colour (linear), white without
         // one: the path tracer shades with it (PathTracer).
         std::array<float, 3> baseColorTextureAverage{1.0f, 1.0f, 1.0f};
+        // The base colour texture itself (8-bit RGBA images; null without
+        // one, or for block-compressed ones): the path tracer samples it.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> baseColorTexture;
         // Shader program drawing this material (Renderer::registerProgram());
         // the built-in PBR shaders by default. The material's bind groups and
         // uniforms are bound either way (custom programs may read them).

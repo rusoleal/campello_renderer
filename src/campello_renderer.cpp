@@ -9558,6 +9558,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     mat->transmission  = (material.khrMaterialsTransmission && material.khrMaterialsTransmission->transmissionFactor > 0.0f);
     if (const auto it = textureAverages.find(baseColorTex.get()); it != textureAverages.end()) {
         mat->baseColorTextureAverage = it->second;
+        mat->baseColorTexture = baseColorTex;
     }
 
 #if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)

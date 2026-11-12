@@ -3888,6 +3888,113 @@ TEST_F(OffscreenRenderTest, PathTracerSeesThroughGlassWithoutSpendingBounces) {
     renderer->setEnvironmentIntensity(1.0f);
 }
 
+// Textures in traced images: an unlit black/white checker (2x2 quadrants of
+// a 4x4 image; the path tracer filters linearly) on a quad, through the renderer's
+// world mapping (no texture coordinates)
+// and through the quad's own TEXCOORD_0. Both show both colours, in cells;
+// without texture sampling every pixel would be the average grey.
+TEST_F(OffscreenRenderTest, PathTracerSamplesBaseColourTextures) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.0f);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+
+    std::vector<uint8_t> tga = {0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 4, 0, 32, 0x28};
+    const uint8_t white[4] = {255, 255, 255, 255}, black[4] = {0, 0, 0, 255};
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            const uint8_t* px = ((x < 2) == (y < 2)) ? white : black;
+            tga.insert(tga.end(), px, px + 4);
+        }
+    }
+    static const char* kBase64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded;
+    for (size_t i = 0; i < tga.size(); i += 3) {
+        const uint32_t n = (uint32_t(tga[i]) << 16) | (i + 1 < tga.size() ? uint32_t(tga[i + 1]) << 8 : 0) |
+                           (i + 2 < tga.size() ? uint32_t(tga[i + 2]) : 0);
+        encoded += kBase64[(n >> 18) & 63];
+        encoded += kBase64[(n >> 12) & 63];
+        encoded += i + 1 < tga.size() ? kBase64[(n >> 6) & 63] : '=';
+        encoded += i + 2 < tga.size() ? kBase64[n & 63] : '=';
+    }
+    const std::string json =
+        std::string(R"({"asset": {"version": "2.0"}, "extensionsUsed": ["KHR_materials_unlit"],)"
+                    R"("images": [{"uri": "data:image/x-tga;base64,)") + encoded +
+        R"("}], "samplers": [{"magFilter": 9728, "minFilter": 9728}], "textures": [{"source": 0, "sampler": 0}],)"
+        R"("materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}},)"
+        R"("extensions": {"KHR_materials_unlit": {}}}]})";
+    auto checker = GLTF::loadGLTF(json.c_str(), kNoOpLoader);
+    ASSERT_NE(checker, nullptr);
+    GpuMaterial* material = renderer->uploadMaterial((*checker->materials)[0], *checker);
+    ASSERT_NE(material, nullptr);
+    ASSERT_NE(material->baseColorTexture, nullptr);
+
+    std::vector<float> positions = {-0.9f, -0.9f, 0.0f, 0.9f, -0.9f, 0.0f, 0.9f, 0.9f, 0.0f, -0.9f, 0.9f, 0.0f};
+    std::vector<float> uvs = {0.0f, 0.0f, 2.0f, 0.0f, 2.0f, 2.0f, 0.0f, 2.0f};  // two repeats each way
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    GpuMesh plain;
+    plain.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    plain.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    plain.indexCount = 6;
+    plain.indexFormat = GPU::IndexFormat::uint32;
+    plain.vertexCount = 4;
+    plain.layout = &VertexLayout::positionOnly();
+    plain.setBoundsFromPositions(positions.data(), 4);
+    GpuMesh mapped = plain;
+    mapped.layout = nullptr;  // the full layout: float2 TEXCOORD_0
+    mapped.vertexBuffers[Renderer::VERTEX_SLOT_TEXCOORD0] =
+        device->createBuffer(uvs.size() * 4, GPU::BufferUsage::vertex, uvs.data());
+
+    const auto trace = [&](GpuMesh* mesh) {
+        RenderScene scene;
+        scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 2.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                        VM::Vector3<double>(0.0, 1.0, 0.0));
+        scene.camera.projection = VM::Matrix4<double>::perspective(45.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+        scene.camera.position = VM::Vector3<double>(0.0, 0.0, 2.5);
+        DrawCall call;
+        call.mesh = mesh;
+        call.material = material;
+        call.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(call);
+        tracer.reset();
+        for (int i = 0; i < 8; ++i) EXPECT_TRUE(tracer.render(scene, *renderer, 64, 64));
+        const auto pixels = readBackPixels(tracer.output());
+        // White shows at ~241 (tone mapped), black at 0, their average
+        // (linear filtering, in linear space) at ~179.
+        int bright = 0, dark = 0;
+        for (int y = 16; y < 48; ++y) {
+            for (int x = 16; x < 48; ++x) {
+                const uint8_t r = pixels[(size_t(y) * 64 + size_t(x)) * 4];
+                if (r > 225) ++bright;
+                if (r < 60) ++dark;
+            }
+        }
+        return std::pair<int, int>{bright, dark};
+    };
+    renderer->setMaterialWorldMapping(material, 1.0f);
+    const auto [worldBright, worldDark] = trace(&plain);
+    EXPECT_GT(worldBright, 100) << "white cells, world mapping";
+    EXPECT_GT(worldDark, 100) << "black cells, world mapping";
+    renderer->setMaterialWorldMapping(material, 0.0f);
+    const auto [uvBright, uvDark] = trace(&mapped);
+    EXPECT_GT(uvBright, 100) << "white cells, texture coordinates";
+    EXPECT_GT(uvDark, 100) << "black cells, texture coordinates";
+    // Without coordinates or mapping: the average colour, no cells.
+    const auto [flatBright, flatDark] = trace(&plain);
+    EXPECT_EQ(flatBright + flatDark, 0) << "the average grey everywhere";
+    renderer->setEnvironmentIntensity(1.0f);
+}
+
 // Ambient occlusion and exposure: a floor meeting a wall. With AO on, the
 // crease darkens and open floor doesn't; nothing gets brighter. -1 EV of
 // exposure darkens a lit pixel.
