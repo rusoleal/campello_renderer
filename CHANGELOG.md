@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Path tracer: glass spent the path's bounces**, so interiors seen through windows were nearly black (a view into a room crosses glass twice: in, then out to the sky, half of the default 4 bounces). Crossing or reflecting off thin glass no longer counts as a bounce (up to 8 crossings per path), and the sky seen through glass is at full strength, as seen directly.
+
 ## [0.18.0] - 2026-11-12
 
 ### Changed

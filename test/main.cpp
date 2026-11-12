@@ -3819,6 +3819,75 @@ TEST_F(OffscreenRenderTest, PathTracerDenoiseSmoothsANoisyImage) {
     EXPECT_NEAR(afterMean, noisyMean, noisyMean * 0.15 + 3.0) << "the ground after denoising and moving the camera";
 }
 
+// Glass doesn't spend the path's bounces: with none allowed, a red wall
+// behind two panes still shows (a view into a room crosses glass twice,
+// in and out; spending bounces on it left interiors black).
+TEST_F(OffscreenRenderTest, PathTracerSeesThroughGlassWithoutSpendingBounces) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.0f);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"},
+        "extensionsUsed": ["KHR_materials_unlit", "KHR_materials_transmission"],
+        "materials": [
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.5, 0.0, 0.0, 1]}, "extensions": {"KHR_materials_unlit": {}}},
+            {"alphaMode": "BLEND", "pbrMetallicRoughness": {"baseColorFactor": [0.95, 0.95, 0.95, 1], "metallicFactor": 0,
+             "roughnessFactor": 0.05}, "extensions": {"KHR_materials_transmission": {"transmissionFactor": 1.0}}}]})",
+                                    kNoOpLoader);
+    ASSERT_NE(materials, nullptr);
+    GpuMaterial* wall = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    GpuMaterial* glass = renderer->uploadMaterial((*materials->materials)[1], *materials);
+    ASSERT_NE(wall, nullptr);
+    ASSERT_NE(glass, nullptr);
+    const auto quad = [&](float half, float z) {
+        std::vector<float> positions = {-half, -half, z, half, -half, z, half, half, z, -half, half, z};
+        std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+        auto mesh = std::make_unique<GpuMesh>();
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh->indexCount = 6;
+        mesh->indexFormat = GPU::IndexFormat::uint32;
+        mesh->vertexCount = 4;
+        mesh->layout = &VertexLayout::positionOnly();
+        mesh->setBoundsFromPositions(positions.data(), 4);
+        return mesh;
+    };
+    auto back = quad(3.0f, 0.0f);
+    auto pane1 = quad(2.0f, 0.5f);
+    auto pane2 = quad(2.0f, 1.0f);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 3.0), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(40.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 3.0);
+    DrawCall draw;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    draw.mesh = back.get();
+    draw.material = wall;
+    scene.opaque.push_back(draw);
+    draw.material = glass;
+    for (GpuMesh* pane : {pane1.get(), pane2.get()}) {
+        draw.mesh = pane;
+        scene.transparent.push_back(draw);
+    }
+    tracer.setMaxBounces(0);
+    for (int i = 0; i < 16; ++i) ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+    const auto pixels = readBackPixels(tracer.output());
+    // Unlit 0.5 red, through two panes (tint and reflection): well above black.
+    EXPECT_GT(int(pixels[(size_t(32) * 64 + 32) * 4]), 120) << "the wall behind the glass";
+    renderer->setEnvironmentIntensity(1.0f);
+}
+
 // Ambient occlusion and exposure: a floor meeting a wall. With AO on, the
 // crease darkens and open floor doesn't; nothing gets brighter. -1 EV of
 // exposure darkens a lit pixel.
