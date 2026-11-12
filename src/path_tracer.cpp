@@ -22,6 +22,7 @@
 #include <campello_gpu/ray_tracing_pipeline.hpp>
 #include <campello_gpu/texture.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -29,9 +30,14 @@
 #include "shaders/metal_path_tracer.h"
 #endif
 
+#if defined(CAMPELLO_RENDERER_DENOISER)
+#include <OpenImageDenoise/oidn.hpp>
+#endif
+
 namespace systems::leal::campello_renderer {
 
 namespace GPU = systems::leal::campello_gpu;
+namespace VM = systems::leal::vector_math;
 
 namespace {
 
@@ -51,6 +57,9 @@ struct TraceUniforms {
     float params[4];
     uint32_t size[4];
     float clearColor[4];
+    float cameraForward[4];
+    float cameraRight[4];
+    float cameraUp[4];
 };
 
 struct InstanceInfo {
@@ -98,7 +107,8 @@ PathTracer::PathTracer(std::shared_ptr<GPU::Device> device)
     if (!module) return;
 
     // Trace: the scene (0), accumulation (1), uniforms (2), instances (3),
-    // materials (4), normals (5); textures: output (0), environment (1).
+    // materials (4), normals (5), denoiser guides (6); textures: output (0),
+    // environment (1).
     {
         GPU::BindGroupLayoutDescriptor desc{};
         GPU::EntryObject scene{};
@@ -106,7 +116,7 @@ PathTracer::PathTracer(std::shared_ptr<GPU::Device> device)
         scene.type = GPU::EntryObjectType::accelerationStructure;
         scene.visibility = GPU::ShaderStage::rayGeneration;
         desc.entries.push_back(scene);
-        for (uint32_t binding = 1; binding <= 5; ++binding) {
+        for (uint32_t binding = 1; binding <= 6; ++binding) {
             GPU::EntryObject buffer{};
             buffer.binding = binding;
             buffer.type = GPU::EntryObjectType::buffer;
@@ -371,6 +381,7 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
     mix(viewKey, scene.camera.projection.data, sizeof(double) * 16);
     mix(viewKey, &width, sizeof(width));
     mix(viewKey, &height, sizeof(height));
+    mix(viewKey, &projection_, sizeof(projection_));
 
     if (!tlas_ || sceneKey != sceneKey_) {
         if (!rebuild(scene, renderer, sceneKey)) return false;
@@ -382,15 +393,19 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
     }
     if (!environment) return false;
     if (width != width_ || height != height_ || !accum_ || !output_) {
-        accum_ = device_->createBuffer((uint64_t)width * height * 16, GPU::BufferUsage::storage);
+        const auto readable = (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::storage) | uint32_t(GPU::BufferUsage::copyDst) |
+                                                 uint32_t(GPU::BufferUsage::copySrc));
+        accum_ = device_->createBuffer((uint64_t)width * height * 16, readable);
+        aux_ = device_->createBuffer((uint64_t)width * height * 32, readable);
         output_ = device_->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm, width, height, 1, 1, 1,
                                          (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::storageBinding) |
                                                              uint32_t(GPU::TextureUsage::textureBinding) |
-                                                             uint32_t(GPU::TextureUsage::copySrc)));
+                                                             uint32_t(GPU::TextureUsage::copySrc) |
+                                                             uint32_t(GPU::TextureUsage::copyDst)));
         width_ = width;
         height_ = height;
         samples_ = 0;
-        if (!accum_ || !output_) return false;
+        if (!accum_ || !aux_ || !output_) return false;
     }
 
     TraceUniforms u{};
@@ -398,9 +413,14 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
     for (int r = 0; r < 4; ++r) {
         for (int c = 0; c < 4; ++c) u.invViewProj[c * 4 + r] = static_cast<float>(invViewProj.data[r * 4 + c]);
     }
-    u.cameraPos[0] = static_cast<float>(scene.camera.position.x());
-    u.cameraPos[1] = static_cast<float>(scene.camera.position.y());
-    u.cameraPos[2] = static_cast<float>(scene.camera.position.z());
+    {
+        // The eye from the view matrix (not CameraData::position, which a
+        // caller may leave unset): camera rays start there.
+        const auto eye = scene.camera.view.inverted() * VM::Vector4<double>(0.0, 0.0, 0.0, 1.0);
+        u.cameraPos[0] = static_cast<float>(eye.x() / eye.w());
+        u.cameraPos[1] = static_cast<float>(eye.y() / eye.w());
+        u.cameraPos[2] = static_cast<float>(eye.z() / eye.w());
+    }
     uint32_t lights = 0;
     for (const auto& light : scene.lights) {
         if (light.type != 0 || lights == 4) continue;  // directional lights, the first four
@@ -424,6 +444,40 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
     u.size[0] = width;
     u.size[1] = height;
     u.size[2] = renderer.getSkyboxEnabled() ? 1u : 0u;
+    u.size[3] = projection_ == Projection::panorama ? 1u : 0u;
+    {
+        // The camera's directions from its projection: straight ahead, and
+        // towards the image's right and top edges (no handedness assumed).
+        const auto unproject = [&](double x, double y) {
+            const auto p = invViewProj * VM::Vector4<double>(x, y, 1.0, 1.0);
+            const auto q = invViewProj * VM::Vector4<double>(x, y, 0.0, 1.0);
+            return VM::Vector3<double>(p.x() / p.w() - q.x() / q.w(), p.y() / p.w() - q.y() / q.w(),
+                                       p.z() / p.w() - q.z() / q.w());
+        };
+        const auto unit = [](VM::Vector3<double> v) {
+            const double len = std::sqrt(v.x() * v.x() + v.y() * v.y() + v.z() * v.z());
+            return len > 1e-30 ? VM::Vector3<double>(v.x() / len, v.y() / len, v.z() / len) : v;
+        };
+        const auto dot = [](const VM::Vector3<double>& a, const VM::Vector3<double>& b) {
+            return a.x() * b.x() + a.y() * b.y() + a.z() * b.z();
+        };
+        const auto forward = unit(unproject(0.0, 0.0));
+        auto up = unit(unproject(0.0, 0.5));
+        up = unit(VM::Vector3<double>(up.x() - forward.x() * dot(up, forward), up.y() - forward.y() * dot(up, forward),
+                                      up.z() - forward.z() * dot(up, forward)));
+        auto right = unit(unproject(0.5, 0.0));
+        right = unit(VM::Vector3<double>(right.x() - forward.x() * dot(right, forward) - up.x() * dot(right, up),
+                                         right.y() - forward.y() * dot(right, forward) - up.y() * dot(right, up),
+                                         right.z() - forward.z() * dot(right, forward) - up.z() * dot(right, up)));
+        const auto store = [](float* out, const VM::Vector3<double>& v) {
+            out[0] = static_cast<float>(v.x());
+            out[1] = static_cast<float>(v.y());
+            out[2] = static_cast<float>(v.z());
+        };
+        store(u.cameraForward, forward);
+        store(u.cameraRight, right);
+        store(u.cameraUp, up);
+    }
     for (int c = 0; c < 3; ++c) u.clearColor[c] = std::pow(std::max(clear[c], 0.0f), 2.2f);  // display -> linear
     if (!uniforms_) uniforms_ = device_->createBuffer(sizeof(TraceUniforms), GPU::BufferUsage::uniform);
     if (!uniforms_) return false;
@@ -437,6 +491,7 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
                     {3, GPU::BufferBinding{instances_, 0, instances_->getLength()}},
                     {4, GPU::BufferBinding{materials_, 0, materials_->getLength()}},
                     {5, GPU::BufferBinding{normals_, 0, normals_->getLength()}},
+                    {6, GPU::BufferBinding{aux_, 0, aux_->getLength()}},
                     {0, output_},
                     {1, environment}};
     auto group = device_->createBindGroup(desc);
@@ -453,7 +508,151 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
     device_->submit(encoder->finish(), fence);
     if (fence) fence->wait();
     ++samples_;
+    exposure_ = renderer.getExposure();
+    denoised_ = false;
     return true;
+}
+
+bool PathTracer::readOutput(std::vector<uint8_t>& rgba) const {
+    if (!output_ || samples_ == 0) return false;
+    rgba.resize((size_t)width_ * height_ * 4);
+    device_->waitForIdle();
+    return output_->download(0, 0, rgba.data(), rgba.size());
+}
+
+bool PathTracer::readLinear(std::vector<float>& rgb, std::vector<float>* albedo, std::vector<float>* normal) const {
+    if (!accum_ || !aux_ || samples_ == 0) return false;
+    const size_t pixels = (size_t)width_ * height_;
+    std::vector<float> sums(pixels * 4);
+    if (!accum_->download(0, sums.size() * 4, sums.data())) return false;
+    const float scale = std::exp2(exposure_);
+    rgb.resize(pixels * 3);
+    for (size_t i = 0; i < pixels; ++i) {
+        const float n = std::max(sums[i * 4 + 3], 1.0f);
+        for (int c = 0; c < 3; ++c) rgb[i * 3 + c] = sums[i * 4 + c] / n * scale;
+    }
+    if (albedo || normal) {
+        std::vector<float> aux(pixels * 8);
+        if (!aux_->download(0, aux.size() * 4, aux.data())) return false;
+        const float n = static_cast<float>(samples_);
+        if (albedo) {
+            albedo->resize(pixels * 3);
+            for (size_t i = 0; i < pixels; ++i) {
+                for (int c = 0; c < 3; ++c) (*albedo)[i * 3 + c] = aux[i * 4 + c] / n;
+            }
+        }
+        if (normal) {
+            normal->resize(pixels * 3);
+            for (size_t i = 0; i < pixels; ++i) {
+                for (int c = 0; c < 3; ++c) (*normal)[i * 3 + c] = aux[(pixels + i) * 4 + c] / n;
+            }
+        }
+    }
+    return true;
+}
+
+void PathTracer::toneMap(const float* rgb, size_t pixels, uint8_t* rgba) {
+    // As toneMapKhronosPbrNeutral() in path_tracer.metal.
+    for (size_t i = 0; i < pixels; ++i) {
+        float c[3] = {std::max(rgb[i * 3], 0.0f), std::max(rgb[i * 3 + 1], 0.0f), std::max(rgb[i * 3 + 2], 0.0f)};
+        const float startCompression = 0.8f - 0.04f;
+        const float desaturation = 0.15f;
+        const float x = std::min(c[0], std::min(c[1], c[2]));
+        const float offset = x < 0.08f ? x - 6.25f * x * x : 0.04f;
+        for (float& v : c) v -= offset;
+        const float peak = std::max(c[0], std::max(c[1], c[2]));
+        if (peak >= startCompression) {
+            const float d = 1.0f - startCompression;
+            const float newPeak = 1.0f - d * d / (peak + d - startCompression);
+            const float g = 1.0f - 1.0f / (desaturation * (peak - newPeak) + 1.0f);
+            for (float& v : c) {
+                v *= newPeak / peak;
+                v = v + (newPeak - v) * g;
+            }
+        }
+        for (int k = 0; k < 3; ++k) {
+            const float display = std::pow(std::max(c[k], 0.0f), 1.0f / 2.2f);
+            rgba[i * 4 + k] = static_cast<uint8_t>(std::lround(std::clamp(display, 0.0f, 1.0f) * 255.0f));
+        }
+        rgba[i * 4 + 3] = 255;
+    }
+}
+
+#if defined(CAMPELLO_RENDERER_DENOISER)
+namespace {
+struct DenoiserState {
+    oidn::DeviceRef device;
+    oidn::FilterRef filter;
+    oidn::BufferRef color, albedo, normal, output;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+} // namespace
+#endif
+
+bool PathTracer::denoiserAvailable() noexcept {
+#if defined(CAMPELLO_RENDERER_DENOISER)
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool PathTracer::denoise() {
+#if defined(CAMPELLO_RENDERER_DENOISER)
+    std::vector<float> color, albedo, normal;
+    if (!readLinear(color, &albedo, &normal)) return false;
+    try {
+        // A CPU device (works everywhere the library does, no sharing with
+        // campello_gpu's device), its filter and buffers kept for the next
+        // image of the same size: committing a filter loads its weights.
+        auto* state = static_cast<DenoiserState*>(denoiser_.get());
+        if (!state) {
+            auto created = std::make_shared<DenoiserState>();
+            created->device = oidn::newDevice(oidn::DeviceType::CPU);
+            created->device.commit();
+            denoiser_ = created;
+            state = created.get();
+        }
+        const size_t bytes = color.size() * sizeof(float);
+        if (state->width != width_ || state->height != height_) {
+            state->color = state->device.newBuffer(bytes);
+            state->albedo = state->device.newBuffer(bytes);
+            state->normal = state->device.newBuffer(bytes);
+            state->output = state->device.newBuffer(bytes);
+            state->filter = state->device.newFilter("RT");
+            state->filter.setImage("color", state->color, oidn::Format::Float3, width_, height_);
+            state->filter.setImage("albedo", state->albedo, oidn::Format::Float3, width_, height_);
+            state->filter.setImage("normal", state->normal, oidn::Format::Float3, width_, height_);
+            state->filter.setImage("output", state->output, oidn::Format::Float3, width_, height_);
+            state->filter.set("hdr", true);
+            state->filter.commit();
+            state->width = width_;
+            state->height = height_;
+        }
+        state->color.write(0, bytes, color.data());
+        state->albedo.write(0, bytes, albedo.data());
+        state->normal.write(0, bytes, normal.data());
+        state->filter.execute();
+        const char* message = nullptr;
+        if (state->device.getError(message) != oidn::Error::None) {
+            denoiser_.reset();  // start afresh next time
+            return false;
+        }
+        state->output.read(0, bytes, color.data());
+    } catch (...) {
+        denoiser_.reset();
+        return false;
+    }
+    std::vector<uint8_t> rgba((size_t)width_ * height_ * 4);
+    toneMap(color.data(), (size_t)width_ * height_, rgba.data());
+    device_->waitForIdle();
+    if (!output_->upload(0, rgba.size(), rgba.data())) return false;
+    denoised_ = true;
+    return true;
+#else
+    return false;
+#endif
 }
 
 } // namespace systems::leal::campello_renderer

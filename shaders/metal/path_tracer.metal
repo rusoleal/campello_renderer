@@ -8,7 +8,10 @@
 //                 structure: diffuse + GGX specular, the sun sampled
 //                 directly (a soft 0.27 degree disc, shadow rays), the sky
 //                 from the environment cube, thin glass (Fresnel reflection
-//                 or straight through), Russian roulette.
+//                 or straight through), Russian roulette. Also the first
+//                 hit's albedo and normal (averaged like the colour), the
+//                 denoiser's guides. Perspective cameras, or a 360 x 180
+//                 degree equirectangular panorama around the camera.
 //
 // Lighting units match the raster renderer (default.metal): directional
 // lights give irradiance colour x intensity, the sky lights with radiance
@@ -57,12 +60,15 @@ kernel void faceNormals(device const uchar*   positions [[buffer(0)]],
 // ---------------------------------------------------------------------------
 struct TraceUniforms {
     float4x4 invViewProj;   // clip -> world
-    float4   cameraPos;     // xyz
+    float4   cameraPos;     // xyz: the eye (from the view matrix)
     float4   sunDirection[4];  // directional lights: xyz towards the light (unit), w = cos of its angular radius
     float4   sunRadiance[4];   // rgb irradiance (colour x intensity); w = 1 for a light in use
     float4   params;        // x environment intensity, y exposure (EV), z max bounces, w sample index
-    uint4    size;          // width, height, sky visible (1) or clear colour, 0
+    uint4    size;          // width, height, sky visible (1) or clear colour, projection (0 perspective, 1 panorama)
     float4   clearColor;    // rgb when the sky isn't visible
+    float4   cameraForward; // panorama: the image centre's direction (unit)
+    float4   cameraRight;   // panorama: right (unit, perpendicular to forward)
+    float4   cameraUp;      // panorama: up, the poles
 };
 
 struct InstanceInfo {
@@ -178,6 +184,7 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
                       device const MaterialInfo*      materials  [[buffer(4)]],
                       device const float4*            normals    [[buffer(5)]],
                       texture2d<float, access::write> output     [[texture(0)]],
+                      device float4*                  aux        [[buffer(6)]],
                       texturecube<float>              environment [[texture(1)]],
                       uint2 gid [[thread_position_in_grid]])
 {
@@ -191,11 +198,29 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
     const float2 jitter = float2(rand01(rng), rand01(rng));
     const float2 ndc = float2((float(gid.x) + jitter.x) / float(u.size.x) * 2.0 - 1.0,
                               1.0 - (float(gid.y) + jitter.y) / float(u.size.y) * 2.0);
-    const float4 far = u.invViewProj * float4(ndc, 1.0, 1.0);
-    const float4 near = u.invViewProj * float4(ndc, 0.0, 1.0);
-    float3 origin = near.xyz / near.w;
-    float3 direction = normalize(far.xyz / far.w - origin);
+    float3 origin;
+    float3 direction;
+    if (u.size.w == 1u) {
+        // Equirectangular: longitude across (the centre straight ahead,
+        // right towards the right), latitude down from the up pole.
+        const float lon = (ndc.x * 0.5) * 2.0 * PI;
+        const float lat = ndc.y * 0.5 * PI;
+        origin = u.cameraPos.xyz;
+        direction = normalize(u.cameraForward.xyz * (cos(lat) * cos(lon)) + u.cameraRight.xyz * (cos(lat) * sin(lon)) +
+                              u.cameraUp.xyz * sin(lat));
+    } else {
+        // From the eye through the pixel's point on the near plane: the far
+        // plane isn't unprojected (in 32-bit floats it loses its precision
+        // when far / near is large, e.g. 5000 m / 5 cm).
+        const float4 near = u.invViewProj * float4(ndc, 0.0, 1.0);
+        origin = near.xyz / near.w;
+        direction = normalize(origin - u.cameraPos.xyz);
+    }
     if (any(isnan(direction))) direction = float3(0.0, 0.0, -1.0);
+    // Denoiser guides: the first surface seen (through glass).
+    float3 firstAlbedo = float3(0.0);
+    float3 firstNormal = float3(0.0);
+    bool guided = false;
 
     intersector<triangle_data, instancing> isect;
     isect.assume_geometry_type(geometry_type::triangle);
@@ -223,8 +248,12 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
                 // Seen directly: the sky as the skybox draws it; as light:
                 // scaled by the environment intensity.
                 const float scale = bounce == 0 ? 1.0 : envIntensity;
-                radiance += throughput * environment.sample(envSampler, direction, level(0.0)).rgb * scale;
+                const float3 sky = environment.sample(envSampler, direction, level(0.0)).rgb * scale;
+                radiance += throughput * sky;
+                if (!guided) firstAlbedo = clamp(sky, 0.0, 1.0);
             }
+            if (!guided && bounce == 0 && u.size.z == 0u) firstAlbedo = clamp(u.clearColor.rgb, 0.0, 1.0);
+            guided = true;
             break;
         }
         const InstanceInfo inst = instances[hit.instance_id];
@@ -238,6 +267,11 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
         const float3 albedo = mat.baseColor.rgb;
         if (mat.unlit > 0.5) {
             radiance += throughput * albedo;
+            if (!guided) {
+                firstAlbedo = clamp(albedo, 0.0, 1.0);
+                firstNormal = n;
+                guided = true;
+            }
             break;
         }
         radiance += throughput * mat.emissive.rgb;
@@ -257,6 +291,11 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
             continue;
         }
 
+        if (!guided) {
+            firstAlbedo = clamp(albedo, 0.0, 1.0);
+            firstNormal = n;
+            guided = true;
+        }
         const float alpha = max(mat.roughness * mat.roughness, 0.002);
         const float3 f0 = mix(float3(0.04), albedo, mat.metallic);
 
@@ -319,6 +358,9 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
     const uint pixel = gid.y * u.size.x + gid.x;
     const float4 sum = (sampleIndex == 0 ? float4(0.0) : accum[pixel]) + float4(radiance, 1.0);
     accum[pixel] = sum;
+    const uint pixels = u.size.x * u.size.y;
+    aux[pixel] = (sampleIndex == 0 ? float4(0.0) : aux[pixel]) + float4(firstAlbedo, 0.0);
+    aux[pixels + pixel] = (sampleIndex == 0 ? float4(0.0) : aux[pixels + pixel]) + float4(firstNormal, 0.0);
     float3 color = sum.rgb / max(sum.w, 1.0) * exp2(u.params.y);
     color = pow(max(toneMapKhronosPbrNeutral(color), 0.0), float3(1.0 / 2.2));
     output.write(float4(color, 1.0), gid);

@@ -49,6 +49,22 @@ add_library(${PROJECT_NAME} SHARED
     src/procedural_texture_baker.cpp
 )
 
+# Path tracer denoising (Intel Open Image Denoise, prebuilt): on by default
+# where the path tracer runs (macOS).
+if(APPLE AND NOT IOS)
+    set(_campello_denoiser_default ON)
+else()
+    set(_campello_denoiser_default OFF)
+endif()
+option(CAMPELLO_RENDERER_DENOISER "PathTracer::denoise() with Intel Open Image Denoise (downloads its release)" ${_campello_denoiser_default})
+if(CAMPELLO_RENDERER_DENOISER)
+    include(${PROJECT_SOURCE_DIR}/dependencies/oidn.cmake)
+    if(OIDN_FOUND)
+        target_link_libraries(${PROJECT_NAME} PRIVATE OpenImageDenoise)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE CAMPELLO_RENDERER_DENOISER)
+    endif()
+endif()
+
 # Enable Unity Build for faster compilation
 set_target_properties(${PROJECT_NAME} PROPERTIES UNITY_BUILD ON)
 
@@ -87,7 +103,7 @@ if(ANDROID)
     set(PLATFORM_LIBS log)
 endif()
 
-target_link_libraries(${PROJECT_NAME}
+target_link_libraries(${PROJECT_NAME} PUBLIC
     ${DEPENDENCIES}
     ${PLATFORM_LIBS}
 )

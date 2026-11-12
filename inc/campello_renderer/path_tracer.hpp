@@ -21,6 +21,12 @@
 // lights (soft discs 0.53 degrees across, as the sun) and the environment
 // map times the renderer's environment intensity (seen directly at full
 // strength, as the skybox); the renderer's exposure applies.
+//
+// Presentation images: setProjection(Projection::panorama) traces a 360 x 180
+// degree equirectangular panorama around the camera (use a 2:1 size);
+// denoise() cleans up the image so far with Intel Open Image Denoise where
+// the library was built with it (denoiserAvailable()); readOutput() and
+// readLinear() read the image back.
 
 #include <campello_renderer/campello_renderer.hpp>
 
@@ -42,6 +48,12 @@ namespace systems::leal::campello_renderer {
 
 class PathTracer {
 public:
+    enum class Projection {
+        perspective,  ///< the camera's projection
+        panorama,     ///< equirectangular, 360 x 180 degrees around the camera position:
+                      ///< the image centre straight ahead, the camera's up at the top
+    };
+
     explicit PathTracer(std::shared_ptr<systems::leal::campello_gpu::Device> device);
     ~PathTracer();
 
@@ -69,6 +81,38 @@ public:
     void reset() noexcept {
         samples_ = 0;
     }
+    /// How camera rays leave the camera (default: perspective).
+    void setProjection(Projection projection) noexcept {
+        if (projection_ != projection) samples_ = 0;
+        projection_ = projection;
+    }
+    [[nodiscard]] Projection projection() const noexcept {
+        return projection_;
+    }
+
+    /// Whether denoise() can work: built with Intel Open Image Denoise
+    /// (CAMPELLO_RENDERER_DENOISER).
+    [[nodiscard]] static bool denoiserAvailable() noexcept;
+    /// Denoises the image so far, guided by the first surfaces' albedo and
+    /// normals, and shows the result in output() until the next render().
+    /// Blocks (the CPU, or the GPU where the library supports it). Returns
+    /// false without a denoiser or an image.
+    bool denoise();
+    /// Whether output() shows the denoised image.
+    [[nodiscard]] bool denoised() const noexcept {
+        return denoised_;
+    }
+
+    /// output() read back: width x height rgba8, display-encoded, top row first.
+    bool readOutput(std::vector<uint8_t>& rgba) const;
+    /// The image so far as linear rgb floats (exposure applied, before tone
+    /// mapping), top row first; optionally the denoiser guides: the first
+    /// surfaces' albedo (rgb) and world normals (xyz).
+    bool readLinear(std::vector<float>& rgb, std::vector<float>* albedo = nullptr, std::vector<float>* normal = nullptr) const;
+    /// Tone mapping of the shader (Khronos PBR Neutral, then display gamma):
+    /// linear rgb -> rgba8, alpha 255.
+    static void toneMap(const float* rgb, size_t pixels, uint8_t* rgba);
+
     /// Light bounces after the first hit (default 4).
     void setMaxBounces(uint32_t bounces) noexcept {
         maxBounces_ = bounces;
@@ -95,6 +139,7 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::Buffer> normals_;
     std::shared_ptr<systems::leal::campello_gpu::Buffer> uniforms_;
     std::shared_ptr<systems::leal::campello_gpu::Buffer> accum_;
+    std::shared_ptr<systems::leal::campello_gpu::Buffer> aux_;  // albedo, then normal sums
     std::shared_ptr<systems::leal::campello_gpu::Texture> output_;
     uint64_t sceneKey_ = 0;
     uint64_t viewKey_ = 0;
@@ -102,6 +147,10 @@ private:
     uint32_t height_ = 0;
     uint32_t samples_ = 0;
     uint32_t maxBounces_ = 4;
+    float exposure_ = 0.0f;  // of the last render(), for readLinear()
+    Projection projection_ = Projection::perspective;
+    bool denoised_ = false;
+    std::shared_ptr<void> denoiser_;  // Open Image Denoise device, filter and buffers (path_tracer.cpp)
 };
 
 } // namespace systems::leal::campello_renderer

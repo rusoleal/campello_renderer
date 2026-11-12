@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Changed
+- campello_gpu v0.28.2 (Metal ray tracing scenes keep their per-mesh structures resident: geometry vanished from path traced images under memory pressure).
+- Path tracer camera rays start at the eye from the view matrix (not `CameraData::position`) and go through the pixel's point on the near plane; the far plane isn't unprojected any more (32-bit precision with deep projections).
+
+### Added
+- **Path tracer presentation images**: `PathTracer::setProjection(Projection::panorama)` traces a 360 x 180 degree equirectangular panorama around the camera (the image centre straight ahead, the camera's up at the top; use a 2:1 size). `denoise()` cleans up the image so far with **Intel Open Image Denoise** 2.5.1 (Apache-2.0; CPU device), guided by the first surfaces' albedo and normals that the path tracer now accumulates, and shows it in `output()` until the next `render()`; `denoiserAvailable()`, `denoised()`. `readOutput()` (rgba8, display-encoded) and `readLinear()` (linear rgb, optionally the albedo and normal guides) read the image back; `toneMap()` is the shader's tone mapping on the CPU.
+- **`CAMPELLO_RENDERER_DENOISER`** CMake option (default on for macOS, the path tracer's platform): downloads OIDN's prebuilt release (`dependencies/oidn.cmake`, checksummed; macOS x86_64 and arm64 for now) and links it; `CAMPELLO_RENDERER_DENOISER_LIBRARY_DIR` names its libraries for apps bundling them.
+- The denoiser keeps its Open Image Denoise device, filter and buffers between images of the same size (committing a filter loads its weights): a walkthrough's denoised frames take less than half as long.
+- `RenderSystemOptions::noCulling`: `build_render_scene()` lists every draw whatever the camera sees (no frustum or size culling, `MeshRenderer::visible` ignored), for path tracing and panoramas.
+
 ## [0.17.0] - 2026-11-11
 
 ### Added

@@ -3601,7 +3601,222 @@ TEST_F(OffscreenRenderTest, PathTracerShadowsTheGroundUnderAPlate) {
                                                     VM::Vector3<double>(0.0, 1.0, 0.0));
     ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
     EXPECT_EQ(tracer.sampleCount(), 1u);
+    // A new scene structure over the same meshes (the draws in another
+    // order) still has them all: reused mesh structures.
+    std::swap(scene.opaque[0], scene.opaque[1]);
+    for (int i = 0; i < 32; ++i) {
+        ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+    }
+    const auto again = readBackPixels(tracer.output());
+    EXPECT_LT(double(again[(size_t(32) * 64 + 32) * 4]), double(again[(size_t(40) * 64 + 10) * 4]) * 0.7)
+        << "the plate's shadow is gone after a rebuild";
+    EXPECT_GT(double(again[(size_t(24) * 64 + 32) * 4]), 60.0) << "the plate is gone after a rebuild";
+    // The scene 10 times bigger, seen from 10 times as far (35 m) with a far
+    // plane 10^5 times the near one (5 cm to 5 km, as an architectural
+    // viewer builds it, right-handed, depth 0..1): the same image.
+    auto bigGround = quad(0.0f, 15.0f);
+    auto bigPlate = quad(6.0f, 3.0f);
+    scene.opaque[0].mesh = bigGround.get();
+    scene.opaque[1].mesh = bigPlate.get();
+    // Right-handed view, depth 0..1 (as campello_bim's camera builds them).
+    {
+        const double eye[3] = {0.0, 25.0, 25.0};
+        double f[3] = {0.0, -25.0, -25.0};
+        const double fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+        for (double& v : f) v /= fl;
+        const double up[3] = {0.0, 1.0, 0.0};
+        double r[3] = {f[1] * up[2] - f[2] * up[1], f[2] * up[0] - f[0] * up[2], f[0] * up[1] - f[1] * up[0]};
+        const double rl = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+        for (double& v : r) v /= rl;
+        const double u[3] = {r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]};
+        const auto dot3 = [](const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+        VM::Matrix4<double> view = VM::Matrix4<double>::identity();
+        double* m = view.data;
+        for (int c = 0; c < 3; ++c) {
+            m[c] = r[c];
+            m[4 + c] = u[c];
+            m[8 + c] = -f[c];
+        }
+        m[3] = -dot3(r, eye);
+        m[7] = -dot3(u, eye);
+        m[11] = dot3(f, eye);
+        VM::Matrix4<double> projection = VM::Matrix4<double>::identity();
+        double* p = projection.data;
+        for (int i = 0; i < 16; ++i) p[i] = 0.0;
+        const double nearPlane = 0.05, farPlane = 5000.0;
+        const double tanHalf = std::tan(60.0 * 3.14159265358979323846 / 360.0);
+        p[0] = 1.0 / tanHalf;
+        p[5] = 1.0 / tanHalf;
+        p[10] = farPlane / (nearPlane - farPlane);
+        p[11] = nearPlane * farPlane / (nearPlane - farPlane);
+        p[14] = -1.0;
+        scene.camera.view = view;
+        scene.camera.projection = projection;
+        scene.camera.position = VM::Vector3<double>(eye[0], eye[1], eye[2]);
+    }
+    for (int i = 0; i < 32; ++i) {
+        ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+    }
+    const auto deep = readBackPixels(tracer.output());
+    EXPECT_GT(double(deep[(size_t(24) * 64 + 32) * 4]), 60.0) << "the plate, with a deep projection";
+    EXPECT_GT(double(deep[(size_t(40) * 64 + 10) * 4]), 60.0) << "open ground, with a deep projection";
     renderer->setEnvironmentIntensity(1.0f);
+}
+
+// Panorama: from a camera above a lit ground plane looking along -z, the
+// whole bottom row sees the ground and the top row the clear colour, in
+// every direction; a wall behind the camera shows at the image's left and
+// right edges, not in the middle.
+TEST_F(OffscreenRenderTest, PathTracerPanoramaSeesAllAround) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setSkyboxEnabled(false);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setEnvironmentIntensity(0.1f);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+
+    const auto mesh = [&](std::vector<float> positions) {
+        std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+        auto m = std::make_unique<GpuMesh>();
+        m->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        m->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        m->indexCount = 6;
+        m->indexFormat = GPU::IndexFormat::uint32;
+        m->vertexCount = 4;
+        m->layout = &VertexLayout::positionOnly();
+        m->setBoundsFromPositions(positions.data(), 4);
+        return m;
+    };
+    auto ground = mesh({-50.0f, 0.0f, -50.0f, -50.0f, 0.0f, 50.0f, 50.0f, 0.0f, 50.0f, 50.0f, 0.0f, -50.0f});
+    // Behind the camera (+z), facing it, from the ground to well above the eye.
+    auto wall = mesh({-3.0f, 0.0f, 2.0f, 3.0f, 0.0f, 2.0f, 3.0f, 4.0f, 2.0f, -3.0f, 4.0f, 2.0f});
+    RenderScene scene;
+    const VM::Vector3<double> eye(0.0, 1.0, 0.0);
+    scene.camera.view = VM::Matrix4<double>::lookAt(eye, VM::Vector3<double>(0.0, 1.0, -1.0), VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = eye;
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.2, -1.0, 0.3);  // from ahead: lights the wall's camera side
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    scene.lights.push_back(sun);
+    for (GpuMesh* m : {ground.get(), wall.get()}) {
+        DrawCall draw;
+        draw.mesh = m;
+        draw.material = red;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    tracer.setProjection(PathTracer::Projection::panorama);
+    for (int i = 0; i < 16; ++i) ASSERT_TRUE(tracer.render(scene, *renderer, 64, 32));
+    std::vector<uint8_t> pixels;
+    ASSERT_TRUE(tracer.readOutput(pixels));
+    ASSERT_EQ(pixels.size(), 64u * 32u * 4u);
+    const auto red8 = [&](int x, int y) { return int(pixels[(size_t(y) * 64 + size_t(x)) * 4]); };
+    for (int x = 0; x < 64; x += 8) {
+        EXPECT_GT(red8(x, 30), 40) << "ground below at column " << x;
+        EXPECT_LT(red8(x, 1), 10) << "nothing above at column " << x;
+    }
+    // Just above the horizon (row 12): the wall behind, open sky ahead.
+    EXPECT_GT(red8(1, 12), 20) << "the wall behind at the left edge";
+    EXPECT_GT(red8(62, 12), 20) << "the wall behind at the right edge";
+    EXPECT_LT(red8(32, 12), 10) << "nothing straight ahead above the horizon";
+    renderer->setEnvironmentIntensity(1.0f);
+}
+
+// Denoising: a few samples of a lit ground plane are noisy; the denoised
+// image is smoother and about as bright. Skipped without the denoiser.
+TEST_F(OffscreenRenderTest, PathTracerDenoiseSmoothsANoisyImage) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    if (!PathTracer::denoiserAvailable()) GTEST_SKIP() << "Built without the denoiser";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setSkyboxEnabled(true);
+    renderer->setEnvironmentIntensity(1.0f);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+    std::vector<float> positions = {-1.5f, 0.0f, -1.5f, 1.5f, 0.0f, -1.5f, 1.5f, 0.0f, 1.5f, -1.5f, 0.0f, 1.5f};
+    std::vector<uint32_t> indices = {0, 2, 1, 0, 3, 2};
+    GpuMesh ground;
+    ground.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    ground.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    ground.indexCount = 6;
+    ground.indexFormat = GPU::IndexFormat::uint32;
+    ground.vertexCount = 4;
+    ground.layout = &VertexLayout::positionOnly();
+    ground.setBoundsFromPositions(positions.data(), 4);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 2.0, 0.01), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 0.0, -1.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(40.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 2.0, 0.01);
+    DrawCall draw;
+    draw.mesh = &ground;
+    draw.material = red;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(draw);  // lit by the sky only: noisy at 2 samples
+
+    for (int i = 0; i < 2; ++i) ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+    const auto roughness = [](const std::vector<uint8_t>& p, double& mean) {
+        double sum = 0.0, diff = 0.0;
+        int n = 0;
+        for (int y = 16; y < 48; ++y) {
+            for (int x = 16; x < 47; ++x) {
+                const double a = p[(size_t(y) * 64 + size_t(x)) * 4], b = p[(size_t(y) * 64 + size_t(x + 1)) * 4];
+                sum += a;
+                diff += std::abs(a - b);
+                ++n;
+            }
+        }
+        mean = sum / n;
+        return diff / n;
+    };
+    std::vector<uint8_t> noisy, clean;
+    ASSERT_TRUE(tracer.readOutput(noisy));
+    ASSERT_TRUE(tracer.denoise());
+    EXPECT_TRUE(tracer.denoised());
+    ASSERT_TRUE(tracer.readOutput(clean));
+    double noisyMean = 0.0, cleanMean = 0.0;
+    const double noisyRough = roughness(noisy, noisyMean);
+    const double cleanRough = roughness(clean, cleanMean);
+    EXPECT_GT(noisyRough, 2.0) << "2 samples should be noisy";
+    EXPECT_LT(cleanRough, noisyRough * 0.5) << "denoising should smooth the image";
+    EXPECT_NEAR(cleanMean, noisyMean, noisyMean * 0.15 + 3.0) << "and keep its brightness";
+    // The next sample shows the traced image again, and tracing goes on as
+    // before: a denoised frame, then another view (walkthroughs).
+    ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+    EXPECT_FALSE(tracer.denoised());
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 2.0, 0.02), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 0.0, -1.0));
+    for (int i = 0; i < 2; ++i) ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+    std::vector<uint8_t> after;
+    ASSERT_TRUE(tracer.readOutput(after));
+    double afterMean = 0.0;
+    roughness(after, afterMean);
+    EXPECT_NEAR(afterMean, noisyMean, noisyMean * 0.15 + 3.0) << "the ground after denoising and moving the camera";
 }
 
 // Ambient occlusion and exposure: a floor meeting a wall. With AO on, the
