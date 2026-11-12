@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- **`PathTracer::render()` doesn't wait for the GPU** any more: the sample is submitted and the next `render()`, `readOutput()`, `readLinear()` and `denoise()` wait for it; `sampleInFlight()` tells an interactive caller to skip a frame instead of waiting (a live view's UI thread spent each sample's GPU time waiting).
+
 ### Fixed
 - **Path tracer: glass spent the path's bounces**, so interiors seen through windows were nearly black (a view into a room crosses glass twice: in, then out to the sky, half of the default 4 bounces). Crossing or reflecting off thin glass no longer counts as a bounce (up to 8 crossings per path), and the sky seen through glass is at full strength, as seen directly.
 

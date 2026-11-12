@@ -42,6 +42,7 @@ class ComputePipeline;
 class RayTracingPipeline;
 class BindGroupLayout;
 class Texture;
+class Fence;
 } // namespace systems::leal::campello_gpu
 
 namespace systems::leal::campello_renderer {
@@ -65,9 +66,16 @@ public:
 
     /// Adds one sample per pixel of `scene` at `width` x `height` to
     /// output(); starts again when the scene, its materials, lights,
-    /// camera or the size changed. `renderer` gives materials, environment,
+    /// camera or the size changed. Doesn't wait for the GPU: work submitted
+    /// afterwards on the device's queue sees the sample; the next render()
+    /// and the read and denoise calls wait for it. `renderer` gives materials, environment,
     /// exposure and clear colour. Returns false if nothing was traced.
     bool render(const RenderScene& scene, const Renderer& renderer, uint32_t width, uint32_t height);
+
+    /// Whether the last render()'s sample is still on the GPU. An
+    /// interactive caller can skip render() until it isn't, so it never
+    /// waits for the GPU (the next render() would).
+    [[nodiscard]] bool sampleInFlight() const;
 
     /// The image so far (rgba8unorm, width x height; display-encoded).
     [[nodiscard]] std::shared_ptr<systems::leal::campello_gpu::Texture> output() const noexcept {
@@ -125,6 +133,7 @@ private:
         uint32_t triangleCount = 0;
     };
     bool rebuild(const RenderScene& scene, const Renderer& renderer, uint64_t sceneKey);
+    void waitForSample() const;  // the last render()'s GPU work
     std::vector<DrawCall> traced(const RenderScene& scene) const;
 
     std::shared_ptr<systems::leal::campello_gpu::Device> device_;
@@ -141,6 +150,7 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::Buffer> accum_;
     std::shared_ptr<systems::leal::campello_gpu::Buffer> aux_;  // albedo, then normal sums
     std::shared_ptr<systems::leal::campello_gpu::Texture> output_;
+    mutable std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;  // the last sample, not yet waited for
     uint64_t sceneKey_ = 0;
     uint64_t viewKey_ = 0;
     uint32_t width_ = 0;
