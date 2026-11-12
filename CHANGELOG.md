@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-12
+
 ### Changed
 - campello_gpu v0.28.2 (Metal ray tracing scenes keep their per-mesh structures resident: geometry vanished from path traced images under memory pressure).
 - Path tracer camera rays start at the eye from the view matrix (not `CameraData::position`) and go through the pixel's point on the near plane; the far plane isn't unprojected any more (32-bit precision with deep projections).
