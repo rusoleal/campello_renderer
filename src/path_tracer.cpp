@@ -172,7 +172,9 @@ PathTracer::PathTracer(std::shared_ptr<GPU::Device> device)
 #endif
 }
 
-PathTracer::~PathTracer() = default;
+PathTracer::~PathTracer() {
+    waitForSample();  // the GPU may still be using the buffers
+}
 
 std::vector<DrawCall> PathTracer::traced(const RenderScene& scene) const {
     std::vector<DrawCall> out;
@@ -346,8 +348,22 @@ bool PathTracer::rebuild(const RenderScene& scene, const Renderer& renderer, uin
     return true;
 }
 
+bool PathTracer::sampleInFlight() const {
+    return pending_ && !pending_->isSignaled();
+}
+
+void PathTracer::waitForSample() const {
+    if (pending_) {
+        pending_->wait();
+        pending_.reset();
+    }
+}
+
 bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint32_t width, uint32_t height) {
     if (!supported() || width == 0 || height == 0) return false;
+    // The previous sample (usually done by now, a frame later): its
+    // uniforms and buffers are rewritten below.
+    waitForSample();
 
     // What the image depends on besides the camera: geometry, materials,
     // lights and the renderer's lighting settings.
@@ -503,10 +519,12 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
         pass->traceRays(width, height, 1);
         pass->end();
     }
-    // One sample at a time, waited for: the uniforms are rewritten next time.
+    // Not waited for here: the GPU traces while the caller goes on (the next
+    // render() and the readers wait). Work submitted later on the same queue
+    // (e.g. copying output()) runs after it.
     auto fence = device_->createFence();
     device_->submit(encoder->finish(), fence);
-    if (fence) fence->wait();
+    pending_ = fence;
     ++samples_;
     exposure_ = renderer.getExposure();
     denoised_ = false;
@@ -515,6 +533,7 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
 
 bool PathTracer::readOutput(std::vector<uint8_t>& rgba) const {
     if (!output_ || samples_ == 0) return false;
+    waitForSample();
     rgba.resize((size_t)width_ * height_ * 4);
     device_->waitForIdle();
     return output_->download(0, 0, rgba.data(), rgba.size());
@@ -522,6 +541,7 @@ bool PathTracer::readOutput(std::vector<uint8_t>& rgba) const {
 
 bool PathTracer::readLinear(std::vector<float>& rgb, std::vector<float>* albedo, std::vector<float>* normal) const {
     if (!accum_ || !aux_ || samples_ == 0) return false;
+    waitForSample();
     const size_t pixels = (size_t)width_ * height_;
     std::vector<float> sums(pixels * 4);
     if (!accum_->download(0, sums.size() * 4, sums.data())) return false;

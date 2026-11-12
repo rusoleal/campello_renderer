@@ -233,6 +233,9 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
     float3 radiance = float3(0.0);
     float3 throughput = float3(1.0);
     const uint maxBounces = uint(u.params.z);
+    // Panes of glass don't spend bounces (a view into a room crosses one
+    // twice: in, and out to the sky), up to this many crossings per path.
+    uint glassLeft = 8u;
     const float envIntensity = u.params.x;
     for (uint bounce = 0; bounce <= maxBounces; ++bounce) {
         ray r;
@@ -278,6 +281,10 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
 
         // Thin glass: Fresnel reflection, else straight through, tinted.
         if (mat.transmission > 0.0) {
+            if (glassLeft > 0u) {
+                --glassLeft;
+                --bounce;  // unsigned: wraps and the loop's ++ brings it back
+            }
             const float f0 = pow((mat.ior - 1.0) / (mat.ior + 1.0), 2.0);
             const float F = f0 + (1.0 - f0) * pow(clamp(1.0 - dot(n, v), 0.0, 1.0), 5.0);
             const float transmit = mat.transmission * (1.0 - F);
