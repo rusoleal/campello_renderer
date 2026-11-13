@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- campello_gpu v0.29.0 (`Surface`: one presentable swapchain per native window, so apps can drive several windows from one device; Vulkan devices accept recording from several threads). The renderer draws into whatever target it is given, so nothing else changes.
+
 ## [0.18.2] - 2026-11-12
 
 ### Added
