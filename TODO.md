@@ -288,10 +288,17 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
   - [ ] An ECS test harness: `build_render_scene()`'s motion pass-through is compile-checked only
 
 **Denoising and reconstruction**
-- [ ] **Real-time denoiser** as a first-class component: SVGF / A-SVGF-style temporal + spatial
-      filtering per signal (diffuse, specular, shadows, AO separately), history rejection on
-      disocclusion and lighting change. Our own implementation in campello_gpu compute, portable
-      to every backend; optionally NVIDIA NRD where available
+- [x] **Real-time denoiser** (Metal) — `RealtimeDenoiser`: SVGF (albedo demodulation, temporal
+      accumulation along the G-buffer's motion with depth / normal disocclusion rejection,
+      luminance moments, a spatial variance estimate for short histories, 5 edge-aware a-trous
+      passes, the first feeding the history). In the test: 8.6x less error after 16 frames, 2.5x
+      at a hard shadow edge, 4.6x with a moving camera
+  - [ ] Per signal (diffuse, specular, shadows, AO filtered separately, specular with
+        roughness-aware reprojection); A-SVGF temporal gradients (history rejection on lighting
+        change, not only disocclusion); bilinear / bicubic history reprojection
+  - [ ] Vulkan / DirectX / WebGPU shaders (render passes: no compute texture binding needed);
+        orthographic projections (linear depth assumes perspective); GPU timing in a stats()
+  - [ ] Optionally NVIDIA NRD where available
 - [ ] **Upscaling** — temporal upscaling behind one interface: MetalFX (Apple), FSR (all GPUs),
       DLSS / XeSS where available; a built-in TAA-upscale fallback. Ray tracing at a lower
       internal resolution depends on it

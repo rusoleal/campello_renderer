@@ -4,6 +4,7 @@
 #include <campello_renderer/procedural_texture_baker.hpp>
 #include <campello_renderer/culling.hpp>
 #include <campello_renderer/path_tracer.hpp>
+#include <campello_renderer/realtime_denoiser.hpp>
 #include <gltf/gltf.hpp>
 #include <algorithm>
 #include <future>
@@ -3767,6 +3768,192 @@ TEST_F(OffscreenRenderTest, TemporalAntiAliasingSmoothsEdgesWithoutGhosting) {
     EXPECT_GT(at(moved, 58, 35), 200) << "the moving object stays solid";
     renderer->setTemporalAntiAliasing(false);
     draw.material->doubleSided = false;
+}
+
+// Real-time denoiser (RealtimeDenoiser): a G-buffer scene (a red plate in
+// front of a green ground) lit on the CPU from its normals and albedo, the
+// clean image; the noisy input is it times 2u (u uniform: mean preserving,
+// as noisy as about one sample per pixel), new noise every frame. The
+// denoised image is much closer to the clean one than the input, from the
+// first frame (spatial filtering) and more so as frames accumulate; the
+// plate's edge and a hard shadow edge in the illumination don't blur; a
+// moving camera keeps it close; the background passes through.
+TEST_F(OffscreenRenderTest, RealtimeDenoiserCleansNoisyFrames) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer on this backend";
+    RealtimeDenoiser denoiser(device);
+    if (!denoiser.supported()) GTEST_SKIP() << "No real-time denoiser on this backend";
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.3, 0.6, 0.3, 1], "metallicFactor": 0, "roughnessFactor": 1}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.2, 0.2, 1], "metallicFactor": 0, "roughnessFactor": 1}}]})",
+                                    kNoOpLoader);
+    ASSERT_NE(materials, nullptr);
+    GpuMaterial* green = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    GpuMaterial* red = renderer->uploadMaterial((*materials->materials)[1], *materials);
+    const auto mesh = [&](std::vector<float> positions) {
+        std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+        auto m = std::make_unique<GpuMesh>();
+        m->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        m->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        m->indexCount = 6;
+        m->indexFormat = GPU::IndexFormat::uint32;
+        m->vertexCount = 4;
+        m->layout = &VertexLayout::positionOnly();
+        m->setBoundsFromPositions(positions.data(), 4);
+        return m;
+    };
+    auto ground = mesh({-3, 0, -3, -3, 0, 3, 3, 0, 3, 3, 0, -3});
+    auto plate = mesh({-0.6f, 0.2f, 0.5f, 0.6f, 0.2f, 0.5f, 0.6f, 1.0f, 0.5f, -0.6f, 1.0f, 0.5f});
+    green->doubleSided = red->doubleSided = true;
+    RenderScene scene;
+    const auto camera = [&](double x) {
+        scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(x, 1.5, 3.0), VM::Vector3<double>(x, 0.4, 0.0),
+                                                        VM::Vector3<double>(0.0, 1.0, 0.0));
+        scene.camera.projection = VM::Matrix4<double>::perspective(50.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+        scene.camera.position = VM::Vector3<double>(x, 1.5, 3.0);
+    };
+    camera(0.0);
+    for (auto [m, material] : {std::pair{ground.get(), green}, std::pair{plate.get(), red}}) {
+        DrawCall draw;
+        draw.mesh = m;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+
+    const auto halfToFloat = [](uint16_t h) {
+        const uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+        float v = exponent == 0 ? std::ldexp(float(mantissa), -24)
+                                : exponent == 31 ? INFINITY : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+        return sign ? -v : v;
+    };
+    const auto floatToHalf = [](float f) {
+        uint32_t x;
+        std::memcpy(&x, &f, 4);
+        const uint32_t sign = (x >> 16) & 0x8000;
+        int exponent = int((x >> 23) & 0xff) - 127 + 15;
+        uint32_t mantissa = (x >> 13) & 0x3ff;
+        if (exponent <= 0) return uint16_t(sign);
+        if (exponent >= 31) return uint16_t(sign | 0x7c00);
+        return uint16_t(sign | (uint32_t(exponent) << 10) | mantissa);
+    };
+    constexpr size_t kPixels = size_t(64) * 64;
+    const auto readHalf4 = [&](const std::shared_ptr<GPU::Texture>& texture) {
+        device->waitForIdle();
+        std::vector<uint16_t> raw(kPixels * 4);
+        EXPECT_TRUE(texture->download(0, 0, raw.data(), raw.size() * 2));
+        std::vector<float> out(raw.size());
+        for (size_t i = 0; i < raw.size(); ++i) out[i] = halfToFloat(raw[i]);
+        return out;
+    };
+    auto noisyTexture = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba16float, 64, 64, 1, 1, 1,
+                                              (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
+                                                                  uint32_t(GPU::TextureUsage::copyDst)));
+    ASSERT_NE(noisyTexture, nullptr);
+    uint32_t rng = 12345u;
+    const auto uniform = [&] {
+        rng = rng * 1664525u + 1013904223u;
+        return float(rng >> 8) / 16777216.0f;
+    };
+    // One frame: the G-buffer, the clean image from it, the noisy input, denoised.
+    std::vector<float> clean(kPixels * 3), noisy(kPixels * 3), denoised(kPixels * 3);
+    std::vector<bool> surface(kPixels);
+    const auto frame = [&] {
+        renderer->renderGBuffer(scene);
+        const auto& g = renderer->gBuffer();
+        const auto normals = readHalf4(g.normalRoughness);
+        std::vector<uint8_t> albedo(kPixels * 4);
+        device->waitForIdle();
+        EXPECT_TRUE(g.albedoMetallic->download(0, 0, albedo.data(), albedo.size()));
+        const double light[3] = {0.3 / 1.0954, 0.9 / 1.0954, 0.3 / 1.0954};
+        std::vector<uint16_t> upload(kPixels * 4);
+        for (size_t i = 0; i < kPixels; ++i) {
+            const double nl = normals[i * 4] * light[0] + normals[i * 4 + 1] * light[1] + normals[i * 4 + 2] * light[2];
+            surface[i] = normals[i * 4] != 0.0f || normals[i * 4 + 1] != 0.0f || normals[i * 4 + 2] != 0.0f;
+            const float noise = 2.0f * uniform();
+            // A hard shadow edge in the illumination (not the albedo): left of
+            // the image centre at 30%. Detail a denoiser must keep.
+            const double shadow = (i % 64) < 32 ? 0.3 : 1.0;
+            for (int c = 0; c < 3; ++c) {
+                clean[i * 3 + c] =
+                    surface[i] ? float(albedo[i * 4 + c] / 255.0 * (0.3 + 0.7 * std::max(nl, 0.0)) * shadow) : 0.2f;
+                noisy[i * 3 + c] = clean[i * 3 + c] * (surface[i] ? noise : 1.0f);
+                upload[i * 4 + c] = floatToHalf(noisy[i * 3 + c]);
+            }
+            upload[i * 4 + 3] = floatToHalf(1.0f);
+        }
+        EXPECT_TRUE(noisyTexture->upload(0, upload.size() * 2, upload.data()));
+        EXPECT_TRUE(denoiser.denoise(noisyTexture, g, scene.camera.projection));
+        const auto out = readHalf4(denoiser.output());
+        for (size_t i = 0; i < kPixels; ++i) {
+            for (int c = 0; c < 3; ++c) denoised[i * 3 + c] = out[i * 4 + c];
+        }
+    };
+    // RMS error against the clean image over the surfaces (or a subset).
+    const auto error = [&](const std::vector<float>& image, const std::function<bool(size_t)>& include) {
+        double sum = 0.0;
+        size_t n = 0;
+        for (size_t i = 0; i < kPixels; ++i) {
+            if (!surface[i] || !include(i)) continue;
+            for (int c = 0; c < 3; ++c) sum += double(image[i * 3 + c] - clean[i * 3 + c]) * (image[i * 3 + c] - clean[i * 3 + c]);
+            n += 3;
+        }
+        return n ? std::sqrt(sum / double(n)) : 0.0;
+    };
+    const auto all = [](size_t) { return true; };
+
+    frame();
+    const double firstNoisy = error(noisy, all), firstDenoised = error(denoised, all);
+    for (int i = 0; i < 15; ++i) frame();
+    const double laterNoisy = error(noisy, all), laterDenoised = error(denoised, all);
+    // The plate's edges: surface pixels with a neighbour of the other material.
+    std::vector<uint8_t> albedoNow(kPixels * 4);
+    device->waitForIdle();
+    ASSERT_TRUE(renderer->gBuffer().albedoMetallic->download(0, 0, albedoNow.data(), albedoNow.size()));
+    const auto edge = [&](size_t i) {
+        const int x = int(i % 64), y = int(i / 64);
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int qx = std::clamp(x + dx, 0, 63), qy = std::clamp(y + dy, 0, 63);
+                if (std::abs(int(albedoNow[(size_t(qy) * 64 + qx) * 4]) - int(albedoNow[i * 4])) > 60) return true;
+            }
+        }
+        return false;
+    };
+    const double edgeNoisy = error(noisy, edge), edgeDenoised = error(denoised, edge);
+    const auto shadowEdge = [](size_t i) { return std::abs(int(i % 64) - 32) <= 2; };
+    const double shadowNoisy = error(noisy, shadowEdge), shadowDenoised = error(denoised, shadowEdge);
+    bool background = true;
+    for (size_t i = 0; i < kPixels; ++i) {
+        if (!surface[i] && std::abs(denoised[i * 3] - noisy[i * 3]) > 1e-3f) background = false;
+    }
+    // A moving camera (0.02 per frame).
+    for (int i = 1; i <= 10; ++i) {
+        scene.camera.view = VM::Matrix4<double>::identity();
+        camera(0.02 * i);
+        frame();
+    }
+    const double movingNoisy = error(noisy, all), movingDenoised = error(denoised, all);
+    std::printf("[RealtimeDenoiser] RMS error noisy -> denoised: first frame %.4f -> %.4f, 16 frames %.4f -> %.4f, "
+                "plate edges %.4f -> %.4f, shadow edge %.4f -> %.4f, moving camera %.4f -> %.4f\n",
+                firstNoisy, firstDenoised, laterNoisy, laterDenoised, edgeNoisy, edgeDenoised, shadowNoisy, shadowDenoised,
+                movingNoisy, movingDenoised);
+    EXPECT_LT(firstDenoised, firstNoisy * 0.5) << "spatial filtering alone";
+    EXPECT_LT(laterDenoised, laterNoisy * 0.2) << "with the history";
+    EXPECT_LT(laterDenoised, firstDenoised) << "accumulation helps";
+    EXPECT_LT(edgeDenoised, edgeNoisy * 0.5) << "edges don't bleed";
+    EXPECT_LT(shadowDenoised, shadowNoisy * 0.5) << "a hard shadow edge in the illumination stays sharp";
+    EXPECT_LT(movingDenoised, movingNoisy * 0.35) << "a moving camera";
+    EXPECT_TRUE(background) << "the background passes through";
+    green->doubleSided = red->doubleSided = false;
 }
 
 // Path tracing (PathTracer): a plate floating over a lit ground plane, the
