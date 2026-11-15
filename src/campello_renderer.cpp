@@ -4584,6 +4584,57 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         pipelineFxaa = device->createRenderPipeline(fxaaDesc);
     }
 
+    // --- TAA resolve pipeline (Metal): current (0), history (1), motion
+    //     (2), sampler (3), uniforms (4); the output and the next history. ---
+    {
+        if (!taaBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor tgl{};
+            for (uint32_t binding = 0; binding < 3; ++binding) {
+                GPU::EntryObject t{};
+                t.binding = binding;
+                t.visibility = GPU::ShaderStage::fragment;
+                t.type = GPU::EntryObjectType::texture;
+                t.data.texture.multisampled = false;
+                t.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+                t.data.texture.viewDimension = GPU::TextureType::tt2d;
+                tgl.entries.push_back(t);
+            }
+            GPU::EntryObject sampler{};
+            sampler.binding = 3;
+            sampler.visibility = GPU::ShaderStage::fragment;
+            sampler.type = GPU::EntryObjectType::sampler;
+            sampler.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            tgl.entries.push_back(sampler);
+            GPU::EntryObject buffer{};
+            buffer.binding = 4;
+            buffer.visibility = GPU::ShaderStage::fragment;
+            buffer.type = GPU::EntryObjectType::buffer;
+            buffer.data.buffer.hasDinamicOffaset = false;
+            buffer.data.buffer.minBindingSize = 16;
+            buffer.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+            tgl.entries.push_back(buffer);
+            taaBindGroupLayout = device->createBindGroupLayout(tgl);
+        }
+        GPU::RenderPipelineDescriptor taaDesc{};
+        taaDesc.vertex.module = shaderModule;
+        taaDesc.vertex.entryPoint = "fxaaVertex";
+        taaDesc.topology = GPU::PrimitiveTopology::triangleList;
+        taaDesc.cullMode = GPU::CullMode::none;
+        taaDesc.frontFace = GPU::FrontFace::ccw;
+        GPU::FragmentDescriptor taaFrag{};
+        taaFrag.module = shaderModule;
+        taaFrag.entryPoint = "taaFragment";
+        for (int k = 0; k < 2; ++k) {
+            GPU::ColorState target{};
+            target.format = colorFormat;
+            target.writeMask = GPU::ColorWrite::all;
+            taaFrag.targets.push_back(target);
+        }
+        taaDesc.fragment = taaFrag;
+        pipelineTaa = device->createRenderPipeline(taaDesc);
+        taaHistoryValid = false;
+    }
+
     // --- Downsample pipeline (Metal) ---
     {
         if (!downsampleBindGroupLayout) {
@@ -8574,7 +8625,7 @@ int Renderer::getProceduralBakeSize() const {
 void Renderer::ensureSceneColorTexture() {
     namespace GPU = systems::leal::campello_gpu;
     using TU = GPU::TextureUsage;
-    bool needsTexture = (fxaaEnabled || ssaaScale > 1.0f)
+    bool needsTexture = (fxaaEnabled || ssaaScale > 1.0f || taaEnabled)
                         && cachedColorFormat != GPU::PixelFormat::invalid
                         && renderWidth > 0 && renderHeight > 0;
     if (!needsTexture) return;
@@ -9689,6 +9740,33 @@ void Renderer::render(const RenderScene& scene,
     if (!colorView) return;
     if (!meshRecipe.ready) return;
 
+    // TAA (setTemporalAntiAliasing()): this frame's jitter, and the G-buffer
+    // pass first for its motion (drawn with the same jitter, its motion
+    // unjittered). A program pass (the G-buffer's own) is never a TAA frame.
+    const bool taaFrameActive = !activeProgramPass && taaEnabled && pipelineTaa && taaBindGroupLayout && supportsGBuffer() &&
+                                ssaaScale <= 1.0f && renderWidth > 0 && renderHeight > 0;
+    struct JitterScope {
+        bool& active;
+        ~JitterScope() { active = false; }
+    } jitterScope{taaJitterActive};
+    if (taaFrameActive) {
+        // Halton(2, 3), 8 positions: sub-pixel offsets in -0.5 .. 0.5.
+        const auto halton = [](uint32_t index, uint32_t base) {
+            double f = 1.0, r = 0.0;
+            for (; index > 0; index /= base) {
+                f /= base;
+                r += f * double(index % base);
+            }
+            return r;
+        };
+        const uint32_t n = taaFrame % 8u + 1u;
+        taaJitter[0] = (halton(n, 2) - 0.5) * 2.0 / double(renderWidth);
+        taaJitter[1] = (halton(n, 3) - 0.5) * 2.0 / double(renderHeight);
+        taaJitterActive = true;
+        renderGBuffer(scene);
+        taaJitterActive = true;  // (still this frame's)
+    }
+
     // Frame-in-flight synchronization.
     auto &frame = frameResources[currentFrameIndex];
     // See the equivalent guard in renderToTarget() for why frame.fence must
@@ -9720,6 +9798,14 @@ void Renderer::render(const RenderScene& scene,
     // Camera matrices from scene.
     M4 view = scene.camera.view;
     M4 proj = scene.camera.projection;
+    const M4 unjitteredViewProj = proj * view;
+    if (taaJitterActive) {
+        // The jitter as a clip-space translation (x + j * w).
+        M4 jitter = M4::identity();
+        jitter.data[3] = taaJitter[0];
+        jitter.data[7] = taaJitter[1];
+        proj = jitter * proj;
+    }
     vpMatrix = proj * view;
 
     // Upload camera position buffer.
@@ -9891,10 +9977,14 @@ void Renderer::render(const RenderScene& scene,
                 // Where the draw was: the previous camera (this one on the
                 // first frame) and its previous transform (this one if unset).
                 const auto& previousModel = draw.previousWorldTransform ? *draw.previousWorldTransform : draw.worldTransform;
-                const auto previousMvp = (gbufferHistoryValid ? gbufferPreviousViewProj : vpMatrix) * previousModel;
+                const auto previousMvp = (gbufferHistoryValid ? gbufferPreviousViewProj : unjitteredViewProj) * previousModel;
                 float previous[32] = {0};
                 for (int row = 0; row < 4; ++row) {
                     for (int col = 0; col < 4; ++col) previous[col * 4 + row] = (float)previousMvp.data[row * 4 + col];
+                }
+                if (taaJitterActive) {  // removed from the motion (gbufferVertex)
+                    previous[16] = (float)taaJitter[0];
+                    previous[17] = (float)taaJitter[1];
                 }
                 previousBuffer->upload(txOffset, 128, previous);
             }
@@ -10104,8 +10194,10 @@ void Renderer::render(const RenderScene& scene,
 
     // A program pass (renderProgramPass()) draws straight into its target.
     bool useSsaa = !activeProgramPass && ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout && sceneColorView[currentFrameIndex];
-    bool useFxaa = !activeProgramPass && fxaaEnabled && !useSsaa && pipelineFxaa && fxaaBindGroupLayout && sceneColorView[currentFrameIndex];
-    bool useIntermediate = useSsaa || useFxaa;
+    const bool useTaa = taaFrameActive && !useSsaa && sceneColorView[currentFrameIndex] && sceneColorTexture[currentFrameIndex] &&
+                        gbufferTargets.motion;
+    bool useFxaa = !activeProgramPass && fxaaEnabled && !useSsaa && !useTaa && pipelineFxaa && fxaaBindGroupLayout && sceneColorView[currentFrameIndex];
+    bool useIntermediate = useSsaa || useFxaa || useTaa;
 
     // Update per-frame bind group (lights + camera + placeholder texture).
 #if CAMPELLO_RENDERER_VK_BINDINGS
@@ -10639,6 +10731,62 @@ void Renderer::render(const RenderScene& scene,
             fxaaRpe->draw(3);
             fxaaRpe->end();
         }
+    }
+
+    // ------------------------------------------------------------------
+    // TAA resolve (when enabled): the frame and the reprojected history into
+    // colorView and the next history.
+    // ------------------------------------------------------------------
+    if (useTaa) {
+        const uint32_t w = renderWidth, h = renderHeight;
+        if (!taaHistory[0] || taaHistory[0]->getWidth() != w || taaHistory[0]->getHeight() != h) {
+            for (size_t k = 0; k < 2; ++k) {
+                taaHistory[k] = device->createTexture(GPU::TextureType::tt2d, cachedColorFormat, w, h, 1, 1, 1,
+                                                      (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                                                          uint32_t(GPU::TextureUsage::textureBinding)));
+                taaHistoryView[k] = taaHistory[k] ? taaHistory[k]->createView(cachedColorFormat, 1, GPU::Aspect::all, 0, 0,
+                                                                              GPU::TextureType::tt2d)
+                                                  : nullptr;
+            }
+            taaHistoryValid = false;
+        }
+        auto& uniforms = taaUniformBuffer[currentFrameIndex % taaUniformBuffer.size()];
+        if (!uniforms) uniforms = device->createBuffer(16, GPU::BufferUsage::uniform);
+        const uint32_t read = taaHistoryIndex, write = 1u - taaHistoryIndex;
+        if (uniforms && taaHistoryView[0] && taaHistoryView[1]) {
+            const float data[4] = {1.0f / float(w), 1.0f / float(h), taaBlend, taaHistoryValid ? 1.0f : 0.0f};
+            uniforms->upload(0, sizeof(data), const_cast<float*>(data));
+            GPU::BindGroupDescriptor tDesc{};
+            tDesc.layout = taaBindGroupLayout;
+            tDesc.entries = {{0, sceneColorTexture[currentFrameIndex]},
+                             {1, taaHistory[read]},
+                             {2, gbufferTargets.motion},
+                             {3, fxaaSampler},
+                             {4, GPU::BufferBinding{uniforms, 0, 16}}};
+            auto group = device->createBindGroup(tDesc);
+            GPU::BeginRenderPassDescriptor tRpDesc{};
+            for (const auto& view : {colorView, taaHistoryView[write]}) {
+                GPU::ColorAttachment ca{};
+                ca.view = view;
+                ca.loadOp = GPU::LoadOp::clear;
+                ca.storeOp = GPU::StoreOp::store;
+                ca.depthSlice = 0;
+                tRpDesc.colorAttachments.push_back(ca);
+            }
+            if (group) {
+                if (auto tRpe = encoder->beginRenderPass(tRpDesc)) {
+                    tRpe->setViewport(0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f);
+                    tRpe->setScissorRect(0.0f, 0.0f, (float)w, (float)h);
+                    tRpe->setPipeline(pipelineTaa);
+                    tRpe->setBindGroup(0, group);
+                    tRpe->draw(3);
+                    tRpe->end();
+                    taaHistoryIndex = write;
+                    taaHistoryValid = true;
+                }
+            }
+        }
+        ++taaFrame;
     }
 
     encodeAmbientOcclusion(encoder, colorView, scene.camera.projection);

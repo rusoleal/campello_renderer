@@ -4,6 +4,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <algorithm>
 #include <optional>
 #include <array>
 #include <string>
@@ -597,6 +598,20 @@ namespace systems::leal::campello_renderer {
         // FXAA post-process pipeline — fullscreen triangle that samples scene color texture.
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineFxaa;
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> fxaaBindGroupLayout;
+        // TAA (setTemporalAntiAliasing()): the resolve pipeline, the two
+        // history textures it alternates, this frame's jitter.
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineTaa;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> taaBindGroupLayout;
+        std::array<std::shared_ptr<systems::leal::campello_gpu::Texture>, 2> taaHistory;
+        std::array<std::shared_ptr<systems::leal::campello_gpu::TextureView>, 2> taaHistoryView;
+        std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, 3> taaUniformBuffer;
+        uint32_t taaHistoryIndex = 0;
+        bool taaHistoryValid = false;
+        bool taaEnabled = false;
+        float taaBlend = 0.1f;
+        bool taaJitterActive = false;  // this frame's draws (main and G-buffer pass) are jittered
+        double taaJitter[2] = {0.0, 0.0};  // clip x / w, clip y / w
+        uint32_t taaFrame = 0;
 
         // SSAA downsample pipeline — bilinear downsample from scaled scene texture.
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineDownsample;
@@ -1339,7 +1354,10 @@ namespace systems::leal::campello_renderer {
         const GBufferTargets& gBuffer() const { return gbufferTargets; }
         /// Forgets the previous camera (a camera cut): the next
         /// renderGBuffer() reports object motion only.
-        void resetMotionHistory() { gbufferHistoryValid = false; }
+        void resetMotionHistory() {
+            gbufferHistoryValid = false;
+            taaHistoryValid = false;
+        }
         /// The layout of meshes with GpuMesh::layout == nullptr (glTF/PBR;
         /// joint and weight formats follow the loaded asset).
         const VertexLayout& standardVertexLayout() const { return standardLayout; }
@@ -1360,6 +1378,22 @@ namespace systems::leal::campello_renderer {
         size_t meshPipelineCount() const { return meshPipelineCache.size(); }
 
         void setFxaaEnabled(bool enabled);
+        /// Temporal anti-aliasing (render(RenderScene, view), where
+        /// supportsGBuffer()): each frame's projection is jittered by a
+        /// sub-pixel Halton(2, 3) offset, the G-buffer pass (renderGBuffer())
+        /// runs first for motion, and a resolve pass blends the frame into a
+        /// history reprojected along the motion, clamped to the frame's
+        /// neighbourhood against ghosting. Replaces FXAA while on; off with
+        /// SSAA (setSsaaScale() > 1). The history restarts on resize, when
+        /// toggled and with resetMotionHistory(). Default off.
+        void setTemporalAntiAliasing(bool enabled) {
+            if (enabled != taaEnabled) taaHistoryValid = false;
+            taaEnabled = enabled;
+        }
+        bool getTemporalAntiAliasing() const { return taaEnabled; }
+        /// The current frame's weight in the TAA history (0..1, default 0.1):
+        /// lower is smoother and slower to follow change.
+        void setTemporalAntiAliasingBlend(float blend) { taaBlend = std::clamp(blend, 0.01f, 1.0f); }
         bool isFxaaEnabled() const;
 
         void setSsaaScale(float scale);

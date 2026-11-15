@@ -1562,7 +1562,8 @@ struct SkyboxOut {
 // offset (same 128-byte stride as NodeTransforms).
 struct GBufferTransforms {
     float4x4 previousMvp;
-    float4x4 pad;
+    float4   jitter;  // xy: this frame's projection jitter (clip x / w), removed from the motion (TAA)
+    float4   pad[3];
 };
 
 struct GBufferVertexOut {
@@ -1579,7 +1580,7 @@ struct GBufferVertexOut {
     float4 previousClip;
 };
 
-inline GBufferVertexOut gbufferOut(VertexOut v, float4 previousClip) {
+inline GBufferVertexOut gbufferOut(VertexOut v, float4 previousClip, float2 jitter) {
     GBufferVertexOut out;
     out.clipPosition   = v.clipPosition;
     out.worldPos       = v.worldPos;
@@ -1590,7 +1591,8 @@ inline GBufferVertexOut gbufferOut(VertexOut v, float4 previousClip) {
     out.normalUV       = v.normalUV;
     out.texcoord1      = v.texcoord1;
     out.color0         = v.color0;
-    out.currentClip    = v.clipPosition;
+    // Unjittered: motion is the surface's, not the jitter's.
+    out.currentClip    = v.clipPosition - float4(jitter * v.clipPosition.w, 0.0, 0.0);
     out.previousClip   = previousClip;
     return out;
 }
@@ -1620,7 +1622,7 @@ vertex GBufferVertexOut gbufferVertex(
             if (in.weights[i] > 0.0) skinned += in.weights[i] * (previousJoints[in.joints[i]] * float4(morphed, 1.0));
         }
     }
-    return gbufferOut(v, previous[0].previousMvp * (instanceMatrices[0] * skinned));
+    return gbufferOut(v, previous[0].previousMvp * (instanceMatrices[0] * skinned), previous[0].jitter.xy);
 }
 
 vertex GBufferVertexOut gbufferVertexLean(
@@ -1639,7 +1641,7 @@ vertex GBufferVertexOut gbufferVertexLean(
     v.normalUV       = float2(0.0);
     v.texcoord1      = float2(0.0);
     v.color0         = float4(1.0);
-    return gbufferOut(v, previous[0].previousMvp * localPos);
+    return gbufferOut(v, previous[0].previousMvp * localPos, previous[0].jitter.xy);
 }
 
 struct GBufferFragmentOut {
@@ -1986,6 +1988,58 @@ struct FxaaUniforms {
     float2 rcpFrame;
     float2 _pad;
 };
+
+// ---------------------------------------------------------------------------
+// TAA resolve (Renderer::setTemporalAntiAliasing()): the history reprojected
+// by the G-buffer's motion, clamped to the current 3x3 neighbourhood's
+// spread in YCoCg (variance clipping, against ghosting), blended with the
+// current jittered frame. Writes the output and the next history.
+// ---------------------------------------------------------------------------
+struct TaaUniforms {
+    float2 rcpFrame;
+    float  blend;         // the current frame's weight (e.g. 0.1)
+    float  historyValid;  // 0: no history (first frame, cut, resize)
+};
+
+struct TaaOut {
+    float4 color   [[color(0)]];
+    float4 history [[color(1)]];
+};
+
+inline float3 rgbToYCoCg(float3 c) {
+    return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0.0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25)));
+}
+inline float3 yCoCgToRgb(float3 c) {
+    return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+fragment TaaOut taaFragment(FxaaOut in [[stage_in]],
+                            texture2d<float> current [[texture(0)]],
+                            texture2d<float> history [[texture(1)]],
+                            texture2d<float> motion  [[texture(2)]],
+                            sampler linearSampler    [[sampler(3)]],
+                            constant TaaUniforms &u  [[buffer(4)]])
+{
+    const float3 c = current.sample(linearSampler, in.uv).rgb;
+    float3 m1 = float3(0.0), m2 = float3(0.0);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const float3 t = rgbToYCoCg(current.sample(linearSampler, in.uv + float2(dx, dy) * u.rcpFrame).rgb);
+            m1 += t;
+            m2 += t * t;
+        }
+    }
+    const float3 mean = m1 / 9.0;
+    const float3 sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
+    const uint2 pixel = min(uint2(in.position.xy), uint2(motion.get_width() - 1, motion.get_height() - 1));
+    const float2 previousUV = in.uv + motion.read(pixel).xy;
+    float3 result = c;
+    if (u.historyValid > 0.5 && all(previousUV >= 0.0) && all(previousUV <= 1.0)) {
+        const float3 h = clamp(rgbToYCoCg(history.sample(linearSampler, previousUV).rgb), mean - sigma, mean + sigma);
+        result = mix(yCoCgToRgb(h), c, u.blend);
+    }
+    return TaaOut{float4(result, 1.0), float4(result, 1.0)};
+}
 
 static float fxaaLuma(float3 rgb) {
     return dot(rgb, float3(0.299, 0.587, 0.114));
