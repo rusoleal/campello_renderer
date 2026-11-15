@@ -329,18 +329,21 @@ struct MorphInfo {
     float weights[8];
 };
 
-vertex VertexOut vertexMain(
-    VertexIn                  in   [[stage_in]],
-    device const NodeTransforms *nodeTransforms  [[buffer(16)]],
-    constant MaterialUniforms &mat [[buffer(17)]],
-    device const float4x4    *instanceMatrices   [[buffer(19)]],
-    device const float4x4    *jointMatrices      [[buffer(20)]],
-    constant MorphInfo       &morph              [[buffer(21)]],
-    // Deltas are uploaded tightly packed (3 floats per vertex): packed_float3,
-    // not float3 (16-byte stride in device memory).
-    device const packed_float3 *morphPositions   [[buffer(22)]],
-    device const packed_float3 *morphNormals     [[buffer(23)]],
-    uint                       vertexID          [[vertex_id]])
+// The PBR vertex stage (vertexMain, gbufferVertex): morphing, skinning,
+// instancing, the tangent frame. morphedPosition: the position after
+// morphing, before skinning (the G-buffer skins it again with the previous
+// frame's joints, for motion vectors).
+inline VertexOut pbrVertex(
+    VertexIn in,
+    device const NodeTransforms *nodeTransforms,
+    constant MaterialUniforms &mat,
+    device const float4x4 *instanceMatrices,
+    device const float4x4 *jointMatrices,
+    constant MorphInfo &morph,
+    device const packed_float3 *morphPositions,
+    device const packed_float3 *morphNormals,
+    uint vertexID,
+    thread float3 &morphedPositionOut)
 {
     // Apply KHR_texture_transform when hasUVTransform flag (row0.w) is set.
     // NOTE: transformedUV becomes VertexOut.texcoord0, the shared fallback UV
@@ -450,8 +453,27 @@ vertex VertexOut vertexMain(
     out.normalUV       = normalUV;
     out.texcoord1      = in.texcoord1;
     out.color0         = in.color0;
+    morphedPositionOut = morphedPosition;
 
     return out;
+}
+
+vertex VertexOut vertexMain(
+    VertexIn                  in   [[stage_in]],
+    device const NodeTransforms *nodeTransforms  [[buffer(16)]],
+    constant MaterialUniforms &mat [[buffer(17)]],
+    device const float4x4    *instanceMatrices   [[buffer(19)]],
+    device const float4x4    *jointMatrices      [[buffer(20)]],
+    constant MorphInfo       &morph              [[buffer(21)]],
+    // Deltas are uploaded tightly packed (3 floats per vertex): packed_float3,
+    // not float3 (16-byte stride in device memory).
+    device const packed_float3 *morphPositions   [[buffer(22)]],
+    device const packed_float3 *morphNormals     [[buffer(23)]],
+    uint                       vertexID          [[vertex_id]])
+{
+    float3 morphed;
+    return pbrVertex(in, nodeTransforms, mat, instanceMatrices, jointMatrices, morph, morphPositions, morphNormals,
+                     vertexID, morphed);
 }
 
 // ---------------------------------------------------------------------------
@@ -1530,6 +1552,173 @@ fragment float4 fragmentMain_textured(
 struct SkyboxOut {
     float4 position [[position]];
 };
+
+// ---------------------------------------------------------------------------
+// G-buffer (Renderer::renderGBuffer()): the opaque draws' world normal and
+// roughness, base colour and metallic, motion and depth, for screen-space
+// and ray traced effects, temporal reuse, denoising and upscaling.
+// ---------------------------------------------------------------------------
+// The previous frame's clip transform per draw, at the draw's transform
+// offset (same 128-byte stride as NodeTransforms).
+struct GBufferTransforms {
+    float4x4 previousMvp;
+    float4x4 pad;
+};
+
+struct GBufferVertexOut {
+    float4 clipPosition [[position]];
+    float3 worldPos;
+    float3 worldNormal;
+    float3 worldTangent;
+    float3 worldBitangent;
+    float2 texcoord0;
+    float2 normalUV;
+    float2 texcoord1;
+    float4 color0;
+    float4 currentClip;   // unjittered motion: the same projection both frames
+    float4 previousClip;
+};
+
+inline GBufferVertexOut gbufferOut(VertexOut v, float4 previousClip) {
+    GBufferVertexOut out;
+    out.clipPosition   = v.clipPosition;
+    out.worldPos       = v.worldPos;
+    out.worldNormal    = v.worldNormal;
+    out.worldTangent   = v.worldTangent;
+    out.worldBitangent = v.worldBitangent;
+    out.texcoord0      = v.texcoord0;
+    out.normalUV       = v.normalUV;
+    out.texcoord1      = v.texcoord1;
+    out.color0         = v.color0;
+    out.currentClip    = v.clipPosition;
+    out.previousClip   = previousClip;
+    return out;
+}
+
+vertex GBufferVertexOut gbufferVertex(
+    VertexIn                  in   [[stage_in]],
+    device const NodeTransforms *nodeTransforms  [[buffer(16)]],
+    constant MaterialUniforms &mat [[buffer(17)]],
+    device const float4x4    *instanceMatrices   [[buffer(19)]],
+    device const float4x4    *jointMatrices      [[buffer(20)]],
+    constant MorphInfo       &morph              [[buffer(21)]],
+    device const packed_float3 *morphPositions   [[buffer(22)]],
+    device const packed_float3 *morphNormals     [[buffer(23)]],
+    device const GBufferTransforms *previous     [[buffer(27)]],
+    device const float4x4    *previousJoints     [[buffer(28)]],
+    uint                       vertexID          [[vertex_id]])
+{
+    float3 morphed;
+    const VertexOut v = pbrVertex(in, nodeTransforms, mat, instanceMatrices, jointMatrices, morph, morphPositions,
+                                  morphNormals, vertexID, morphed);
+    // Where this vertex was: the previous joints (the current ones when the
+    // draw has none) and the previous transform.
+    float4 skinned = float4(morphed, 1.0);
+    if (in.weights.x + in.weights.y + in.weights.z + in.weights.w > 0.001) {
+        skinned = float4(0.0);
+        for (int i = 0; i < 4; i++) {
+            if (in.weights[i] > 0.0) skinned += in.weights[i] * (previousJoints[in.joints[i]] * float4(morphed, 1.0));
+        }
+    }
+    return gbufferOut(v, previous[0].previousMvp * (instanceMatrices[0] * skinned));
+}
+
+vertex GBufferVertexOut gbufferVertexLean(
+    VertexInLean                 in             [[stage_in]],
+    device const NodeTransforms *nodeTransforms [[buffer(16)]],
+    device const GBufferTransforms *previous    [[buffer(27)]])
+{
+    const float4 localPos = float4(in.position, 1.0);
+    VertexOut v;
+    v.clipPosition   = nodeTransforms[0].mvp * localPos;
+    v.worldPos       = (nodeTransforms[0].model * localPos).xyz;
+    v.worldNormal    = float3(0.0);
+    v.worldTangent   = float3(0.0);
+    v.worldBitangent = float3(0.0);
+    v.texcoord0      = float2(0.0);
+    v.normalUV       = float2(0.0);
+    v.texcoord1      = float2(0.0);
+    v.color0         = float4(1.0);
+    return gbufferOut(v, previous[0].previousMvp * localPos);
+}
+
+struct GBufferFragmentOut {
+    float4 normalRoughness [[color(0)]];  // xyz world normal (unit, towards the viewer), w perceptual roughness
+    float4 albedoMetallic  [[color(1)]];  // rgb base colour (linear), a metallic
+    float2 motion          [[color(2)]];  // where this point was a frame ago, minus where it is: image uv, y down
+};
+
+fragment GBufferFragmentOut gbufferFragment(
+    GBufferVertexOut inRaw                     [[stage_in]],
+    constant MaterialUniforms &mat             [[buffer(17)]],
+    constant CameraUniforms  &camera           [[buffer(18)]],
+    texture2d<float> baseColorTexture          [[texture(0)]],
+    sampler          baseColorSampler          [[sampler(1)]],
+    texture2d<float> metallicRoughnessTexture  [[texture(2)]],
+    sampler          metallicRoughnessSampler  [[sampler(3)]],
+    texture2d<float> normalTexture             [[texture(4)]],
+    sampler          normalSampler             [[sampler(5)]],
+    bool             frontFacing               [[front_facing]])
+{
+    // As fragmentMain_textured: flat normals for position-only meshes, the
+    // world mapping, clip planes, base colour, alpha mask, metallic-
+    // roughness and normal textures.
+    float3 worldNormal = inRaw.worldNormal;
+    float3 worldTangent = inRaw.worldTangent;
+    float3 worldBitangent = inRaw.worldBitangent;
+    float2 texcoord0 = inRaw.texcoord0;
+    float2 normalUV = inRaw.normalUV;
+    const float3 faceNormal = cross(dfdx(inRaw.worldPos), dfdy(inRaw.worldPos));
+    if (dot(worldNormal, worldNormal) < 1e-8) {
+        float3 N = length(faceNormal) > 1e-20 ? normalize(faceNormal) : float3(0.0, 0.0, 1.0);
+        if (dot(N, camera.cameraPos.xyz - inRaw.worldPos) < 0.0) N = -N;
+        const float3 T = abs(N.y) < 0.999 ? normalize(cross(float3(0, 1, 0), N)) : normalize(cross(float3(1, 0, 0), N));
+        worldNormal = N;
+        worldTangent = T;
+        worldBitangent = cross(N, T);
+    }
+    if (mat.worldMapping > 0.0) {
+        float2 wuv;
+        float3 T, B;
+        worldMappingFrame(inRaw.worldPos, normalize(worldNormal), mat.worldMapping, mat.worldMappingUp > 0.5, wuv, T, B);
+        texcoord0 = wuv;
+        normalUV = wuv;
+        worldTangent = T;
+        worldBitangent = B;
+    }
+    for (uint i = 0; i < camera.clipInfo.x; ++i) {
+        if (dot(camera.clipPlanes[i].xyz, inRaw.worldPos) + camera.clipPlanes[i].w < 0.0) discard_fragment();
+    }
+    const float2 baseColorUV = (mat.uvTransformRow0.w > 0.5)
+        ? texcoord0 : selectUV(texcoord0, inRaw.texcoord1, mat.texCoord1Mask, kUV1BaseColor);
+    const float4 baseColor = baseColorTexture.sample(baseColorSampler, baseColorUV) * mat.baseColorFactor * inRaw.color0;
+    if (mat.alphaMode > 0.5 && mat.alphaMode < 1.5 && baseColor.a < mat.alphaCutoff) discard_fragment();
+
+    float metallic = 0.0;
+    float roughness = 1.0;
+    float3 N = normalize(worldNormal);
+    if (mat.unlit < 0.5) {
+        const float2 mrUV = selectUV(texcoord0, inRaw.texcoord1, mat.texCoord1Mask, kUV1MetallicRoughness);
+        const float4 mr = metallicRoughnessTexture.sample(metallicRoughnessSampler, mrUV);
+        metallic = mr.b * mat.metallicFactor;
+        roughness = clamp(mr.g * mat.roughnessFactor, 0.04, 1.0);
+        if (mat.hasNormalTexture > 0.5) {
+            float3 ns = normalTexture.sample(normalSampler, normalUV).rgb * 2.0 - 1.0;
+            ns.xy *= mat.normalScale;
+            N = normalize(float3x3(normalize(worldTangent), normalize(worldBitangent), N) * normalize(ns));
+        }
+    }
+    // Towards the viewer (back faces of two-sided surfaces).
+    if (dot(N, camera.cameraPos.xyz - inRaw.worldPos) < 0.0 && !frontFacing) N = -N;
+
+    GBufferFragmentOut out;
+    out.normalRoughness = float4(N, roughness);
+    out.albedoMetallic = float4(clamp(baseColor.rgb, 0.0, 1.0), metallic);
+    const float2 current = inRaw.currentClip.xy / inRaw.currentClip.w;
+    const float2 previous = inRaw.previousClip.xy / inRaw.previousClip.w;
+    out.motion = (previous - current) * float2(0.5, -0.5);
+    return out;
+}
 
 vertex SkyboxOut skyboxVertex(uint vertexID [[vertex_id]]) {
     float2 pos;

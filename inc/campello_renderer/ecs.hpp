@@ -24,6 +24,11 @@ namespace systems::leal::campello_renderer {
 
 struct Transform {
     systems::leal::vector_math::Matrix4<double> worldMatrix;
+    /// worldMatrix before the last transform_hierarchy_system() run: where
+    /// the entity was a frame ago (motion vectors, Renderer::renderGBuffer()).
+    /// Unset until that system has run twice.
+    std::optional<systems::leal::vector_math::Matrix4<double>> previousWorldMatrix;
+    bool worldMatrixComputed = false;  // transform_hierarchy_system() has set worldMatrix
     systems::leal::vector_math::Vector3<double> translation = {0.0, 0.0, 0.0};
     systems::leal::vector_math::Quaternion<double> rotation = {0.0, 0.0, 0.0, 1.0};
     systems::leal::vector_math::Vector3<double> scale = {1.0, 1.0, 1.0};
@@ -40,6 +45,9 @@ struct MeshRenderer {
     // the renderer will bind it to the joint matrix palette slot.
     std::shared_ptr<systems::leal::campello_gpu::Buffer> jointMatrixBuffer;
     uint32_t jointCount = 0;
+    // The previous frame's joint matrices (skinning_system() alternates two
+    // buffers): skinned motion vectors. Null on the first frame.
+    std::shared_ptr<systems::leal::campello_gpu::Buffer> previousJointMatrixBuffer;
 };
 
 struct Skin {
@@ -291,7 +299,9 @@ inline void transform_hierarchy_system(campello::core::World& world) {
             if (!tx) continue;
 
             VM::Matrix4<double> localMatrix = computeLocalMatrix(*tx);
+            if (tx->worldMatrixComputed) tx->previousWorldMatrix = tx->worldMatrix;
             tx->worldMatrix = parentWorld * localMatrix;
+            tx->worldMatrixComputed = true;
 
             updateChildren(child, tx->worldMatrix);
         }
@@ -301,7 +311,9 @@ inline void transform_hierarchy_system(campello::core::World& world) {
         if (world.has<campello::core::Parent>(entity)) return;
 
         VM::Matrix4<double> localMatrix = computeLocalMatrix(tx);
+        if (tx.worldMatrixComputed) tx.previousWorldMatrix = tx.worldMatrix;
         tx.worldMatrix = localMatrix;
+        tx.worldMatrixComputed = true;
 
         updateChildren(entity, tx.worldMatrix);
     });
@@ -352,6 +364,9 @@ inline void skinning_system(campello::core::World& world, Renderer& renderer) {
             }
 
             uint64_t bufferSize = jointCount * 64;
+            // Last frame's joints become the previous ones; this frame's go
+            // into the other buffer.
+            std::swap(mr.previousJointMatrixBuffer, mr.jointMatrixBuffer);
             if (!mr.jointMatrixBuffer || mr.jointMatrixBuffer->getLength() < bufferSize) {
                 mr.jointMatrixBuffer = device->createBuffer(bufferSize, GPU::BufferUsage::vertex);
             }
@@ -505,9 +520,11 @@ inline RenderScene build_render_scene(
         draw.worldTransform = transform.worldMatrix;
         draw.instanceCount = 1;
 
+        draw.previousWorldTransform = transform.previousWorldMatrix;
         if (meshRenderer.jointMatrixBuffer && meshRenderer.jointCount > 0) {
             draw.jointMatrixBuffer = meshRenderer.jointMatrixBuffer;
             draw.jointCount = meshRenderer.jointCount;
+            draw.previousJointMatrixBuffer = meshRenderer.previousJointMatrixBuffer;
         }
 
         if (draw.material->alphaBlend) {

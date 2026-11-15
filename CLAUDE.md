@@ -92,6 +92,9 @@ Defined in `inc/campello_renderer/campello_renderer.hpp`, implemented in `src/ca
 | 21 | MorphInfo (targetCount, hasNormal, vertexCount, weights[8]) | raw struct |
 | 22 | Morph target POSITION deltas, indexed via `[[vertex_id]]` | float3[] |
 | 23 | Morph target NORMAL deltas, indexed via `[[vertex_id]]` | float3[] |
+| 26 | Wide line segments (`GpuMesh::wideLines`) | raw |
+| 27 | G-buffer: previous frame's MVP per draw (same offset/stride as slot 16) | float4x4 + pad |
+| 28 | G-buffer: previous frame's joint matrix palette | float4x4[] |
 
 Slots 21–23 are raw `device const T*` buffers, not part of the `[[stage_in]]` vertex descriptor (target count varies per primitive) — bound directly in `renderPrimitive()`/`drawDrawCall()`, always with a valid (possibly zero-weight) fallback since `MorphInfo` is a non-pointer `constant` reference in the shader and Metal requires something bound there regardless of use.
 
