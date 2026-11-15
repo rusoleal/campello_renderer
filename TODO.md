@@ -340,9 +340,15 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
 - [ ] **Light lists / light BVH** for many-light sampling (point, spot, area, emissive meshes)
 
 **Global illumination without per-pixel path tracing**
-- [ ] **Probe-based GI (DDGI-style)** — a grid (or cascades) of irradiance probes updated by a
-      small number of rays every frame, with visibility (depth moments) to avoid leaks. Much
-      cheaper than per-pixel GI, stable under motion; the usual GI choice in games
+- [x] **Probe-based GI (DDGI-style)** (Metal) — `DdgiVolume` (`ddgi.hpp`): a probe grid tracing
+      rays with the path tracer (`PathTracer::traceProbeRays()`, rotated spherical Fibonacci),
+      octahedral irradiance / distance atlases with hysteresis, a screen-space resolve with
+      backface and Chebyshev visibility weights (no leaks through walls: tested by disabling the
+      visibility term, which then leaks); `Renderer::setIndirectDiffuse()` replaces the
+      irradiance map (reflections and GI share the scene colour slot, side by side)
+  - [ ] Probe relocation / classification (probes inside geometry), cascades / scrolling volumes
+        for large or open worlds, probe updates spread over frames; infinite bounces from the
+        probes at ray hits (the path tracer's bounces today)
 - [ ] **Screen-space fallbacks** — SSAO / SSR / SSGI where ray tracing is off or too expensive,
       blended with ray-traced results at screen edges
 - [ ] **Software ray tracing for GPUs without RT hardware** — signed distance fields or simplified

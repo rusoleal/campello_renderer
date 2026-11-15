@@ -72,6 +72,10 @@ struct TraceUniforms {
     uint32_t envSampling[4]; // x environment table resolution per face (0: none)
     uint32_t lights[4];      // x emissive triangles sampled as lights
     float camera[4];         // x lens aperture radius, y focus distance, z tone mapping
+    float probeOrigin[4];
+    float probeSpacing[4];
+    uint32_t probeCount[4];  // xyz probes per axis, w rays per probe
+    float probeRotation[16];
 };
 
 struct EmissiveParams {
@@ -883,9 +887,20 @@ bool PathTracer::traceReflections(const RenderScene& scene, const Renderer& rend
     return ok;
 }
 
+bool PathTracer::traceProbeRays(const RenderScene& scene, const Renderer& renderer, const ProbeRays& rays) {
+    const uint32_t probes = rays.count[0] * rays.count[1] * rays.count[2];
+    if (!supported() || probes == 0 || rays.raysPerProbe == 0) return false;
+    probeRequest_ = &rays;
+    const bool ok = render(scene, renderer, rays.raysPerProbe, probes);
+    probeRequest_ = nullptr;
+    return ok;
+}
+
 bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint32_t width, uint32_t height) {
     if (!supported() || width == 0 || height == 0) return false;
-    const bool reflectionPass = reflectionGBuffer_ != nullptr;
+    // Reflections and probe rays (one sample, their own output; the
+    // progressive image's state untouched).
+    const bool reflectionPass = reflectionGBuffer_ != nullptr || probeRequest_ != nullptr;
     // The previous sample (usually done by now, a frame later): its
     // uniforms and buffers are rewritten below.
     waitForSample();
@@ -962,7 +977,9 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
         rebuildMs_ += millisecondsSince(start);
         samples_ = 0;
     }
-    if (width != width_ || height != height_ || !accum_ || !output_) {
+    // (Reflections and probes don't use the image's buffers, only bind
+    // them: no reallocation when their sizes alternate.)
+    if (!accum_ || !output_ || (!reflectionPass && (width != width_ || height != height_))) {
         const auto readable = (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::storage) | uint32_t(GPU::BufferUsage::copyDst) |
                                                  uint32_t(GPU::BufferUsage::copySrc));
         accum_ = device_->createBuffer((uint64_t)width * height * 16, readable);
@@ -1038,12 +1055,26 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
     u.params[1] = renderer.getExposure();
     // Fewer bounces for the first samples (setProgressiveBounces()).
     const uint32_t bounces = samples_ < progressiveSamples_ ? std::min(progressiveBounces_, maxBounces_) : maxBounces_;
-    u.params[2] = static_cast<float>(reflectionPass ? reflectionBounces_ + 1 : bounces);
+    u.params[2] = static_cast<float>(probeRequest_     ? probeBounces_ + 1
+                                     : reflectionPass ? reflectionBounces_ + 1
+                                                      : bounces);
     u.params[3] = static_cast<float>(reflectionPass ? reflectionFrame_++ : samples_);
     u.size[0] = traceWidth_;
     u.size[1] = traceHeight_;
     u.size[2] = renderer.getSkyboxEnabled() ? 1u : 0u;
-    u.size[3] = reflectionPass ? 2u : (projection_ == Projection::panorama ? 1u : 0u);
+    u.size[3] = probeRequest_ ? 3u : reflectionPass ? 2u : (projection_ == Projection::panorama ? 1u : 0u);
+    if (probeRequest_) {
+        const auto& r = *probeRequest_;
+        u.probeOrigin[0] = static_cast<float>(r.origin.x());
+        u.probeOrigin[1] = static_cast<float>(r.origin.y());
+        u.probeOrigin[2] = static_cast<float>(r.origin.z());
+        u.probeSpacing[0] = static_cast<float>(r.spacing.x());
+        u.probeSpacing[1] = static_cast<float>(r.spacing.y());
+        u.probeSpacing[2] = static_cast<float>(r.spacing.z());
+        for (int k = 0; k < 3; ++k) u.probeCount[k] = r.count[k];
+        u.probeCount[3] = r.raysPerProbe;
+        std::copy(std::begin(r.rotation), std::end(r.rotation), u.probeRotation);
+    }
     {
         // The camera's directions from its projection: straight ahead, and
         // towards the image's right and top edges (no handedness assumed).
@@ -1185,7 +1216,18 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
                                                                             uint32_t(GPU::TextureUsage::textureBinding)));
         if (!placeholderDepth_ || !placeholderReflection_) return false;
     }
-    if (reflectionPass) {
+    if (probeRequest_) {
+        if (!probeRayTarget_ || probeRayTarget_->getWidth() != width || probeRayTarget_->getHeight() != height) {
+            probeRayTarget_ = device_->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba16float, width, height, 1, 1, 1,
+                                                     (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::storageBinding) |
+                                                                         uint32_t(GPU::TextureUsage::textureBinding) |
+                                                                         uint32_t(GPU::TextureUsage::copySrc)));
+            if (!probeRayTarget_) return false;
+        }
+        desc.entries.push_back({66, placeholderReflection_});
+        desc.entries.push_back({67, placeholderDepth_});
+        desc.entries.push_back({68, probeRayTarget_});
+    } else if (reflectionPass) {
         if (!reflectionTarget_ || reflectionTarget_->getWidth() != width || reflectionTarget_->getHeight() != height) {
             reflectionTarget_ = device_->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba16float, width, height, 1, 1, 1,
                                                        (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::storageBinding) |

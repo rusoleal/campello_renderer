@@ -47,6 +47,7 @@ add_library(${PROJECT_NAME} SHARED
     src/path_tracer.cpp
     src/realtime_denoiser.cpp
     src/rt_effects.cpp
+    src/ddgi.cpp
     src/animation.cpp
     src/procedural_texture_baker.cpp
 )

@@ -10109,11 +10109,14 @@ void Renderer::render(const RenderScene& scene,
         float nearBlock[20] = {0};    // shadowNearViewProj, shadowNearParams
         bool nearOn = false;
         shadowBlock[20] = exposureEv;
-        if (reflections && !activeProgramPass) {
-            // viewParams yzw: reflections on, their cut-off, their pixels per target pixel.
-            shadowBlock[21] = 1.0f;
+        if ((reflections || indirectDiffuse) && !activeProgramPass) {
+            // viewParams yzw: reflections on, their cut-off, the screen
+            // lighting's pixels per target pixel; shadowParams z: indirect diffuse on.
+            const auto& base = reflections ? reflections : indirectDiffuse;
+            shadowBlock[21] = reflections ? 1.0f : 0.0f;
             shadowBlock[22] = reflectionMaxRoughness;
-            shadowBlock[23] = (float)reflections->getWidth() / (float)std::max(1u, sceneTargetWidth());
+            shadowBlock[23] = (float)base->getWidth() / (float)std::max(1u, sceneTargetWidth());
+            shadowBlock[18] = indirectDiffuse ? 1.0f : 0.0f;
         }
         const LightData* sun = nullptr;
         for (const auto& l : scene.lights) {
@@ -10338,11 +10341,29 @@ void Renderer::render(const RenderScene& scene,
         // Reflections (setReflections()): the same, the radiance in slot 22
         // for the opaque draws (the transparent ones need the scene colour).
         reflectionFrameBindGroup.reset();
-        if (reflections && !activeProgramPass) {
-            for (auto& entry : bgDesc.entries) {
-                if (entry.binding == 22) entry.resource = reflections;
+        if ((reflections || indirectDiffuse) && !activeProgramPass) {
+            // Reflections (left) and indirect diffuse (right) side by side.
+            const auto& base = reflections ? reflections : indirectDiffuse;
+            const uint32_t lw = base->getWidth(), lh = base->getHeight();
+            if (!screenLighting || screenLighting->getWidth() != 2 * lw || screenLighting->getHeight() != lh) {
+                screenLighting = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba16float, 2 * lw, lh, 1, 1, 1,
+                                                       (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::copyDst) |
+                                                                           uint32_t(GPU::TextureUsage::textureBinding)));
             }
-            reflectionFrameBindGroup = device->createBindGroup(bgDesc);
+            if (screenLighting) {
+                if (reflections) {
+                    encoder->copyTextureToTexture(reflections, 0, GPU::Offset3D{0, 0, 0}, screenLighting, 0,
+                                                  GPU::Offset3D{0, 0, 0}, GPU::Extent3D{lw, lh, 1});
+                }
+                if (indirectDiffuse && indirectDiffuse->getWidth() == lw && indirectDiffuse->getHeight() == lh) {
+                    encoder->copyTextureToTexture(indirectDiffuse, 0, GPU::Offset3D{0, 0, 0}, screenLighting, 0,
+                                                  GPU::Offset3D{static_cast<int32_t>(lw), 0, 0}, GPU::Extent3D{lw, lh, 1});
+                }
+                for (auto& entry : bgDesc.entries) {
+                    if (entry.binding == 22) entry.resource = screenLighting;
+                }
+                reflectionFrameBindGroup = device->createBindGroup(bgDesc);
+            }
         }
     }
 #endif

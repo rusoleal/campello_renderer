@@ -171,6 +171,29 @@ public:
     [[nodiscard]] std::shared_ptr<systems::leal::campello_gpu::Texture> reflections() const noexcept {
         return reflectionTarget_;
     }
+    /// Probe rays (DdgiVolume): from each probe of a grid, `raysPerProbe`
+    /// rays along spherical Fibonacci directions turned by `rotation`
+    /// (column-major 4 x 4, its 3 x 3 part), shaded as this tracer shades
+    /// (setProbeBounces() bounces after the first hit). probeRays(): x a
+    /// ray, y a probe (x + nx (y + ny z)); rgb the radiance arriving along
+    /// it, a the first hit's distance (65000: a miss). Use a PathTracer of
+    /// its own (or the reflections' one). Submitted, not waited for.
+    struct ProbeRays {
+        systems::leal::vector_math::Vector3<double> origin;
+        systems::leal::vector_math::Vector3<double> spacing;
+        uint32_t count[3] = {1, 1, 1};
+        uint32_t raysPerProbe = 64;
+        float rotation[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    };
+    bool traceProbeRays(const RenderScene& scene, const Renderer& renderer, const ProbeRays& rays);
+    /// rgba16float, raysPerProbe x probes.
+    [[nodiscard]] std::shared_ptr<systems::leal::campello_gpu::Texture> probeRays() const noexcept {
+        return probeRayTarget_;
+    }
+    void setProbeBounces(uint32_t bounces) noexcept {
+        probeBounces_ = bounces;
+    }
+
     /// Bounces after the reflected surface (default 1: its direct light and one more).
     void setReflectionBounces(uint32_t bounces) noexcept {
         reflectionBounces_ = bounces;
@@ -442,6 +465,10 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::Texture> placeholderReflection_;
     uint32_t reflectionFrame_ = 0;
     uint32_t reflectionBounces_ = 1;
+    // Probe rays (traceProbeRays()): the request in progress, its output.
+    const ProbeRays* probeRequest_ = nullptr;
+    std::shared_ptr<systems::leal::campello_gpu::Texture> probeRayTarget_;
+    uint32_t probeBounces_ = 1;
     std::shared_ptr<void> denoiser_;  // Open Image Denoise device, filter and buffers (path_tracer.cpp)
     DenoiserDevice denoiserDevice_ = DenoiserDevice::automatic;
     DenoiserQuality denoiserQuality_ = DenoiserQuality::high;
