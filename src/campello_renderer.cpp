@@ -3460,13 +3460,14 @@ void Renderer::detectQuantizedLayout() {
 
 const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines,
                                                           bool wide) const {
-    if (program >= programs.size()) return nullptr;
+    const ProgramState* state = programState(program);
+    if (!state) return nullptr;
     // The stage that reads the most attributes among those reading only
     // attributes the layout has (the full shader for glTF meshes, the lean
     // one for position-only meshes). Ties: the first listed.
     const uint32_t has = layout.semanticMask();
     const MeshVertexStage* best = nullptr;
-    for (const auto& stage : programs[program].vertexStages) {
+    for (const auto& stage : state->vertexStages) {
         if (stage.lines != lines || stage.wide != wide) continue;
         if ((stage.readMask & ~has) != 0) continue;
         if (!best || std::popcount(stage.readMask) > std::popcount(best->readMask)) best = &stage;
@@ -3479,8 +3480,10 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     systems::leal::campello_gpu::PixelFormat colorFormat, systems::leal::campello_gpu::PrimitiveTopology topology,
     bool wideLines) {
     namespace GPU = systems::leal::campello_gpu;
-    if (!meshRecipe.ready || !device || programHandle >= programs.size()) return nullptr;
-    const ProgramState& program = programs[programHandle];
+    const ProgramState* programPtr = programState(programHandle);
+    if (!meshRecipe.ready || !device || !programPtr) return nullptr;
+    const ProgramState& program = *programPtr;
+    const bool gbuffer = programHandle == kGBufferProgram;
     // Wide lines: their own vertex and fragment stages, always blended
     // (coverage antialiasing) and double-sided.
     if (wideLines) {
@@ -3579,7 +3582,16 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     GPU::FragmentDescriptor frag{};
     frag.module     = program.fragmentModule;
     frag.entryPoint = wideLines ? program.wideLineFragment : program.fragmentEntries[(size_t)variant];
-    frag.targets.push_back(color);
+    if (gbuffer) {
+        // GBufferTargets: normal + roughness, base colour + metallic, motion.
+        for (GPU::PixelFormat format : {GPU::PixelFormat::rgba16float, GPU::PixelFormat::rgba8unorm, GPU::PixelFormat::rg16float}) {
+            GPU::ColorState target = meshRecipe.colorTarget;
+            target.format = format;
+            frag.targets.push_back(target);
+        }
+    } else {
+        frag.targets.push_back(color);
+    }
     d.fragment = frag;
 
     entry.pipeline = device->createRenderPipeline(d);
@@ -4251,6 +4263,63 @@ void Renderer::renderProgramPass(const RenderScene& scene,
     activeProgramPass = nullptr;
 }
 
+void Renderer::renderGBuffer(const RenderScene& scene) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!supportsGBuffer() || !device) return;
+    const uint32_t w = std::max(1u, renderWidth);
+    const uint32_t h = std::max(1u, renderHeight);
+    if (!gbufferTargets.normalRoughness || gbufferTargets.width != w || gbufferTargets.height != h) {
+        const auto usage = (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                               uint32_t(GPU::TextureUsage::textureBinding) |
+                                               uint32_t(GPU::TextureUsage::copySrc));
+        const auto make = [&](GPU::PixelFormat format) {
+            return device->createTexture(GPU::TextureType::tt2d, format, w, h, 1, 1, 1, usage);
+        };
+        gbufferTargets = {};
+        gbufferTargets.normalRoughness = make(GPU::PixelFormat::rgba16float);
+        gbufferTargets.albedoMetallic = make(GPU::PixelFormat::rgba8unorm);
+        gbufferTargets.motion = make(GPU::PixelFormat::rg16float);
+        gbufferTargets.depth = make(GPU::PixelFormat::depth32float);
+        if (!gbufferTargets.normalRoughness || !gbufferTargets.albedoMetallic || !gbufferTargets.motion ||
+            !gbufferTargets.depth) {
+            gbufferTargets = {};
+            return;
+        }
+        gbufferTargets.width = w;
+        gbufferTargets.height = h;
+        gbufferAlbedoView = gbufferTargets.albedoMetallic->createView(GPU::PixelFormat::rgba8unorm, 1, GPU::Aspect::all, 0, 0,
+                                                                      GPU::TextureType::tt2d);
+        gbufferMotionView = gbufferTargets.motion->createView(GPU::PixelFormat::rg16float, 1, GPU::Aspect::all, 0, 0,
+                                                              GPU::TextureType::tt2d);
+        gbufferDepthView = gbufferTargets.depth->createView(GPU::PixelFormat::depth32float, 1, GPU::Aspect::depthOnly, 0, 0,
+                                                            GPU::TextureType::tt2d);
+    }
+    auto normalView = gbufferTargets.normalRoughness->createView(GPU::PixelFormat::rgba16float, 1, GPU::Aspect::all, 0, 0,
+                                                                 GPU::TextureType::tt2d);
+    if (!normalView || !gbufferAlbedoView || !gbufferMotionView || !gbufferDepthView) return;
+    // The previous transforms, per frame in flight, as large as the transforms.
+    const uint64_t needed = (uint64_t)(scene.opaque.size() + scene.transparent.size() + 1 +
+                                       2 * std::max(scene.opaque.size(), scene.shadowCasters.size())) *
+                            128;
+    auto& previous = gbufferPreviousTransforms[currentFrameIndex % gbufferPreviousTransforms.size()];
+    if (!previous || previous->getLength() < needed) {
+        previous = device->createBuffer(std::max<uint64_t>(needed, 4096 * 128), kTransformBufferUsage);
+    }
+    ProgramPassOptions options;
+    options.program = kGBufferProgram;
+    options.colorFormat = GPU::PixelFormat::rgba16float;
+    options.clearColor = {0.0, 0.0, 0.0, 0.0};
+    options.includeTransparent = false;
+    gbufferPassActive = true;
+    activeProgramPass = &options;
+    render(scene, normalView);
+    activeProgramPass = nullptr;
+    gbufferPassActive = false;
+    // This frame's camera is the next one's previous.
+    gbufferPreviousViewProj = scene.camera.projection * scene.camera.view;
+    gbufferHistoryValid = true;
+}
+
 void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat colorFormat) {
     namespace GPU = systems::leal::campello_gpu;
     cachedColorFormat = colorFormat;
@@ -4264,6 +4333,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     if (programs.empty()) programs.resize(1);
     programs[kPbrProgram] = ProgramState{};
     programs[kPbrProgram].name = "pbr";
+    gbufferProgram = ProgramState{};  // set below where the backend has G-buffer shaders
     currentPipelineVariant = 0;
     currentPipelineObject = nullptr;
     activeMeshSlots = nullptr;
@@ -4331,6 +4401,15 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         programs[kPbrProgram].wideLineFragment = "fragmentWideLine";
         programs[kPbrProgram].fragmentModule = shaderModule;
         programs[kPbrProgram].fragmentEntries = {"fragmentMain_flat", "fragmentMain_textured", "fragmentMain_debug"};
+        // The G-buffer (renderGBuffer()): the PBR vertex stages plus the
+        // previous frame's position, one fragment shader, three targets.
+        gbufferProgram.name = "gbuffer";
+        gbufferProgram.vertexStages = {
+            {allSemantics, shaderModule, "gbufferVertex"},
+            {semanticBit(VertexSemantic::position), shaderModule, "gbufferVertexLean"},
+        };
+        gbufferProgram.fragmentModule = shaderModule;
+        gbufferProgram.fragmentEntries = {"", "gbufferFragment", ""};
         meshRecipe.rawBufferSlots = true;  // [[buffer(15..23)]]: lights, transforms, material, ...
         // Sun shadows: depth only, float3 positions at buffer 0, the model
         // matrix at [[buffer(16)]], the light's view-projection in the camera
@@ -9807,6 +9886,19 @@ void Renderer::render(const RenderScene& scene,
             }
         }
         transformBuffer->upload(txOffset, 128, matrices);
+        if (gbufferPassActive) {
+            if (const auto& previousBuffer = gbufferPreviousTransforms[currentFrameIndex % gbufferPreviousTransforms.size()]) {
+                // Where the draw was: the previous camera (this one on the
+                // first frame) and its previous transform (this one if unset).
+                const auto& previousModel = draw.previousWorldTransform ? *draw.previousWorldTransform : draw.worldTransform;
+                const auto previousMvp = (gbufferHistoryValid ? gbufferPreviousViewProj : vpMatrix) * previousModel;
+                float previous[32] = {0};
+                for (int row = 0; row < 4; ++row) {
+                    for (int col = 0; col < 4; ++col) previous[col * 4 + row] = (float)previousMvp.data[row * 4 + col];
+                }
+                previousBuffer->upload(txOffset, 128, previous);
+            }
+        }
         transformOffsets.push_back(txOffset);
         txOffset += 128;
     };
@@ -10387,8 +10479,17 @@ void Renderer::render(const RenderScene& scene,
         ca.storeOp = GPU::StoreOp::store;
         ca.depthSlice = 0;
         desc.colorAttachments.push_back(ca);
+        if (gbufferPassActive) {
+            // The G-buffer's other targets (colorView is its normal + roughness).
+            for (const auto& view : {gbufferAlbedoView, gbufferMotionView}) {
+                GPU::ColorAttachment extra = ca;
+                extra.view = view;
+                for (auto& c : extra.clearValue) c = 0.0;
+                desc.colorAttachments.push_back(extra);
+            }
+        }
         // A program pass has its own depth buffer at the target's (1x) size.
-        const auto passDepthView = activeProgramPass ? programPassDepthView : depthView;
+        const auto passDepthView = gbufferPassActive ? gbufferDepthView : activeProgramPass ? programPassDepthView : depthView;
         if (passDepthView) {
             GPU::DepthStencilAttachment ds{};
             ds.view = passDepthView;
@@ -10589,7 +10690,7 @@ void Renderer::renderPrimitive(
     // The material's program, or the program pass's for every draw
     // (renderProgramPass()); an unknown handle falls back to PBR.
     ProgramHandle program = activeProgramPass ? activeProgramPass->program : draw.material->program;
-    if (program >= programs.size()) program = kPbrProgram;
+    if (program != kGBufferProgram && program >= programs.size()) program = kPbrProgram;
     const auto colorFormat = activeProgramPass ? activeProgramPass->colorFormat : GPU::PixelFormat::invalid;
     bool debugView = program == kPbrProgram && viewMode == ViewMode::worldNormal && !customLayout &&
                      draw.mesh->topology == GPU::PrimitiveTopology::triangleList;
@@ -10647,6 +10748,16 @@ void Renderer::renderPrimitive(
     // --- 3. Bind transform ---
     if (transformBuffer) {
         bindMeshBuffer(rpe, VERTEX_SLOT_MVP, transformBuffer, transformOffset);
+    }
+    // G-buffer: the previous frame's transform (same offset) and joints.
+    if (gbufferPassActive && meshRecipe.rawBufferSlots) {
+        if (const auto& previous = gbufferPreviousTransforms[currentFrameIndex % gbufferPreviousTransforms.size()]) {
+            setVertexBufferIfChanged(rpe, kGBufferPreviousTransformSlot, previous, transformOffset);
+        }
+        const auto& joints = draw.previousJointMatrixBuffer ? draw.previousJointMatrixBuffer
+                             : draw.jointMatrixBuffer       ? draw.jointMatrixBuffer
+                                                            : defaultJointMatrixBuffer;
+        if (joints) setVertexBufferIfChanged(rpe, kGBufferPreviousJointSlot, joints, 0);
     }
 
     // --- 4. Bind instance matrix ---

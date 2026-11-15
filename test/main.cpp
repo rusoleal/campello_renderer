@@ -3531,6 +3531,156 @@ TEST_F(OffscreenRenderTest, ThinGlassShowsTheBackgroundAtItsBrightness) {
     EXPECT_LT(at(32, 32, 2), 20);
 }
 
+// G-buffer (Renderer::renderGBuffer()): a quad facing the camera fills it
+// with its normal, roughness, base colour and metallic, depth in front of
+// the cleared background; motion from the camera moving, the object moving
+// (DrawCall::previousWorldTransform) and its skin moving
+// (previousJointMatrixBuffer), and none after resetMotionHistory().
+TEST_F(OffscreenRenderTest, GBufferHoldsSurfacesAndMotion) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer on this backend";
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.2, 0.4, 0.6, 1], "metallicFactor": 0.3, "roughnessFactor": 0.6}}]})",
+                                    kNoOpLoader);
+    ASSERT_NE(materials, nullptr);
+    GpuMaterial* material = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    ASSERT_NE(material, nullptr);
+
+    // A 1 x 1 quad facing +z, at z = 0; the standard layout with joints
+    // (all joint 0, weight 1) so its skin can move it.
+    std::vector<float> positions = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f, -0.5f, 0.5f, 0.0f};
+    std::vector<float> normals = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    std::vector<uint8_t> joints(16, 0);
+    std::vector<float> weights = {1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0};
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] = device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] = device->createBuffer(normals.size() * 4, GPU::BufferUsage::vertex, normals.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_JOINTS] = device->createBuffer(joints.size(), GPU::BufferUsage::vertex, joints.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_WEIGHTS] = device->createBuffer(weights.size() * 4, GPU::BufferUsage::vertex, weights.data());
+    quad.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = nullptr;
+    quad.setBoundsFromPositions(positions.data(), 4);
+    float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    auto jointsNow = device->createBuffer(sizeof(identity), GPU::BufferUsage::storage, identity);
+
+    constexpr double kFov = 40.0 * 3.14159265358979323846 / 180.0;
+    const auto camera = [&](double x) {
+        CameraData c;
+        c.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(x, 0.0, 2.5), VM::Vector3<double>(x, 0.0, 0.0),
+                                             VM::Vector3<double>(0.0, 1.0, 0.0));
+        c.projection = VM::Matrix4<double>::perspective(kFov, 1.0, 0.1, 100.0);
+        c.position = VM::Vector3<double>(x, 0.0, 2.5);
+        return c;
+    };
+    RenderScene scene;
+    scene.camera = camera(0.0);
+    DrawCall draw;
+    draw.mesh = &quad;
+    draw.material = material;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    draw.jointMatrixBuffer = jointsNow;
+    draw.jointCount = 1;
+    scene.opaque.push_back(draw);
+
+    const auto halfToFloat = [](uint16_t h) {
+        const uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+        float v = exponent == 0 ? std::ldexp(float(mantissa), -24)
+                                : exponent == 31 ? INFINITY : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+        return sign ? -v : v;
+    };
+    const auto readHalf = [&](const std::shared_ptr<GPU::Texture>& texture, int channels) {
+        device->waitForIdle();
+        std::vector<uint16_t> raw(size_t(64) * 64 * channels);
+        EXPECT_TRUE(texture->download(0, 0, raw.data(), raw.size() * 2));
+        std::vector<float> out(raw.size());
+        for (size_t i = 0; i < raw.size(); ++i) out[i] = halfToFloat(raw[i]);
+        return out;
+    };
+    const size_t centre = size_t(32) * 64 + 32, corner = size_t(2) * 64 + 2;
+
+    renderer->renderGBuffer(scene);
+    const auto& g = renderer->gBuffer();
+    ASSERT_EQ(g.width, 64u);
+    ASSERT_NE(g.normalRoughness, nullptr);
+    const auto nr = readHalf(g.normalRoughness, 4);
+    EXPECT_NEAR(nr[centre * 4 + 2], 1.0, 0.01) << "the normal, +z";
+    EXPECT_NEAR(nr[centre * 4 + 3], 0.6, 0.01) << "roughness";
+    EXPECT_EQ(nr[corner * 4 + 2], 0.0f) << "the background is cleared";
+    std::vector<uint8_t> am(size_t(64) * 64 * 4);
+    device->waitForIdle();
+    ASSERT_TRUE(g.albedoMetallic->download(0, 0, am.data(), am.size()));
+    EXPECT_NEAR(am[centre * 4 + 0], 0.2 * 255, 2);
+    EXPECT_NEAR(am[centre * 4 + 1], 0.4 * 255, 2);
+    EXPECT_NEAR(am[centre * 4 + 2], 0.6 * 255, 2);
+    EXPECT_NEAR(am[centre * 4 + 3], 0.3 * 255, 2) << "metallic";
+    std::vector<float> depth(size_t(64) * 64);
+    ASSERT_TRUE(g.depth->download(0, 0, depth.data(), depth.size() * 4));
+    EXPECT_LT(depth[centre], 1.0f);
+    EXPECT_EQ(depth[corner], 1.0f);
+    auto motion = readHalf(g.motion, 2);
+    EXPECT_EQ(motion[centre * 2], 0.0f) << "no motion on the first frame";
+
+    // The camera moves 0.1 to the right: the quad was 0.1 / (2 * 2.5 * tan(20 deg)) of the image to the right.
+    const double expected = 0.1 / (2.0 * 2.5 * std::tan(kFov / 2.0));
+    scene.camera = camera(0.1);
+    renderer->renderGBuffer(scene);
+    motion = readHalf(g.motion, 2);
+    std::printf("[GBuffer] camera motion %.4f (expected %.4f), %.4f\n", motion[centre * 2], expected, motion[centre * 2 + 1]);
+    EXPECT_NEAR(motion[centre * 2], expected, expected * 0.05);
+    EXPECT_NEAR(motion[centre * 2 + 1], 0.0, 1e-3);
+    EXPECT_EQ(motion[corner * 2], 0.0f) << "no motion where nothing was drawn";
+
+    // The object was 0.1 lower (the camera still): it was further down the image (v grows downwards).
+    VM::Matrix4<double> lower = VM::Matrix4<double>::identity();
+    lower.data[7] = -0.1;
+    scene.opaque[0].previousWorldTransform = lower;
+    renderer->renderGBuffer(scene);
+    motion = readHalf(g.motion, 2);
+    EXPECT_NEAR(motion[centre * 2], 0.0, 1e-3);
+    EXPECT_NEAR(motion[centre * 2 + 1], expected, expected * 0.05) << "object motion";
+    scene.opaque[0].previousWorldTransform.reset();
+
+    // Its skin was 0.1 lower.
+    float jointBefore[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, -0.1f, 0, 1};  // column-major translation
+    scene.opaque[0].previousJointMatrixBuffer = device->createBuffer(sizeof(jointBefore), GPU::BufferUsage::storage, jointBefore);
+    renderer->renderGBuffer(scene);
+    motion = readHalf(g.motion, 2);
+    EXPECT_NEAR(motion[centre * 2 + 1], expected, expected * 0.05) << "skinned motion";
+    scene.opaque[0].previousJointMatrixBuffer.reset();
+
+    // A camera cut: no camera motion reported.
+    scene.camera = camera(0.5);
+    renderer->resetMotionHistory();
+    renderer->renderGBuffer(scene);
+    motion = readHalf(g.motion, 2);
+    EXPECT_EQ(motion[centre * 2], 0.0f);
+
+    // Position-only meshes (the lean vertex stage): the flat face normal, their motion.
+    GpuMesh lean = quad;
+    lean.layout = &VertexLayout::positionOnly();
+    scene.camera = camera(0.0);
+    scene.opaque[0].mesh = &lean;
+    scene.opaque[0].jointMatrixBuffer.reset();
+    scene.opaque[0].previousWorldTransform = lower;
+    renderer->resetMotionHistory();
+    renderer->renderGBuffer(scene);
+    const auto leanNormals = readHalf(g.normalRoughness, 4);
+    motion = readHalf(g.motion, 2);
+    EXPECT_NEAR(leanNormals[centre * 4 + 2], 1.0, 0.01) << "flat normal towards the camera";
+    EXPECT_NEAR(motion[centre * 2 + 1], expected, expected * 0.05) << "position-only object motion";
+}
+
 // Path tracing (PathTracer): a plate floating over a lit ground plane, the
 // sun straight above. After a few dozen samples the image is lit and the
 // ground under the plate is in shadow; ground away from it isn't.

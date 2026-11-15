@@ -276,9 +276,16 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
 - [ ] **Ray queries from raster and compute shaders** (inline RT), not only the RT pipeline: what
       most RT effects use, and the shape the WebGPU proposal and compute emulation would offer
       (see campello_gpu's TODO: emulated ray tracing on WebGPU)
-- [ ] **G-buffer and motion vectors** from the raster renderer (depth, normals, roughness, albedo,
-      per-pixel motion including skinned and animated objects): the input for ray tracing from
-      the first hit, temporal reuse, denoising and upscaling
+- [x] **G-buffer and motion vectors** (Metal) — `renderGBuffer()`: normal + roughness, albedo +
+      metallic, motion (uv, previous - current), depth; camera, object and skinned motion; filled
+      automatically by the ECS
+  - [ ] Vulkan / DirectX / WebGPU G-buffer shaders (`supportsGBuffer()` is false there)
+  - [ ] Morph target motion (the previous weights; motion ignores morphing today), per-instance
+        previous transforms (EXT_mesh_gpu_instancing instances are assumed static)
+  - [ ] Write the G-buffer from the main pass (multiple render targets) instead of a separate
+        geometry pass, once a deferred or hybrid frame needs it every frame
+  - [ ] Projection jitter support (TAA / upscalers): a jittered projection with unjittered motion
+  - [ ] An ECS test harness: `build_render_scene()`'s motion pass-through is compile-checked only
 
 **Denoising and reconstruction**
 - [ ] **Real-time denoiser** as a first-class component: SVGF / A-SVGF-style temporal + spatial

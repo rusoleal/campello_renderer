@@ -124,6 +124,31 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::Buffer> jointMatrixBuffer; // nullptr if unskinned
         uint32_t jointCount = 0;
         uint32_t instanceCount = 1;
+        /// The previous frame's world transform, for motion vectors
+        /// (Renderer::renderGBuffer()). Unset: it didn't move.
+        std::optional<systems::leal::vector_math::Matrix4<double>> previousWorldTransform;
+        /// The previous frame's joint matrices (skinned motion), laid out
+        /// as jointMatrixBuffer. Null: the current ones (no skinned motion).
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> previousJointMatrixBuffer;
+    };
+
+    /// The G-buffer (Renderer::renderGBuffer()): renderWidth x renderHeight
+    /// textures of the opaque draws' nearest surfaces.
+    struct GBufferTargets {
+        /// rgba16float: xyz world-space unit normal (normal textures applied,
+        /// towards the viewer), w perceptual roughness.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> normalRoughness;
+        /// rgba8unorm: rgb linear base colour, a metallic.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> albedoMetallic;
+        /// rg16float: where the surface was a frame ago minus where it is,
+        /// in image uv units (1 = the image's width / height, y down):
+        /// multiply by the size for pixels. Camera and object motion
+        /// (previousWorldTransform), skinning (previousJointMatrixBuffer).
+        std::shared_ptr<systems::leal::campello_gpu::Texture> motion;
+        /// depth32float: the depth buffer (0 near .. 1 far, cleared to 1).
+        std::shared_ptr<systems::leal::campello_gpu::Texture> depth;
+        uint32_t width = 0;
+        uint32_t height = 0;
     };
 
     struct CameraData {
@@ -241,6 +266,8 @@ namespace systems::leal::campello_renderer {
         static constexpr uint32_t VERTEX_SLOT_MORPH_POSITION  = 22; // float3[targetCount * vertexCount] position deltas
         static constexpr uint32_t VERTEX_SLOT_MORPH_NORMAL    = 23; // float3[targetCount * vertexCount] normal deltas
         static constexpr uint32_t kWideLineSegmentSlot        = 26; // Metal [[buffer(26)]]: wide line segments (GpuMesh::wideLines)
+        static constexpr uint32_t kGBufferPreviousTransformSlot = 27; // Metal [[buffer(27)]]: the G-buffer's previous transforms
+        static constexpr uint32_t kGBufferPreviousJointSlot     = 28; // Metal [[buffer(28)]]: the G-buffer's previous joints
                                                                //   [0..15]  baseColorFactor
                                                                //   [16..31] uvTransformRow0 (.w = hasTransform)
                                                                //   [32..47] uvTransformRow1
@@ -533,6 +560,22 @@ namespace systems::leal::campello_renderer {
         bool hasFlatProgram() const { return !programs.empty() && !programs[0].fragmentEntries[0].empty(); }
         // renderProgramPass() in progress (render() draws in its mode).
         const ProgramPassOptions* activeProgramPass = nullptr;
+        // G-buffer: a built-in program behind a reserved handle (its
+        // pipelines have three colour targets), renderGBuffer() in progress,
+        // its targets, the previous transforms per frame in flight and the
+        // previous camera.
+        static constexpr ProgramHandle kGBufferProgram = 0xFFFFFFFEu;
+        ProgramState gbufferProgram;
+        bool gbufferPassActive = false;
+        GBufferTargets gbufferTargets;
+        std::shared_ptr<systems::leal::campello_gpu::TextureView> gbufferAlbedoView, gbufferMotionView, gbufferDepthView;
+        std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, 3> gbufferPreviousTransforms;
+        systems::leal::vector_math::Matrix4<double> gbufferPreviousViewProj;
+        bool gbufferHistoryValid = false;
+        const ProgramState* programState(ProgramHandle program) const {
+            if (program == kGBufferProgram) return &gbufferProgram;
+            return program < programs.size() ? &programs[program] : nullptr;
+        }
         // Clip planes (setClipPlanes()); uploaded after the camera block.
         std::vector<std::array<double, 4>> clipPlanes;
         bool sectionCapsEnabled = true;
@@ -1281,6 +1324,22 @@ namespace systems::leal::campello_renderer {
         void renderProgramPass(const RenderScene& scene,
                                std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView,
                                const ProgramPassOptions& options);
+        /// Whether renderGBuffer() works on this backend (Metal for now).
+        bool supportsGBuffer() const { return gbufferProgram.fragmentModule != nullptr && meshRecipe.ready; }
+        /// Draws the scene's opaque draws into the G-buffer (gBuffer()) at
+        /// renderWidth x renderHeight (resize()): normals, roughness, base
+        /// colour, metallic, motion vectors, depth. The input for screen-
+        /// space and ray traced effects, temporal reuse, denoising and
+        /// upscaling. Motion is against the previous renderGBuffer() call's
+        /// camera (none on the first call or after resetMotionHistory()) and
+        /// each draw's DrawCall::previousWorldTransform /
+        /// previousJointMatrixBuffer. Pass unjittered projections (or the
+        /// same jitter both frames). Submitted, not waited for.
+        void renderGBuffer(const RenderScene& scene);
+        const GBufferTargets& gBuffer() const { return gbufferTargets; }
+        /// Forgets the previous camera (a camera cut): the next
+        /// renderGBuffer() reports object motion only.
+        void resetMotionHistory() { gbufferHistoryValid = false; }
         /// The layout of meshes with GpuMesh::layout == nullptr (glTF/PBR;
         /// joint and weight formats follow the loaded asset).
         const VertexLayout& standardVertexLayout() const { return standardLayout; }
