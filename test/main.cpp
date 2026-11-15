@@ -5,6 +5,7 @@
 #include <campello_renderer/culling.hpp>
 #include <campello_renderer/path_tracer.hpp>
 #include <campello_renderer/realtime_denoiser.hpp>
+#include <campello_renderer/rt_effects.hpp>
 #include <gltf/gltf.hpp>
 #include <algorithm>
 #include <future>
@@ -3954,6 +3955,176 @@ TEST_F(OffscreenRenderTest, RealtimeDenoiserCleansNoisyFrames) {
     EXPECT_LT(movingDenoised, movingNoisy * 0.35) << "a moving camera";
     EXPECT_TRUE(background) << "the background passes through";
     green->doubleSided = red->doubleSided = false;
+}
+
+// Ray traced shadows (RayTracedShadows): a plate over a ground plane, the
+// sun overhead. The raw visibility is 0 under the plate and 1 on open
+// ground; a larger sun gives a penumbra (partial visibility averaged over
+// frames); moving the plate rebuilds the instances only. Through the
+// denoiser into Renderer::setShadowMask(), the raster frame is shadowed
+// under the plate as with the shadow maps.
+TEST_F(OffscreenRenderTest, RayTracedShadowsDarkenTheRasterFrame) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer on this backend";
+    RayTracedShadows shadows(device);
+    if (!shadows.supported()) GTEST_SKIP() << "No ray tracing on this device";
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.0f);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.8, 0.8, 1], "metallicFactor": 0, "roughnessFactor": 1}}]})",
+                                    kNoOpLoader);
+    GpuMaterial* grey = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    const auto quad = [&](float y, float half) {
+        std::vector<float> positions = {-half, y, -half, -half, y, half, half, y, half, half, y, -half};
+        std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+        auto m = std::make_unique<GpuMesh>();
+        m->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        m->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        m->indexCount = 6;
+        m->indexFormat = GPU::IndexFormat::uint32;
+        m->vertexCount = 4;
+        m->layout = &VertexLayout::positionOnly();
+        m->setBoundsFromPositions(positions.data(), 4);
+        return m;
+    };
+    auto ground = quad(0.0f, 2.0f), plate = quad(1.0f, 0.4f);
+    grey->doubleSided = true;
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 3.0, 0.01), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 0.0, -1.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 3.0, 0.01);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.5, -1.0, 0.0);  // the shadow falls 0.5 m beside the plate
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    sun.castShadows = true;
+    scene.lights.push_back(sun);
+    for (GpuMesh* m : {ground.get(), plate.get()}) {
+        DrawCall draw;
+        draw.mesh = m;
+        draw.material = grey;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    const auto halfToFloat = [](uint16_t h) {
+        const uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+        float v = exponent == 0 ? std::ldexp(float(mantissa), -24)
+                                : exponent == 31 ? INFINITY : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+        return sign ? -v : v;
+    };
+    const auto visibility = [&]() {
+        device->waitForIdle();
+        std::vector<uint16_t> raw(size_t(64) * 64 * 4);
+        EXPECT_TRUE(shadows.output()->download(0, 0, raw.data(), raw.size() * 2));
+        std::vector<float> v(size_t(64) * 64);
+        for (size_t i = 0; i < v.size(); ++i) v[i] = halfToFloat(raw[i * 4]);
+        return v;
+    };
+    // Looking straight down from 3 m: the plate's top is lit, and so is open
+    // ground; its shadow falls beside it (x 0.4 .. 0.9 m), shadowed.
+    renderer->renderGBuffer(scene);
+    ASSERT_TRUE(shadows.trace(scene, renderer->gBuffer()));
+    auto v = visibility();
+    const auto at = [](const std::vector<float>& img, int x, int y) { return img[size_t(y) * 64 + size_t(x)]; };
+    EXPECT_EQ(at(v, 32, 32), 1.0f) << "the plate's top is lit";
+    EXPECT_EQ(at(v, 4, 4), 1.0f) << "open ground is lit";
+    std::vector<float> depth(size_t(64) * 64);
+    device->waitForIdle();
+    ASSERT_TRUE(renderer->gBuffer().depth->download(0, 0, depth.data(), depth.size() * 4));
+    int shadowed = 0, lit = 0;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (depth[i] >= 1.0f) continue;
+        (v[i] < 0.5f ? shadowed : lit)++;
+    }
+    EXPECT_GT(shadowed, 20) << "the plate's shadow on the ground";
+    EXPECT_GT(lit, 200) << "lit ground around it";
+
+    // A 30 degree sun: a wide penumbra (visibility between 0 and 1 averaged over frames), the real sun's barely any.
+    const auto partialPixels = [&](float degrees) {
+        shadows.setSunAngularDiameter(degrees);
+        std::vector<float> sum(v.size(), 0.0f);
+        for (int f = 0; f < 64; ++f) {
+            EXPECT_TRUE(shadows.trace(scene, renderer->gBuffer()));
+            const auto one = visibility();
+            for (size_t i = 0; i < sum.size(); ++i) sum[i] += one[i] / 64.0f;
+        }
+        int n = 0;
+        for (size_t i = 0; i < sum.size(); ++i) n += depth[i] < 1.0f && sum[i] > 0.1f && sum[i] < 0.9f;
+        return n;
+    };
+    const int sharp = partialPixels(0.53f);
+    const int soft = partialPixels(30.0f);
+    std::printf("[RayTracedShadows] shadowed %d, lit %d; penumbra pixels: 0.53 deg sun %d, 30 deg sun %d\n", shadowed, lit,
+                sharp, soft);
+    EXPECT_GT(soft, sharp + 30) << "a larger sun, softer shadows";
+    shadows.setSunAngularDiameter(0.53f);
+
+    // Moving the plate: the instances only.
+    const uint32_t full = shadows.fullRebuilds();
+    scene.opaque[1].worldTransform.data[3] = 0.1;
+    ASSERT_TRUE(shadows.trace(scene, renderer->gBuffer()));
+    EXPECT_EQ(shadows.fullRebuilds(), full);
+    EXPECT_EQ(shadows.transformRebuilds(), 1u);
+    scene.opaque[1].worldTransform.data[3] = 0.0;
+
+    // Through the denoiser into the raster frame: shadowed under the plate,
+    // as with the shadow maps.
+    RealtimeDenoiser denoiser(device);
+    ASSERT_TRUE(denoiser.supported());
+    RealtimeDenoiser::Settings settings;
+    settings.demodulate = false;
+    denoiser.setSettings(settings);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    // (16 frames: the denoiser's first frames are soft, its history converges.)
+    for (int f = 0; f < 16; ++f) {
+        renderer->renderGBuffer(scene);
+        ASSERT_TRUE(shadows.trace(scene, renderer->gBuffer()));
+        ASSERT_TRUE(denoiser.denoise(shadows.output(), renderer->gBuffer(), scene.camera.projection));
+        renderer->setShadowMask(denoiser.output());
+        renderer->render(scene, view);
+    }
+    const auto traced = readBackPixels(tex);
+    renderer->setShadowMask(nullptr);
+    renderer->setShadowsEnabled(true);
+    renderer->render(scene, view);
+    renderer->render(scene, view);
+    const auto mapped = readBackPixels(tex);
+    renderer->setShadowsEnabled(false);
+    // Mean red of the pixels the trace saw as shadowed vs lit, in both frames.
+    double tracedShadow = 0, tracedLit = 0, mappedShadow = 0, mappedLit = 0;
+    int ns = 0, nl = 0;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (depth[i] >= 1.0f) continue;
+        if (v[i] < 0.5f) {
+            tracedShadow += traced[i * 4];
+            mappedShadow += mapped[i * 4];
+            ++ns;
+        } else {
+            tracedLit += traced[i * 4];
+            mappedLit += mapped[i * 4];
+            ++nl;
+        }
+    }
+    tracedShadow /= ns;
+    tracedLit /= nl;
+    mappedShadow /= ns;
+    mappedLit /= nl;
+    std::printf("[RayTracedShadows] raster frame, shadowed / lit red: traced %.1f / %.1f, shadow maps %.1f / %.1f\n",
+                tracedShadow, tracedLit, mappedShadow, mappedLit);
+    EXPECT_LT(tracedShadow, tracedLit * 0.6) << "ray traced shadows darken the raster frame";
+    EXPECT_NEAR(tracedShadow / tracedLit, mappedShadow / mappedLit, 0.2) << "about as the shadow maps do";
+    grey->doubleSided = false;
 }
 
 // Path tracing (PathTracer): a plate floating over a lit ground plane, the

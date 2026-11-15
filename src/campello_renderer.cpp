@@ -3881,6 +3881,7 @@ std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::shadowMapBinding
 }
 
 std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::shadowMapNearBinding() {
+    if (shadowMaskBound && shadowMaskDepth) return shadowMaskDepth;  // setShadowMask()
     if (shadowMapNear) return shadowMapNear;
     return shadowMapBinding();  // the placeholder (or the far map)
 }
@@ -4633,6 +4634,37 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         taaDesc.fragment = taaFrag;
         pipelineTaa = device->createRenderPipeline(taaDesc);
         taaHistoryValid = false;
+    }
+
+    // --- Shadow mask pack pipeline (Metal; setShadowMask()): the mask (0) into depth. ---
+    {
+        if (!shadowMaskPackLayout) {
+            GPU::BindGroupLayoutDescriptor ml{};
+            GPU::EntryObject t{};
+            t.binding = 0;
+            t.visibility = GPU::ShaderStage::fragment;
+            t.type = GPU::EntryObjectType::texture;
+            t.data.texture.multisampled = false;
+            t.data.texture.sampleType = GPU::EntryObjectTextureType::ttUnfilterableFloat;
+            t.data.texture.viewDimension = GPU::TextureType::tt2d;
+            ml.entries.push_back(t);
+            shadowMaskPackLayout = device->createBindGroupLayout(ml);
+        }
+        GPU::RenderPipelineDescriptor md{};
+        md.vertex.module = shaderModule;
+        md.vertex.entryPoint = "fxaaVertex";
+        md.topology = GPU::PrimitiveTopology::triangleList;
+        md.cullMode = GPU::CullMode::none;
+        md.frontFace = GPU::FrontFace::ccw;
+        GPU::DepthStencilDescriptor mds = ds;
+        mds.depthCompare = GPU::CompareOp::always;
+        mds.depthWriteEnabled = true;
+        md.depthStencil = mds;
+        GPU::FragmentDescriptor mf{};
+        mf.module = shaderModule;
+        mf.entryPoint = "shadowMaskPack";
+        md.fragment = mf;
+        pipelineShadowMaskPack = device->createRenderPipeline(md);
     }
 
     // --- Downsample pipeline (Metal) ---
@@ -9740,6 +9772,14 @@ void Renderer::render(const RenderScene& scene,
     if (!colorView) return;
     if (!meshRecipe.ready) return;
 
+    // A shadow mask (setShadowMask()) for this frame's main pass (not a
+    // program pass: they don't shade).
+    struct MaskScope {
+        bool& bound;
+        ~MaskScope() { bound = false; }
+    } maskScope{shadowMaskBound};
+    const bool useShadowMask = !activeProgramPass && shadowMask && pipelineShadowMaskPack && shadowMaskPackLayout;
+
     // TAA (setTemporalAntiAliasing()): this frame's jitter, and the G-buffer
     // pass first for its motion (drawn with the same jitter, its motion
     // unjittered). A program pass (the G-buffer's own) is never a TAA frame.
@@ -9917,7 +9957,7 @@ void Renderer::render(const RenderScene& scene,
             lightsData.lights[i].position[2] = (float)(directional ? -l.direction.z() : l.position.z());
             // spotAngles.z: this light casts the shadow map (the first
             // shadow-casting directional light, when shadows are on).
-            if (directional && l.castShadows && shadowsEnabled && shadowPipeline && !shadowAssigned) {
+            if (directional && l.castShadows && (useShadowMask || (shadowsEnabled && shadowPipeline)) && !shadowAssigned) {
                 lightsData.lights[i].spotAngles[2] = 1.0f;
                 shadowAssigned = true;
             }
@@ -10077,7 +10117,51 @@ void Renderer::render(const RenderScene& scene,
         // Casters: every opaque mesh of the scene whatever the camera sees
         // (render_system() lists them before culling), else the opaque draws.
         const auto& casters = scene.shadowCasters.empty() ? sortedOpaque : scene.shadowCasters;
-        if (sun && shadowsEnabled && shadowPipeline && !activeProgramPass && cameraPositionBuffer) {
+        if (useShadowMask) {
+            // The mask's red channel into a depth texture of its size.
+            const uint32_t mw = shadowMask->getWidth(), mh = shadowMask->getHeight();
+            if (!shadowMaskDepth || shadowMaskDepth->getWidth() != mw || shadowMaskDepth->getHeight() != mh) {
+                shadowMaskDepth = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::depth32float, mw, mh, 1, 1, 1,
+                                                        (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                                                            uint32_t(GPU::TextureUsage::textureBinding)));
+                shadowMaskDepthView = shadowMaskDepth ? shadowMaskDepth->createView(GPU::PixelFormat::depth32float, 1,
+                                                                                    GPU::Aspect::depthOnly, 0, 0,
+                                                                                    GPU::TextureType::tt2d)
+                                                      : nullptr;
+            }
+            GPU::BindGroupDescriptor mDesc{};
+            mDesc.layout = shadowMaskPackLayout;
+            mDesc.entries = {{0, shadowMask}};
+            auto group = shadowMaskDepthView ? device->createBindGroup(mDesc) : nullptr;
+            if (group) {
+                GPU::BeginRenderPassDescriptor mRp{};
+                GPU::DepthStencilAttachment ds{};
+                ds.view = shadowMaskDepthView;
+                ds.depthClearValue = 1.0f;
+                ds.depthLoadOp = GPU::LoadOp::clear;
+                ds.depthStoreOp = GPU::StoreOp::store;
+                ds.depthReadOnly = false;
+                ds.stencilClearValue = 0;
+                ds.stencilLoadOp = GPU::LoadOp::clear;
+                ds.stencilStoreOp = GPU::StoreOp::discard;
+                ds.stencilReadOnly = false;
+                mRp.depthStencilAttachment = ds;
+                if (auto mRpe = encoder->beginRenderPass(mRp)) {
+                    mRpe->setViewport(0.0f, 0.0f, (float)mw, (float)mh, 0.0f, 1.0f);
+                    mRpe->setScissorRect(0.0f, 0.0f, (float)mw, (float)mh);
+                    mRpe->setPipeline(pipelineShadowMaskPack);
+                    mRpe->setBindGroup(0, group);
+                    mRpe->draw(3);
+                    mRpe->end();
+                    shadowMaskBound = true;
+                    // The shaders read it at their pixel, scaled to its size.
+                    nearBlock[17] = 1.0f;
+                    nearBlock[18] = (float)mw / (float)std::max(1u, sceneTargetWidth());
+                    nearBlock[19] = (float)mh / (float)std::max(1u, sceneTargetHeight());
+                }
+            }
+        }
+        if (!shadowMaskBound && sun && shadowsEnabled && shadowPipeline && !activeProgramPass && cameraPositionBuffer) {
             // The map depends on the light, its resolution and the casters,
             // not on the camera: redrawn only when one of them changes.
             uint64_t key = 1469598103934665603ull;

@@ -271,6 +271,17 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
       optional and with a quality level: RT shadows (sun, local lights, soft), RT reflections,
       RT ambient occlusion, RT global illumination, RT translucency/refraction. Turned on per
       effect by the game, by quality preset and by `Feature::raytracing`
+  - [x] RT sun shadows (Metal) — `RayTracedShadows` (`rt_effects.hpp`): one ray per pixel from
+        the G-buffer to a random point of the sun's disc (`setSunAngularDiameter()`), its own
+        BLAS cache / TLAS (instances only when transforms change); `RealtimeDenoiser` with
+        `Settings::demodulate = false`; `Renderer::setShadowMask()` replaces the shadow maps (the
+        mask is packed into the near cascade's slot: the PBR shader is at iOS's 31 texture limit)
+  - [ ] Local light shadows (point / spot), several lights; alpha-tested casters; a shared
+        acceleration structure with PathTracer (each builds its own today)
+  - [ ] The denoiser's first frames on a binary signal are soft (a 9 px wide shadow: mask 0.63
+        after 1 frame, 0.025 after 16): a smaller variance boost for short histories, or
+        temporal-only accumulation where the signal agrees with the history
+  - [ ] RT reflections, RT ambient occlusion, RT GI, RT translucency
 - [ ] **Full path-traced mode** (longer term, high-end GPUs): the "path tracing" setting of modern
       games — 1–2 samples per pixel, ReSTIR DI/GI, real-time denoising, upscaling
 - [ ] **Ray queries from raster and compute shaders** (inline RT), not only the RT pipeline: what

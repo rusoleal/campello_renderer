@@ -46,6 +46,7 @@ add_library(${PROJECT_NAME} SHARED
     src/campello_renderer.cpp
     src/path_tracer.cpp
     src/realtime_denoiser.cpp
+    src/rt_effects.cpp
     src/animation.cpp
     src/procedural_texture_baker.cpp
 )

@@ -80,6 +80,10 @@ public:
         float phiColor = 4.0f;
         float phiNormal = 128.0f;
         float phiDepth = 1.0f;
+        /// Filter the input divided by the G-buffer's base colour (radiance:
+        /// keeps texture detail) or as it is (visibility, ambient occlusion:
+        /// signals without albedo).
+        bool demodulate = true;
         /// A-trous passes (steps 1, 2, 4, ...; 1 to 7): 5 cover a 125 pixel footprint.
         uint32_t iterations = 5;
     };

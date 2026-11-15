@@ -109,7 +109,7 @@ RealtimeDenoiser::RealtimeDenoiser(std::shared_ptr<GPU::Device> device)
     varianceLayout_ = makeLayout(d, {Slot::color, Slot::color, Slot::color}, true);
     atrousLayout_ = makeLayout(d, {Slot::color, Slot::color}, true);
     atrousFirstLayout_ = makeLayout(d, {Slot::color, Slot::color, Slot::color}, true);
-    modulateLayout_ = makeLayout(d, {Slot::color, Slot::color, Slot::color, Slot::color}, false);
+    modulateLayout_ = makeLayout(d, {Slot::color, Slot::color, Slot::color, Slot::color}, true);
     const auto half4 = GPU::PixelFormat::rgba16float;
     const auto float4 = GPU::PixelFormat::rgba32float;
     variancePipeline_ = makePipeline(d, module, "denoiseVariance", varianceLayout_, {half4});
@@ -180,6 +180,7 @@ bool RealtimeDenoiser::denoise(const std::shared_ptr<GPU::Texture>& noisy, const
         u.depth[0] = static_cast<float>(projection.data[10]);
         u.depth[1] = static_cast<float>(projection.data[11]);
         u.depth[2] = settings_.depthTolerance;
+        u.depth[3] = settings_.demodulate ? 1.0f : 0.0f;
         u.filter[0] = i == 0 ? 1.0f : static_cast<float>(1u << (i - 1));
         u.filter[1] = settings_.phiColor;
         u.filter[2] = settings_.phiNormal;
@@ -251,7 +252,7 @@ bool RealtimeDenoiser::denoise(const std::shared_ptr<GPU::Texture>& noisy, const
         std::swap(source, destination);
     }
     ok = ok && pass(modulatePipeline_, modulateLayout_,
-                    {{0, source->texture}, {1, gbuffer.albedoMetallic}, {2, noisy}, {3, geometry_[write].texture}},
+                    {{0, source->texture}, {1, gbuffer.albedoMetallic}, {2, noisy}, {3, geometry_[write].texture}, uniform(4, 0)},
                     {outputTarget_.view});
     if (!ok) return false;
 

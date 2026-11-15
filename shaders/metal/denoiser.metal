@@ -37,7 +37,7 @@ vertex FullscreenOut denoiseVertex(uint vertexID [[vertex_id]]) {
 
 struct DenoiseUniforms {
     float4 params;   // x colour blend floor (e.g. 0.2), y moments blend floor, z history valid, w max history length
-    float4 depth;    // x, y: the projection's depth terms (linear depth = y / (device depth + x)); z: depth tolerance (relative)
+    float4 depth;    // x, y: the projection's depth terms (linear depth = y / (device depth + x)); z: depth tolerance (relative); w: demodulate by albedo (1) or not (0)
     float4 filter;   // x step size (pixels), y phi colour, z phi normal (power), w phi depth
 };
 
@@ -87,7 +87,7 @@ fragment TemporalOut denoiseTemporal(FullscreenOut in [[stage_in]],
         out.geometry = float4(0.0);
         return out;
     }
-    const float3 albedo = max(albedoMetallic.read(p).rgb, ALBEDO_FLOOR);
+    const float3 albedo = u.depth.w > 0.5 ? max(albedoMetallic.read(p).rgb, ALBEDO_FLOOR) : float3(1.0);
     const float3 illumination = n.rgb / albedo;
     const float l = luminance(illumination);
 
@@ -234,9 +234,11 @@ fragment float4 denoiseModulate(FullscreenOut in [[stage_in]],
                                 texture2d<float> filtered       [[texture(0)]],
                                 texture2d<float> albedoMetallic [[texture(1)]],
                                 texture2d<float> noisy          [[texture(2)]],
-                                texture2d<float> geometry       [[texture(3)]])
+                                texture2d<float> geometry       [[texture(3)]],
+                                constant DenoiseUniforms& u     [[buffer(4)]])
 {
     const uint2 p = pixelOf(in.position);
     if (geometry.read(p).w <= 0.0) return float4(noisy.read(p).rgb, 1.0);
-    return float4(filtered.read(p).rgb * max(albedoMetallic.read(p).rgb, ALBEDO_FLOOR), 1.0);
+    const float3 albedo = u.depth.w > 0.5 ? max(albedoMetallic.read(p).rgb, ALBEDO_FLOOR) : float3(1.0);
+    return float4(filtered.read(p).rgb * albedo, 1.0);
 }

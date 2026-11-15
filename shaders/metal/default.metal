@@ -255,7 +255,8 @@ struct CameraUniforms {
     float4   shadowParams;    // x = on, y = one texel in uv
     float4   viewParams;      // x = exposure in EV (0: unchanged; colour x 2^EV before tone mapping)
     float4x4 shadowNearViewProj;  // world -> the near cascade's clip space
-    float4   shadowNearParams;    // x = near cascade on
+    float4   shadowNearParams;    // x = near cascade on; y = shadowMapNear is a screen-space visibility mask
+                                  // (Renderer::setShadowMask()), zw = its pixels per target pixel
 };
 
 constant float VIEW_MODE_NORMAL       = 0.0;
@@ -886,7 +887,14 @@ inline float shadowLookup(depth2d<float> shadowMap, float4x4 M, float texel, flo
 // finer) where it covers the point, else the far map (the whole scene).
 // Outside both: lit.
 inline float sunShadow(constant CameraUniforms &camera, depth2d<float> shadowMap, depth2d<float> shadowMapNear,
-                       float3 worldPos, float3 N, float3 L) {
+                       float3 worldPos, float3 N, float3 L, float4 fragPosition) {
+    // A visibility mask (ray traced shadows) in place of the shadow maps:
+    // read at this pixel.
+    if (camera.shadowNearParams.y > 0.5) {
+        const uint2 size = uint2(shadowMapNear.get_width(), shadowMapNear.get_height());
+        const uint2 pixel = min(uint2(fragPosition.xy * camera.shadowNearParams.zw), size - 1);
+        return saturate(shadowMapNear.read(pixel));
+    }
     if (camera.shadowParams.x < 0.5) {
         return 1.0;
     }
@@ -1426,7 +1434,7 @@ fragment float4 fragmentMain_textured(
 
         float  NdotL      = max(dot(N, lightDir), 0.0);
         // The sun (spotAngles.z): darkened where the shadow map says so.
-        const float shadow = light.spotAngles.z > 0.5 ? sunShadow(camera, shadowMap, shadowMapNear, in.worldPos, N, lightDir) : 1.0;
+        const float shadow = light.spotAngles.z > 0.5 ? sunShadow(camera, shadowMap, shadowMapNear, in.worldPos, N, lightDir, inRaw.clipPosition) : 1.0;
         float3 lightColor = light.color.xyz * light.color.w * attenuation * spotFactor * shadow;
 
         float3 halfDir = normalize(lightDir + viewDir);
@@ -2039,6 +2047,17 @@ fragment TaaOut taaFragment(FxaaOut in [[stage_in]],
         result = mix(yCoCgToRgb(h), c, u.blend);
     }
     return TaaOut{float4(result, 1.0), float4(result, 1.0)};
+}
+
+// Renderer::setShadowMask(): a visibility texture's red channel into a
+// depth texture, so it binds where the near shadow cascade does.
+struct ShadowMaskOut {
+    float depth [[depth(any)]];
+};
+
+fragment ShadowMaskOut shadowMaskPack(FxaaOut in [[stage_in]], texture2d<float> mask [[texture(0)]]) {
+    const uint2 size = uint2(mask.get_width(), mask.get_height());
+    return ShadowMaskOut{saturate(mask.read(min(uint2(in.position.xy), size - 1)).r)};
 }
 
 static float fxaaLuma(float3 rgb) {
