@@ -903,6 +903,10 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::Texture> reflections;
         float reflectionMaxRoughness = 0.6f;
         std::shared_ptr<systems::leal::campello_gpu::BindGroup> reflectionFrameBindGroup;
+        // setIndirectDiffuse(); and the texture both go into each frame
+        // (reflections left, indirect diffuse right), bound for the opaque draws.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> indirectDiffuse;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> screenLighting;
         bool shadowCascades = true;
         bool shadowNearValid = false;
         uint64_t shadowNearKey = 0;
@@ -1434,6 +1438,16 @@ namespace systems::leal::campello_renderer {
         void setReflections(std::shared_ptr<systems::leal::campello_gpu::Texture> radiance, float maxRoughness = 0.6f) {
             reflections = std::move(radiance);
             reflectionMaxRoughness = std::clamp(maxRoughness, 0.01f, 1.0f);
+        }
+        /// Indirect diffuse light (Metal): `irradiance` (rgba16float, at
+        /// renderWidth x renderHeight, as the irradiance map: what a white
+        /// diffuse surface reflects, before exposure; e.g. DdgiVolume's)
+        /// replaces the irradiance map in opaque, non-transmissive surfaces'
+        /// diffuse term. Needs image-based lighting on. Null: off.
+        /// (setReflections() too takes rgba16float: both are copied side by
+        /// side into one texture the shaders read.)
+        void setIndirectDiffuse(std::shared_ptr<systems::leal::campello_gpu::Texture> irradiance) {
+            indirectDiffuse = std::move(irradiance);
         }
         /// The current frame's weight in the TAA history (0..1, default 0.1):
         /// lower is smoother and slower to follow change.

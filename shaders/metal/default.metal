@@ -252,7 +252,8 @@ struct CameraUniforms {
     float4   clipPlanes[6];  // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
     // Shadow block (Renderer: sun shadows).
     float4x4 shadowViewProj;  // world -> the shadow map's clip space
-    float4   shadowParams;    // x = on, y = one texel in uv
+    float4   shadowParams;    // x = on, y = one texel in uv, z = indirect diffuse (Renderer::setIndirectDiffuse()) in
+                              // sceneColorTexture's right half
     float4   viewParams;      // x = exposure in EV (0: unchanged; colour x 2^EV before tone mapping); y = ray traced
                               // reflections in sceneColorTexture (Renderer::setReflections()), z = their roughness
                               // cut-off, w = their pixels per target pixel
@@ -1220,7 +1221,19 @@ fragment float4 fragmentMain_textured(
         // brightness fudge factor is needed the way the old raw-sample
         // approximation required.
         float3 envDiffuse = irradianceEnvironmentMap.sample(baseColorSampler, N).rgb;
-        iblDiffuse = baseColor.rgb * (1.0 - metallic) * envDiffuse * mat.environmentIntensity;
+        float3 diffuseIrradiance = envDiffuse * mat.environmentIntensity;
+        // Screen-space lighting (opaque, non-transmissive surfaces): the
+        // scene colour slot holds reflections (left) and indirect diffuse
+        // light (right), each at the frame's size.
+        const bool screenLighting = (camera.viewParams.y > 0.5 || camera.shadowParams.z > 0.5) && mat.alphaMode < 1.5 &&
+                                    mat.transmissionFactor <= 0.0;
+        const uint2 lightingSize = uint2(sceneColorTexture.get_width() / 2, sceneColorTexture.get_height());
+        const uint2 lightingPixel = min(uint2(inRaw.clipPosition.xy * camera.viewParams.w), lightingSize - 1);
+        if (screenLighting && camera.shadowParams.z > 0.5) {
+            // Probe-based GI (DdgiVolume): the irradiance at this surface.
+            diffuseIrradiance = sceneColorTexture.read(lightingPixel + uint2(lightingSize.x, 0)).rgb;
+        }
+        iblDiffuse = baseColor.rgb * (1.0 - metallic) * diffuseIrradiance;
 
         // Roughness-based LOD so rough surfaces reflect a blurred (lower mip)
         // environment instead of always sampling the sharpest level.
@@ -1246,10 +1259,8 @@ fragment float4 fragmentMain_textured(
         // transparent pass has the scene colour in that slot): the radiance
         // traced along this pixel's GGX lobe instead of the prefiltered sky,
         // fading back to it towards the roughness cut-off.
-        if (camera.viewParams.y > 0.5 && mat.alphaMode < 1.5 && mat.transmissionFactor <= 0.0) {
-            const uint2 size = uint2(sceneColorTexture.get_width(), sceneColorTexture.get_height());
-            const uint2 pixel = min(uint2(inRaw.clipPosition.xy * camera.viewParams.w), size - 1);
-            const float3 traced = sceneColorTexture.read(pixel).rgb;
+        if (screenLighting && camera.viewParams.y > 0.5) {
+            const float3 traced = sceneColorTexture.read(lightingPixel).rgb;
             const float cutoff = camera.viewParams.z;
             specularRadiance = mix(specularRadiance, traced, 1.0 - smoothstep(0.75 * cutoff, cutoff, roughness));
         }

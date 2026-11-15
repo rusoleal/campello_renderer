@@ -132,6 +132,12 @@ struct TraceUniforms {
     uint4    envSampling;   // x environment distribution resolution per cube face (0: none), y light portals, z resolution divisor (preview: 1 / z of the output's), w samples per pixel in this dispatch
     uint4    lights;        // x emissive triangles sampled as lights
     float4   camera;        // x lens aperture radius (0: a pinhole), y focus distance, z tone mapping (0 PBR Neutral, 1 ACES, 2 AgX)
+    // Probe rays (mode 3, PathTracer::traceProbeRays()): a grid of probes,
+    // each tracing rays along rotated spherical Fibonacci directions.
+    float4   probeOrigin;   // xyz: probe (0, 0, 0)
+    float4   probeSpacing;  // xyz: between probes
+    uint4    probeCount;    // xyz: probes per axis, w: rays per probe
+    float4x4 probeRotation; // this frame's rotation of the directions
 };
 
 struct InstanceInfo {
@@ -814,6 +820,9 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
     // the G-buffer's surface, the first direction from its GGX lobe; the
     // radiance arriving along it goes to reflectionOut (no accumulation).
     const bool reflections = u.size.w == 2u;
+    // Probe rays (mode 3): x a ray, y a probe; the radiance and the first
+    // hit's distance go to reflectionOut.
+    const bool probes = u.size.w == 3u;
     float3 surfaceP = float3(0.0), surfaceN = float3(0.0), surfaceV = float3(0.0);
     float surfaceAlpha = 0.0;
     if (reflections) {
@@ -837,8 +846,10 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
     // sample numbers firstSample .. firstSample + samplesNow - 1.
     const uint firstSample = uint(u.params.w);
     const uint pixel = gid.y * u.size.x + gid.x;
-    const float4 before = firstSample == 0 ? float4(0.0) : accum[pixel];
-    const float momentBefore = firstSample == 0 ? 0.0 : moments[pixel];
+    // (The other modes don't accumulate: their grids aren't the image's.)
+    const bool accumulates = !reflections && !probes;
+    const float4 before = firstSample == 0 || !accumulates ? float4(0.0) : accum[pixel];
+    const float momentBefore = firstSample == 0 || !accumulates ? 0.0 : moments[pixel];
     // Adaptive sampling (setNoiseTarget()): a pixel whose average's
     // relative standard error (luminance, from its samples' second moment)
     // is under the target takes no more samples; it's still shown.
@@ -855,6 +866,7 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
         }
     }
     float3 radianceSum = float3(0.0);
+    float firstHitDistance = 65000.0;  // probes: the first segment's (a miss: far; fits a half float)
     float momentSum = 0.0;
     float3 albedoSum = float3(0.0);
     float3 normalSum = float3(0.0);
@@ -881,6 +893,18 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
             direction = reflect(-surfaceV, h);
             if (dot(direction, surfaceN) <= 0.0) direction = reflect(-surfaceV, surfaceN);
             origin = surfaceP + surfaceN * max(1e-3, 2e-4 * length(surfaceP - u.cameraPos.xyz));
+        } else if (probes) {
+            const uint3 n = u.probeCount.xyz;
+            const uint index = gid.y;
+            const uint3 cell = uint3(index % n.x, (index / n.x) % n.y, index / (n.x * n.y));
+            origin = u.probeOrigin.xyz + float3(cell) * u.probeSpacing.xyz;
+            // As rayDirection() in ddgi.metal.
+            const float golden = 1.618033988749895;
+            const float rays = float(u.probeCount.w);
+            const float phi = 2.0 * PI * fract(float(gid.x) / golden);
+            const float cosTheta = 1.0 - (2.0 * float(gid.x) + 1.0) / rays;
+            const float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+            direction = normalize((u.probeRotation * float4(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta, 0.0)).xyz);
         } else if (u.size.w == 1u) {
             // Equirectangular: longitude across (the centre straight ahead,
             // right towards the right), latitude down from the up pole.
@@ -966,14 +990,15 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
         float misBsdfPdf = 0.0;
         float3 misOrigin = float3(0.0);  // that vertex (the sky's light density depends on where from)
         uint pathVertex = 0u;
-        // (Reflections: the first segment already left a surface, bounce 1.)
-        for (uint bounce = reflections ? 1u : 0u; bounce <= maxBounces; ++bounce, ++pathVertex) {
+        // (Reflections and probes: indirect light, as from a bounce.)
+        for (uint bounce = reflections || probes ? 1u : 0u; bounce <= maxBounces; ++bounce, ++pathVertex) {
             ray r;
             r.origin = origin;
             r.direction = direction;
             r.min_distance = 1e-4;
             r.max_distance = 1e30;
             const auto hit = isect.intersect(r, scene, MASK_OPAQUE | MASK_GLASS);
+            if (pathVertex == 0u && hit.type != intersection_type::none) firstHitDistance = min(hit.distance, 65000.0);
             if (hit.type == intersection_type::none) {
                 if (bounce == 0 && u.size.z == 0u) {
                     radiance += throughput * u.clearColor.rgb;
@@ -1277,8 +1302,8 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
         normalSum += firstNormal;
     }
 
-    if (reflections) {
-        reflectionOut.write(float4(radianceSum, 1.0), gid);
+    if (reflections || probes) {
+        reflectionOut.write(float4(radianceSum, probes ? firstHitDistance : 1.0), gid);
         return;
     }
     const float4 sum = before + float4(radianceSum, float(samplesNow));

@@ -130,6 +130,7 @@ Two variants are created by `createDefaultPipelines()`:
 - `src/path_tracer.cpp`, `shaders/metal/path_tracer.metal` — `PathTracer` (progressive GPU path tracing)
 - `src/realtime_denoiser.cpp`, `shaders/metal/denoiser.metal` — `RealtimeDenoiser` (SVGF, G-buffer guided)
 - `src/rt_effects.cpp`, `shaders/metal/rt_effects.metal` — `RayTracingScene`, `RayTracedShadows`, `RayTracedAmbientOcclusion` (ray traced effects on the raster renderer)
+- `src/ddgi.cpp`, `shaders/metal/ddgi.metal` — `DdgiVolume` (probe-based GI; rays traced by `PathTracer::traceProbeRays()`)
 - `src/shaders/vulkan_default.h` — embedded Vulkan SPIR-V
 - `src/shaders/directx_default.h` — DirectX DXIL (currently empty stubs)
 - `dependencies/campello_gpu.cmake` / `gltf.cmake` / `campello_image.cmake` — FetchContent declarations

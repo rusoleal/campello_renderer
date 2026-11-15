@@ -6,6 +6,7 @@
 #include <campello_renderer/path_tracer.hpp>
 #include <campello_renderer/realtime_denoiser.hpp>
 #include <campello_renderer/rt_effects.hpp>
+#include <campello_renderer/ddgi.hpp>
 #include <gltf/gltf.hpp>
 #include <algorithm>
 #include <future>
@@ -4384,6 +4385,232 @@ TEST_F(OffscreenRenderTest, RayTracedReflectionsShowTheScene) {
     EXPECT_NEAR(mean(roughWith, 0), mean(roughWithout, 0), 1.5) << "rough surfaces keep the environment";
     mirror->doubleSided = rough->doubleSided = red->doubleSided = false;
     renderer->setSkyboxEnabled(true);
+}
+
+// Probe-based GI (DdgiVolume): a white ground and a red wall lit by the
+// sun, no sky. The probes' irradiance on the ground is red near the wall
+// (light it bounced: the ground's only indirect light) and weaker far from it; the probes converge over
+// frames; through Renderer::setIndirectDiffuse() the raster frame's ground
+// near the wall turns redder.
+TEST_F(OffscreenRenderTest, DdgiBleedsColourOntoTheGround) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer on this backend";
+    PathTracer tracer(device);
+    DdgiVolume gi(device);
+    if (!tracer.supported() || !gi.supported()) GTEST_SKIP() << "No path tracing on this device";
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.0f);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.8, 0.8, 1], "metallicFactor": 0, "roughnessFactor": 1}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.9, 0.05, 0.05, 1], "metallicFactor": 0, "roughnessFactor": 1}}]})",
+                                    kNoOpLoader);
+    GpuMaterial* white = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    GpuMaterial* red = renderer->uploadMaterial((*materials->materials)[1], *materials);
+    white->doubleSided = red->doubleSided = true;
+    const auto mesh = [&](std::vector<float> positions) {
+        std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+        auto m = std::make_unique<GpuMesh>();
+        m->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        m->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        m->indexCount = 6;
+        m->indexFormat = GPU::IndexFormat::uint32;
+        m->vertexCount = 4;
+        m->layout = &VertexLayout::positionOnly();
+        m->setBoundsFromPositions(positions.data(), 4);
+        return m;
+    };
+    auto ground = mesh({-3, 0, -3, -3, 0, 3, 3, 0, 3, 3, 0, -3});
+    auto wall = mesh({-1, 0, -3, -1, 0, 3, -1, 1.5f, 3, -1, 1.5f, -3});  // x = -1, 1.5 m high
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.5, 4.0, 0.01), VM::Vector3<double>(0.5, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 0.0, -1.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.5, 4.0, 0.01);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(-0.5, -1.0, 0.0);  // from above, the +x side: lights the wall's face and the ground
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    scene.lights.push_back(sun);
+    DrawCall g;
+    g.mesh = ground.get();
+    g.material = white;
+    g.worldTransform = VM::Matrix4<double>::identity();
+    DrawCall w = g;
+    w.mesh = wall.get();
+    w.material = red;
+    scene.opaque = {g, w};
+
+    gi.setGrid(DdgiVolume::fitting(VM::Vector3<double>(-2.0, 0.1, -2.0), VM::Vector3<double>(2.0, 2.0, 2.0), 0.5));
+    const auto halfToFloat = [](uint16_t h) {
+        const uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+        float v = exponent == 0 ? std::ldexp(float(mantissa), -24)
+                                : exponent == 31 ? INFINITY : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+        return sign ? -v : v;
+    };
+    const auto readHalf = [&](const std::shared_ptr<GPU::Texture>& texture) {
+        device->waitForIdle();
+        std::vector<uint16_t> raw(size_t(texture->getWidth()) * texture->getHeight() * 4);
+        EXPECT_TRUE(texture->download(0, 0, raw.data(), raw.size() * 2));
+        std::vector<float> out(raw.size());
+        for (size_t i = 0; i < raw.size(); ++i) out[i] = halfToFloat(raw[i]);
+        return out;
+    };
+    // Looking down from 4 m (60 degrees): 13.9 pixels per metre on the ground,
+    // the wall (x = -1) at column 11; x = -0.7 m is column 15, x = 1.6 m column 47.
+    const auto band = [](const std::vector<float>& img, int x, int c) {
+        double s = 0.0;
+        for (int y = 26; y < 38; ++y) s += img[(size_t(y) * 64 + size_t(x)) * 4 + size_t(c)];
+        return s / 12.0;
+    };
+    renderer->renderGBuffer(scene);
+    for (int f = 0; f < 16; ++f) ASSERT_TRUE(gi.update(tracer, scene, *renderer));
+    ASSERT_TRUE(gi.resolve(renderer->gBuffer(), scene.camera));
+    const auto at16 = readHalf(gi.irradiance());
+    for (int f = 0; f < 16; ++f) ASSERT_TRUE(gi.update(tracer, scene, *renderer));
+    ASSERT_TRUE(gi.resolve(renderer->gBuffer(), scene.camera));
+    const auto at32 = readHalf(gi.irradiance());
+    const double nearR = band(at32, 15, 0), nearG = band(at32, 15, 1), farR = band(at32, 47, 0), farG = band(at32, 47, 1);
+    std::printf("[DDGI] ground irradiance near the wall r %.3f g %.3f, far r %.3f g %.3f; near r after 16 frames %.3f\n", nearR,
+                nearG, farR, farG, band(at16, 15, 0));
+    EXPECT_GT(nearR, 0.01) << "bounced light reaches the ground";
+    EXPECT_GT(nearR, nearG * 1.5) << "red light from the wall near it";
+    // (The ground's only bounced light is the wall's: red everywhere, weaker with distance.)
+    EXPECT_LT(farR, nearR * 0.5) << "less bounced light far from the wall";
+    EXPECT_NEAR(band(at16, 15, 0), nearR, 0.25 * nearR) << "converged";
+    EXPECT_EQ(gi.frames(), 32u);
+
+    // Into the raster frame.
+    renderer->setIBLEnabled(true);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    renderer->render(scene, view);
+    const auto plain = readBackPixels(tex);
+    renderer->setIndirectDiffuse(gi.irradiance());
+    renderer->render(scene, view);
+    const auto lit = readBackPixels(tex);
+    renderer->setIndirectDiffuse(nullptr);
+    const auto rgb = [](const std::vector<uint8_t>& p, int x, int c) {
+        double s = 0.0;
+        for (int y = 26; y < 38; ++y) s += p[(size_t(y) * 64 + size_t(x)) * 4 + size_t(c)];
+        return s / 12.0;
+    };
+    std::printf("[DDGI] raster ground near the wall r/g: without %.1f / %.1f, with %.1f / %.1f\n", rgb(plain, 15, 0), rgb(plain, 15, 1),
+                rgb(lit, 15, 0), rgb(lit, 15, 1));
+    EXPECT_GT(rgb(lit, 15, 0) - rgb(lit, 15, 1), rgb(plain, 15, 0) - rgb(plain, 15, 1) + 5.0) << "redder with GI";
+    white->doubleSided = red->doubleSided = false;
+    renderer->setSkyboxEnabled(true);
+    renderer->setEnvironmentIntensity(1.0f);
+}
+
+// Probe-based GI doesn't leak through walls: a sealed 1 m box on sunlit
+// ground. Its floor's irradiance (from the probes inside it, which see only
+// its dark walls) stays near zero, while ground outside gets bounced light.
+TEST_F(OffscreenRenderTest, DdgiDoesNotLeakThroughWalls) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer on this backend";
+    PathTracer tracer(device);
+    DdgiVolume gi(device);
+    if (!tracer.supported() || !gi.supported()) GTEST_SKIP() << "No path tracing on this device";
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.0f);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.8, 0.8, 1], "metallicFactor": 0, "roughnessFactor": 1}}]})",
+                                    kNoOpLoader);
+    GpuMaterial* white = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    white->doubleSided = true;
+    std::vector<std::unique_ptr<GpuMesh>> meshes;
+    RenderScene scene;
+    const auto add = [&](std::vector<float> positions) {
+        std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+        auto m = std::make_unique<GpuMesh>();
+        m->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        m->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        m->indexCount = 6;
+        m->indexFormat = GPU::IndexFormat::uint32;
+        m->vertexCount = 4;
+        m->layout = &VertexLayout::positionOnly();
+        m->setBoundsFromPositions(positions.data(), 4);
+        DrawCall draw;
+        draw.mesh = m.get();
+        draw.material = white;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+        meshes.push_back(std::move(m));
+    };
+    add({-3, 0, -3, -3, 0, 3, 3, 0, 3, 3, 0, -3});  // the ground (also the box's floor)
+    const float h = 0.5f;  // the box: x, z in [-0.5, 0.5], y in [0, 1]
+    add({-h, 1, -h, h, 1, -h, h, 1, h, -h, 1, h});
+    add({-h, 0, -h, -h, 1, -h, -h, 1, h, -h, 0, h});
+    add({h, 0, -h, h, 0, h, h, 1, h, h, 1, -h});
+    add({-h, 0, -h, h, 0, -h, h, 1, -h, -h, 1, -h});
+    add({-h, 0, h, -h, 1, h, h, 1, h, h, 0, h});
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(-0.4, -1.0, 0.3);
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    scene.lights.push_back(sun);
+    DdgiVolume::Grid grid;  // probes off the walls: 8 inside the box (x, z +-0.25, y 0.25 / 0.75)
+    grid.origin = VM::Vector3<double>(-1.75, 0.25, -1.75);
+    grid.spacing = VM::Vector3<double>(0.5, 0.5, 0.5);
+    grid.count[0] = 8;
+    grid.count[1] = 4;
+    grid.count[2] = 8;
+    gi.setGrid(grid);
+    const auto camera = [&](double x, double y, double z, double tx, double ty, double tz) {
+        scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(x, y, z), VM::Vector3<double>(tx, ty, tz),
+                                                        VM::Vector3<double>(0.0, 0.0, -1.0));
+        scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.05, 100.0);
+        scene.camera.position = VM::Vector3<double>(x, y, z);
+    };
+    const auto halfToFloat = [](uint16_t v) {
+        const uint32_t sign = (v >> 15) & 1, exponent = (v >> 10) & 31, mantissa = v & 1023;
+        float f = exponent == 0 ? std::ldexp(float(mantissa), -24)
+                                : exponent == 31 ? INFINITY : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+        return sign ? -f : f;
+    };
+    const auto meanIrradiance = [&]() {
+        renderer->renderGBuffer(scene);
+        EXPECT_TRUE(gi.resolve(renderer->gBuffer(), scene.camera));
+        device->waitForIdle();
+        std::vector<uint16_t> raw(size_t(64) * 64 * 4);
+        EXPECT_TRUE(gi.irradiance()->download(0, 0, raw.data(), raw.size() * 2));
+        // Pixels 8..55: inside, the floor to +-0.39 m, where points near the
+        // walls have probes outside the box among their eight (visibility).
+        double sum = 0.0;
+        for (int y = 8; y < 56; ++y) {
+            for (int x = 8; x < 56; ++x) sum += halfToFloat(raw[(size_t(y) * 64 + size_t(x)) * 4]);
+        }
+        return sum / (48.0 * 48.0);
+    };
+    for (int f = 0; f < 24; ++f) ASSERT_TRUE(gi.update(tracer, scene, *renderer));
+    camera(0.0, 0.9, 0.01, 0.0, 0.0, 0.0);  // inside the box, looking at its floor
+    const double inside = meanIrradiance();
+    camera(1.5, 0.9, 0.01, 1.5, 0.0, 0.0);  // outside, beside it
+    const double outside = meanIrradiance();
+    std::printf("[DDGI] floor irradiance inside the sealed box %.4f, ground outside %.4f\n", inside, outside);
+    EXPECT_GT(outside, 0.01) << "bounced light outside";
+    EXPECT_LT(inside, outside * 0.1) << "none of it leaks into the box";
+    white->doubleSided = false;
+    renderer->setSkyboxEnabled(true);
+    renderer->setEnvironmentIntensity(1.0f);
 }
 
 // Path tracing (PathTracer): a plate floating over a lit ground plane, the
