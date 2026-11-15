@@ -107,6 +107,10 @@ namespace systems::leal::campello_renderer {
         // The base colour texture itself (8-bit RGBA images; null without
         // one, or for block-compressed ones): the path tracer samples it.
         std::shared_ptr<systems::leal::campello_gpu::Texture> baseColorTexture;
+        // The normal and metallic-roughness textures (null without them):
+        // the path tracer samples them too.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> normalTexture;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> metallicRoughnessTexture;
         // Shader program drawing this material (Renderer::registerProgram());
         // the built-in PBR shaders by default. The material's bind groups and
         // uniforms are bound either way (custom programs may read them).

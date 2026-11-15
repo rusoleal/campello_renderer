@@ -5,6 +5,7 @@
 #include <campello_renderer/culling.hpp>
 #include <campello_renderer/path_tracer.hpp>
 #include <gltf/gltf.hpp>
+#include <algorithm>
 #include <future>
 #include <vector>
 #include <fstream>
@@ -3993,6 +3994,1148 @@ TEST_F(OffscreenRenderTest, PathTracerSamplesBaseColourTextures) {
     const auto [flatBright, flatDark] = trace(&plain);
     EXPECT_EQ(flatBright + flatDark, 0) << "the average grey everywhere";
     renderer->setEnvironmentIntensity(1.0f);
+}
+
+// Sampling (PathTracer): a ground plane seen from above, lit only by an HDR
+// sky that is dim except for a small bright patch overhead, the case where
+// finding the sky by chance is noisy. Shared by the tests below.
+namespace {
+struct SkyPatchScene {
+    std::unique_ptr<GpuMesh> ground;
+    RenderScene scene;
+};
+
+SkyPatchScene makeSkyPatchScene(const std::shared_ptr<systems::leal::campello_gpu::Device>& device, Renderer& renderer,
+                                GpuMaterial* material) {
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    // 16 x 16 texels per face, rgba32float: 0.05 everywhere, 2 x 2 texels
+    // of 200 in the middle of +Y (layer 2).
+    constexpr uint32_t size = 16;
+    auto cube = device->createTexture(GPU::TextureType::ttCube, GPU::PixelFormat::rgba32float, size, size, 1, 1, 1,
+                                      (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
+                                                          uint32_t(GPU::TextureUsage::copyDst)));
+    if (cube) {
+        std::vector<float> texels(size_t(6) * size * size * 4);
+        for (uint32_t face = 0; face < 6; ++face) {
+            for (uint32_t y = 0; y < size; ++y) {
+                for (uint32_t x = 0; x < size; ++x) {
+                    const bool patch = face == 2 && (x == 7 || x == 8) && (y == 7 || y == 8);
+                    float* t = &texels[((size_t(face) * size + y) * size + x) * 4];
+                    t[0] = t[1] = t[2] = patch ? 200.0f : 0.05f;
+                    t[3] = 1.0f;
+                }
+            }
+        }
+        auto staging = device->createBuffer(texels.size() * 4, GPU::BufferUsage::copySrc, texels.data());
+        auto encoder = device->createCommandEncoder();
+        for (uint32_t face = 0; face < 6; ++face) {
+            encoder->copyBufferToTexture(staging, uint64_t(face) * size * size * 16, size * 16, cube, 0, face);
+        }
+        auto fence = device->createFence();
+        device->submit(encoder->finish(), fence);
+        if (fence) fence->wait();
+        renderer.setEnvironmentMap(cube);
+    }
+    renderer.setSkyboxEnabled(false);
+    renderer.setEnvironmentIntensity(1.0f);
+
+    SkyPatchScene out;
+    std::vector<float> positions = {-1.5f, 0.0f, -1.5f, 1.5f, 0.0f, -1.5f, 1.5f, 0.0f, 1.5f, -1.5f, 0.0f, 1.5f};
+    std::vector<uint32_t> indices = {0, 2, 1, 0, 3, 2};
+    out.ground = std::make_unique<GpuMesh>();
+    out.ground->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    out.ground->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    out.ground->indexCount = 6;
+    out.ground->indexFormat = GPU::IndexFormat::uint32;
+    out.ground->vertexCount = 4;
+    out.ground->layout = &VertexLayout::positionOnly();
+    out.ground->setBoundsFromPositions(positions.data(), 4);
+    out.scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 2.0, 0.01), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                        VM::Vector3<double>(0.0, 0.0, -1.0));
+    out.scene.camera.projection = VM::Matrix4<double>::perspective(40.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    out.scene.camera.position = VM::Vector3<double>(0.0, 2.0, 0.01);
+    DrawCall draw;
+    draw.mesh = out.ground.get();
+    draw.material = material;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    out.scene.opaque.push_back(draw);
+    return out;
+}
+
+// The linear image after `samples` samples, from the start.
+std::vector<float> traceLinear(PathTracer& tracer, const RenderScene& scene, const Renderer& renderer, int samples) {
+    tracer.reset();
+    for (int i = 0; i < samples; ++i) {
+        if (!tracer.render(scene, renderer, 64, 64)) return {};
+    }
+    std::vector<float> rgb;
+    if (!tracer.readLinear(rgb)) return {};
+    return rgb;
+}
+
+double meanOf(const std::vector<float>& rgb) {
+    double sum = 0.0;
+    for (float v : rgb) sum += v;
+    return rgb.empty() ? 0.0 : sum / double(rgb.size());
+}
+
+double rmsError(const std::vector<float>& a, const std::vector<float>& b) {
+    double sum = 0.0;
+    for (size_t i = 0; i < a.size() && i < b.size(); ++i) sum += double(a[i] - b[i]) * double(a[i] - b[i]);
+    return a.empty() ? 0.0 : std::sqrt(sum / double(a.size()));
+}
+} // namespace
+
+// Sampling the sky as a light (with multiple importance sampling) gives the
+// same image on average as finding it by bounces only, with much less
+// noise for the same samples. Owen-scrambled Sobol numbers have less error
+// than independent ones.
+TEST_F(OffscreenRenderTest, PathTracerSamplesTheSkyAsALight) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+    auto sky = makeSkyPatchScene(device, *renderer, red);
+
+    // The reference with independent random numbers: it shares its first
+    // samples with the random 16 sample image below, not the Sobol one (a
+    // comparison that, if anything, favours random numbers).
+    tracer.setSampler(PathTracer::Sampler::random);
+    const auto reference = traceLinear(tracer, sky.scene, *renderer, 1024);
+    tracer.setSampler(PathTracer::Sampler::sobol);
+    ASSERT_FALSE(reference.empty());
+    ASSERT_GT(meanOf(reference), 0.01) << "the sky lights the ground";
+
+    tracer.setEnvironmentSampling(false);
+    const auto bouncesOnly = traceLinear(tracer, sky.scene, *renderer, 256);
+    tracer.setEnvironmentSampling(true);
+    const auto sampled = traceLinear(tracer, sky.scene, *renderer, 256);
+    ASSERT_FALSE(bouncesOnly.empty());
+    ASSERT_FALSE(sampled.empty());
+    // Unbiased: the same mean either way (within the bounces-only noise).
+    EXPECT_NEAR(meanOf(sampled) / meanOf(reference), 1.0, 0.03);
+    EXPECT_NEAR(meanOf(bouncesOnly) / meanOf(reference), 1.0, 0.08);
+    const double errorSampled = rmsError(sampled, reference);
+    const double errorBouncesOnly = rmsError(bouncesOnly, reference);
+    EXPECT_LT(errorSampled, errorBouncesOnly * 0.5) << "sky sampling: " << errorSampled << ", bounces only: " << errorBouncesOnly;
+
+    tracer.setSampler(PathTracer::Sampler::random);
+    const auto random = traceLinear(tracer, sky.scene, *renderer, 16);
+    tracer.setSampler(PathTracer::Sampler::sobol);
+    const auto sobol = traceLinear(tracer, sky.scene, *renderer, 16);
+    const double errorRandom = rmsError(random, reference);
+    const double errorSobol = rmsError(sobol, reference);
+    EXPECT_LT(errorSobol, errorRandom) << "Sobol: " << errorSobol << ", random: " << errorRandom;
+    std::printf("[PathTracer] 256 spp RMS error: sky sampling %.5f, bounces only %.5f; 16 spp: Sobol %.5f, random %.5f\n",
+                errorSampled, errorBouncesOnly, errorSobol, errorRandom);
+
+    // Under a glass roof: the sky's light samples cross the glass, tinted
+    // as paths crossing it are on average. The same mean as finding the
+    // sky by bounces through it, a little darker than without the roof.
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"},
+        "extensionsUsed": ["KHR_materials_transmission"],
+        "materials": [
+            {"alphaMode": "BLEND", "pbrMetallicRoughness": {"baseColorFactor": [0.9, 0.9, 0.9, 1], "metallicFactor": 0,
+             "roughnessFactor": 0.05}, "extensions": {"KHR_materials_transmission": {"transmissionFactor": 1.0}}}]})",
+                                    kNoOpLoader);
+    ASSERT_NE(materials, nullptr);
+    GpuMaterial* glass = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    ASSERT_NE(glass, nullptr);
+    DrawCall roof = sky.scene.opaque[0];
+    roof.material = glass;
+    roof.worldTransform.data[7] = 1.0;  // row-major: 1 m up
+    sky.scene.transparent.push_back(roof);
+    tracer.setEnvironmentSampling(false);
+    const auto roofBouncesOnly = traceLinear(tracer, sky.scene, *renderer, 1024);
+    tracer.setEnvironmentSampling(true);
+    const auto roofSampled = traceLinear(tracer, sky.scene, *renderer, 256);
+    ASSERT_FALSE(roofSampled.empty());
+    EXPECT_NEAR(meanOf(roofSampled) / meanOf(roofBouncesOnly), 1.0, 0.05);
+    EXPECT_LT(meanOf(roofSampled), meanOf(sampled)) << "the glass takes some light";
+    EXPECT_GT(meanOf(roofSampled), meanOf(sampled) * 0.6) << "most of it comes through";
+    renderer->setSkyboxEnabled(true);
+}
+
+// Light portals: a closed 3 m room under a uniform sky, lit through one
+// 1 x 1 m glass skylight. Sampling the sky by brightness aims nearly every
+// light sample at the walls; aiming at the skylight (a portal) gives the
+// same image with much less noise. portalsFromGlass() finds the pane.
+TEST_F(OffscreenRenderTest, PathTracerAimsAtLightPortals) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"},
+        "extensionsUsed": ["KHR_materials_transmission"],
+        "materials": [
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.7, 0.7, 0.7, 1], "metallicFactor": 0, "roughnessFactor": 1}},
+            {"alphaMode": "BLEND", "pbrMetallicRoughness": {"baseColorFactor": [0.9, 0.9, 0.9, 1], "metallicFactor": 0,
+             "roughnessFactor": 0.05}, "extensions": {"KHR_materials_transmission": {"transmissionFactor": 1.0}}}]})",
+                                    kNoOpLoader);
+    ASSERT_NE(materials, nullptr);
+    GpuMaterial* wallMaterial = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    GpuMaterial* glass = renderer->uploadMaterial((*materials->materials)[1], *materials);
+    ASSERT_NE(wallMaterial, nullptr);
+    ASSERT_NE(glass, nullptr);
+
+    // A uniform sky of radiance 1.
+    auto cube = device->createTexture(GPU::TextureType::ttCube, GPU::PixelFormat::rgba32float, 4, 4, 1, 1, 1,
+                                      (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
+                                                          uint32_t(GPU::TextureUsage::copyDst)));
+    ASSERT_NE(cube, nullptr);
+    std::vector<float> texels(6 * 4 * 4 * 4, 1.0f);
+    auto staging = device->createBuffer(texels.size() * 4, GPU::BufferUsage::copySrc, texels.data());
+    auto encoder = device->createCommandEncoder();
+    for (uint32_t face = 0; face < 6; ++face) encoder->copyBufferToTexture(staging, face * 4 * 4 * 16, 4 * 16, cube, 0, face);
+    auto fence = device->createFence();
+    device->submit(encoder->finish(), fence);
+    fence->wait();
+    renderer->setEnvironmentMap(cube);
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(1.0f);
+
+    // Rectangles in the xz plane (normal +y), placed by their draws' transforms.
+    const auto rect = [&](float x0, float x1, float z0, float z1) {
+        std::vector<float> positions = {x0, 0.0f, z0, x1, 0.0f, z0, x1, 0.0f, z1, x0, 0.0f, z1};
+        std::vector<uint32_t> indices = {0, 2, 1, 0, 3, 2};
+        auto mesh = std::make_unique<GpuMesh>();
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh->indexCount = 6;
+        mesh->indexFormat = GPU::IndexFormat::uint32;
+        mesh->vertexCount = 4;
+        mesh->layout = &VertexLayout::positionOnly();
+        mesh->setBoundsFromPositions(positions.data(), 4);
+        return mesh;
+    };
+    std::vector<std::unique_ptr<GpuMesh>> meshes;
+    RenderScene scene;
+    const auto add = [&](std::unique_ptr<GpuMesh> mesh, GpuMaterial* material, const VM::Matrix4<double>& transform,
+                         bool transparent) {
+        DrawCall draw;
+        draw.mesh = mesh.get();
+        draw.material = material;
+        draw.worldTransform = transform;
+        (transparent ? scene.transparent : scene.opaque).push_back(draw);
+        meshes.push_back(std::move(mesh));
+    };
+    const auto translate = [](double x, double y, double z) {
+        VM::Matrix4<double> m = VM::Matrix4<double>::identity();
+        m.data[3] = x;
+        m.data[7] = y;
+        m.data[11] = z;
+        return m;
+    };
+    add(rect(-1.5f, 1.5f, -1.5f, 1.5f), wallMaterial, VM::Matrix4<double>::identity(), false);  // floor
+    // Ceiling at 3 m around a 1 x 1 m hole, the glass in it.
+    add(rect(-1.5f, 1.5f, -1.5f, -0.5f), wallMaterial, translate(0, 3, 0), false);
+    add(rect(-1.5f, 1.5f, 0.5f, 1.5f), wallMaterial, translate(0, 3, 0), false);
+    add(rect(-1.5f, -0.5f, -0.5f, 0.5f), wallMaterial, translate(0, 3, 0), false);
+    add(rect(0.5f, 1.5f, -0.5f, 0.5f), wallMaterial, translate(0, 3, 0), false);
+    add(rect(-0.5f, 0.5f, -0.5f, 0.5f), glass, translate(0, 3, 0), true);
+    for (double side : {-1.5, 1.5}) {
+        VM::Matrix4<double> wx = translate(side, 1.5, 0.0);  // about z: (x, 0, z) -> (0, x, z)
+        wx.data[0] = 0.0;
+        wx.data[1] = -1.0;
+        wx.data[4] = 1.0;
+        wx.data[5] = 0.0;
+        add(rect(-1.5f, 1.5f, -1.5f, 1.5f), wallMaterial, wx, false);
+        VM::Matrix4<double> wz = translate(0.0, 1.5, side);  // about x: (x, 0, z) -> (x, -z, 0)
+        wz.data[5] = 0.0;
+        wz.data[6] = -1.0;
+        wz.data[9] = 1.0;
+        wz.data[10] = 0.0;
+        add(rect(-1.5f, 1.5f, -1.5f, 1.5f), wallMaterial, wz, false);
+    }
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 2.5, 0.01), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 0.0, -1.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 2.5, 0.01);
+
+    const auto portals = PathTracer::portalsFromGlass(scene, *renderer);
+    ASSERT_EQ(portals.size(), 1u);
+    EXPECT_NEAR(portals[0].corner.y(), 3.0, 1e-6);
+    const double area = std::sqrt(std::pow(portals[0].edge1.y() * portals[0].edge2.z() - portals[0].edge1.z() * portals[0].edge2.y(), 2) +
+                                  std::pow(portals[0].edge1.z() * portals[0].edge2.x() - portals[0].edge1.x() * portals[0].edge2.z(), 2) +
+                                  std::pow(portals[0].edge1.x() * portals[0].edge2.y() - portals[0].edge1.y() * portals[0].edge2.x(), 2));
+    EXPECT_NEAR(area, 1.0, 1e-6);
+
+    tracer.setPortals(portals);
+    tracer.setSampler(PathTracer::Sampler::random);  // independent of the images below
+    const auto reference = traceLinear(tracer, scene, *renderer, 1024);
+    tracer.setSampler(PathTracer::Sampler::sobol);
+    ASSERT_FALSE(reference.empty());
+    ASSERT_GT(meanOf(reference), 0.005) << "the skylight lights the room";
+    const auto withPortals = traceLinear(tracer, scene, *renderer, 256);
+    tracer.setPortals({});
+    const auto withoutPortals = traceLinear(tracer, scene, *renderer, 256);
+    const auto withoutLong = traceLinear(tracer, scene, *renderer, 1024);
+    EXPECT_NEAR(meanOf(withoutLong) / meanOf(reference), 1.0, 0.03) << "the same image either way";
+    EXPECT_NEAR(meanOf(withPortals) / meanOf(reference), 1.0, 0.03);
+    const double errorWith = rmsError(withPortals, reference), errorWithout = rmsError(withoutPortals, reference);
+    std::printf("[PathTracer] room with a skylight, 256 spp RMS error: portals %.5f, without %.5f (mean %.4f)\n", errorWith,
+                errorWithout, meanOf(reference));
+    EXPECT_LT(errorWith, errorWithout * 0.5);
+    renderer->setSkyboxEnabled(true);
+}
+
+// Reduced resolution preview: the first samples at a quarter of the
+// resolution (shown as 4 x 4 blocks, 16 times fewer rays), then the image
+// starts again at full resolution. The preview is the same image, coarser.
+TEST_F(OffscreenRenderTest, PathTracerPreviewsAtReducedResolution) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+    auto sky = makeSkyPatchScene(device, *renderer, red);
+    const auto full = traceLinear(tracer, sky.scene, *renderer, 64);
+    ASSERT_FALSE(full.empty());
+
+    tracer.setPreviewResolution(4, 8);
+    tracer.reset();
+    std::vector<double> previewMs;
+    for (int i = 0; i < 8; ++i) {
+        ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+        EXPECT_TRUE(tracer.previewing());
+        std::vector<float> wait;
+        ASSERT_TRUE(tracer.readLinear(wait));
+        previewMs.push_back(tracer.stats().sampleGpuMs);
+    }
+    EXPECT_EQ(tracer.sampleCount(), 8u);
+    std::vector<float> preview;
+    ASSERT_TRUE(tracer.readLinear(preview));
+    ASSERT_EQ(preview.size(), size_t(64) * 64 * 3);
+    bool blocks = true;
+    for (int y = 0; y < 64; ++y) {
+        for (int x = 0; x < 64; ++x) {
+            const size_t at = (size_t(y) * 64 + size_t(x)) * 3, corner = (size_t(y & ~3) * 64 + size_t(x & ~3)) * 3;
+            if (preview[at] != preview[corner]) blocks = false;
+        }
+    }
+    EXPECT_TRUE(blocks) << "a preview pixel covers 4 x 4";
+    const auto pixels = readBackPixels(tracer.output());
+    EXPECT_EQ(pixels[(size_t(5) * 64 + 6) * 4], pixels[(size_t(4) * 64 + 4) * 4]) << "output() shows the blocks";
+    EXPECT_NEAR(meanOf(preview) / meanOf(full), 1.0, 0.1) << "the same image, coarser";
+    if (PathTracer::denoiserAvailable()) {
+        ASSERT_TRUE(tracer.denoise()) << "denoises the small image";
+        EXPECT_TRUE(tracer.denoised());
+    }
+
+    // Then full resolution, from the start.
+    ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    EXPECT_FALSE(tracer.previewing());
+    EXPECT_EQ(tracer.sampleCount(), 1u);
+    for (int i = 0; i < 7; ++i) ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    std::vector<float> after;
+    ASSERT_TRUE(tracer.readLinear(after));
+    const double fullMs = tracer.stats().sampleGpuMs;
+    bool anyEdge = false;
+    for (int y = 0; y < 64 && !anyEdge; ++y) {
+        for (int x = 1; x < 64; ++x) {
+            if ((x & 3) != 0 && after[(size_t(y) * 64 + size_t(x)) * 3] != after[(size_t(y) * 64 + size_t(x - 1)) * 3]) anyEdge = true;
+        }
+    }
+    EXPECT_TRUE(anyEdge) << "full resolution again";
+    std::sort(previewMs.begin(), previewMs.end());
+    std::printf("[PathTracer] 64x64 GPU ms per sample: preview (1/4) %.3f, full %.3f\n", previewMs[previewMs.size() / 2], fullMs);
+    EXPECT_LT(previewMs[previewMs.size() / 2], fullMs) << "the preview is cheaper";
+    renderer->setSkyboxEnabled(true);
+}
+
+// Denoiser settings: fast, high and high with prefiltered guides all clean
+// up a 2 sample image (each closer to the converged image than the noisy
+// one), and they differ; timings printed.
+TEST_F(OffscreenRenderTest, PathTracerDenoiserQualitySettings) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    if (!PathTracer::denoiserAvailable()) GTEST_SKIP() << "Built without the denoiser";
+    namespace GPU = systems::leal::campello_gpu;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+    auto sky = makeSkyPatchScene(device, *renderer, red);
+    const auto reference = traceLinear(tracer, sky.scene, *renderer, 1024);
+    ASSERT_FALSE(reference.empty());
+    std::vector<uint8_t> referenceRgba(size_t(64) * 64 * 4);
+    PathTracer::toneMap(reference.data(), size_t(64) * 64, referenceRgba.data());
+    const auto error = [&](const std::vector<uint8_t>& rgba) {
+        double sum = 0.0;
+        for (size_t i = 0; i < rgba.size(); ++i) {
+            if (i % 4 == 3) continue;
+            const double d = double(rgba[i]) - double(referenceRgba[i]);
+            sum += d * d;
+        }
+        return std::sqrt(sum / double(rgba.size() / 4 * 3));
+    };
+    tracer.reset();
+    for (int i = 0; i < 2; ++i) ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    std::vector<uint8_t> noisy;
+    ASSERT_TRUE(tracer.readOutput(noisy));
+    const double noisyError = error(noisy);
+    struct Setting {
+        const char* name;
+        PathTracer::DenoiserQuality quality;
+        bool prefilter;
+    };
+    std::vector<std::vector<uint8_t>> results;
+    for (const Setting& setting : {Setting{"fast", PathTracer::DenoiserQuality::fast, false},
+                                   Setting{"high", PathTracer::DenoiserQuality::high, false},
+                                   Setting{"high + prefiltered guides", PathTracer::DenoiserQuality::high, true}}) {
+        tracer.setDenoiserQuality(setting.quality);
+        tracer.setDenoiserPrefilter(setting.prefilter);
+        ASSERT_TRUE(tracer.denoise()) << setting.name;  // (makes the filters)
+        ASSERT_TRUE(tracer.denoise()) << setting.name;  // timed: the filters as an interactive caller reuses them
+        std::vector<uint8_t> clean;
+        ASSERT_TRUE(tracer.readOutput(clean));
+        const double e = error(clean);
+        std::printf("[PathTracer] denoise %s: %.2f ms, error %.2f (noisy %.2f, 8-bit levels)\n", setting.name,
+                    tracer.stats().denoiseMs, e, noisyError);
+        EXPECT_LT(e, noisyError) << setting.name;
+        results.push_back(clean);
+    }
+    EXPECT_NE(results[0], results[1]) << "fast and high are different filters";
+    EXPECT_NE(results[1], results[2]) << "prefiltered guides change the result";
+    renderer->setSkyboxEnabled(true);
+}
+
+// Several samples per render(): one dispatch of 4 is the same image as 4
+// of 1; a GPU time budget picks the count from the measured cost; a
+// dispatch stops at the end of the preview.
+TEST_F(OffscreenRenderTest, PathTracerAddsSeveralSamplesPerRender) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+    auto sky = makeSkyPatchScene(device, *renderer, red);
+
+    const auto ones = traceLinear(tracer, sky.scene, *renderer, 4);
+    tracer.setSamplesPerRender(4);
+    const auto four = traceLinear(tracer, sky.scene, *renderer, 1);
+    EXPECT_EQ(tracer.sampleCount(), 4u);
+    EXPECT_EQ(tracer.stats().samplesPerRender, 4u);
+    ASSERT_FALSE(four.empty());
+    EXPECT_EQ(rmsError(ones, four), 0.0) << "the same samples, in one dispatch";
+    std::vector<float> albedoOnes, albedoFour, rgb;
+    tracer.setSamplesPerRender(1);
+    traceLinear(tracer, sky.scene, *renderer, 4);
+    ASSERT_TRUE(tracer.readLinear(rgb, &albedoOnes));
+    tracer.setSamplesPerRender(4);
+    traceLinear(tracer, sky.scene, *renderer, 1);
+    ASSERT_TRUE(tracer.readLinear(rgb, &albedoFour));
+    EXPECT_EQ(rmsError(albedoOnes, albedoFour), 0.0) << "the denoiser guides too";
+
+    // A budget of about 4 samples' GPU time.
+    tracer.setSamplesPerRender(1);
+    traceLinear(tracer, sky.scene, *renderer, 3);
+    const double perSample = tracer.stats().sampleGpuMs;
+    ASSERT_GT(perSample, 0.0);
+    tracer.setFrameBudget(perSample * 4.0);
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+        ASSERT_TRUE(tracer.readLinear(rgb));  // waits, so the next render() sees this one's time
+    }
+    // (A dispatch of several samples shares its fixed cost: more than 4 fit.)
+    const uint32_t budgeted = tracer.stats().samplesPerRender;
+    const double dispatchMs = tracer.stats().sampleGpuMs * budgeted;
+    std::printf("[PathTracer] budget %.3f ms (%.3f ms for 1 sample): %u samples per render, %.3f ms\n", perSample * 4.0,
+                perSample, budgeted, dispatchMs);
+    EXPECT_GE(budgeted, 2u);
+    EXPECT_LE(dispatchMs, perSample * 4.0 * 1.5) << "within the budget";
+    tracer.setFrameBudget(0.0);
+
+    // 5 per render, an 8 sample preview: 5, then the remaining 3, then full resolution.
+    tracer.setSamplesPerRender(5);
+    tracer.setPreviewResolution(4, 8);
+    ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    EXPECT_EQ(tracer.sampleCount(), 5u);
+    ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    EXPECT_EQ(tracer.sampleCount(), 8u);
+    EXPECT_TRUE(tracer.previewing());
+    ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    EXPECT_FALSE(tracer.previewing());
+    EXPECT_EQ(tracer.sampleCount(), 5u);
+    renderer->setSkyboxEnabled(true);
+}
+
+// Rebuilds by what changed: moving an instance rebuilds the instances only
+// (the same image as a tracer building everything afresh); a light starts
+// the image again without a rebuild; exposure keeps the samples.
+TEST_F(OffscreenRenderTest, PathTracerRebuildsOnlyWhatChanged) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+    auto sky = makeSkyPatchScene(device, *renderer, red);
+    // A second, smaller copy of the ground above it (the same mesh).
+    DrawCall plate = sky.scene.opaque[0];
+    VM::Matrix4<double> m = VM::Matrix4<double>::identity();
+    m.data[0] = m.data[10] = 0.3;
+    m.data[7] = 0.6;
+    plate.worldTransform = m;
+    sky.scene.opaque.push_back(plate);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.3, -1.0, 0.2);
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 2.0f;
+    sky.scene.lights.push_back(sun);
+
+    traceLinear(tracer, sky.scene, *renderer, 4);
+    EXPECT_EQ(tracer.stats().fullRebuilds, 1u);
+    EXPECT_EQ(tracer.stats().transformRebuilds, 0u);
+    const double fullMs = tracer.stats().rebuildMs;
+
+    // Move the plate.
+    sky.scene.opaque[1].worldTransform.data[3] = 0.4;
+    const auto moved = traceLinear(tracer, sky.scene, *renderer, 4);
+    EXPECT_EQ(tracer.stats().fullRebuilds, 1u);
+    EXPECT_EQ(tracer.stats().transformRebuilds, 1u);
+    const double transformMs = tracer.stats().rebuildMs;
+    PathTracer fresh(device);
+    const auto afresh = traceLinear(fresh, sky.scene, *renderer, 4);
+    ASSERT_FALSE(moved.empty());
+    EXPECT_EQ(rmsError(moved, afresh), 0.0) << "the same image as building everything";
+    std::printf("[PathTracer] rebuild: full %.2f ms, transforms only %.2f ms\n", fullMs, transformMs);
+
+    // A light: a new image, no rebuild.
+    sky.scene.lights[0].intensity = 3.0f;
+    ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    EXPECT_EQ(tracer.sampleCount(), 1u);
+    EXPECT_EQ(tracer.stats().fullRebuilds, 1u);
+    EXPECT_EQ(tracer.stats().transformRebuilds, 1u);
+
+    // Exposure: the samples stay, the image scales.
+    for (int i = 0; i < 3; ++i) ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    std::vector<float> before, after;
+    ASSERT_TRUE(tracer.readLinear(before));
+    const float exposure = renderer->getExposure();
+    renderer->setExposure(exposure + 1.0f);
+    ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    EXPECT_EQ(tracer.sampleCount(), 5u) << "exposure doesn't start the image again";
+    ASSERT_TRUE(tracer.readLinear(after));
+    EXPECT_NEAR(meanOf(after) / meanOf(before), 2.0, 0.1);
+    renderer->setExposure(exposure);
+    renderer->setSkyboxEnabled(true);
+}
+
+// Adaptive sampling: with a noise target, pixels stop as their estimated
+// error falls under it (more of them over time); those that stopped are
+// close to the converged image, and the image's mean is unchanged.
+TEST_F(OffscreenRenderTest, PathTracerStopsConvergedPixels) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+    auto sky = makeSkyPatchScene(device, *renderer, red);
+    renderer->setEnvironmentIntensity(0.05f);  // the sun's light, mostly: open ground converges fast, shade doesn't
+    DrawCall plate = sky.scene.opaque[0];
+    VM::Matrix4<double> m = VM::Matrix4<double>::identity();
+    m.data[0] = m.data[10] = 0.25;
+    m.data[7] = 0.5;
+    plate.worldTransform = m;
+    sky.scene.opaque.push_back(plate);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.2, -1.0, 0.1);
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    sky.scene.lights.push_back(sun);
+
+    tracer.setSampler(PathTracer::Sampler::random);
+    const auto reference = traceLinear(tracer, sky.scene, *renderer, 1024);
+    tracer.setSampler(PathTracer::Sampler::sobol);
+    ASSERT_FALSE(reference.empty());
+
+    constexpr float target = 0.02f;
+    tracer.setNoiseTarget(target, 16);
+    tracer.reset();
+    std::vector<uint32_t> converged;
+    std::vector<float> rgb;
+    for (int i = 0; i < 256; ++i) {
+        ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+        if ((i + 1) % 32 == 0) {
+            ASSERT_TRUE(tracer.readLinear(rgb));
+            converged.push_back(tracer.stats().convergedPixels);
+        }
+    }
+    EXPECT_EQ(tracer.stats().tracedPixels, 64u * 64u);
+    std::printf("[PathTracer] noise target %.2f: converged pixels after 32..256 samples:", target);
+    for (uint32_t c : converged) std::printf(" %u", c);
+    std::printf(" (of %u)\n", 64u * 64u);
+    EXPECT_GT(converged.back(), 64u * 64u / 4) << "the easy pixels stop";
+    EXPECT_LT(converged.front(), converged.back()) << "more stop over time";
+    for (size_t i = 1; i < converged.size(); ++i) EXPECT_GE(converged[i] + 64, converged[i - 1]);  // (about monotonic)
+
+    ASSERT_TRUE(tracer.readLinear(rgb));
+    EXPECT_NEAR(meanOf(rgb) / meanOf(reference), 1.0, 0.03) << "the same image";
+    // Stopped pixels are close: relative error (luminance) within a few times the target.
+    int close = 0, judged = 0;
+    for (size_t p = 0; p < size_t(64) * 64; ++p) {
+        const double a = 0.2126 * rgb[p * 3] + 0.7152 * rgb[p * 3 + 1] + 0.0722 * rgb[p * 3 + 2];
+        const double b = 0.2126 * reference[p * 3] + 0.7152 * reference[p * 3 + 1] + 0.0722 * reference[p * 3 + 2];
+        if (b < 0.05) continue;
+        ++judged;
+        if (std::abs(a - b) / b < 4.0 * target) ++close;
+    }
+    ASSERT_GT(judged, 0);
+    EXPECT_GT(double(close) / judged, 0.95) << close << " of " << judged;
+    renderer->setSkyboxEnabled(true);
+}
+
+// Denoiser guides through mirrors: a mirror floor reflecting a red wall
+// guides the denoiser with the wall (its red albedo, tinted by the mirror,
+// and its normal), not the mirror's grey, so the reflection keeps its detail.
+TEST_F(OffscreenRenderTest, PathTracerGuidesThroughMirrors) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.95, 0.95, 0.95, 1], "metallicFactor": 1, "roughnessFactor": 0.05}},
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.05, 0.05, 1], "metallicFactor": 0, "roughnessFactor": 1}}]})",
+                                    kNoOpLoader);
+    ASSERT_NE(materials, nullptr);
+    GpuMaterial* mirror = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    GpuMaterial* red = renderer->uploadMaterial((*materials->materials)[1], *materials);
+    ASSERT_NE(mirror, nullptr);
+    ASSERT_NE(red, nullptr);
+    auto sky = makeSkyPatchScene(device, *renderer, mirror);  // the ground: a mirror
+    DrawCall wall = sky.scene.opaque[0];
+    wall.material = red;
+    VM::Matrix4<double> w = VM::Matrix4<double>::identity();  // about x: (x, 0, z) -> (x, -z, 0), at z = -1.5
+    w.data[5] = 0.0;
+    w.data[6] = -1.0;
+    w.data[9] = 1.0;
+    w.data[10] = 0.0;
+    w.data[7] = 1.5;
+    w.data[11] = -1.5;
+    wall.worldTransform = w;
+    sky.scene.opaque.push_back(wall);
+    sky.scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 1.0, 1.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                        VM::Vector3<double>(0.0, 1.0, 0.0));
+    sky.scene.camera.position = VM::Vector3<double>(0.0, 1.0, 1.5);
+
+    tracer.reset();
+    // (The guides average the paths' lobes: about 5% of them take a metal's
+    // diffuse lobe and are guided by the mirror itself.)
+    for (int i = 0; i < 64; ++i) ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    std::vector<float> rgb, albedo, normal;
+    ASSERT_TRUE(tracer.readLinear(rgb, &albedo, &normal));
+    const size_t centre = (size_t(32) * 64 + 32) * 3;
+    std::printf("[PathTracer] mirror pixel guides: albedo %.2f %.2f %.2f, normal %.2f %.2f %.2f\n", albedo[centre],
+                albedo[centre + 1], albedo[centre + 2], normal[centre], normal[centre + 1], normal[centre + 2]);
+    EXPECT_GT(albedo[centre], 0.5) << "the wall's red";
+    EXPECT_LT(albedo[centre + 1], albedo[centre] * 0.25) << "not the mirror's grey";
+    EXPECT_GT(normal[centre + 2], 0.85) << "the wall's normal (+z), not the floor's (+y)";
+    renderer->setSkyboxEnabled(true);
+}
+
+// Richer materials: smooth shading from the mesh's normals, normal
+// textures (tangents from the texture coordinates) and metallic-roughness
+// textures, seen in the denoiser guides (the shading normal; a mirror
+// passes the guides on to what it reflects).
+TEST_F(OffscreenRenderTest, PathTracerShadesWithNormalsAndMaterialTextures) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+
+    // 1 x 1 TGA images (pixels stored b, g, r, a) as data URIs.
+    const auto tga = [](uint8_t r, uint8_t g, uint8_t b) {
+        std::vector<uint8_t> bytes = {0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 32, 0x28, b, g, r, 255};
+        static const char* kBase64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string encoded;
+        for (size_t i = 0; i < bytes.size(); i += 3) {
+            const uint32_t n = (uint32_t(bytes[i]) << 16) | (i + 1 < bytes.size() ? uint32_t(bytes[i + 1]) << 8 : 0) |
+                               (i + 2 < bytes.size() ? uint32_t(bytes[i + 2]) : 0);
+            encoded += kBase64[(n >> 18) & 63];
+            encoded += kBase64[(n >> 12) & 63];
+            encoded += i + 1 < bytes.size() ? kBase64[(n >> 6) & 63] : '=';
+            encoded += i + 2 < bytes.size() ? kBase64[n & 63] : '=';
+        }
+        return std::string("data:image/x-tga;base64,") + encoded;
+    };
+    // A tangent-space normal (0.6, 0, 0.8); roughness 0, metallic 1.
+    const std::string json = std::string(R"({"asset": {"version": "2.0"}, "images": [{"uri": ")") + tga(204, 128, 230) +
+                             R"("}, {"uri": ")" + tga(0, 0, 255) +
+                             R"("}], "samplers": [{"magFilter": 9728, "minFilter": 9728}],
+        "textures": [{"source": 0, "sampler": 0}, {"source": 1, "sampler": 0}],
+        "materials": [
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.8, 0.8, 1], "metallicFactor": 0, "roughnessFactor": 1}},
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.8, 0.8, 1], "metallicFactor": 0, "roughnessFactor": 1},
+             "normalTexture": {"index": 0}},
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.9, 0.9, 0.9, 1], "metallicFactor": 1, "roughnessFactor": 1}},
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.9, 0.9, 0.9, 1], "metallicFactor": 1, "roughnessFactor": 1,
+             "metallicRoughnessTexture": {"index": 1}}}]})";
+    auto gltf = GLTF::loadGLTF(json.c_str(), kNoOpLoader);
+    ASSERT_NE(gltf, nullptr);
+    GpuMaterial* plain = renderer->uploadMaterial((*gltf->materials)[0], *gltf);
+    GpuMaterial* bumped = renderer->uploadMaterial((*gltf->materials)[1], *gltf);
+    GpuMaterial* roughMetal = renderer->uploadMaterial((*gltf->materials)[2], *gltf);
+    GpuMaterial* mappedMetal = renderer->uploadMaterial((*gltf->materials)[3], *gltf);
+    ASSERT_NE(bumped->normalTexture, nullptr);
+    ASSERT_NE(mappedMetal->metallicRoughnessTexture, nullptr);
+
+    // A quad facing +z, u along +x and v along +y; its normals given.
+    const auto quad = [&](float nx, float ny, float nz) {
+        std::vector<float> positions = {-0.9f, -0.9f, 0.0f, 0.9f, -0.9f, 0.0f, 0.9f, 0.9f, 0.0f, -0.9f, 0.9f, 0.0f};
+        std::vector<float> uvs = {0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
+        std::vector<float> normals;
+        for (int i = 0; i < 4; ++i) normals.insert(normals.end(), {nx, ny, nz});
+        std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+        auto mesh = std::make_unique<GpuMesh>();
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+            device->createBuffer(normals.size() * 4, GPU::BufferUsage::vertex, normals.data());
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_TEXCOORD0] =
+            device->createBuffer(uvs.size() * 4, GPU::BufferUsage::vertex, uvs.data());
+        mesh->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh->indexCount = 6;
+        mesh->indexFormat = GPU::IndexFormat::uint32;
+        mesh->vertexCount = 4;
+        mesh->layout = nullptr;  // the full layout: float3 NORMAL, float2 TEXCOORD_0
+        mesh->setBoundsFromPositions(positions.data(), 4);
+        return mesh;
+    };
+    const auto guides = [&](GpuMesh* mesh, GpuMaterial* material, std::vector<float>& albedo, std::vector<float>& normal) {
+        RenderScene scene;
+        scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 2.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                        VM::Vector3<double>(0.0, 1.0, 0.0));
+        scene.camera.projection = VM::Matrix4<double>::perspective(30.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+        scene.camera.position = VM::Vector3<double>(0.0, 0.0, 2.5);
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+        tracer.reset();
+        for (int i = 0; i < 64; ++i) ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+        std::vector<float> rgb;
+        ASSERT_TRUE(tracer.readLinear(rgb, &albedo, &normal));
+    };
+    const size_t centre = (size_t(32) * 64 + 32) * 3;
+    std::vector<float> albedo, normal;
+
+    auto flat = quad(0.0f, 0.0f, 1.0f);
+    guides(flat.get(), plain, albedo, normal);
+    EXPECT_NEAR(normal[centre + 2], 1.0, 0.01) << "flat";
+    const float t = 0.70710678f;
+    auto tilted = quad(t, 0.0f, t);
+    guides(tilted.get(), plain, albedo, normal);
+    EXPECT_NEAR(normal[centre], t, 0.02) << "smooth shading: the mesh's normals";
+    EXPECT_NEAR(normal[centre + 2], t, 0.02);
+
+    guides(flat.get(), bumped, albedo, normal);
+    std::printf("[PathTracer] normal map: shading normal %.3f %.3f %.3f\n", normal[centre], normal[centre + 1], normal[centre + 2]);
+    EXPECT_NEAR(normal[centre], 0.6, 0.03) << "the normal texture bends it along the tangent (+x)";
+    EXPECT_NEAR(normal[centre + 1], 0.0, 0.03);
+    EXPECT_NEAR(normal[centre + 2], 0.8, 0.03);
+
+    guides(flat.get(), roughMetal, albedo, normal);
+    EXPECT_NEAR(normal[centre + 2], 1.0, 0.01) << "rough metal: guided by itself";
+    guides(flat.get(), mappedMetal, albedo, normal);
+    // (About 5% of a metal's paths take its diffuse lobe: guided by itself.)
+    EXPECT_LT(std::abs(normal[centre + 2]), 0.15) << "roughness 0 from the texture: a mirror, guided by the sky it reflects";
+}
+
+// Emissive surfaces as lights: a closed room lit only by a small ceiling
+// panel glowing downwards (one-sided, as glTF). Sampling the panel directly gives the same image as
+// finding it by bounces, with much less noise.
+TEST_F(OffscreenRenderTest, PathTracerSamplesEmissiveSurfaces) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.0f);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"},
+        "extensionsUsed": ["KHR_materials_emissive_strength"],
+        "materials": [
+            {"pbrMetallicRoughness": {"baseColorFactor": [0.7, 0.7, 0.7, 1], "metallicFactor": 0, "roughnessFactor": 1}},
+            {"pbrMetallicRoughness": {"baseColorFactor": [0, 0, 0, 1], "metallicFactor": 0, "roughnessFactor": 1},
+             "emissiveFactor": [1, 0.9, 0.8], "extensions": {"KHR_materials_emissive_strength": {"emissiveStrength": 20}}}]})",
+                                    kNoOpLoader);
+    ASSERT_NE(materials, nullptr);
+    GpuMaterial* wallMaterial = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    GpuMaterial* glow = renderer->uploadMaterial((*materials->materials)[1], *materials);
+    ASSERT_NE(wallMaterial, nullptr);
+    ASSERT_NE(glow, nullptr);
+
+    const auto rect = [&](float x0, float x1, float z0, float z1) {
+        std::vector<float> positions = {x0, 0.0f, z0, x1, 0.0f, z0, x1, 0.0f, z1, x0, 0.0f, z1};
+        std::vector<uint32_t> indices = {0, 2, 1, 0, 3, 2};
+        auto mesh = std::make_unique<GpuMesh>();
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh->indexCount = 6;
+        mesh->indexFormat = GPU::IndexFormat::uint32;
+        mesh->vertexCount = 4;
+        mesh->layout = &VertexLayout::positionOnly();
+        mesh->setBoundsFromPositions(positions.data(), 4);
+        return mesh;
+    };
+    std::vector<std::unique_ptr<GpuMesh>> meshes;
+    RenderScene scene;
+    const auto add = [&](std::unique_ptr<GpuMesh> mesh, GpuMaterial* material, const VM::Matrix4<double>& transform) {
+        DrawCall draw;
+        draw.mesh = mesh.get();
+        draw.material = material;
+        draw.worldTransform = transform;
+        scene.opaque.push_back(draw);
+        meshes.push_back(std::move(mesh));
+    };
+    const auto translate = [](double x, double y, double z) {
+        VM::Matrix4<double> m = VM::Matrix4<double>::identity();
+        m.data[3] = x;
+        m.data[7] = y;
+        m.data[11] = z;
+        return m;
+    };
+    add(rect(-1.5f, 1.5f, -1.5f, 1.5f), wallMaterial, VM::Matrix4<double>::identity());
+    add(rect(-1.5f, 1.5f, -1.5f, 1.5f), wallMaterial, translate(0, 3, 0));
+    VM::Matrix4<double> downwards = translate(0, 2.95, 0);  // turned over (about x): it glows downwards
+    downwards.data[5] = -1.0;
+    downwards.data[10] = -1.0;
+    add(rect(-0.3f, 0.3f, -0.3f, 0.3f), glow, downwards);
+    for (double side : {-1.5, 1.5}) {
+        VM::Matrix4<double> wx = translate(side, 1.5, 0.0);
+        wx.data[0] = 0.0;
+        wx.data[1] = -1.0;
+        wx.data[4] = 1.0;
+        wx.data[5] = 0.0;
+        add(rect(-1.5f, 1.5f, -1.5f, 1.5f), wallMaterial, wx);
+        VM::Matrix4<double> wz = translate(0.0, 1.5, side);
+        wz.data[5] = 0.0;
+        wz.data[6] = -1.0;
+        wz.data[9] = 1.0;
+        wz.data[10] = 0.0;
+        add(rect(-1.5f, 1.5f, -1.5f, 1.5f), wallMaterial, wz);
+    }
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 2.5, 0.01), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 0.0, -1.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 2.5, 0.01);
+
+    tracer.setSampler(PathTracer::Sampler::random);
+    const auto reference = traceLinear(tracer, scene, *renderer, 512);
+    tracer.setSampler(PathTracer::Sampler::sobol);
+    ASSERT_FALSE(reference.empty());
+    ASSERT_GT(meanOf(reference), 0.005) << "the panel lights the room";
+    const auto sampled = traceLinear(tracer, scene, *renderer, 64);
+    // Light samples at the last vertex add one more bounce of light than
+    // paths that must hit the panel: bounces only gets one bounce more.
+    tracer.setEmissiveSampling(false);
+    tracer.setMaxBounces(5);
+    const auto bouncesOnly = traceLinear(tracer, scene, *renderer, 64);
+    const auto bouncesLong = traceLinear(tracer, scene, *renderer, 512);
+    EXPECT_NEAR(meanOf(bouncesLong) / meanOf(reference), 1.0, 0.03) << "the same image either way";
+    EXPECT_NEAR(meanOf(sampled) / meanOf(reference), 1.0, 0.03);
+    const double errorSampled = rmsError(sampled, reference), errorBounces = rmsError(bouncesOnly, reference);
+    std::printf("[PathTracer] room lit by a panel, 64 spp RMS error: light sampling %.5f, bounces only %.5f\n", errorSampled,
+                errorBounces);
+    EXPECT_LT(errorSampled, errorBounces * 0.5);
+    renderer->setSkyboxEnabled(true);
+    renderer->setEnvironmentIntensity(1.0f);
+}
+
+// Camera effects: depth of field blurs an edge that's out of focus and
+// keeps it sharp in focus; each tone mapping's output() is its CPU
+// toneMap() of the linear image; the physical exposure helper.
+TEST_F(OffscreenRenderTest, PathTracerCameraEffects) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setSkyboxEnabled(false);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "extensionsUsed": ["KHR_materials_unlit"],
+        "materials": [
+            {"pbrMetallicRoughness": {"baseColorFactor": [3, 0, 0, 1]}, "extensions": {"KHR_materials_unlit": {}}},
+            {"pbrMetallicRoughness": {"baseColorFactor": [0, 0.6, 0.2, 1]}, "extensions": {"KHR_materials_unlit": {}}}]})",
+                                    kNoOpLoader);
+    ASSERT_NE(materials, nullptr);
+    GpuMaterial* red = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    GpuMaterial* green = renderer->uploadMaterial((*materials->materials)[1], *materials);
+    // Two unlit halves meeting at x = 0, 2.5 in front of the camera.
+    const auto half = [&](float x0, float x1) {
+        std::vector<float> positions = {x0, -2.0f, 0.0f, x1, -2.0f, 0.0f, x1, 2.0f, 0.0f, x0, 2.0f, 0.0f};
+        std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+        auto mesh = std::make_unique<GpuMesh>();
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh->indexCount = 6;
+        mesh->indexFormat = GPU::IndexFormat::uint32;
+        mesh->vertexCount = 4;
+        mesh->layout = &VertexLayout::positionOnly();
+        mesh->setBoundsFromPositions(positions.data(), 4);
+        return mesh;
+    };
+    auto left = half(-2.0f, 0.0f), right = half(0.0f, 2.0f);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 2.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(40.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 2.5);
+    for (auto [mesh, material] : {std::pair{left.get(), red}, std::pair{right.get(), green}}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    // Columns of the middle row that are neither red nor green: the edge's width.
+    const auto edgeWidth = [&](const std::vector<float>& rgb) {
+        int mixed = 0;
+        for (int x = 0; x < 64; ++x) {
+            const size_t at = (size_t(32) * 64 + size_t(x)) * 3;
+            const double redShare = rgb[at] / 3.0;
+            if (redShare > 0.1 && redShare < 0.9) ++mixed;
+        }
+        return mixed;
+    };
+    tracer.setDepthOfField(0.1f, 2.5f);
+    const auto focused = traceLinear(tracer, scene, *renderer, 64);
+    tracer.setDepthOfField(0.1f, 0.6f);
+    const auto blurred = traceLinear(tracer, scene, *renderer, 64);
+    tracer.setDepthOfField(0.0f, 1.0f);
+    std::printf("[PathTracer] depth of field: edge %d px in focus, %d px out of focus\n", edgeWidth(focused), edgeWidth(blurred));
+    EXPECT_LE(edgeWidth(focused), 2) << "in focus: sharp";
+    EXPECT_GE(edgeWidth(blurred), 6) << "out of focus: blurred";
+
+    std::vector<std::vector<uint8_t>> outputs;
+    for (auto mode : {PathTracer::ToneMapping::pbrNeutral, PathTracer::ToneMapping::aces, PathTracer::ToneMapping::agx}) {
+        tracer.setToneMapping(mode);
+        const auto rgb = traceLinear(tracer, scene, *renderer, 2);
+        std::vector<uint8_t> gpu, cpu(size_t(64) * 64 * 4);
+        ASSERT_TRUE(tracer.readOutput(gpu));
+        PathTracer::toneMap(rgb.data(), size_t(64) * 64, cpu.data(), mode);
+        int worst = 0;
+        for (size_t i = 0; i < cpu.size(); ++i) worst = std::max(worst, std::abs(int(cpu[i]) - int(gpu[i])));
+        EXPECT_LE(worst, 1) << "the shader's tone mapping, mode " << int(mode);
+        outputs.push_back(gpu);
+    }
+    EXPECT_NE(outputs[0], outputs[1]);
+    EXPECT_NE(outputs[1], outputs[2]);
+    tracer.setToneMapping(PathTracer::ToneMapping::pbrNeutral);
+
+    // Sunny 16: f/16, 1/100 s, ISO 100 is EV100 ~14.64.
+    EXPECT_NEAR(PathTracer::exposureForCamera(16.0f, 0.01f, 100.0f), -(std::log2(256.0f * 100.0f) + std::log2(1.2f)), 1e-4);
+    EXPECT_NEAR(PathTracer::apertureRadius(0.05f, 2.0f), 0.0125f, 1e-7);
+    renderer->setSkyboxEnabled(true);
+}
+
+// Firefly clamp: a clamp above every path's light changes nothing; a low
+// one takes indirect light away (and only indirect light: with no bounces
+// the image is the same). Progressive bounces: the first samples are those
+// of the lower bounce count, the later ones the full count's.
+TEST_F(OffscreenRenderTest, PathTracerClampsIndirectLightAndBouncesProgressively) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+    auto sky = makeSkyPatchScene(device, *renderer, red);
+    // A wall beside the ground, so light bounces between them.
+    namespace VM = systems::leal::vector_math;
+    DrawCall wall = sky.scene.opaque[0];
+    VM::Matrix4<double> standing = VM::Matrix4<double>::identity();
+    double* m = standing.data;  // row-major: rotate 90 degrees about z, move to x = -1.5, y = 1.5
+    m[0] = 0.0;
+    m[1] = -1.0;
+    m[4] = 1.0;
+    m[5] = 0.0;
+    m[3] = -1.5;
+    m[7] = 1.5;
+    wall.worldTransform = standing;
+    sky.scene.opaque.push_back(wall);
+
+    const auto unclamped = traceLinear(tracer, sky.scene, *renderer, 8);
+    tracer.setIndirectClamp(1e9f);
+    const auto high = traceLinear(tracer, sky.scene, *renderer, 8);
+    tracer.setIndirectClamp(0.001f);
+    const auto low = traceLinear(tracer, sky.scene, *renderer, 8);
+    ASSERT_FALSE(unclamped.empty());
+    EXPECT_EQ(rmsError(unclamped, high), 0.0) << "a clamp above everything changes nothing";
+    EXPECT_LT(meanOf(low), meanOf(unclamped)) << "a low clamp takes indirect light away";
+    tracer.setMaxBounces(0);
+    tracer.setIndirectClamp(0.0f);
+    const auto directOnly = traceLinear(tracer, sky.scene, *renderer, 8);
+    tracer.setIndirectClamp(0.001f);
+    const auto directClamped = traceLinear(tracer, sky.scene, *renderer, 8);
+    EXPECT_EQ(rmsError(directOnly, directClamped), 0.0) << "direct light isn't clamped";
+    tracer.setIndirectClamp(0.0f);
+
+    // 2 samples at 0 bounces, then 4: the first two match a 0 bounce image,
+    // the next ones add 4 bounce samples.
+    tracer.setMaxBounces(4);
+    tracer.setProgressiveBounces(0, 2);
+    const auto progressiveStart = traceLinear(tracer, sky.scene, *renderer, 2);
+    tracer.setProgressiveBounces(0, 0);
+    tracer.setMaxBounces(0);
+    const auto zeroBounces = traceLinear(tracer, sky.scene, *renderer, 2);
+    EXPECT_EQ(rmsError(progressiveStart, zeroBounces), 0.0) << "the first samples use the lower count";
+    tracer.setMaxBounces(4);
+    tracer.setProgressiveBounces(0, 2);
+    const auto progressiveLater = traceLinear(tracer, sky.scene, *renderer, 64);
+    EXPECT_GT(meanOf(progressiveLater), meanOf(progressiveStart)) << "later samples bounce: more light";
+    renderer->setSkyboxEnabled(true);
+}
+
+// Timings (stats()): GPU time per sample, the scene rebuild, the size of
+// the traced scene. Also printed: the baseline for performance work.
+TEST_F(OffscreenRenderTest, PathTracerMeasuresItsWork) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    PathTracer tracer(device);
+    if (!tracer.supported()) GTEST_SKIP() << "No path tracing on this device";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+    auto sky = makeSkyPatchScene(device, *renderer, red);
+    EXPECT_EQ(tracer.stats().sampleGpuMs, 0.0) << "nothing traced yet";
+    for (int i = 0; i < 8; ++i) ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    std::vector<float> rgb;
+    ASSERT_TRUE(tracer.readLinear(rgb));  // waits for the last sample
+    const auto stats = tracer.stats();
+    EXPECT_GT(stats.sampleGpuMs, 0.0);
+    EXPECT_GT(stats.averageSampleGpuMs, 0.0);
+    EXPECT_GT(stats.rebuildMs, 0.0);
+    EXPECT_EQ(stats.triangles, 2u);
+    EXPECT_EQ(stats.instances, 1u);
+    if (PathTracer::denoiserAvailable()) {
+        EXPECT_EQ(tracer.denoiserDeviceType(), "") << "no device before the first denoise()";
+        ASSERT_TRUE(tracer.denoise());
+        EXPECT_GT(tracer.stats().denoiseMs, 0.0);
+        EXPECT_GT(tracer.stats().firstDenoisedMs, 0.0);
+        const std::string automatic = tracer.denoiserDeviceType();
+        EXPECT_FALSE(automatic.empty());
+        // A GPU device only: its result, or a failure where the library
+        // has none (no CPU fallback).
+        tracer.setDenoiserDevice(PathTracer::DenoiserDevice::gpu);
+        const bool gpu = tracer.denoise();
+        if (gpu) {
+            EXPECT_NE(tracer.denoiserDeviceType(), "cpu");
+        } else {
+            EXPECT_EQ(automatic, "cpu") << "automatic found a GPU device that gpu didn't";
+            EXPECT_EQ(tracer.denoiserDeviceType(), "");
+        }
+        tracer.setDenoiserDevice(PathTracer::DenoiserDevice::cpu);
+        ASSERT_TRUE(tracer.denoise());
+        EXPECT_EQ(tracer.denoiserDeviceType(), "cpu");
+        const double cpuMs = tracer.stats().denoiseMs;
+        std::printf("[PathTracer] denoiser: automatic picks %s; GPU device %s; CPU denoise %.2f ms\n", automatic.c_str(),
+                    gpu ? "available" : "not available in this build", cpuMs);
+        tracer.setDenoiserDevice(PathTracer::DenoiserDevice::automatic);
+        ASSERT_TRUE(tracer.denoise());
+    }
+    std::printf("[PathTracer] 64x64: %.3f ms GPU per sample (mean %.3f), rebuild %.2f ms, denoise %.2f ms, "
+                "first denoised image %.2f ms\n",
+                tracer.stats().sampleGpuMs, tracer.stats().averageSampleGpuMs, tracer.stats().rebuildMs,
+                tracer.stats().denoiseMs, tracer.stats().firstDenoisedMs);
+    renderer->setSkyboxEnabled(true);
 }
 
 // Ambient occlusion and exposure: a floor meeting a wall. With AO on, the

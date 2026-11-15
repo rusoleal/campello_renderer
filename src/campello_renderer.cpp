@@ -9560,6 +9560,8 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
         mat->baseColorTextureAverage = it->second;
         mat->baseColorTexture = baseColorTex;
     }
+    if (material.normalTexture && normalTex != defaultTexture) mat->normalTexture = normalTex;
+    if (mrTex != defaultTexture) mat->metallicRoughnessTexture = mrTex;
 
 #if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
     // Real scene-color/opaque-scene texture is filled in by

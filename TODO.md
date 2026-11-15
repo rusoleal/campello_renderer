@@ -1,6 +1,8 @@
 # campello_renderer TODO
 
-## Current State (v0.7.0)
+## Baseline (v0.7.0, historical)
+
+What worked at v0.7.0. `CHANGELOG.md` lists everything that has landed since (the library is now v0.19.0).
 
 ### What works
 - `setAsset(shared_ptr<GLTF>)` — loads asset, allocates GPU buffer/texture/sampler/bind-group slot arrays
@@ -34,6 +36,8 @@
 
 - [ ] **Vulkan vertex input not applied** — `campello_gpu` Vulkan backend hardcodes `vertexBindingDescriptionCount = 0`, so vertex buffer layouts passed via `createDefaultPipelines()` are ignored. Fix upstream in `campello_gpu`. Tracked in the Vulkan `createDefaultPipelines` path.
 - [ ] **DirectX rendering nonfunctional** — DXIL binaries not compiled; `kDefaultDirectXVertShaderSize == 0` causes early return. `pipelineFlat` and `pipelineTextured` remain null on Windows.
+- [ ] **No acceleration structure compacted-size query** in `campello_gpu`, so the path tracer can't compact its BLASes (memory).
+- [ ] **Metal compute passes don't bind textures** — `campello_gpu`'s Metal `ComputePassEncoder::setBindGroup()` binds buffers and acceleration structures only. The path tracer's `environmentLuminance` kernel reads the environment cube, so it runs as a ray tracing pass (which binds textures) instead. Fix upstream, then move it back to a compute pipeline.
 
 ---
 
@@ -111,6 +115,219 @@
 
 - [x] **Add renderer performance counters** — `RenderStats` exposes `opaqueDrawCount`, `transparentDrawCount`, `totalDrawCount`, `culledNodeCount`, `visibleNodeCount`, `cpuFrameTimeMs`. Populated in both legacy and ECS render paths.
 - [ ] **Add distance-based LOD hooks** — define per-mesh LOD selection and optional far-distance impostor / low-poly fallback support so large environments do not submit full-resolution geometry at every distance.
+
+---
+
+## Path Tracing (`PathTracer`)
+
+Two goals with different trade-offs: **real-time** (the live viewport: first clean image as
+fast as possible, never blocking the UI) and **stills** (rendered images, panoramas and
+walkthrough frames: the best image within minutes). Techniques that help both are listed once.
+
+What's there today (`shaders/metal/path_tracer.metal`): unidirectional path tracing,
+Owen-scrambled Sobol random numbers (or PCG), cosine-weighted diffuse + GGX specular, the sun
+sampled directly (soft disc, shadow rays), the sky sampled as a light by brightness with MIS
+(shadow rays through glass), optional indirect clamp, Russian roulette, 4 bounces (optionally
+fewer for the first samples), glass passing through without spending a bounce. Denoising with
+OIDN `RT` (CPU device, `hdr`, albedo + normal from the first hit) on request. `stats()` gives
+GPU time per sample, rebuild and denoise times.
+
+Baseline (`PathTracerMeasuresItsWork`, 64 x 64, ground plane, Intel UHD 630): about 0.35 ms GPU
+per sample, 4–8 ms rebuild, 11 ms denoise (CPU OIDN), 17 ms to the first denoised image. Larger
+scenes and sizes still to measure.
+
+### Both — fewer samples for the same noise
+- [x] **Low-discrepancy sampling** — Owen-scrambled Sobol (Burley 2020), 2D pairs padded per
+      path vertex, one pair per sampling strategy (a choice's remainder reused as a coordinate):
+      about 23% less error at 16 spp in the sky test. `setSampler()`
+- [ ] **Blue-noise error distribution** — so the remaining error denoises better at low counts.
+      Tried and backed out: one image-wide Sobol scramble shifted per pixel by a 64 x 64
+      void-and-cluster mask (Georgiev & Fajardo 2016). At 1 spp it lowered the error of 4 x 4
+      block means by only ~20% in the sky test; from 4 spp on, pixels sharing the scramble's fine
+      digits made per-pixel error up to 4x worse (a pure 1D test: 0.111 vs 0.029) and the error
+      no longer blue. A progressive tracer needs a sampler built for both: Heitz et al. 2019
+      ("A Low-Discrepancy Sampler that Distributes Monte Carlo Errors as a Blue Noise in Screen
+      Space", ranking + scrambling keys optimised per tile) or Ahmed & Wonka 2020 (hierarchical
+      pixel ordering; needs a fixed sample count, so stills). For games at ~1 spp with temporal
+      accumulation, spatiotemporal blue-noise masks (STBN) are the usual choice instead
+- [x] **Sky importance sampling + MIS** — the environment's luminance on a 6 x 64 x 64 cube, a CDF
+      inverted by binary search (keeps Sobol stratification), shadow rays through glass (average
+      tint), power heuristic against the BSDF. About 9x less error at 256 spp with a bright sky
+      patch. `setEnvironmentSampling()`
+  - [ ] Follow-ups: MIS for the sun discs too (glossy highlights of the sun are BSDF-unsampled
+        today); the table assumes the environment texture's contents don't change under the same
+        pointer; a finer table (or a two-level one) for very small HDR suns
+- [x] **Light portals** — `setPortals()` (rectangles, up to 32), `portalsFromGlass()` (flat glass
+      panes from their bounds); spherical-rectangle sampling by solid angle, 80% of the sky's light
+      samples where portals are in sight, MIS with the table and the BSDF. About 6x less error at
+      256 spp in a room lit through one skylight
+  - [ ] Follow-ups: portal-masked environment sampling (Bitterli et al. 2015: aim through the
+        portal at the bright part of the sky, e.g. the sun's region of an HDR map); many portals
+        (a light BVH instead of a loop over all, past ~32); glass meshes that aren't single flat
+        panes (one mesh per facade, curved glass) as several portals
+- [x] **Firefly control** — `setIndirectClamp()`: light after two or more diffuse / glossy
+      bounces clamped to a max component, hue kept; off by default (stills)
+- [x] **OIDN on the GPU** — `setDenoiserDevice()`: the first GPU physical device OIDN reports
+      (Metal in the arm64 macOS package), CPU fallback. Only the fallback is tested so far (the
+      dev machine is an Intel Mac, whose OIDN package is CPU-only)
+  - [ ] Measure the Metal device on Apple silicon (denoise ms at 1280 x 720 vs CPU)
+  - [ ] No readback: share campello_gpu's buffers with OIDN (`oidnNewSharedBufferFromMetal`, and
+        the CUDA/HIP equivalents) and denoise on the same queue; needs native buffer handles
+        from campello_gpu
+
+### Real-time (viewport) — performance
+- [x] **Measure first** — `stats()`: GPU time per sample (command buffer GPU time) and its mean,
+      rebuild and denoise time, time to first denoised image; baseline above
+  - [ ] Measure larger scenes and viewport sizes (e.g. a BIM model at 1280 x 720) and record them
+- [x] **Fewer bounces while converging** — `setProgressiveBounces(bounces, samples)`; the early
+      samples stay in the average (their bias shrinks as samples are added)
+  - [ ] Russian roulette tuned earlier (starts after 2 bounces today)
+- [x] **Reduced resolution first samples** — `setPreviewResolution(divisor, samples)`: blocks in
+      `output()`, `denoise()` at the small size then bilinear upscaling; full resolution restarts
+      the count
+  - [ ] Keep the preview's samples (splat them into the full image as a prior) instead of
+        restarting; an edge-aware upscale (guided by a full-resolution albedo / normal pass)
+- [x] **Denoise more often, cheaper** — `setDenoiserQuality(fast | balanced | high)`; fast is about
+      half the time of high on the CPU
+  - [ ] The schedule is the application's: denoise every N samples or by time budget instead of
+        only at 8 / 32 / 128 / 512, fast early, high later (the viewer); `stats().denoiseMs` to
+        budget it
+- [x] **Adaptive sample budget per frame** — `setSamplesPerRender()`, `setFrameBudget(ms)` (from
+      the measured GPU time per sample and pixel, 1 to 64 per dispatch); none when slow is the
+      caller skipping `render()` while `sampleInFlight()`, as before
+- [ ] **Temporal reuse while moving** (longer term) — reproject the previous accumulated image with
+      motion vectors so camera moves don't restart from zero; ReSTIR-style reuse of light samples;
+      a real-time denoiser (SVGF-like, or OIDN with temporal input) for interactive tracing while
+      the camera moves. Also what walkthrough video frames need. See Games: Denoising and
+      reconstruction, and Light sampling (ReSTIR)
+- [x] **Acceleration structure cost** — transforms only: the instances and the TLAS rebuilt (1 ms vs
+      24 in the test), BLASes, normals, UVs and materials kept; lights / settings: no rebuild;
+      exposure: no restart; BLASes kept per mesh (rebuilt when its buffers change);
+      `preferFastTrace` for all
+  - [ ] Compaction: needs a compacted-size query in campello_gpu (it has `allowCompaction` and
+        `copyAccelerationStructure`, no size)
+  - [ ] TLAS refit: campello_gpu's `updateAccelerationStructure` refits from the original build
+        inputs, so it can't take new instance transforms; a TLAS rebuild is cheap anyway. BLAS
+        refit is what skinned / morphing meshes need (Games: Dynamic scenes)
+- [ ] **Hybrid** — raster primary visibility (G-buffer from the raster renderer), rays only for
+      secondary effects (shadows, reflections, indirect): the first hit costs nothing extra. See
+      Games: Frame structure (G-buffer and motion vectors, ray queries)
+
+### Stills — quality
+- [x] **Adaptive sampling** — `setNoiseTarget(relativeError, minSamples)`: per-pixel second moment,
+      converged pixels stop (still shown), `Stats::convergedPixels` as the stopping criterion
+  - [ ] Error estimates over small neighbourhoods (or a denoised reference) instead of each
+        pixel's own, which stops a few pixels early; a tile-based dispatch so stopped regions
+        cost no threads at all
+- [x] **OIDN quality settings** — `setDenoiserQuality(high)` (default) and
+      `setDenoiserPrefilter()` (`cleanAux`, the guides denoised by their own `RT` filters): 30% less
+      error at 2 spp in the sky test, about 4x the time
+- [x] **More bounces, no clamping** — `setMaxBounces(8)` or more for interiors; the firefly clamp is
+      off by default (glass crossings don't spend bounces)
+- [x] **Better guides for the denoiser** — through glass (before) and mirrors (roughness < 0.15:
+      the reflected surface, tinted by the Fresnel colour), averaged over samples
+- [x] **Richer materials: shading normals and maps** — interpolated vertex normals (face normals
+      before), normal textures (per-triangle tangents from TEXCOORD_0, or the world mapping frame),
+      metallic-roughness textures; geometric-normal offsets and rejection against light leaks
+  - [ ] Rough glass with IOR (refraction through thick glass, GGX transmission) and volume
+        absorption (KHR_materials_volume)
+  - [x] Emissive surfaces sampled directly as area lights — a light list of world-space
+        emissive triangles, a power CDF, uniform points, MIS; one-sided unless double-sided.
+        About 25x less error in a room lit by one panel. `setEmissiveSampling()`
+  - [ ] Emissive textures (the list uses the factor; a textured emitter's texture average would
+        do for sampling); a light BVH for many emitters with spatial importance (the CDF picks
+        by power regardless of distance: fine for a few luminaires, poor for a city at night)
+  - [ ] TEXCOORD_1 (occlusion and other textures on the second set); the mesh's TANGENT
+        attribute where present (MikkTSpace-exact normal maps)
+- [ ] **Bidirectional path tracing / MLT** (longer term) — paths from the lights as well as the
+      camera: much better for interiors lit through small openings and for caustics through glass.
+      Metropolis (MLT/PSSMLT) on top for the hardest light paths. Only for stills: slow per sample,
+      doesn't fit progressive viewport use
+- [ ] **Path guiding** (alternative to BDPT, longer term) — learn where light comes from during
+      the first samples (e.g. Open PGL, by Intel, works with OIDN) and aim later paths there.
+      Keeps the unidirectional tracer
+- [x] **Camera effects** — `setDepthOfField()` (thin lens), `exposureForCamera()`,
+      `setToneMapping(pbrNeutral | aces | agx)` on the GPU and in `toneMap()`
+  - [ ] Bloom / glare in post (a GPU pass over the linear image before tone mapping; on the
+        denoised image for stills); bokeh shapes (polygonal apertures); an autofocus helper
+        (focus distance from a ray through the image centre)
+- [ ] **No-GPU-RT fallback for stills** — a CPU path tracer (Embree) running the same shading, for
+      machines where campello_gpu has no `Feature::raytracing` (Vulkan without RT, web). Time
+      matters less for stills than for the viewport
+
+### Games — real-time, moving camera
+campello_renderer must be capable of first-class games: about 16 ms per frame (8 ms at 120 Hz),
+a camera that never stops, moving and skinned objects, under 1 sample per pixel. No progressive
+convergence: noise is hidden by temporal reuse, a real-time denoiser and upscaling. OIDN, BDPT/MLT,
+adaptive-to-a-noise-target and the CPU fallback above are offline-only and don't apply.
+
+Shared with the groups above (needed for games as well): low-discrepancy / blue-noise sampling
+(spatiotemporal blue noise here), sky importance sampling + MIS, firefly clamping, measuring
+first, few bounces, reduced resolution, per-frame budget, temporal reuse / ReSTIR, acceleration
+structure cost, hybrid raster + rays, richer materials, camera effects.
+
+**Frame structure**
+- [ ] **Ray-traced effects as separate, budgeted passes** on top of the raster renderer, each
+      optional and with a quality level: RT shadows (sun, local lights, soft), RT reflections,
+      RT ambient occlusion, RT global illumination, RT translucency/refraction. Turned on per
+      effect by the game, by quality preset and by `Feature::raytracing`
+- [ ] **Full path-traced mode** (longer term, high-end GPUs): the "path tracing" setting of modern
+      games — 1–2 samples per pixel, ReSTIR DI/GI, real-time denoising, upscaling
+- [ ] **Ray queries from raster and compute shaders** (inline RT), not only the RT pipeline: what
+      most RT effects use, and the shape the WebGPU proposal and compute emulation would offer
+      (see campello_gpu's TODO: emulated ray tracing on WebGPU)
+- [ ] **G-buffer and motion vectors** from the raster renderer (depth, normals, roughness, albedo,
+      per-pixel motion including skinned and animated objects): the input for ray tracing from
+      the first hit, temporal reuse, denoising and upscaling
+
+**Denoising and reconstruction**
+- [ ] **Real-time denoiser** as a first-class component: SVGF / A-SVGF-style temporal + spatial
+      filtering per signal (diffuse, specular, shadows, AO separately), history rejection on
+      disocclusion and lighting change. Our own implementation in campello_gpu compute, portable
+      to every backend; optionally NVIDIA NRD where available
+- [ ] **Upscaling** — temporal upscaling behind one interface: MetalFX (Apple), FSR (all GPUs),
+      DLSS / XeSS where available; a built-in TAA-upscale fallback. Ray tracing at a lower
+      internal resolution depends on it
+- [ ] **Denoise-aware upscaling** (longer term) — DLSS Ray Reconstruction-style combined
+      denoise + upscale where available
+- [ ] **TAA** with the same history and motion vectors (shared with the denoiser)
+
+**Light sampling**
+- [ ] **ReSTIR DI** — many dynamic lights (hundreds to thousands) with one or few shadow rays per
+      pixel, reservoirs reused over neighbors and frames
+- [ ] **ReSTIR GI** — reuse of indirect light samples for one-bounce GI at about 1 sample per pixel
+- [ ] **Light lists / light BVH** for many-light sampling (point, spot, area, emissive meshes)
+
+**Global illumination without per-pixel path tracing**
+- [ ] **Probe-based GI (DDGI-style)** — a grid (or cascades) of irradiance probes updated by a
+      small number of rays every frame, with visibility (depth moments) to avoid leaks. Much
+      cheaper than per-pixel GI, stable under motion; the usual GI choice in games
+- [ ] **Screen-space fallbacks** — SSAO / SSR / SSGI where ray tracing is off or too expensive,
+      blended with ray-traced results at screen edges
+- [ ] **Software ray tracing for GPUs without RT hardware** — signed distance fields or simplified
+      scene proxies traced in compute (as Unreal's Lumen does), for GI and reflections on Intel/older
+      GPUs and on WebGPU. Complements the compute BVH emulation in campello_gpu
+
+**Dynamic scenes**
+- [ ] **TLAS rebuilt every frame** (cheap, instances only), BLASes built once per mesh and reused
+- [ ] **Skinned and morphing meshes** — skin in compute into a vertex buffer, refit their BLAS
+      every frame (rebuild every N frames or on large deformation to keep BVH quality)
+- [ ] **Instancing at scale** — thousands of instances (vegetation, props) sharing BLASes,
+      `EXT_mesh_gpu_instancing` into the TLAS
+- [ ] **Async compute** — acceleration structure builds and denoising overlapped with raster work
+      where the backend has a separate compute queue
+- [ ] **LOD for ray tracing** — lower-detail BLASes for distant objects and for secondary rays
+      (ties into the LOD item in Rendering Performance)
+- [ ] **Alpha-tested geometry** (foliage, fences) — any-hit / alpha testing in ray queries, with
+      opacity micromaps where the hardware supports them
+
+**Budgets and scaling**
+- [ ] **Quality presets** (off / low / medium / high / path traced) mapping to effects, rays per
+      pixel, internal resolution and denoiser settings
+- [ ] **Per-effect GPU timing** (timestamp queries) in `RenderStats`, and dynamic resolution
+      driven by frame time
+- [ ] **Stable frame pacing** — fixed cost per frame (no work that grows with time spent still,
+      unlike the viewer's accumulation); BLAS builds spread over frames when streaming geometry
 
 ---
 
