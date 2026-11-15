@@ -129,6 +129,7 @@ Two variants are created by `createDefaultPipelines()`:
 - `src/shaders/metal_default.h` — embedded Metal shader library
 - `src/path_tracer.cpp`, `shaders/metal/path_tracer.metal` — `PathTracer` (progressive GPU path tracing)
 - `src/realtime_denoiser.cpp`, `shaders/metal/denoiser.metal` — `RealtimeDenoiser` (SVGF, G-buffer guided)
+- `src/rt_effects.cpp`, `shaders/metal/rt_effects.metal` — `RayTracedShadows` (ray traced effects on the raster renderer)
 - `src/shaders/vulkan_default.h` — embedded Vulkan SPIR-V
 - `src/shaders/directx_default.h` — DirectX DXIL (currently empty stubs)
 - `dependencies/campello_gpu.cmake` / `gltf.cmake` / `campello_image.cmake` — FetchContent declarations

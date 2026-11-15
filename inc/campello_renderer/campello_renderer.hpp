@@ -889,6 +889,14 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapNear;
         std::shared_ptr<systems::leal::campello_gpu::TextureView> shadowMapNearView;
         std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapNearBinding();
+        // setShadowMask(): the mask, packed each frame into a depth texture
+        // bound where the near cascade is; on for this frame's main pass.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMask;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMaskDepth;
+        std::shared_ptr<systems::leal::campello_gpu::TextureView> shadowMaskDepthView;
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineShadowMaskPack;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> shadowMaskPackLayout;
+        bool shadowMaskBound = false;
         bool shadowCascades = true;
         bool shadowNearValid = false;
         uint64_t shadowNearKey = 0;
@@ -1391,6 +1399,16 @@ namespace systems::leal::campello_renderer {
             taaEnabled = enabled;
         }
         bool getTemporalAntiAliasing() const { return taaEnabled; }
+        /// Sun shadows from a screen-space visibility mask (Metal) instead of
+        /// the shadow maps: `visibility`'s red channel, 1 lit .. 0 shadowed,
+        /// at renderWidth x renderHeight (e.g. RayTracedShadows' output,
+        /// denoised by RealtimeDenoiser). Applies to the first shadow-casting
+        /// directional light (LightData::castShadows) whether or not
+        /// setShadowsEnabled() is on; the shadow map passes are skipped.
+        /// Null: back to the shadow maps. Kept until replaced.
+        void setShadowMask(std::shared_ptr<systems::leal::campello_gpu::Texture> visibility) {
+            shadowMask = std::move(visibility);
+        }
         /// The current frame's weight in the TAA history (0..1, default 0.1):
         /// lower is smoother and slower to follow change.
         void setTemporalAntiAliasingBlend(float blend) { taaBlend = std::clamp(blend, 0.01f, 1.0f); }
