@@ -10109,6 +10109,12 @@ void Renderer::render(const RenderScene& scene,
         float nearBlock[20] = {0};    // shadowNearViewProj, shadowNearParams
         bool nearOn = false;
         shadowBlock[20] = exposureEv;
+        if (reflections && !activeProgramPass) {
+            // viewParams yzw: reflections on, their cut-off, their pixels per target pixel.
+            shadowBlock[21] = 1.0f;
+            shadowBlock[22] = reflectionMaxRoughness;
+            shadowBlock[23] = (float)reflections->getWidth() / (float)std::max(1u, sceneTargetWidth());
+        }
         const LightData* sun = nullptr;
         for (const auto& l : scene.lights) {
             if (l.type == 0 && l.castShadows) {
@@ -10329,6 +10335,15 @@ void Renderer::render(const RenderScene& scene,
             {28, brdfLutTexture ? brdfLutTexture : defaultTexture},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
+        // Reflections (setReflections()): the same, the radiance in slot 22
+        // for the opaque draws (the transparent ones need the scene colour).
+        reflectionFrameBindGroup.reset();
+        if (reflections && !activeProgramPass) {
+            for (auto& entry : bgDesc.entries) {
+                if (entry.binding == 22) entry.resource = reflections;
+            }
+            reflectionFrameBindGroup = device->createBindGroup(bgDesc);
+        }
     }
 #endif
 
@@ -10496,9 +10511,11 @@ void Renderer::render(const RenderScene& scene,
                 webgpuBoundDrawGroup = nullptr;
                 lastBoundVertexBuffers.fill({});
                 drawIdx = 0;
+                if (reflectionFrameBindGroup) std::swap(frameBindGroup[currentFrameIndex], reflectionFrameBindGroup);
                 for (auto &draw : sortedOpaque) {
                     renderPrimitive(opaqueRpe, draw, transformOffsets[drawIdx++]);
                 }
+                if (reflectionFrameBindGroup) std::swap(frameBindGroup[currentFrameIndex], reflectionFrameBindGroup);
                 opaqueRpe->end();
             }
 
@@ -10699,9 +10716,12 @@ void Renderer::render(const RenderScene& scene,
         webgpuBoundDrawGroup = nullptr;
         lastBoundVertexBuffers.fill({});
         drawIdx = 0;
+        // (Reflections: the opaque draws with the radiance in slot 22.)
+        if (reflectionFrameBindGroup) std::swap(frameBindGroup[currentFrameIndex], reflectionFrameBindGroup);
         for (auto &draw : sortedOpaque) {
             renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
         }
+        if (reflectionFrameBindGroup) std::swap(frameBindGroup[currentFrameIndex], reflectionFrameBindGroup);
 
         // Transparent draws (already sorted by caller). Same encoder as the
         // opaque loop above — do NOT reset lastBoundVertexBuffers here, or the

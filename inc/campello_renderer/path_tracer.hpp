@@ -156,6 +156,26 @@ public:
     /// The device denoise() used: "cpu", "metal", "cuda", "hip" or "sycl";
     /// empty before the first denoise().
     [[nodiscard]] std::string denoiserDeviceType() const;
+    /// Ray traced reflections for the raster renderer (the Games track):
+    /// for each pixel of `gbuffer` (Renderer::renderGBuffer(), this frame,
+    /// of `scene`), one path from its surface in a direction of its GGX
+    /// lobe (its roughness), shaded as this tracer shades (materials,
+    /// textures, the sun, the sky, emitters, setReflectionBounces() more
+    /// bounces). reflections() is the radiance arriving along it, about one
+    /// sample per pixel: denoise it (RealtimeDenoiser, demodulate off) and
+    /// give it to Renderer::setReflections(). Use a PathTracer of its own
+    /// for this (it doesn't keep the progressive image's state). Submitted,
+    /// not waited for (the next call waits).
+    bool traceReflections(const RenderScene& scene, const Renderer& renderer, const GBufferTargets& gbuffer);
+    /// rgba16float, the G-buffer's size: linear radiance before exposure, 0 on the background.
+    [[nodiscard]] std::shared_ptr<systems::leal::campello_gpu::Texture> reflections() const noexcept {
+        return reflectionTarget_;
+    }
+    /// Bounces after the reflected surface (default 1: its direct light and one more).
+    void setReflectionBounces(uint32_t bounces) noexcept {
+        reflectionBounces_ = bounces;
+    }
+
     /// Whether output() shows the denoised image.
     [[nodiscard]] bool denoised() const noexcept {
         return denoised_;
@@ -414,6 +434,14 @@ private:
     float exposure_ = 0.0f;  // of the last render(), for readLinear()
     Projection projection_ = Projection::perspective;
     bool denoised_ = false;
+    // Reflections (traceReflections()): the G-buffer of the call in
+    // progress, its output, placeholders for the other mode, its sample index.
+    const GBufferTargets* reflectionGBuffer_ = nullptr;
+    std::shared_ptr<systems::leal::campello_gpu::Texture> reflectionTarget_;
+    std::shared_ptr<systems::leal::campello_gpu::Texture> placeholderDepth_;
+    std::shared_ptr<systems::leal::campello_gpu::Texture> placeholderReflection_;
+    uint32_t reflectionFrame_ = 0;
+    uint32_t reflectionBounces_ = 1;
     std::shared_ptr<void> denoiser_;  // Open Image Denoise device, filter and buffers (path_tracer.cpp)
     DenoiserDevice denoiserDevice_ = DenoiserDevice::automatic;
     DenoiserQuality denoiserQuality_ = DenoiserQuality::high;
