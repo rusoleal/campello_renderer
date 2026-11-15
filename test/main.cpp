@@ -3681,6 +3681,94 @@ TEST_F(OffscreenRenderTest, GBufferHoldsSurfacesAndMotion) {
     EXPECT_NEAR(motion[centre * 2 + 1], expected, expected * 0.05) << "position-only object motion";
 }
 
+// TAA (setTemporalAntiAliasing()): a white triangle with slanted edges on
+// black. Without it the edges are hard; after 16 jittered frames they're
+// anti-aliased (partly covered pixels), with the same brightness overall.
+// A moving triangle leaves no trail where it was.
+TEST_F(OffscreenRenderTest, TemporalAntiAliasingSmoothsEdgesWithoutGhosting) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer (TAA) on this backend";
+    renderer->setSkyboxEnabled(false);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "extensionsUsed": ["KHR_materials_unlit"],
+        "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1]}, "extensions": {"KHR_materials_unlit": {}}}]})",
+                                    kNoOpLoader);
+    ASSERT_NE(materials, nullptr);
+    GpuMaterial* white = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    std::vector<float> positions = {-0.6f, -0.5f, 0.0f, 0.55f, -0.35f, 0.0f, -0.1f, 0.6f, 0.0f};
+    std::vector<uint32_t> indices = {0, 1, 2};
+    GpuMesh triangle;
+    triangle.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    triangle.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    triangle.indexCount = 3;
+    triangle.indexFormat = GPU::IndexFormat::uint32;
+    triangle.vertexCount = 3;
+    triangle.layout = &VertexLayout::positionOnly();
+    triangle.setBoundsFromPositions(positions.data(), 3);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 2.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(40.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 2.5);
+    DrawCall draw;
+    draw.mesh = &triangle;
+    draw.material = white;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    draw.material->doubleSided = true;
+    scene.opaque.push_back(draw);
+
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    const auto partial = [](const std::vector<uint8_t>& p) {
+        int n = 0;
+        for (size_t i = 0; i < p.size(); i += 4) n += p[i] > 25 && p[i] < 230;
+        return n;
+    };
+    const auto mean = [](const std::vector<uint8_t>& p) {
+        double sum = 0.0;
+        for (size_t i = 0; i < p.size(); i += 4) sum += p[i];
+        return sum / double(p.size() / 4);
+    };
+    renderer->render(scene, view);
+    const auto hard = readBackPixels(tex);
+    renderer->setTemporalAntiAliasing(true);
+    for (int i = 0; i < 16; ++i) renderer->render(scene, view);
+    const auto smooth = readBackPixels(tex);
+    std::printf("[TAA] partly covered pixels: %d without, %d with; mean %.1f vs %.1f\n", partial(hard), partial(smooth),
+                mean(hard), mean(smooth));
+    EXPECT_LE(partial(hard), 5) << "no anti-aliasing without TAA";
+    EXPECT_GE(partial(smooth), 40) << "anti-aliased edges with TAA";
+    EXPECT_NEAR(mean(smooth) / mean(hard), 1.0, 0.04) << "the same coverage";
+
+    // Moving 0.05 to the right per frame for 16 frames (0.8 in all): where it
+    // started (its left corner) is background again, its middle still white.
+    for (int i = 1; i <= 16; ++i) {
+        VM::Matrix4<double> before = VM::Matrix4<double>::identity(), now = VM::Matrix4<double>::identity();
+        before.data[3] = 0.05 * (i - 1);
+        now.data[3] = 0.05 * i;
+        scene.opaque[0].worldTransform = now;
+        scene.opaque[0].previousWorldTransform = before;
+        renderer->render(scene, view);
+    }
+    const auto moved = readBackPixels(tex);
+    // The centroid (-0.05, -0.08) was at pixel (30, 35); 0.8 to the right it's at (58, 35)
+    // (0.91 m per half image at 2.5 m with a 40 degree field of view).
+    const auto at = [&](const std::vector<uint8_t>& p, int x, int y) { return int(p[(size_t(y) * 64 + size_t(x)) * 4]); };
+    std::printf("[TAA] after moving: old place %d, new middle %d\n", at(moved, 30, 35), at(moved, 58, 35));
+    EXPECT_LT(at(moved, 30, 35), 25) << "no trail where it was";
+    EXPECT_GT(at(moved, 58, 35), 200) << "the moving object stays solid";
+    renderer->setTemporalAntiAliasing(false);
+    draw.material->doubleSided = false;
+}
+
 // Path tracing (PathTracer): a plate floating over a lit ground plane, the
 // sun straight above. After a few dozen samples the image is lit and the
 // ground under the plate is in shadow; ground away from it isn't.

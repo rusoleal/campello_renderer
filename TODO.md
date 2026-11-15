@@ -297,7 +297,11 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
       internal resolution depends on it
 - [ ] **Denoise-aware upscaling** (longer term) — DLSS Ray Reconstruction-style combined
       denoise + upscale where available
-- [ ] **TAA** with the same history and motion vectors (shared with the denoiser)
+- [x] **TAA** (Metal) — `setTemporalAntiAliasing()`: Halton(2, 3) jitter, the G-buffer's motion,
+      YCoCg neighbourhood clamping, two alternating history textures
+  - [ ] Catmull-Rom history sampling (sharper), depth / disocclusion rejection, sub-pixel
+        jitter removal from the current frame, luminance-weighted blending against flicker
+  - [ ] With SSAA; motion from the main pass instead of an extra G-buffer pass (MRT)
 
 **Light sampling**
 - [ ] **ReSTIR DI** — many dynamic lights (hundreds to thousands) with one or few shadow rays per
