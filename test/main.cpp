@@ -4127,6 +4127,135 @@ TEST_F(OffscreenRenderTest, RayTracedShadowsDarkenTheRasterFrame) {
     grey->doubleSided = false;
 }
 
+// Ray traced ambient occlusion (RayTracedAmbientOcclusion): a 1 m wall
+// standing on a ground plane, seen from above. Averaged over frames, ground
+// beside the wall is occluded, ground beyond the radius isn't, a larger
+// radius occludes more. Shadows and AO sharing one RayTracingScene build it
+// once. Denoised into Renderer::setAmbientOcclusionMask(), the raster frame
+// is darker by the wall.
+TEST_F(OffscreenRenderTest, RayTracedAmbientOcclusionDarkensCreases) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer on this backend";
+    auto rtScene = std::make_shared<RayTracingScene>(device);
+    RayTracedAmbientOcclusion ao(device, rtScene);
+    RayTracedShadows shadows(device, rtScene);
+    if (!ao.supported()) GTEST_SKIP() << "No ray tracing on this device";
+    renderer->setSkyboxEnabled(false);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.8, 0.8, 1], "metallicFactor": 0, "roughnessFactor": 1}}]})",
+                                    kNoOpLoader);
+    GpuMaterial* grey = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    grey->doubleSided = true;
+    const auto mesh = [&](std::vector<float> positions) {
+        std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+        auto m = std::make_unique<GpuMesh>();
+        m->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        m->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        m->indexCount = 6;
+        m->indexFormat = GPU::IndexFormat::uint32;
+        m->vertexCount = 4;
+        m->layout = &VertexLayout::positionOnly();
+        m->setBoundsFromPositions(positions.data(), 4);
+        return m;
+    };
+    auto ground = mesh({-3, 0, -3, -3, 0, 3, 3, 0, 3, 3, 0, -3});
+    auto wall = mesh({0, 0, -3, 0, 0, 3, 0, 1, 3, 0, 1, -3});  // the plane x = 0, 1 m high
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.75, 3.0, 0.01), VM::Vector3<double>(0.75, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 0.0, -1.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.75, 3.0, 0.01);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.0, -1.0, 0.0);
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    sun.castShadows = true;
+    scene.lights.push_back(sun);
+    for (GpuMesh* m : {ground.get(), wall.get()}) {
+        DrawCall draw;
+        draw.mesh = m;
+        draw.material = grey;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    const auto halfToFloat = [](uint16_t h) {
+        const uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+        float v = exponent == 0 ? std::ldexp(float(mantissa), -24)
+                                : exponent == 31 ? INFINITY : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+        return sign ? -v : v;
+    };
+    // Looking down from 3 m with a 60 degree view: 18.5 pixels per metre at
+    // the ground, the wall (x = 0) at column 18; x = 0.1 m is column 20 and
+    // x = 1.6 m column 48.
+    renderer->renderGBuffer(scene);
+    const auto averaged = [&](int frames) {
+        std::vector<float> sum(size_t(64) * 64, 0.0f);
+        for (int f = 0; f < frames; ++f) {
+            EXPECT_TRUE(ao.trace(scene, renderer->gBuffer()));
+            device->waitForIdle();
+            std::vector<uint16_t> raw(sum.size() * 4);
+            EXPECT_TRUE(ao.output()->download(0, 0, raw.data(), raw.size() * 2));
+            for (size_t i = 0; i < sum.size(); ++i) sum[i] += halfToFloat(raw[i * 4]) / float(frames);
+        }
+        return sum;
+    };
+    const auto column = [](const std::vector<float>& img, int x) {
+        double s = 0.0;
+        for (int y = 24; y < 40; ++y) s += img[size_t(y) * 64 + size_t(x)];
+        return s / 16.0;
+    };
+    const auto oneMetre = averaged(64);
+    ao.setRadius(3.0f);
+    const auto threeMetres = averaged(64);
+    ao.setRadius(1.0f);
+    std::printf("[RTAO] beside the wall %.3f (radius 3: %.3f), 1.6 m away %.3f (radius 3: %.3f)\n", column(oneMetre, 20),
+                column(threeMetres, 20), column(oneMetre, 48), column(threeMetres, 48));
+    EXPECT_LT(column(oneMetre, 20), 0.75) << "occluded beside the wall";
+    EXPECT_GT(column(oneMetre, 48), 0.99) << "beyond the radius: open";
+    EXPECT_LT(column(threeMetres, 48), column(oneMetre, 48) - 0.05) << "a larger radius reaches further";
+
+    ASSERT_TRUE(shadows.trace(scene, renderer->gBuffer()));
+    EXPECT_EQ(rtScene->fullRebuilds(), 1u) << "built once for both effects";
+
+    // Into the raster frame through the denoiser.
+    RealtimeDenoiser denoiser(device);
+    RealtimeDenoiser::Settings settings;
+    settings.demodulate = false;
+    denoiser.setSettings(settings);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    renderer->render(scene, view);
+    const auto plain = readBackPixels(tex);
+    for (int f = 0; f < 16; ++f) {
+        renderer->renderGBuffer(scene);
+        ASSERT_TRUE(ao.trace(scene, renderer->gBuffer()));
+        ASSERT_TRUE(denoiser.denoise(ao.output(), renderer->gBuffer(), scene.camera.projection));
+        renderer->setAmbientOcclusionMask(denoiser.output());
+        renderer->render(scene, view);
+    }
+    const auto occluded = readBackPixels(tex);
+    renderer->setAmbientOcclusionMask(nullptr);
+    const auto red = [](const std::vector<uint8_t>& p, int x) {
+        double s = 0.0;
+        for (int y = 24; y < 40; ++y) s += p[(size_t(y) * 64 + size_t(x)) * 4];
+        return s / 16.0;
+    };
+    std::printf("[RTAO] raster red beside the wall / far: without %.1f / %.1f, with %.1f / %.1f\n", red(plain, 20),
+                red(plain, 48), red(occluded, 20), red(occluded, 48));
+    EXPECT_LT(red(occluded, 20), red(plain, 20) * 0.85) << "darker by the wall";
+    EXPECT_NEAR(red(occluded, 48), red(plain, 48), 3.0) << "unchanged far from it";
+    grey->doubleSided = false;
+}
+
 // Path tracing (PathTracer): a plate floating over a lit ground plane, the
 // sun straight above. After a few dozen samples the image is lit and the
 // ground under the plate is in shadow; ground away from it isn't.

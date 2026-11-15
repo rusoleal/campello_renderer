@@ -897,6 +897,7 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineShadowMaskPack;
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> shadowMaskPackLayout;
         bool shadowMaskBound = false;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> aoMask;  // setAmbientOcclusionMask()
         bool shadowCascades = true;
         bool shadowNearValid = false;
         uint64_t shadowNearKey = 0;
@@ -1408,6 +1409,15 @@ namespace systems::leal::campello_renderer {
         /// Null: back to the shadow maps. Kept until replaced.
         void setShadowMask(std::shared_ptr<systems::leal::campello_gpu::Texture> visibility) {
             shadowMask = std::move(visibility);
+        }
+        /// Ambient occlusion from a screen-space mask (Metal) instead of
+        /// SSAO's estimate: `occlusion`'s red channel, 1 open .. 0 occluded,
+        /// at renderWidth x renderHeight (e.g. RayTracedAmbientOcclusion's
+        /// output, denoised), applied as SSAO is (an edge-aware 4 x 4 blur,
+        /// the frame darkened), whether or not SSAO is on. Null: SSAO (when
+        /// on) as before. Kept until replaced.
+        void setAmbientOcclusionMask(std::shared_ptr<systems::leal::campello_gpu::Texture> occlusion) {
+            aoMask = std::move(occlusion);
         }
         /// The current frame's weight in the TAA history (0..1, default 0.1):
         /// lower is smoother and slower to follow change.
