@@ -123,7 +123,7 @@ struct TraceUniforms {
     float4   sunDirection[4];  // directional lights: xyz towards the light (unit), w = cos of its angular radius
     float4   sunRadiance[4];   // rgb irradiance (colour x intensity); w = 1 for a light in use
     float4   params;        // x environment intensity, y exposure (EV), z max bounces, w first sample number
-    uint4    size;          // width, height, sky visible (1) or clear colour, projection (0 perspective, 1 panorama)
+    uint4    size;          // width, height, sky visible (1) or clear colour, mode (0 perspective, 1 panorama, 2 reflections from the G-buffer)
     float4   clearColor;    // rgb when the sky isn't visible
     float4   cameraForward; // panorama: the image centre's direction (unit)
     float4   cameraRight;   // panorama: right (unit, perpendicular to forward)
@@ -804,9 +804,33 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
                       device const EnvTexel*          lightTable [[buffer(15)]],
                       texturecube<float>              environment [[texture(1)]],
                       array<texture2d<float>, MAX_TEXTURES> textures [[texture(2)]],
+                      texture2d<float>                gbufferNormal [[texture(66)]],
+                      depth2d<float>                  gbufferDepth  [[texture(67)]],
+                      texture2d<float, access::write> reflectionOut [[texture(68)]],
                       uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.size.x || gid.y >= u.size.y) return;
+    // Reflections (PathTracer::traceReflections(), mode 2): paths start at
+    // the G-buffer's surface, the first direction from its GGX lobe; the
+    // radiance arriving along it goes to reflectionOut (no accumulation).
+    const bool reflections = u.size.w == 2u;
+    float3 surfaceP = float3(0.0), surfaceN = float3(0.0), surfaceV = float3(0.0);
+    float surfaceAlpha = 0.0;
+    if (reflections) {
+        const float d = gbufferDepth.read(gid);
+        if (d >= 1.0) {
+            reflectionOut.write(float4(0.0), gid);  // background: no surface
+            return;
+        }
+        const float2 ndc0 = float2((float(gid.x) + 0.5) / float(u.size.x) * 2.0 - 1.0,
+                                   1.0 - (float(gid.y) + 0.5) / float(u.size.y) * 2.0);
+        const float4 h = u.invViewProj * float4(ndc0, d, 1.0);
+        surfaceP = h.xyz / h.w;
+        const float4 nr = gbufferNormal.read(gid);
+        surfaceN = nr.xyz;
+        surfaceAlpha = max(nr.w * nr.w, 0.002);
+        surfaceV = normalize(u.cameraPos.xyz - surfaceP);
+    }
     constexpr sampler envSampler(filter::linear, mip_filter::linear);
     constexpr sampler texSampler(filter::linear, mip_filter::linear, address::repeat);
     // Several samples per dispatch (setSamplesPerRender(), setFrameBudget()):
@@ -849,7 +873,15 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
                                   1.0 - (float(gid.y) + jitter.y) / float(u.size.y) * 2.0);
         float3 origin;
         float3 direction;
-        if (u.size.w == 1u) {
+        if (reflections) {
+            // A GGX half vector (the surface's roughness) mirrors the view
+            // direction; directions under the surface take the mirror one.
+            const float2 l = sample2D(rs, DIM_LENS);
+            const float3 h = ggxHalfVector(surfaceN, surfaceAlpha, l.x, l.y);
+            direction = reflect(-surfaceV, h);
+            if (dot(direction, surfaceN) <= 0.0) direction = reflect(-surfaceV, surfaceN);
+            origin = surfaceP + surfaceN * max(1e-3, 2e-4 * length(surfaceP - u.cameraPos.xyz));
+        } else if (u.size.w == 1u) {
             // Equirectangular: longitude across (the centre straight ahead,
             // right towards the right), latitude down from the up pole.
             const float lon = (ndc.x * 0.5) * 2.0 * PI;
@@ -934,7 +966,8 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
         float misBsdfPdf = 0.0;
         float3 misOrigin = float3(0.0);  // that vertex (the sky's light density depends on where from)
         uint pathVertex = 0u;
-        for (uint bounce = 0; bounce <= maxBounces; ++bounce, ++pathVertex) {
+        // (Reflections: the first segment already left a surface, bounce 1.)
+        for (uint bounce = reflections ? 1u : 0u; bounce <= maxBounces; ++bounce, ++pathVertex) {
             ray r;
             r.origin = origin;
             r.direction = direction;
@@ -1244,6 +1277,10 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
         normalSum += firstNormal;
     }
 
+    if (reflections) {
+        reflectionOut.write(float4(radianceSum, 1.0), gid);
+        return;
+    }
     const float4 sum = before + float4(radianceSum, float(samplesNow));
     accum[pixel] = sum;
     moments[pixel] = momentBefore + momentSum;

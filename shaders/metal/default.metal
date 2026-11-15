@@ -253,7 +253,9 @@ struct CameraUniforms {
     // Shadow block (Renderer: sun shadows).
     float4x4 shadowViewProj;  // world -> the shadow map's clip space
     float4   shadowParams;    // x = on, y = one texel in uv
-    float4   viewParams;      // x = exposure in EV (0: unchanged; colour x 2^EV before tone mapping)
+    float4   viewParams;      // x = exposure in EV (0: unchanged; colour x 2^EV before tone mapping); y = ray traced
+                              // reflections in sceneColorTexture (Renderer::setReflections()), z = their roughness
+                              // cut-off, w = their pixels per target pixel
     float4x4 shadowNearViewProj;  // world -> the near cascade's clip space
     float4   shadowNearParams;    // x = near cascade on; y = shadowMapNear is a screen-space visibility mask
                                   // (Renderer::setShadowMask()), zw = its pixels per target pixel
@@ -1239,7 +1241,19 @@ fragment float4 fragmentMain_textured(
             F0 = mix(F0, iridF0, iridescenceFactor);
         }
         float3 F = iblGGXFresnel(NdotV, roughness, F0, brdfLutTexture, baseColorSampler);
-        iblSpecular = envSpecular * F * mat.environmentIntensity;
+        float3 specularRadiance = envSpecular * mat.environmentIntensity;
+        // Ray traced reflections (opaque, non-transmissive surfaces; the
+        // transparent pass has the scene colour in that slot): the radiance
+        // traced along this pixel's GGX lobe instead of the prefiltered sky,
+        // fading back to it towards the roughness cut-off.
+        if (camera.viewParams.y > 0.5 && mat.alphaMode < 1.5 && mat.transmissionFactor <= 0.0) {
+            const uint2 size = uint2(sceneColorTexture.get_width(), sceneColorTexture.get_height());
+            const uint2 pixel = min(uint2(inRaw.clipPosition.xy * camera.viewParams.w), size - 1);
+            const float3 traced = sceneColorTexture.read(pixel).rgb;
+            const float cutoff = camera.viewParams.z;
+            specularRadiance = mix(specularRadiance, traced, 1.0 - smoothstep(0.75 * cutoff, cutoff, roughness));
+        }
+        iblSpecular = specularRadiance * F;
 
         // IBL clearcoat: sample environment with clearcoat normal and Fresnel,
         // blurred by the clearcoat layer's own roughness.

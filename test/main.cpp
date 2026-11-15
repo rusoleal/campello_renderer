@@ -4256,6 +4256,136 @@ TEST_F(OffscreenRenderTest, RayTracedAmbientOcclusionDarkensCreases) {
     grey->doubleSided = false;
 }
 
+// Ray traced reflections (PathTracer::traceReflections(),
+// Renderer::setReflections()): a mirror floor with an unlit red wall behind
+// it. The traced radiance in the floor's pixels is the wall's red; denoised
+// into the raster frame, the floor turns red (the prefiltered sky can't
+// show the wall); a rough floor (above the cut-off) is unchanged.
+TEST_F(OffscreenRenderTest, RayTracedReflectionsShowTheScene) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer on this backend";
+    PathTracer reflections(device);
+    if (!reflections.supported()) GTEST_SKIP() << "No path tracing on this device";
+    renderer->setSkyboxEnabled(false);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "extensionsUsed": ["KHR_materials_unlit"], "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.9, 0.9, 0.9, 1], "metallicFactor": 1, "roughnessFactor": 0.05}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.9, 0.9, 0.9, 1], "metallicFactor": 1, "roughnessFactor": 0.95}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [1, 0.05, 0.05, 1]}, "extensions": {"KHR_materials_unlit": {}}}]})",
+                                    kNoOpLoader);
+    ASSERT_NE(materials, nullptr);
+    GpuMaterial* mirror = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    GpuMaterial* rough = renderer->uploadMaterial((*materials->materials)[1], *materials);
+    GpuMaterial* red = renderer->uploadMaterial((*materials->materials)[2], *materials);
+    const auto mesh = [&](std::vector<float> positions) {
+        std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+        auto m = std::make_unique<GpuMesh>();
+        m->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        m->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        m->indexCount = 6;
+        m->indexFormat = GPU::IndexFormat::uint32;
+        m->vertexCount = 4;
+        m->layout = &VertexLayout::positionOnly();
+        m->setBoundsFromPositions(positions.data(), 4);
+        return m;
+    };
+    auto floor = mesh({-3, 0, -3, -3, 0, 3, 3, 0, 3, 3, 0, -3});
+    auto wall = mesh({-3, 0, -2, 3, 0, -2, 3, 3, -2, -3, 3, -2});  // z = -2, facing +z
+    mirror->doubleSided = rough->doubleSided = red->doubleSided = true;
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 1.0, 2.0), VM::Vector3<double>(0.0, 0.0, -0.5),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(50.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 1.0, 2.0);
+    DrawCall floorDraw;
+    floorDraw.mesh = floor.get();
+    floorDraw.material = mirror;
+    floorDraw.worldTransform = VM::Matrix4<double>::identity();
+    DrawCall wallDraw = floorDraw;
+    wallDraw.mesh = wall.get();
+    wallDraw.material = red;
+    scene.opaque = {floorDraw, wallDraw};
+
+    // The floor's pixels: the G-buffer's lower rows with an upward normal.
+    renderer->renderGBuffer(scene);
+    ASSERT_TRUE(reflections.traceReflections(scene, *renderer, renderer->gBuffer()));
+    const auto halfToFloat = [](uint16_t h) {
+        const uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+        float v = exponent == 0 ? std::ldexp(float(mantissa), -24)
+                                : exponent == 31 ? INFINITY : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+        return sign ? -v : v;
+    };
+    const auto readHalf = [&](const std::shared_ptr<GPU::Texture>& texture) {
+        device->waitForIdle();
+        std::vector<uint16_t> raw(size_t(64) * 64 * 4);
+        EXPECT_TRUE(texture->download(0, 0, raw.data(), raw.size() * 2));
+        std::vector<float> out(raw.size());
+        for (size_t i = 0; i < raw.size(); ++i) out[i] = halfToFloat(raw[i]);
+        return out;
+    };
+    const auto normals = readHalf(renderer->gBuffer().normalRoughness);
+    std::vector<size_t> floorPixels;
+    for (size_t i = 0; i < size_t(64) * 64; ++i) {
+        if (normals[i * 4 + 1] > 0.9f && i / 64 > 40) floorPixels.push_back(i);
+    }
+    ASSERT_GT(floorPixels.size(), 100u);
+    const auto traced = readHalf(reflections.reflections());
+    double tr = 0, tg = 0;
+    for (size_t i : floorPixels) {
+        tr += traced[i * 4];
+        tg += traced[i * 4 + 1];
+    }
+    std::printf("[RTReflections] traced radiance on the floor: r %.3f, g %.3f\n", tr / floorPixels.size(), tg / floorPixels.size());
+    EXPECT_GT(tr, tg * 4.0) << "the floor reflects the red wall";
+
+    // Into the raster frame.
+    RealtimeDenoiser denoiser(device);
+    RealtimeDenoiser::Settings settings;
+    settings.demodulate = false;
+    denoiser.setSettings(settings);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    const auto frame = [&](bool withReflections) {
+        renderer->setReflections(nullptr);
+        for (int f = 0; f < (withReflections ? 8 : 1); ++f) {
+            if (withReflections) {
+                renderer->renderGBuffer(scene);
+                EXPECT_TRUE(reflections.traceReflections(scene, *renderer, renderer->gBuffer()));
+                EXPECT_TRUE(denoiser.denoise(reflections.reflections(), renderer->gBuffer(), scene.camera.projection));
+                renderer->setReflections(denoiser.output());
+            }
+            renderer->render(scene, view);
+        }
+        renderer->setReflections(nullptr);
+        return readBackPixels(tex);
+    };
+    const auto mean = [&](const std::vector<uint8_t>& p, int c) {
+        double sum = 0;
+        for (size_t i : floorPixels) sum += p[i * 4 + c];
+        return sum / floorPixels.size();
+    };
+    const auto without = frame(false), with = frame(true);
+    std::printf("[RTReflections] raster floor r/g: without %.1f / %.1f, with %.1f / %.1f\n", mean(without, 0), mean(without, 1),
+                mean(with, 0), mean(with, 1));
+    // (Without, the floor shows the bright prefiltered sky: near white.)
+    EXPECT_LT(mean(with, 1), mean(without, 1) * 0.5) << "the red wall, not the sky, in the floor";
+    EXPECT_GT(mean(with, 0), mean(with, 1) * 2.0);
+    // A rough floor (above the cut-off): the same either way.
+    scene.opaque[0].material = rough;
+    denoiser.reset();
+    const auto roughWithout = frame(false), roughWith = frame(true);
+    EXPECT_NEAR(mean(roughWith, 0), mean(roughWithout, 0), 1.5) << "rough surfaces keep the environment";
+    mirror->doubleSided = rough->doubleSided = red->doubleSided = false;
+    renderer->setSkyboxEnabled(true);
+}
+
 // Path tracing (PathTracer): a plate floating over a lit ground plane, the
 // sun straight above. After a few dozen samples the image is lit and the
 // ground under the plate is in shadow; ground away from it isn't.

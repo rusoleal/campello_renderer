@@ -898,6 +898,11 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> shadowMaskPackLayout;
         bool shadowMaskBound = false;
         std::shared_ptr<systems::leal::campello_gpu::Texture> aoMask;  // setAmbientOcclusionMask()
+        // setReflections(): the radiance, its cut-off, and the frame bind
+        // group with it in the scene colour slot (22) for the opaque draws.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> reflections;
+        float reflectionMaxRoughness = 0.6f;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroup> reflectionFrameBindGroup;
         bool shadowCascades = true;
         bool shadowNearValid = false;
         uint64_t shadowNearKey = 0;
@@ -1418,6 +1423,17 @@ namespace systems::leal::campello_renderer {
         /// on) as before. Kept until replaced.
         void setAmbientOcclusionMask(std::shared_ptr<systems::leal::campello_gpu::Texture> occlusion) {
             aoMask = std::move(occlusion);
+        }
+        /// Ray traced reflections (Metal): `radiance` (linear, before
+        /// exposure, at renderWidth x renderHeight; e.g. PathTracer::
+        /// traceReflections() denoised) replaces the prefiltered environment
+        /// in the specular term of opaque, non-transmissive surfaces up to
+        /// `maxRoughness` (fading back to the environment towards it; above,
+        /// rough surfaces keep the environment). Needs image-based lighting
+        /// on. Null: off. Kept until replaced.
+        void setReflections(std::shared_ptr<systems::leal::campello_gpu::Texture> radiance, float maxRoughness = 0.6f) {
+            reflections = std::move(radiance);
+            reflectionMaxRoughness = std::clamp(maxRoughness, 0.01f, 1.0f);
         }
         /// The current frame's weight in the TAA history (0..1, default 0.1):
         /// lower is smoother and slower to follow change.

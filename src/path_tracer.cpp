@@ -261,6 +261,16 @@ PathTracer::PathTracer(std::shared_ptr<GPU::Device> device)
                                     binding == 1 ? GPU::TextureType::ttCube : GPU::TextureType::tt2d};
             desc.entries.push_back(texture);
         }
+        // Reflections: the G-buffer's normal + roughness (66), depth (67), the output (68).
+        for (uint32_t binding = 66; binding <= 68; ++binding) {
+            GPU::EntryObject texture{};
+            texture.binding = binding;
+            texture.type = GPU::EntryObjectType::texture;
+            texture.visibility = GPU::ShaderStage::rayGeneration;
+            texture.data.texture = {false, binding == 67 ? GPU::EntryObjectTextureType::ttDepth : GPU::EntryObjectTextureType::ttFloat,
+                                    GPU::TextureType::tt2d};
+            desc.entries.push_back(texture);
+        }
         traceLayout_ = device_->createBindGroupLayout(desc);
     }
     {
@@ -865,8 +875,17 @@ bool PathTracer::buildEnvironmentTable(const std::shared_ptr<GPU::Texture>& envi
     return true;
 }
 
+bool PathTracer::traceReflections(const RenderScene& scene, const Renderer& renderer, const GBufferTargets& gbuffer) {
+    if (!supported() || !gbuffer.normalRoughness || !gbuffer.depth || gbuffer.width == 0 || gbuffer.height == 0) return false;
+    reflectionGBuffer_ = &gbuffer;
+    const bool ok = render(scene, renderer, gbuffer.width, gbuffer.height);
+    reflectionGBuffer_ = nullptr;
+    return ok;
+}
+
 bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint32_t width, uint32_t height) {
     if (!supported() || width == 0 || height == 0) return false;
+    const bool reflectionPass = reflectionGBuffer_ != nullptr;
     // The previous sample (usually done by now, a frame later): its
     // uniforms and buffers are rewritten below.
     waitForSample();
@@ -962,14 +981,15 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
 
     // The preview at reduced resolution (setPreviewResolution()): an
     // image's first samples, then it starts again at full resolution.
-    const bool newImage = samples_ == 0;
+    // (Not for reflections: one sample per frame at the G-buffer's size.)
+    const bool newImage = samples_ == 0 && !reflectionPass;
     if (newImage) {
         previewActive_ = previewSamples_ > 0 && previewDivisor_ > 1;
-    } else if (previewActive_ && samples_ >= previewSamples_) {
+    } else if (!reflectionPass && previewActive_ && samples_ >= previewSamples_) {
         previewActive_ = false;
         samples_ = 0;
     }
-    const uint32_t divisor = previewActive_ ? previewDivisor_ : 1;
+    const uint32_t divisor = previewActive_ && !reflectionPass ? previewDivisor_ : 1;
     traceWidth_ = (width + divisor - 1) / divisor;
     traceHeight_ = (height + divisor - 1) / divisor;
 
@@ -983,7 +1003,7 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
     }
     if (previewActive_) samplesNow = std::min(samplesNow, previewSamples_ - samples_);
     if (samples_ < progressiveSamples_) samplesNow = std::min(samplesNow, progressiveSamples_ - samples_);
-    samplesNow = std::max(samplesNow, 1u);
+    samplesNow = reflectionPass ? 1u : std::max(samplesNow, 1u);
 
     TraceUniforms u{};
     const auto invViewProj = (scene.camera.projection * scene.camera.view).inverted();
@@ -1018,12 +1038,12 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
     u.params[1] = renderer.getExposure();
     // Fewer bounces for the first samples (setProgressiveBounces()).
     const uint32_t bounces = samples_ < progressiveSamples_ ? std::min(progressiveBounces_, maxBounces_) : maxBounces_;
-    u.params[2] = static_cast<float>(bounces);
-    u.params[3] = static_cast<float>(samples_);
+    u.params[2] = static_cast<float>(reflectionPass ? reflectionBounces_ + 1 : bounces);
+    u.params[3] = static_cast<float>(reflectionPass ? reflectionFrame_++ : samples_);
     u.size[0] = traceWidth_;
     u.size[1] = traceHeight_;
     u.size[2] = renderer.getSkyboxEnabled() ? 1u : 0u;
-    u.size[3] = projection_ == Projection::panorama ? 1u : 0u;
+    u.size[3] = reflectionPass ? 2u : (projection_ == Projection::panorama ? 1u : 0u);
     {
         // The camera's directions from its projection: straight ahead, and
         // towards the image's right and top edges (no handedness assumed).
@@ -1059,7 +1079,7 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
     }
     for (int c = 0; c < 3; ++c) u.clearColor[c] = std::pow(std::max(clear[c], 0.0f), 2.2f);  // display -> linear
     u.tuning[0] = indirectClamp_;
-    u.tuning[2] = noiseTarget_;
+    u.tuning[2] = reflectionPass ? 0.0f : noiseTarget_;  // (reflections: every pixel every frame)
     u.tuning[3] = static_cast<float>(noiseMinSamples_);
     if (!converged_) {
         converged_ = device_->createBuffer(16, (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::storage) |
@@ -1155,6 +1175,32 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
         const auto& texture = i < textures_.size() ? textures_[i] : blank_;
         if (texture) desc.entries.push_back({FIRST_TEXTURE + i, texture});
     }
+    // Reflections' G-buffer and output, or 1 x 1 placeholders.
+    if (!placeholderDepth_) {
+        placeholderDepth_ = device_->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::depth32float, 1, 1, 1, 1, 1,
+                                                   (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                                                       uint32_t(GPU::TextureUsage::textureBinding)));
+        placeholderReflection_ = device_->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba16float, 1, 1, 1, 1, 1,
+                                                        (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::storageBinding) |
+                                                                            uint32_t(GPU::TextureUsage::textureBinding)));
+        if (!placeholderDepth_ || !placeholderReflection_) return false;
+    }
+    if (reflectionPass) {
+        if (!reflectionTarget_ || reflectionTarget_->getWidth() != width || reflectionTarget_->getHeight() != height) {
+            reflectionTarget_ = device_->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba16float, width, height, 1, 1, 1,
+                                                       (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::storageBinding) |
+                                                                           uint32_t(GPU::TextureUsage::textureBinding) |
+                                                                           uint32_t(GPU::TextureUsage::copySrc)));
+            if (!reflectionTarget_) return false;
+        }
+        desc.entries.push_back({66, reflectionGBuffer_->normalRoughness});
+        desc.entries.push_back({67, reflectionGBuffer_->depth});
+        desc.entries.push_back({68, reflectionTarget_});
+    } else {
+        desc.entries.push_back({66, placeholderReflection_});
+        desc.entries.push_back({67, placeholderDepth_});
+        desc.entries.push_back({68, placeholderReflection_});
+    }
     auto group = device_->createBindGroup(desc);
     auto encoder = device_->createCommandEncoder();
     if (!group || !encoder) return false;
@@ -1180,6 +1226,7 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
     auto commands = encoder->finish();
     device_->submit(commands, fence);
     pending_ = fence;
+    if (reflectionPass) return true;  // the progressive image's state is untouched
     pendingCommands_ = commands;
     pendingSamples_ = samplesNow;
     pendingPixels_ = uint64_t(traceWidth_) * traceHeight_;

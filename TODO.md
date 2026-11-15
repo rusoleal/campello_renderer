@@ -284,8 +284,16 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
   - [ ] The denoiser's first frames on a binary signal are soft (a 9 px wide shadow: mask 0.63
         after 1 frame, 0.025 after 16): a smaller variance boost for short histories, or
         temporal-only accumulation where the signal agrees with the history
-  - [ ] RT reflections, RT GI, RT translucency; AO applied to the indirect light only (SSAO's
-        apply pass darkens the whole frame, direct light included)
+  - [x] RT reflections (Metal) — `PathTracer::traceReflections()`: paths from the G-buffer's
+        surface along its GGX lobe, shaded by the path tracer (materials, textures, sun, sky,
+        emitters, `setReflectionBounces()`); `Renderer::setReflections(radiance, maxRoughness)`
+        replaces the prefiltered environment in opaque surfaces' specular term (in the scene colour
+        slot for the opaque draws: the transparent pass keeps the scene colour there)
+  - [ ] Reflections on alpha-blended and transmissive surfaces; clear coat; reflection rays from
+        rough surfaces at reduced resolution; specular-aware denoising (reprojection along the
+        reflected virtual point, not the surface: reflections lag a moving camera today)
+  - [ ] RT GI, RT translucency; AO applied to the indirect light only (SSAO's apply pass darkens
+        the whole frame, direct light included)
 - [ ] **Full path-traced mode** (longer term, high-end GPUs): the "path tracing" setting of modern
       games — 1–2 samples per pixel, ReSTIR DI/GI, real-time denoising, upscaling
 - [ ] **Ray queries from raster and compute shaders** (inline RT), not only the RT pipeline: what
