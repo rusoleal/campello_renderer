@@ -36,11 +36,11 @@ namespace VM = systems::leal::vector_math;
 // whose anonymous namespace has helpers of the same names.)
 namespace rt_effects_detail {
 
-// As ShadowUniforms in rt_effects.metal.
-struct ShadowUniforms {
+// As EffectUniforms in rt_effects.metal.
+struct EffectUniforms {
     float invViewProj[16];  // column-major
     float eye[4];
-    float sun[4];
+    float params[4];
     uint32_t size[4];
 };
 
@@ -72,55 +72,34 @@ std::vector<DrawCall> casters(const RenderScene& scene) {
 
 } // namespace rt_effects_detail
 
+// ---------------------------------------------------------------------------
+// RayTracingScene
+// ---------------------------------------------------------------------------
 
-RayTracedShadows::RayTracedShadows(std::shared_ptr<GPU::Device> device)
-    : device_(std::move(device)) {
-#if defined(__APPLE__) && !TARGET_OS_SIMULATOR
-    if (!device_ || !device_->getFeatures().count(GPU::Feature::raytracing)) return;
-    auto module = device_->createShaderModule(shaders::kRtEffectsMetalShader, shaders::kRtEffectsMetalShaderSize);
-    if (!module) return;
-    // The scene (buffer 0), uniforms (buffer 1); normal + roughness (texture
-    // 0), depth (texture 1), visibility out (texture 2).
-    GPU::BindGroupLayoutDescriptor desc{};
-    GPU::EntryObject sceneEntry{};
-    sceneEntry.binding = 0;
-    sceneEntry.type = GPU::EntryObjectType::accelerationStructure;
-    sceneEntry.visibility = GPU::ShaderStage::rayGeneration;
-    desc.entries.push_back(sceneEntry);
-    GPU::EntryObject uniforms{};
-    uniforms.binding = 1;
-    uniforms.type = GPU::EntryObjectType::buffer;
-    uniforms.visibility = GPU::ShaderStage::rayGeneration;
-    uniforms.data.buffer.hasDinamicOffaset = false;
-    uniforms.data.buffer.minBindingSize = 0;
-    uniforms.data.buffer.type = GPU::EntryObjectBufferType::uniform;
-    desc.entries.push_back(uniforms);
-    for (uint32_t binding = 0; binding < 3; ++binding) {
-        GPU::EntryObject texture{};
-        texture.binding = binding;
-        texture.type = GPU::EntryObjectType::texture;
-        texture.visibility = GPU::ShaderStage::rayGeneration;
-        texture.data.texture = {false, binding == 1 ? GPU::EntryObjectTextureType::ttDepth : GPU::EntryObjectTextureType::ttFloat,
-                                GPU::TextureType::tt2d};
-        desc.entries.push_back(texture);
+RayTracingScene::RayTracingScene(std::shared_ptr<GPU::Device> device)
+    : device_(std::move(device)) {}
+
+bool RayTracingScene::update(const RenderScene& scene) {
+    if (!device_) return false;
+    uint64_t geometryKey = 1469598103934665603ull, transformKey = 1469598103934665603ull;
+    for (const auto& draw : rt_effects_detail::casters(scene)) {
+        rt_effects_detail::mix(geometryKey, &draw.mesh, sizeof(draw.mesh));
+        const void* buffers[2] = {draw.mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION].get(), draw.mesh->indexBuffer.get()};
+        rt_effects_detail::mix(geometryKey, buffers, sizeof(buffers));
+        rt_effects_detail::mix(geometryKey, &draw.mesh->indexCount, sizeof(draw.mesh->indexCount));
+        rt_effects_detail::mix(transformKey, draw.worldTransform.data, sizeof(double) * 16);
     }
-    layout_ = device_->createBindGroupLayout(desc);
-    if (!layout_) return;
-    GPU::PipelineLayoutDescriptor pl{};
-    pl.bindGroupLayouts = {layout_};
-    GPU::RayTracingPipelineDescriptor rt{};
-    rt.rayGeneration = {module, "rayTracedShadows"};
-    rt.layout = device_->createPipelineLayout(pl);
-    rt.maxRecursionDepth = 1;
-    pipeline_ = device_->createRayTracingPipeline(rt);
-#endif
+    if (tlas_ && geometryKey == geometryKey_ && transformKey == transformKey_) return true;
+    if (!rebuild(scene)) {
+        tlas_.reset();
+        return false;
+    }
+    geometryKey_ = geometryKey;
+    transformKey_ = transformKey;
+    return true;
 }
 
-RayTracedShadows::~RayTracedShadows() {
-    if (pending_) pending_->wait();
-}
-
-bool RayTracedShadows::rebuild(const RenderScene& scene) {
+bool RayTracingScene::rebuild(const RenderScene& scene) {
     const auto draws = rt_effects_detail::casters(scene);
     if (draws.empty()) return false;
     // Mesh structures: reused while the mesh's buffers are the same.
@@ -190,49 +169,74 @@ bool RayTracedShadows::rebuild(const RenderScene& scene) {
     auto fence = device_->createFence();
     device_->submit(encoder->finish(), fence);
     if (fence) fence->wait();
-    if (builds.empty()) {
-        ++transformRebuilds_;
-    } else {
-        ++fullRebuilds_;
-    }
+    ++(builds.empty() ? transformRebuilds_ : fullRebuilds_);
     return true;
 }
 
-bool RayTracedShadows::trace(const RenderScene& scene, const GBufferTargets& gbuffer) {
-    if (!supported() || !gbuffer.normalRoughness || !gbuffer.depth || gbuffer.width == 0 || gbuffer.height == 0) return false;
-    // The sun: the first shadow-casting directional light, else the first directional one.
-    const LightData* sun = nullptr;
-    for (const auto& light : scene.lights) {
-        if (light.type != 0) continue;
-        if (!sun || (light.castShadows && !sun->castShadows)) sun = &light;
+// ---------------------------------------------------------------------------
+// RayTracedEffect
+// ---------------------------------------------------------------------------
+
+RayTracedEffect::RayTracedEffect(std::shared_ptr<GPU::Device> device, std::shared_ptr<RayTracingScene> scene,
+                                 const char* entryPoint)
+    : device_(std::move(device)), scene_(std::move(scene)) {
+    if (!scene_ && device_) scene_ = std::make_shared<RayTracingScene>(device_);
+#if defined(__APPLE__) && !TARGET_OS_SIMULATOR
+    if (!device_ || !device_->getFeatures().count(GPU::Feature::raytracing)) return;
+    auto module = device_->createShaderModule(shaders::kRtEffectsMetalShader, shaders::kRtEffectsMetalShaderSize);
+    if (!module) return;
+    // The scene (buffer 0), uniforms (buffer 1); normal + roughness (texture
+    // 0), depth (texture 1), visibility out (texture 2).
+    GPU::BindGroupLayoutDescriptor desc{};
+    GPU::EntryObject sceneEntry{};
+    sceneEntry.binding = 0;
+    sceneEntry.type = GPU::EntryObjectType::accelerationStructure;
+    sceneEntry.visibility = GPU::ShaderStage::rayGeneration;
+    desc.entries.push_back(sceneEntry);
+    GPU::EntryObject uniforms{};
+    uniforms.binding = 1;
+    uniforms.type = GPU::EntryObjectType::buffer;
+    uniforms.visibility = GPU::ShaderStage::rayGeneration;
+    uniforms.data.buffer.hasDinamicOffaset = false;
+    uniforms.data.buffer.minBindingSize = 0;
+    uniforms.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+    desc.entries.push_back(uniforms);
+    for (uint32_t binding = 0; binding < 3; ++binding) {
+        GPU::EntryObject texture{};
+        texture.binding = binding;
+        texture.type = GPU::EntryObjectType::texture;
+        texture.visibility = GPU::ShaderStage::rayGeneration;
+        texture.data.texture = {false, binding == 1 ? GPU::EntryObjectTextureType::ttDepth : GPU::EntryObjectTextureType::ttFloat,
+                                GPU::TextureType::tt2d};
+        desc.entries.push_back(texture);
     }
-    if (!sun) return false;
-    const double len = std::sqrt(sun->direction.x() * sun->direction.x() + sun->direction.y() * sun->direction.y() +
-                                 sun->direction.z() * sun->direction.z());
-    if (len < 1e-12) return false;
+    layout_ = device_->createBindGroupLayout(desc);
+    if (!layout_) return;
+    GPU::PipelineLayoutDescriptor pl{};
+    pl.bindGroupLayouts = {layout_};
+    GPU::RayTracingPipelineDescriptor rt{};
+    rt.rayGeneration = {module, entryPoint};
+    rt.layout = device_->createPipelineLayout(pl);
+    rt.maxRecursionDepth = 1;
+    pipeline_ = device_->createRayTracingPipeline(rt);
+#else
+    (void)entryPoint;
+#endif
+}
+
+RayTracedEffect::~RayTracedEffect() {
+    if (pending_) pending_->wait();
+}
+
+bool RayTracedEffect::dispatch(const RenderScene& scene, const GBufferTargets& gbuffer, const float (&parameters)[4]) {
+    if (!supported() || !scene_ || !gbuffer.normalRoughness || !gbuffer.depth || gbuffer.width == 0 || gbuffer.height == 0) {
+        return false;
+    }
     if (pending_) {
         pending_->wait();  // its uniforms are rewritten below
         pending_.reset();
     }
-
-    // The scene structure: rebuilt when the casters' meshes or transforms change.
-    uint64_t geometryKey = 1469598103934665603ull, transformKey = 1469598103934665603ull;
-    for (const auto& draw : rt_effects_detail::casters(scene)) {
-        rt_effects_detail::mix(geometryKey, &draw.mesh, sizeof(draw.mesh));
-        const void* buffers[2] = {draw.mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION].get(), draw.mesh->indexBuffer.get()};
-        rt_effects_detail::mix(geometryKey, buffers, sizeof(buffers));
-        rt_effects_detail::mix(geometryKey, &draw.mesh->indexCount, sizeof(draw.mesh->indexCount));
-        rt_effects_detail::mix(transformKey, draw.worldTransform.data, sizeof(double) * 16);
-    }
-    if (!tlas_ || geometryKey != geometryKey_ || transformKey != transformKey_) {
-        if (!rebuild(scene)) {
-            tlas_.reset();
-            return false;
-        }
-        geometryKey_ = geometryKey;
-        transformKey_ = transformKey;
-    }
-
+    if (!scene_->update(scene) || !scene_->tlas()) return false;
     const uint32_t w = gbuffer.width, h = gbuffer.height;
     if (!output_ || output_->getWidth() != w || output_->getHeight() != h) {
         output_ = device_->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba16float, w, h, 1, 1, 1,
@@ -241,7 +245,7 @@ bool RayTracedShadows::trace(const RenderScene& scene, const GBufferTargets& gbu
                                                              uint32_t(GPU::TextureUsage::copySrc)));
         if (!output_) return false;
     }
-    rt_effects_detail::ShadowUniforms u{};
+    rt_effects_detail::EffectUniforms u{};
     const auto invViewProj = (scene.camera.projection * scene.camera.view).inverted();
     for (int r = 0; r < 4; ++r) {
         for (int c = 0; c < 4; ++c) u.invViewProj[c * 4 + r] = static_cast<float>(invViewProj.data[r * 4 + c]);
@@ -250,21 +254,18 @@ bool RayTracedShadows::trace(const RenderScene& scene, const GBufferTargets& gbu
     u.eye[0] = static_cast<float>(eye.x() / eye.w());
     u.eye[1] = static_cast<float>(eye.y() / eye.w());
     u.eye[2] = static_cast<float>(eye.z() / eye.w());
-    u.sun[0] = static_cast<float>(-sun->direction.x() / len);
-    u.sun[1] = static_cast<float>(-sun->direction.y() / len);
-    u.sun[2] = static_cast<float>(-sun->direction.z() / len);
-    u.sun[3] = std::cos(sunDiameterDegrees_ * 0.5f * 3.14159265f / 180.0f);
+    for (int k = 0; k < 4; ++k) u.params[k] = parameters[k];
     u.size[0] = w;
     u.size[1] = h;
     u.size[2] = frame_++;
-    if (!uniforms_) uniforms_ = device_->createBuffer(sizeof(rt_effects_detail::ShadowUniforms), GPU::BufferUsage::uniform);
+    if (!uniforms_) uniforms_ = device_->createBuffer(sizeof(u), GPU::BufferUsage::uniform);
     if (!uniforms_) return false;
     uniforms_->upload(0, sizeof(u), &u);
 
     GPU::BindGroupDescriptor desc{};
     desc.layout = layout_;
-    desc.entries = {{0, tlas_},
-                    {1, GPU::BufferBinding{uniforms_, 0, sizeof(rt_effects_detail::ShadowUniforms)}},
+    desc.entries = {{0, scene_->tlas()},
+                    {1, GPU::BufferBinding{uniforms_, 0, sizeof(u)}},
                     {0, gbuffer.normalRoughness},
                     {1, gbuffer.depth},
                     {2, output_}};
@@ -281,6 +282,42 @@ bool RayTracedShadows::trace(const RenderScene& scene, const GBufferTargets& gbu
     device_->submit(encoder->finish(), fence);
     pending_ = fence;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// RayTracedShadows
+// ---------------------------------------------------------------------------
+
+RayTracedShadows::RayTracedShadows(std::shared_ptr<GPU::Device> device, std::shared_ptr<RayTracingScene> scene)
+    : RayTracedEffect(std::move(device), std::move(scene), "rayTracedShadows") {}
+
+bool RayTracedShadows::trace(const RenderScene& scene, const GBufferTargets& gbuffer) {
+    // The sun: the first shadow-casting directional light, else the first directional one.
+    const LightData* sun = nullptr;
+    for (const auto& light : scene.lights) {
+        if (light.type != 0) continue;
+        if (!sun || (light.castShadows && !sun->castShadows)) sun = &light;
+    }
+    if (!sun) return false;
+    const double len = std::sqrt(sun->direction.x() * sun->direction.x() + sun->direction.y() * sun->direction.y() +
+                                 sun->direction.z() * sun->direction.z());
+    if (len < 1e-12) return false;
+    const float parameters[4] = {static_cast<float>(-sun->direction.x() / len), static_cast<float>(-sun->direction.y() / len),
+                                 static_cast<float>(-sun->direction.z() / len),
+                                 std::cos(sunDiameterDegrees_ * 0.5f * 3.14159265f / 180.0f)};
+    return dispatch(scene, gbuffer, parameters);
+}
+
+// ---------------------------------------------------------------------------
+// RayTracedAmbientOcclusion
+// ---------------------------------------------------------------------------
+
+RayTracedAmbientOcclusion::RayTracedAmbientOcclusion(std::shared_ptr<GPU::Device> device, std::shared_ptr<RayTracingScene> scene)
+    : RayTracedEffect(std::move(device), std::move(scene), "rayTracedAmbientOcclusion") {}
+
+bool RayTracedAmbientOcclusion::trace(const RenderScene& scene, const GBufferTargets& gbuffer) {
+    const float parameters[4] = {radius_, 0.0f, 0.0f, 0.0f};
+    return dispatch(scene, gbuffer, parameters);
 }
 
 } // namespace systems::leal::campello_renderer

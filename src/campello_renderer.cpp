@@ -3717,7 +3717,9 @@ void Renderer::encodeAmbientOcclusion(const std::shared_ptr<systems::leal::campe
                                       const systems::leal::vector_math::Matrix4<double>& projection) {
     namespace GPU = systems::leal::campello_gpu;
     using TU = GPU::TextureUsage;
-    if (!aoEnabled || activeProgramPass || !aoPipeline || !aoApplyPipeline || !aoBindGroupLayout || !depthTexture ||
+    // A mask (setAmbientOcclusionMask()) replaces SSAO's estimate, on or not.
+    const bool useMask = aoMask != nullptr;
+    if ((!aoEnabled && !useMask) || activeProgramPass || !aoPipeline || !aoApplyPipeline || !aoBindGroupLayout || !depthTexture ||
         !colorView || renderWidth == 0 || renderHeight == 0 || !defaultTexture) {
         return;
     }
@@ -3764,7 +3766,7 @@ void Renderer::encodeAmbientOcclusion(const std::shared_ptr<systems::leal::campe
     const auto aoGroup = device->createBindGroup(aoDesc);
     GPU::BindGroupDescriptor applyDesc{};
     applyDesc.layout = aoBindGroupLayout;
-    applyDesc.entries = {{0, depthTexture}, {1, aoTexture}, {2, GPU::BufferBinding{uniforms, 0, 160}}, {3, aoSampler}};
+    applyDesc.entries = {{0, depthTexture}, {1, useMask ? aoMask : aoTexture}, {2, GPU::BufferBinding{uniforms, 0, 160}}, {3, aoSampler}};
     const auto applyGroup = device->createBindGroup(applyDesc);
     if (!aoGroup || !applyGroup) return;
 
@@ -3788,7 +3790,7 @@ void Renderer::encodeAmbientOcclusion(const std::shared_ptr<systems::leal::campe
             rpe->end();
         }
     };
-    pass(aoView, GPU::LoadOp::clear, aoPipeline, aoGroup);
+    if (!useMask) pass(aoView, GPU::LoadOp::clear, aoPipeline, aoGroup);
     pass(colorView, GPU::LoadOp::load, aoApplyPipeline, applyGroup);
 }
 

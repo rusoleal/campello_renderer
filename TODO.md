@@ -276,12 +276,16 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
         BLAS cache / TLAS (instances only when transforms change); `RealtimeDenoiser` with
         `Settings::demodulate = false`; `Renderer::setShadowMask()` replaces the shadow maps (the
         mask is packed into the near cascade's slot: the PBR shader is at iOS's 31 texture limit)
-  - [ ] Local light shadows (point / spot), several lights; alpha-tested casters; a shared
-        acceleration structure with PathTracer (each builds its own today)
+  - [x] RT ambient occlusion (Metal) — `RayTracedAmbientOcclusion`: one cosine-weighted ray per
+        pixel within a radius; `Renderer::setAmbientOcclusionMask()` replaces SSAO's estimate (its
+        apply pass). Effects share a `RayTracingScene` (built once per frame)
+  - [ ] Local light shadows (point / spot), several lights; alpha-tested casters; PathTracer on
+        `RayTracingScene` too (it builds its own today)
   - [ ] The denoiser's first frames on a binary signal are soft (a 9 px wide shadow: mask 0.63
         after 1 frame, 0.025 after 16): a smaller variance boost for short histories, or
         temporal-only accumulation where the signal agrees with the history
-  - [ ] RT reflections, RT ambient occlusion, RT GI, RT translucency
+  - [ ] RT reflections, RT GI, RT translucency; AO applied to the indirect light only (SSAO's
+        apply pass darkens the whole frame, direct light included)
 - [ ] **Full path-traced mode** (longer term, high-end GPUs): the "path tracing" setting of modern
       games — 1–2 samples per pixel, ReSTIR DI/GI, real-time denoising, upscaling
 - [ ] **Ray queries from raster and compute shaders** (inline RT), not only the RT pipeline: what
