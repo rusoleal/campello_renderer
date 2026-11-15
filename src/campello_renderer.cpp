@@ -4269,8 +4269,9 @@ void Renderer::renderProgramPass(const RenderScene& scene,
 void Renderer::renderGBuffer(const RenderScene& scene) {
     namespace GPU = systems::leal::campello_gpu;
     if (!supportsGBuffer() || !device) return;
-    const uint32_t w = std::max(1u, renderWidth);
-    const uint32_t h = std::max(1u, renderHeight);
+    // The internal size (setRenderScale()): the scene's.
+    const uint32_t w = std::max(1u, internalWidth());
+    const uint32_t h = std::max(1u, internalHeight());
     if (!gbufferTargets.normalRoughness || gbufferTargets.width != w || gbufferTargets.height != h) {
         const auto usage = (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
                                                uint32_t(GPU::TextureUsage::textureBinding) |
@@ -4613,7 +4614,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             buffer.visibility = GPU::ShaderStage::fragment;
             buffer.type = GPU::EntryObjectType::buffer;
             buffer.data.buffer.hasDinamicOffaset = false;
-            buffer.data.buffer.minBindingSize = 16;
+            buffer.data.buffer.minBindingSize = 32;
             buffer.data.buffer.type = GPU::EntryObjectBufferType::uniform;
             tgl.entries.push_back(buffer);
             taaBindGroupLayout = device->createBindGroupLayout(tgl);
@@ -5927,14 +5928,28 @@ uint32_t Renderer::sceneTargetWidth() const {
     if (ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout) {
         return std::max(1u, (uint32_t)((float)renderWidth * ssaaScale));
     }
+    return internalWidth();
+}
+
+uint32_t Renderer::internalWidth() const {
+    if (renderScale < 1.0f && ssaaScale <= 1.0f && pipelineDownsample && downsampleBindGroupLayout) {
+        return std::max(1u, (uint32_t)std::lround((float)renderWidth * renderScale));
+    }
     return renderWidth;
+}
+
+uint32_t Renderer::internalHeight() const {
+    if (renderScale < 1.0f && ssaaScale <= 1.0f && pipelineDownsample && downsampleBindGroupLayout) {
+        return std::max(1u, (uint32_t)std::lround((float)renderHeight * renderScale));
+    }
+    return renderHeight;
 }
 
 uint32_t Renderer::sceneTargetHeight() const {
     if (ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout) {
         return std::max(1u, (uint32_t)((float)renderHeight * ssaaScale));
     }
-    return renderHeight;
+    return internalHeight();
 }
 
 void Renderer::ensureDepthTexture() {
@@ -6932,8 +6947,8 @@ void Renderer::renderToTarget(
     // When screen-space refraction is needed, create an offscreen texture for
     // the opaque pass so the transparent pass can sample it.
     if (needsScreenSpaceRefraction) {
-        uint32_t texW = (uint32_t)((float)renderWidth * ssaaScale);
-        uint32_t texH = (uint32_t)((float)renderHeight * ssaaScale);
+        uint32_t texW = sceneTargetWidth();  // (SSAA or a render scale)
+        uint32_t texH = sceneTargetHeight();
         if (texW < 1) texW = 1;
         if (texH < 1) texH = 1;
         if (!opaqueSceneTexture[currentFrameIndex] || opaqueSceneTexture[currentFrameIndex]->getWidth() != texW ||
@@ -8629,6 +8644,17 @@ bool Renderer::isFxaaEnabled() const {
     return fxaaEnabled;
 }
 
+void Renderer::setRenderScale(float scale) {
+    scale = std::clamp(scale, 0.25f, 1.0f);
+    if (scale == renderScale) return;
+    renderScale = scale;
+    taaHistoryValid = false;
+    // As setSsaaScale(): the scene target's size changed.
+    invalidatePostProcessBindGroups();
+    ensureDepthTexture();
+    ensureSceneColorTexture();
+}
+
 void Renderer::setSsaaScale(float scale) {
     ssaaScale = scale;
     // The scene target size changed: every slot's scene color texture and
@@ -8659,13 +8685,13 @@ int Renderer::getProceduralBakeSize() const {
 void Renderer::ensureSceneColorTexture() {
     namespace GPU = systems::leal::campello_gpu;
     using TU = GPU::TextureUsage;
-    bool needsTexture = (fxaaEnabled || ssaaScale > 1.0f || taaEnabled)
+    bool needsTexture = (fxaaEnabled || ssaaScale > 1.0f || taaEnabled || renderScale < 1.0f)
                         && cachedColorFormat != GPU::PixelFormat::invalid
                         && renderWidth > 0 && renderHeight > 0;
     if (!needsTexture) return;
 
-    uint32_t texW = (uint32_t)((float)renderWidth * ssaaScale);
-    uint32_t texH = (uint32_t)((float)renderHeight * ssaaScale);
+    uint32_t texW = sceneTargetWidth();  // (SSAA or a render scale)
+    uint32_t texH = sceneTargetHeight();
     if (texW < 1) texW = 1;
     if (texH < 1) texH = 1;
 
@@ -9801,9 +9827,12 @@ void Renderer::render(const RenderScene& scene,
             }
             return r;
         };
-        const uint32_t n = taaFrame % 8u + 1u;
-        taaJitter[0] = (halton(n, 2) - 0.5) * 2.0 / double(renderWidth);
-        taaJitter[1] = (halton(n, 3) - 0.5) * 2.0 / double(renderHeight);
+        // In internal pixels; more positions at lower render scales, so
+        // every output pixel gets samples (8 / scale^2, at most 128).
+        const uint32_t phases = std::min(128u, (uint32_t)std::ceil(8.0f / (renderScale * renderScale)));
+        const uint32_t n = taaFrame % phases + 1u;
+        taaJitter[0] = (halton(n, 2) - 0.5) * 2.0 / double(sceneTargetWidth());
+        taaJitter[1] = (halton(n, 3) - 0.5) * 2.0 / double(sceneTargetHeight());
         taaJitterActive = true;
         renderGBuffer(scene);
         taaJitterActive = true;  // (still this frame's)
@@ -10288,9 +10317,12 @@ void Renderer::render(const RenderScene& scene,
     ensureSceneColorTexture();
 
     // A program pass (renderProgramPass()) draws straight into its target.
-    bool useSsaa = !activeProgramPass && ssaaScale > 1.0f && pipelineDownsample && downsampleBindGroupLayout && sceneColorView[currentFrameIndex];
-    const bool useTaa = taaFrameActive && !useSsaa && sceneColorView[currentFrameIndex] && sceneColorTexture[currentFrameIndex] &&
+    // TAA (and temporal upscaling with a render scale); else, when the scene
+    // isn't drawn at the output's size (SSAA, a render scale), a bilinear resample.
+    const bool useTaa = taaFrameActive && sceneColorView[currentFrameIndex] && sceneColorTexture[currentFrameIndex] &&
                         gbufferTargets.motion;
+    bool useSsaa = !activeProgramPass && !useTaa && (sceneTargetWidth() != renderWidth || sceneTargetHeight() != renderHeight) &&
+                   pipelineDownsample && downsampleBindGroupLayout && sceneColorView[currentFrameIndex];
     bool useFxaa = !activeProgramPass && fxaaEnabled && !useSsaa && !useTaa && pipelineFxaa && fxaaBindGroupLayout && sceneColorView[currentFrameIndex];
     bool useIntermediate = useSsaa || useFxaa || useTaa;
 
@@ -10470,8 +10502,8 @@ void Renderer::render(const RenderScene& scene,
         // ------------------------------------------------------------------
         // Multi-pass path: opaque → offscreen texture → transparent with refraction.
         // ------------------------------------------------------------------
-        uint32_t texW = (uint32_t)((float)renderWidth * ssaaScale);
-        uint32_t texH = (uint32_t)((float)renderHeight * ssaaScale);
+        uint32_t texW = sceneTargetWidth();  // (SSAA or a render scale)
+        uint32_t texH = sceneTargetHeight();
         if (texW < 1) texW = 1;
         if (texH < 1) texH = 1;
         if (!opaqueSceneTexture[currentFrameIndex] || opaqueSceneTexture[currentFrameIndex]->getWidth() != texW ||
@@ -10723,8 +10755,11 @@ void Renderer::render(const RenderScene& scene,
         auto rpe = encoder->beginRenderPass(desc);
         if (!rpe) return;
         if (renderWidth > 0 && renderHeight > 0) {
-            const float sw = activeProgramPass ? (float)renderWidth : (float)sceneTargetWidth();
-            const float sh = activeProgramPass ? (float)renderHeight : (float)sceneTargetHeight();
+            // (The G-buffer's pass: its size, the internal one.)
+            const float sw = gbufferPassActive ? (float)gbufferTargets.width
+                             : activeProgramPass ? (float)renderWidth : (float)sceneTargetWidth();
+            const float sh = gbufferPassActive ? (float)gbufferTargets.height
+                             : activeProgramPass ? (float)renderHeight : (float)sceneTargetHeight();
             rpe->setViewport(0.0f, 0.0f, sw, sh, 0.0f, 1.0f);
             rpe->setScissorRect(0.0f, 0.0f, sw, sh);
         }
@@ -10878,18 +10913,21 @@ void Renderer::render(const RenderScene& scene,
             taaHistoryValid = false;
         }
         auto& uniforms = taaUniformBuffer[currentFrameIndex % taaUniformBuffer.size()];
-        if (!uniforms) uniforms = device->createBuffer(16, GPU::BufferUsage::uniform);
+        if (!uniforms) uniforms = device->createBuffer(32, GPU::BufferUsage::uniform);
         const uint32_t read = taaHistoryIndex, write = 1u - taaHistoryIndex;
         if (uniforms && taaHistoryView[0] && taaHistoryView[1]) {
-            const float data[4] = {1.0f / float(w), 1.0f / float(h), taaBlend, taaHistoryValid ? 1.0f : 0.0f};
-            uniforms->upload(0, sizeof(data), const_cast<float*>(data));
+            // TaaUniforms: the frame's size, its jitter in its pixels (y down), blend, history.
+            const float iw = (float)sceneTargetWidth(), ih = (float)sceneTargetHeight();
+            float data[8] = {iw, ih, (float)(taaJitter[0] * iw * 0.5), (float)(-taaJitter[1] * ih * 0.5), taaBlend,
+                             taaHistoryValid ? 1.0f : 0.0f, (float)w, (float)h};
+            uniforms->upload(0, sizeof(data), data);
             GPU::BindGroupDescriptor tDesc{};
             tDesc.layout = taaBindGroupLayout;
             tDesc.entries = {{0, sceneColorTexture[currentFrameIndex]},
                              {1, taaHistory[read]},
                              {2, gbufferTargets.motion},
                              {3, fxaaSampler},
-                             {4, GPU::BufferBinding{uniforms, 0, 16}}};
+                             {4, GPU::BufferBinding{uniforms, 0, 32}}};
             auto group = device->createBindGroup(tDesc);
             GPU::BeginRenderPassDescriptor tRpDesc{};
             for (const auto& view : {colorView, taaHistoryView[write]}) {

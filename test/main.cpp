@@ -4125,6 +4125,53 @@ TEST_F(OffscreenRenderTest, RayTracedShadowsDarkenTheRasterFrame) {
                 tracedShadow, tracedLit, mappedShadow, mappedLit);
     EXPECT_LT(tracedShadow, tracedLit * 0.6) << "ray traced shadows darken the raster frame";
     EXPECT_NEAR(tracedShadow / tracedLit, mappedShadow / mappedLit, 0.2) << "about as the shadow maps do";
+
+    // At half the render scale (temporal upscaling): the G-buffer, rays and
+    // denoiser at 32 x 32, the mask mapped to the output; the same shadow.
+    renderer->setRenderScale(0.5f);
+    renderer->setTemporalAntiAliasing(true);
+    denoiser.reset();
+    for (int f = 0; f < 24; ++f) {
+        renderer->renderGBuffer(scene);
+        ASSERT_TRUE(shadows.trace(scene, renderer->gBuffer()));
+        ASSERT_TRUE(denoiser.denoise(shadows.output(), renderer->gBuffer(), scene.camera.projection));
+        renderer->setShadowMask(denoiser.output());
+        renderer->render(scene, view);
+    }
+    EXPECT_EQ(shadows.output()->getWidth(), 32u);
+    const auto scaled = readBackPixels(tex);
+    renderer->setShadowMask(nullptr);
+    renderer->setTemporalAntiAliasing(false);
+    renderer->setRenderScale(1.0f);
+    // (The shadow strip is 6 pixels wide at the output, 2 at half scale:
+    // its edge columns land on partly lit internal pixels. Its core: the
+    // shadowed pixels whose 3 x 3 neighbourhood is all shadowed.)
+    double scaledShadow = 0, scaledLit = 0;
+    int coreCount = 0;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (depth[i] >= 1.0f) continue;
+        if (v[i] >= 0.5f) {
+            scaledLit += scaled[i * 4];
+            continue;
+        }
+        bool core = true;
+        const int x = int(i % 64), y = int(i / 64);
+        for (int dy = -1; dy <= 1 && core; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                const size_t q = size_t(std::clamp(y + dy, 0, 63)) * 64 + size_t(std::clamp(x + dx, 0, 63));
+                if (v[q] >= 0.5f) core = false;
+            }
+        }
+        if (core) {
+            scaledShadow += scaled[i * 4];
+            ++coreCount;
+        }
+    }
+    ASSERT_GT(coreCount, 10);
+    scaledShadow /= coreCount;
+    scaledLit /= nl;
+    std::printf("[RayTracedShadows] half render scale, shadow core / lit red: %.1f / %.1f\n", scaledShadow, scaledLit);
+    EXPECT_LT(scaledShadow, scaledLit * 0.6) << "the same shadow at a reduced render scale";
     grey->doubleSided = false;
 }
 
@@ -4611,6 +4658,101 @@ TEST_F(OffscreenRenderTest, DdgiDoesNotLeakThroughWalls) {
     white->doubleSided = false;
     renderer->setSkyboxEnabled(true);
     renderer->setEnvironmentIntensity(1.0f);
+}
+
+// Temporal upscaling (setRenderScale() with TAA): a white triangle with
+// slanted edges on black, drawn at half the resolution (32 x 32 for a 64 x
+// 64 output). Bilinearly scaled up its edges are blocky; the temporal
+// upscaler accumulates the jittered half-resolution frames into an image
+// close to native resolution TAA's. A moving triangle leaves no trail.
+TEST_F(OffscreenRenderTest, TemporalUpscalingRecoversDetail) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer (TAA) on this backend";
+    renderer->setSkyboxEnabled(false);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "extensionsUsed": ["KHR_materials_unlit"],
+        "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1]}, "extensions": {"KHR_materials_unlit": {}}}]})",
+                                    kNoOpLoader);
+    GpuMaterial* white = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    white->doubleSided = true;
+    std::vector<float> positions = {-0.6f, -0.5f, 0.0f, 0.55f, -0.35f, 0.0f, -0.1f, 0.6f, 0.0f};
+    std::vector<uint32_t> indices = {0, 1, 2};
+    GpuMesh triangle;
+    triangle.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    triangle.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    triangle.indexCount = 3;
+    triangle.indexFormat = GPU::IndexFormat::uint32;
+    triangle.vertexCount = 3;
+    triangle.layout = &VertexLayout::positionOnly();
+    triangle.setBoundsFromPositions(positions.data(), 3);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 2.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(40.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 2.5);
+    DrawCall draw;
+    draw.mesh = &triangle;
+    draw.material = white;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(draw);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    const auto frames = [&](int n) {
+        for (int i = 0; i < n; ++i) renderer->render(scene, view);
+        return readBackPixels(tex);
+    };
+    const auto rms = [](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+        double sum = 0.0;
+        for (size_t i = 0; i < a.size(); i += 4) sum += double(a[i] - b[i]) * double(a[i] - b[i]);
+        return std::sqrt(sum / double(a.size() / 4));
+    };
+    // The reference: 4x SSAA (edge coverage, close to the true image).
+    renderer->setSsaaScale(4.0f);
+    const auto reference = frames(1);
+    renderer->setSsaaScale(1.0f);
+    // Native resolution TAA; half resolution bilinear; half resolution temporal.
+    renderer->setTemporalAntiAliasing(true);
+    const auto native = frames(32);
+    renderer->setTemporalAntiAliasing(false);
+    renderer->setRenderScale(0.5f);
+    EXPECT_EQ(renderer->internalWidth(), 32u);
+    const auto bilinear = frames(1);
+    renderer->setTemporalAntiAliasing(true);
+    const auto upscaled = frames(64);
+    EXPECT_EQ(renderer->gBuffer().width, 32u) << "the G-buffer at the internal size";
+    const double nativeError = rms(native, reference), bilinearError = rms(bilinear, reference),
+                 upscaledError = rms(upscaled, reference);
+    std::printf("[Upscaling] RMS error against 4x SSAA (levels): native TAA %.2f, half resolution bilinear %.2f, "
+                "half resolution temporal %.2f\n",
+                nativeError, bilinearError, upscaledError);
+    EXPECT_LT(upscaledError, bilinearError * 0.6) << "the temporal upscaler recovers the edges";
+    EXPECT_LT(upscaledError, nativeError * 1.5) << "close to native resolution";
+
+    // Moving at half resolution: no trail where it started.
+    for (int i = 1; i <= 16; ++i) {
+        VM::Matrix4<double> before = VM::Matrix4<double>::identity(), now = VM::Matrix4<double>::identity();
+        before.data[3] = 0.05 * (i - 1);
+        now.data[3] = 0.05 * i;
+        scene.opaque[0].worldTransform = now;
+        scene.opaque[0].previousWorldTransform = before;
+        renderer->render(scene, view);
+    }
+    const auto moved = readBackPixels(tex);
+    const auto at = [&](const std::vector<uint8_t>& p, int x, int y) { return int(p[(size_t(y) * 64 + size_t(x)) * 4]); };
+    std::printf("[Upscaling] after moving: old place %d, new middle %d\n", at(moved, 30, 35), at(moved, 58, 35));
+    EXPECT_LT(at(moved, 30, 35), 25) << "no trail where it was";
+    EXPECT_GT(at(moved, 58, 35), 180) << "the moving object stays solid";
+    renderer->setTemporalAntiAliasing(false);
+    renderer->setRenderScale(1.0f);
+    white->doubleSided = false;
 }
 
 // Path tracing (PathTracer): a plate floating over a lit ground plane, the
