@@ -12,6 +12,7 @@
 #include <campello_gpu/descriptors/render_pipeline_descriptor.hpp>
 #include <campello_gpu/device.hpp>
 #include <campello_gpu/fence.hpp>
+#include <campello_gpu/pipeline_layout.hpp>
 #include <campello_gpu/render_pass_encoder.hpp>
 #include <campello_gpu/render_pipeline.hpp>
 #include <campello_gpu/texture.hpp>
@@ -22,6 +23,9 @@
 
 #if defined(__APPLE__)
 #include "shaders/metal_denoiser.h"
+#elif (defined(ANDROID) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+#include "shaders/vulkan_denoiser.h"
+#define CAMPELLO_RENDERER_VULKAN_DENOISER 1
 #endif
 
 namespace systems::leal::campello_renderer {
@@ -66,23 +70,28 @@ std::shared_ptr<GPU::BindGroupLayout> makeLayout(GPU::Device& device, const std:
     return device.createBindGroupLayout(desc);
 }
 
-std::shared_ptr<GPU::RenderPipeline> makePipeline(GPU::Device& device, const std::shared_ptr<GPU::ShaderModule>& module,
-                                                  const char* fragment,
+// A fullscreen pass: `vertex`'s entry point "denoiseVertex" (Metal) or
+// "main" (Vulkan), and `fragment`'s `entry`.
+std::shared_ptr<GPU::RenderPipeline> makePipeline(GPU::Device& device, const std::shared_ptr<GPU::ShaderModule>& vertex,
+                                                  const char* vertexEntry,
+                                                  const std::shared_ptr<GPU::ShaderModule>& fragment, const char* entry,
                                                   const std::shared_ptr<GPU::BindGroupLayout>& layout,
-                                                  const std::vector<GPU::PixelFormat>& targets) {
-    if (!layout) return nullptr;
+                                                  const std::vector<GPU::PixelFormat>& targets,
+                                                  std::vector<std::shared_ptr<GPU::PipelineLayout>>& keep) {
+    if (!layout || !vertex || !fragment) return nullptr;
     GPU::PipelineLayoutDescriptor pl{};
     pl.bindGroupLayouts = {layout};
     GPU::RenderPipelineDescriptor d{};
     d.layout = device.createPipelineLayout(pl);
-    d.vertex.module = module;
-    d.vertex.entryPoint = "denoiseVertex";
+    keep.push_back(d.layout);  // Vulkan pipelines use it while they exist
+    d.vertex.module = vertex;
+    d.vertex.entryPoint = vertexEntry;
     d.topology = GPU::PrimitiveTopology::triangleList;
     d.cullMode = GPU::CullMode::none;
     d.frontFace = GPU::FrontFace::ccw;
     GPU::FragmentDescriptor frag{};
-    frag.module = module;
-    frag.entryPoint = fragment;
+    frag.module = fragment;
+    frag.entryPoint = entry;
     for (GPU::PixelFormat format : targets) {
         GPU::ColorState target{};
         target.format = format;
@@ -97,11 +106,37 @@ std::shared_ptr<GPU::RenderPipeline> makePipeline(GPU::Device& device, const std
 
 RealtimeDenoiser::RealtimeDenoiser(std::shared_ptr<GPU::Device> device)
     : device_(std::move(device)) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(CAMPELLO_RENDERER_VULKAN_DENOISER)
     if (!device_) return;
+    auto& d = *device_;
+#if defined(__APPLE__)
+    // One library: every entry point.
     auto module = device_->createShaderModule(shaders::kDenoiserMetalShader, shaders::kDenoiserMetalShaderSize);
     if (!module) return;
-    auto& d = *device_;
+    const auto vertex = module;
+    const char* vertexEntry = "denoiseVertex";
+    const auto temporal = module, variance = module, atrous = module, atrousFirst = module, modulate = module;
+    const char* temporalEntry = "denoiseTemporal";
+    const char* varianceEntry = "denoiseVariance";
+    const char* atrousEntry = "denoiseAtrous";
+    const char* atrousFirstEntry = "denoiseAtrousFirst";
+    const char* modulateEntry = "denoiseModulate";
+#else
+    // SPIR-V: a module per pass (shaders/vulkan/denoise_*.frag), each "main".
+    const auto spirv = [&](const unsigned char* code, unsigned int size) { return device_->createShaderModule(code, size); };
+    const auto vertex = spirv(shaders::kDenoiserVulkanVertShader, shaders::kDenoiserVulkanVertShaderSize);
+    const char* vertexEntry = "main";
+    const auto temporal = spirv(shaders::kDenoiserVulkanTemporalShader, shaders::kDenoiserVulkanTemporalShaderSize);
+    const auto variance = spirv(shaders::kDenoiserVulkanVarianceShader, shaders::kDenoiserVulkanVarianceShaderSize);
+    const auto atrous = spirv(shaders::kDenoiserVulkanAtrousShader, shaders::kDenoiserVulkanAtrousShaderSize);
+    const auto atrousFirst = spirv(shaders::kDenoiserVulkanAtrousFirstShader, shaders::kDenoiserVulkanAtrousFirstShaderSize);
+    const auto modulate = spirv(shaders::kDenoiserVulkanModulateShader, shaders::kDenoiserVulkanModulateShaderSize);
+    const char* temporalEntry = "main";
+    const char* varianceEntry = "main";
+    const char* atrousEntry = "main";
+    const char* atrousFirstEntry = "main";
+    const char* modulateEntry = "main";
+#endif
     temporalLayout_ = makeLayout(d,
                                  {Slot::color, Slot::color, Slot::color, Slot::color, Slot::depth, Slot::color,
                                   Slot::color, Slot::color},
@@ -112,12 +147,13 @@ RealtimeDenoiser::RealtimeDenoiser(std::shared_ptr<GPU::Device> device)
     modulateLayout_ = makeLayout(d, {Slot::color, Slot::color, Slot::color, Slot::color}, true);
     const auto half4 = GPU::PixelFormat::rgba16float;
     const auto float4 = GPU::PixelFormat::rgba32float;
-    variancePipeline_ = makePipeline(d, module, "denoiseVariance", varianceLayout_, {half4});
-    atrousPipeline_ = makePipeline(d, module, "denoiseAtrous", atrousLayout_, {half4});
-    atrousFirstPipeline_ = makePipeline(d, module, "denoiseAtrousFirst", atrousFirstLayout_, {half4, half4});
-    modulatePipeline_ = makePipeline(d, module, "denoiseModulate", modulateLayout_, {half4});
+    variancePipeline_ = makePipeline(d, vertex, vertexEntry, variance, varianceEntry, varianceLayout_, {half4}, pipelineLayouts_);
+    atrousPipeline_ = makePipeline(d, vertex, vertexEntry, atrous, atrousEntry, atrousLayout_, {half4}, pipelineLayouts_);
+    atrousFirstPipeline_ = makePipeline(d, vertex, vertexEntry, atrousFirst, atrousFirstEntry, atrousFirstLayout_, {half4, half4}, pipelineLayouts_);
+    modulatePipeline_ = makePipeline(d, vertex, vertexEntry, modulate, modulateEntry, modulateLayout_, {half4}, pipelineLayouts_);
     if (variancePipeline_ && atrousPipeline_ && atrousFirstPipeline_ && modulatePipeline_) {
-        temporalPipeline_ = makePipeline(d, module, "denoiseTemporal", temporalLayout_, {half4, half4, float4});
+        temporalPipeline_ =
+            makePipeline(d, vertex, vertexEntry, temporal, temporalEntry, temporalLayout_, {half4, half4, float4}, pipelineLayouts_);
     }
 #endif
 }

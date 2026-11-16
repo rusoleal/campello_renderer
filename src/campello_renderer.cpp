@@ -3555,6 +3555,10 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
         entry.slots[logical] = (int8_t)d.vertex.buffers.size();
         d.vertex.buffers.push_back(buffer);
     }
+    if (gbuffer && meshRecipe.gbufferPreviousTransforms) {
+        entry.previousTransformSlot = (int8_t)d.vertex.buffers.size();
+        d.vertex.buffers.push_back(*meshRecipe.gbufferPreviousTransforms);
+    }
     if (meshRecipe.rawBufferSlots) {
         for (size_t logical = kVertexSemanticCount; logical < kLogicalSlotCount; ++logical) {
             if (entry.slots[logical] < 0) entry.slots[logical] = (int8_t)logical;
@@ -5011,6 +5015,37 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         programs[kPbrProgram].fragmentModule = fragModule;
         programs[kPbrProgram].fragmentEntries = {"", "main", ""};
         meshRecipe.supportsBlend = false;
+        // The G-buffer (renderGBuffer()): gbuffer.vert / gbuffer_lean.vert
+        // (default.vert's reads plus the previous transform, a per-instance
+        // buffer: previous clip from local at locations 20-23, the jitter at
+        // 28) and gbuffer.frag (three targets).
+        {
+            auto gbufferVert = device->createShaderModule(kDefaultVulkanGBufferVertShader, kDefaultVulkanGBufferVertShaderSize);
+            auto gbufferLean = device->createShaderModule(kDefaultVulkanGBufferLeanVertShader,
+                                                          kDefaultVulkanGBufferLeanVertShaderSize);
+            auto gbufferFrag = device->createShaderModule(kDefaultVulkanGBufferFragShader, kDefaultVulkanGBufferFragShaderSize);
+            if (gbufferVert && gbufferLean && gbufferFrag) {
+                GPU::VertexLayout previous{};
+                previous.arrayStride = 128;  // GBufferTransforms, NodeTransforms' stride
+                previous.stepMode = GPU::StepMode::instance;
+                for (uint32_t col = 0; col < 5; ++col) {
+                    GPU::VertexAttribute attr{};
+                    attr.componentType = GPU::ComponentType::ctFloat;
+                    attr.accessorType = GPU::AccessorType::acVec4;
+                    attr.offset = col * 16;  // previousMvp columns, then the jitter
+                    attr.shaderLocation = col < 4 ? 20 + col : 28;
+                    previous.attributes.push_back(attr);
+                }
+                meshRecipe.gbufferPreviousTransforms = previous;
+                gbufferProgram.name = "gbuffer";
+                gbufferProgram.vertexStages = {
+                    {standardReads, gbufferVert, "main"},
+                    {semanticBit(VertexSemantic::position), gbufferLean, "main"},
+                };
+                gbufferProgram.fragmentModule = gbufferFrag;
+                gbufferProgram.fragmentEntries = {"", "main", ""};
+            }
+        }
 #endif
         meshRecipe.ready = true;
         prewarmMeshPipelines();
@@ -5200,6 +5235,65 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             dsDesc.layout = vulkanDownsamplePipelineLayout;
 
             pipelineDownsample = device->createRenderPipeline(dsDesc);
+        }
+    }
+
+    // --- TAA resolve pipeline (Vulkan; taa.frag): current (0), history (1),
+    //     motion (2), sampler (3), uniforms (4); the output and the next history. ---
+    {
+        if (!taaBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor tgl{};
+            for (uint32_t binding = 0; binding < 3; ++binding) {
+                GPU::EntryObject t{};
+                t.binding = binding;
+                t.visibility = GPU::ShaderStage::fragment;
+                t.type = GPU::EntryObjectType::texture;
+                t.data.texture.multisampled = false;
+                t.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+                t.data.texture.viewDimension = GPU::TextureType::tt2d;
+                tgl.entries.push_back(t);
+            }
+            GPU::EntryObject sampler{};
+            sampler.binding = 3;
+            sampler.visibility = GPU::ShaderStage::fragment;
+            sampler.type = GPU::EntryObjectType::sampler;
+            sampler.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            tgl.entries.push_back(sampler);
+            GPU::EntryObject buffer{};
+            buffer.binding = 4;
+            buffer.visibility = GPU::ShaderStage::fragment;
+            buffer.type = GPU::EntryObjectType::buffer;
+            buffer.data.buffer.hasDinamicOffaset = false;
+            buffer.data.buffer.minBindingSize = 32;
+            buffer.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+            tgl.entries.push_back(buffer);
+            taaBindGroupLayout = device->createBindGroupLayout(tgl);
+        }
+        auto taaVertModule = device->createShaderModule(kDefaultVulkanFxaaVertShader, kDefaultVulkanFxaaVertShaderSize);
+        auto taaFragModule = device->createShaderModule(kDefaultVulkanTaaFragShader, kDefaultVulkanTaaFragShaderSize);
+        if (taaBindGroupLayout && taaVertModule && taaFragModule) {
+            GPU::RenderPipelineDescriptor taaDesc{};
+            taaDesc.vertex.module = taaVertModule;
+            taaDesc.vertex.entryPoint = "main";
+            taaDesc.topology = GPU::PrimitiveTopology::triangleList;
+            taaDesc.cullMode = GPU::CullMode::none;
+            taaDesc.frontFace = GPU::FrontFace::ccw;
+            GPU::FragmentDescriptor taaFrag{};
+            taaFrag.module = taaFragModule;
+            taaFrag.entryPoint = "main";
+            for (int k = 0; k < 2; ++k) {
+                GPU::ColorState target{};
+                target.format = colorFormat;
+                target.writeMask = GPU::ColorWrite::all;
+                taaFrag.targets.push_back(target);
+            }
+            taaDesc.fragment = taaFrag;
+            GPU::PipelineLayoutDescriptor taaPlDesc{};
+            taaPlDesc.bindGroupLayouts = {taaBindGroupLayout};
+            vulkanTaaPipelineLayout = device->createPipelineLayout(taaPlDesc);
+            taaDesc.layout = vulkanTaaPipelineLayout;
+            pipelineTaa = device->createRenderPipeline(taaDesc);
+            taaHistoryValid = false;
         }
     }
 
@@ -11182,6 +11276,10 @@ void Renderer::renderPrimitive(
                              : draw.jointMatrixBuffer       ? draw.jointMatrixBuffer
                                                             : defaultJointMatrixBuffer;
         if (joints) setVertexBufferIfChanged(rpe, kGBufferPreviousJointSlot, joints, 0);
+    } else if (gbufferPassActive && entry->previousTransformSlot >= 0) {
+        if (const auto& previous = gbufferPreviousTransforms[currentFrameIndex % gbufferPreviousTransforms.size()]) {
+            setVertexBufferIfChanged(rpe, (uint32_t)entry->previousTransformSlot, previous, transformOffset);
+        }
     }
 
     // --- 4. Bind instance matrix ---

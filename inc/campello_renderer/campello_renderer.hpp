@@ -532,6 +532,10 @@ namespace systems::leal::campello_renderer {
             // at their own index. Elsewhere they aren't vertex buffers and
             // binding them is skipped.
             bool rawBufferSlots = false;
+            // The G-buffer's previous transforms read as a per-instance
+            // vertex buffer (Vulkan: gbuffer.vert's previous clip transform
+            // and jitter), after the per-draw buffers; G-buffer pipelines only.
+            std::optional<systems::leal::campello_gpu::VertexLayout> gbufferPreviousTransforms;
         };
         // A cached pipeline and where its vertex buffers go: physical slot per
         // logical slot (VERTEX_SLOT_*), -1 = not read by this pipeline.
@@ -541,6 +545,8 @@ namespace systems::leal::campello_renderer {
         struct MeshPipelineEntry {
             std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipeline;
             std::array<int8_t, kLogicalSlotCount> slots{};
+            // MeshPipelineRecipe::gbufferPreviousTransforms' vertex buffer slot (-1: none).
+            int8_t previousTransformSlot = -1;
         };
         MeshPipelineRecipe meshRecipe;
         std::unordered_map<uint64_t, MeshPipelineEntry> meshPipelineCache;
@@ -666,6 +672,7 @@ namespace systems::leal::campello_renderer {
         // after the first referencing an already-destroyed VkPipelineLayout.
         std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanDefaultPipelineLayout;
         std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanFxaaPipelineLayout;
+        std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanTaaPipelineLayout;
         std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanDownsamplePipelineLayout;
         std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanIblBakePipelineLayout;
         std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> vulkanSkyboxPipelineLayout;
@@ -1396,7 +1403,8 @@ namespace systems::leal::campello_renderer {
         void renderProgramPass(const RenderScene& scene,
                                std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView,
                                const ProgramPassOptions& options);
-        /// Whether renderGBuffer() works on this backend (Metal for now).
+        /// Whether renderGBuffer() works on this backend (Metal, Vulkan;
+        /// Vulkan draws don't skin yet, so skinned draws have no skinned motion).
         bool supportsGBuffer() const { return gbufferProgram.fragmentModule != nullptr && meshRecipe.ready; }
         /// Draws the scene's opaque draws into the G-buffer (gBuffer()) at
         /// renderWidth x renderHeight (resize()): normals, roughness, base
