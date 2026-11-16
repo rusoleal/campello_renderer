@@ -42,6 +42,7 @@
 // readLinear() read the image back.
 
 #include <campello_renderer/campello_renderer.hpp>
+#include <campello_renderer/gpu_timing.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -407,6 +408,12 @@ public:
     };
     /// Doesn't wait for the GPU: a sample still in flight is counted once it finishes.
     [[nodiscard]] Stats stats() const;
+    /// GPU time of the last finished traceReflections(),
+    /// traceGlobalIllumination() or traceProbeRays() (ms; 0 before one
+    /// finishes). Not in stats(), which is the progressive image's.
+    [[nodiscard]] double passGpuTimeMs() const {
+        return passTiming_.ms();
+    }
 
 private:
     struct MeshEntry {
@@ -488,6 +495,7 @@ private:
     bool giRequest_ = false;
     std::shared_ptr<systems::leal::campello_gpu::Texture> giTarget_;
     uint32_t giBounces_ = 1;
+    GpuTiming passTiming_;  // the passes above (passGpuTimeMs())
     // Probe rays (traceProbeRays()): the request in progress, its output.
     const ProbeRays* probeRequest_ = nullptr;
     std::shared_ptr<systems::leal::campello_gpu::Texture> probeRayTarget_;

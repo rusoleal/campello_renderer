@@ -286,7 +286,10 @@ bool DdgiVolume::update(PathTracer& tracer, const RenderScene& scene, const Rend
         return false;
     }
     auto fence = device_->createFence();
-    device_->submit(encoder->finish(), fence);
+    auto commands = encoder->finish();
+    device_->submit(commands, fence);
+    updateTiming_.begin();
+    updateTiming_.submitted(commands, fence);
     pendingUpdate_ = fence;
     historyIndex_ = write;
     historyValid_ = true;
@@ -345,7 +348,10 @@ bool DdgiVolume::resolve(const GBufferTargets& gbuffer, const CameraData& camera
         rpe->end();
     }
     auto fence = device_->createFence();
-    device_->submit(encoder->finish(), fence);
+    auto commands = encoder->finish();
+    device_->submit(commands, fence);
+    resolveTiming_.begin();
+    resolveTiming_.submitted(commands, fence);
     pendingResolve_ = fence;
     irradiance_ = resolveTarget_.texture;
     return true;

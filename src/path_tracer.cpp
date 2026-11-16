@@ -1290,7 +1290,11 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
     auto commands = encoder->finish();
     device_->submit(commands, fence);
     pending_ = fence;
-    if (reflectionPass) return true;  // the progressive image's state is untouched
+    if (reflectionPass) {
+        passTiming_.begin();
+        passTiming_.submitted(commands, fence);
+        return true;  // the progressive image's state is untouched
+    }
     pendingCommands_ = commands;
     pendingSamples_ = samplesNow;
     pendingPixels_ = uint64_t(traceWidth_) * traceHeight_;

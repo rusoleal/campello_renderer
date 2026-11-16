@@ -257,7 +257,10 @@ bool RealtimeDenoiser::denoise(const std::shared_ptr<GPU::Texture>& noisy, const
     if (!ok) return false;
 
     auto fence = device_->createFence();
-    device_->submit(encoder->finish(), fence);
+    auto commands = encoder->finish();
+    device_->submit(commands, fence);
+    timing_.begin();
+    timing_.submitted(commands, fence);
     pending_ = fence;
     historyIndex_ = write;
     historyValid_ = true;

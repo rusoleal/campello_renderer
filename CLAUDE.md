@@ -132,6 +132,7 @@ Two variants are created by `createDefaultPipelines()`:
 - `src/path_tracer.cpp`, `shaders/metal/path_tracer.metal` — `PathTracer` (progressive GPU path tracing)
 - `src/realtime_denoiser.cpp`, `shaders/metal/denoiser.metal` — `RealtimeDenoiser` (SVGF, G-buffer guided)
 - `src/rt_effects.cpp`, `shaders/metal/rt_effects.metal` — `RayTracingScene`, `RayTracedShadows`, `RayTracedAmbientOcclusion`, `RestirDirectLighting`, `RestirGlobalIllumination` (ray traced effects on the raster renderer; ReSTIR DI feeds `Renderer::setDirectLighting()`, ReSTIR GI `setIndirectDiffuse()` with samples from `PathTracer::traceGlobalIllumination()`)
+- `src/realtime_effects.cpp` — `RealtimeEffects`: the effect chain with quality presets (`EffectQuality`), per-effect GPU timings (`GpuTiming`, `gpu_timing.hpp`) and dynamic resolution
 - `src/ddgi.cpp`, `shaders/metal/ddgi.metal` — `DdgiVolume` (probe-based GI; rays traced by `PathTracer::traceProbeRays()`)
 - `src/shaders/vulkan_default.h` — embedded Vulkan SPIR-V
 - `src/shaders/directx_default.h` — DirectX DXIL (currently empty stubs)

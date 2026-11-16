@@ -279,7 +279,10 @@ bool RayTracedEffect::dispatch(const RenderScene& scene, const GBufferTargets& g
         pass->end();
     }
     auto fence = device_->createFence();
-    device_->submit(encoder->finish(), fence);
+    auto commands = encoder->finish();
+    device_->submit(commands, fence);
+    timing_.begin();
+    timing_.submitted(commands, fence);
     pending_ = fence;
     return true;
 }
@@ -569,7 +572,10 @@ bool RestirDirectLighting::frame(const RenderScene& scene, const GBufferTargets&
         }
     }
     auto fence = device_->createFence();
-    device_->submit(encoder->finish(), fence);
+    auto commands = encoder->finish();
+    device_->submit(commands, fence);
+    timing_.begin();
+    timing_.submitted(commands, fence);
     pending_ = fence;
     if (!reference) {
         surfaceIndex_ = 1 - surfaceIndex_;
@@ -755,7 +761,10 @@ bool RestirGlobalIllumination::render(const RenderScene& scene, const Renderer& 
         }
     }
     auto fence = device_->createFence();
-    device_->submit(encoder->finish(), fence);
+    auto commands = encoder->finish();
+    device_->submit(commands, fence);
+    timing_.begin();
+    timing_.submitted(commands, fence);
     pending_ = fence;
     index_ = 1 - index_;
     historyValid_ = true;

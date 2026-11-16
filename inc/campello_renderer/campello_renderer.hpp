@@ -229,8 +229,11 @@ namespace systems::leal::campello_renderer {
         double cpuFrameTimeMs = 0.0;
         // GPU execution time of the most recent render() whose command buffer
         // has completed (frames in flight: usually two or three frames old).
-        // 0 when the backend doesn't report it (Metal does).
+        // 0 when the backend doesn't report it (Metal does). The G-buffer
+        // pass (renderGBuffer()) isn't in it: gbufferGpuTimeMs.
         double gpuFrameTimeMs = 0.0;
+        // GPU execution time of the most recent completed renderGBuffer().
+        double gbufferGpuTimeMs = 0.0;
     };
 
     using OverlayCallback = std::function<void(
@@ -776,6 +779,7 @@ namespace systems::leal::campello_renderer {
             // render()'s command buffer, kept to read its GPU time once the
             // fence says it completed.
             std::shared_ptr<systems::leal::campello_gpu::CommandBuffer> commandBuffer;
+            bool gbuffer = false;  // it was renderGBuffer()'s
         };
         FrameResources frameResources[kMaxFramesInFlight];
         uint32_t currentFrameIndex = 0;
@@ -1082,6 +1086,7 @@ namespace systems::leal::campello_renderer {
         std::vector<uint8_t> materialUniformShadow;
         void writeMaterialUniform(uint64_t offset, const float* slot);
         double gpuFrameTimeMs = 0.0;  // latest completed render() command buffer
+        double gbufferGpuTimeMs = 0.0;  // latest completed renderGBuffer() command buffer
         // Web: getGPUExecutionTime() would block (yield) until the timestamp
         // readback resolves, so render() asks asynchronously and the result
         // lands here; shared so a late callback outlives the Renderer safely.

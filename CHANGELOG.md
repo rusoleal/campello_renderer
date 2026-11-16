@@ -3,6 +3,22 @@
 ## [Unreleased]
 
 ### Added
+- **Quality presets: `RealtimeEffects`** (new header `realtime_effects.hpp`). It runs the Games track's effect chain for an app: the G-buffer, then the enabled ray traced effects, each denoised and handed to the renderer, then the frame with TAA at the render scale.
+  - `EffectQuality` presets:
+    - `off`: raster only.
+    - `low`: RT sun shadows, half resolution.
+    - `medium`: + RT AO.
+    - `high`: AO, reflections and ReSTIR DI.
+    - `ultra`: + ReSTIR GI.
+  - `Settings` changes the effects one by one; `settingsFor()` returns a preset's.
+  - Without `Feature::raytracing` the presets fall back to raster only. MetalFX is the upscaler wherever it's supported.
+  - `setFrameBudget(ms, minScale)` adds dynamic resolution: the render scale steps by 0.05, at most every 8 frames, to keep the frame's GPU time under the budget.
+  - `timings()` gives the last finished frame's GPU milliseconds per effect, without waiting.
+  - At `ultra`, at 64 × 64 on the Intel UHD 630, a frame takes 6.9 ms: denoising 2.3, GI 1.4, reflections 1.1, raster 1.5.
+- **Per-effect GPU timing**:
+  - `gpuTimeMs()` on `RayTracedShadows`, `RayTracedAmbientOcclusion`, `RestirDirectLighting`, `RestirGlobalIllumination`, `RealtimeDenoiser` and `DdgiVolume`. These are command-buffer GPU times read once each fence signals (`GpuTiming`, `gpu_timing.hpp`).
+  - `PathTracer::passGpuTimeMs()` for its reflection, GI and probe passes.
+  - `RenderStats::gbufferGpuTimeMs`: `renderGBuffer()` no longer overwrites the frame's `gpuFrameTimeMs`.
 - **ReSTIR GI: one-bounce indirect light** (Metal, `Feature::raytracing`). `RestirGlobalIllumination` (`rt_effects.hpp`), after Ouyang et al. 2021, traces one cosine-weighted path per pixel from the G-buffer with its own `PathTracer`. The paths see the tracer's materials, sun, sky and emitters.
   - The samples are resampled by the irradiance they bring and reused along the motion vectors (M capped at 30).
   - While a pixel's history is short, neighbours' samples are reused too, with the reconnection's Jacobian and a visibility test.

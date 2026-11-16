@@ -48,6 +48,7 @@ add_library(${PROJECT_NAME} SHARED
     src/realtime_denoiser.cpp
     src/rt_effects.cpp
     src/ddgi.cpp
+    src/realtime_effects.cpp
     src/animation.cpp
     src/procedural_texture_baker.cpp
 )
