@@ -55,16 +55,16 @@ use(tracer.output());
 | SSAO | `setAmbientOcclusion()` | off | varies (see the setter) | automatic (applied to the frame) |
 | FXAA / SSAA | `setFxaaEnabled()` / `setSsaaScale()` | off | varies (see the setter) | automatic |
 | Clip planes | `setClipPlanes()` | off | Metal, Vulkan | clip in your fragment shader (`CameraUniforms::clipPlanes`) |
-| TAA | `setTemporalAntiAliasing(true)` | off | Metal | automatic (with your G-buffer stages if you move geometry) |
-| Render scale + upscaling | `setRenderScale()`, `setUpscaler()` | 1, built-in | Metal (MetalFX on macOS 13 / iOS 16) | automatic |
-| G-buffer | `renderGBuffer()` | not run | Metal | your own G-buffer stages (see 3) |
+| TAA | `setTemporalAntiAliasing(true)` | off | Metal, Vulkan | automatic (with your G-buffer stages if you move geometry) |
+| Render scale + upscaling | `setRenderScale()`, `setUpscaler()` | 1, built-in | Metal, Vulkan (built-in); MetalFX on macOS 13 / iOS 16 | automatic |
+| G-buffer | `renderGBuffer()` | not run | Metal, Vulkan (no skinned motion yet) | your own G-buffer stages (see 3) |
 | Ray traced shadows | `RayTracedShadows` → `setShadowMask()` | null (shadow maps) | Metal + `Feature::raytracing` | `campello::sunVisibility()` |
 | Ray traced AO | `RayTracedAmbientOcclusion` → `setAmbientOcclusionMask()` | null (SSAO) | same | automatic |
 | Ray traced reflections | `PathTracer::traceReflections()` → `setReflections()` | null (environment) | same | `campello::reflectedRadiance()` |
 | Probe GI (DDGI) | `DdgiVolume` → `setIndirectDiffuse()` | null (irradiance map) | same | `campello::indirectIrradiance()` |
 | Many lights (ReSTIR DI) | `RestirDirectLighting` → `setDirectLighting()` | null (4-light loop) | same | `campello::directRadiance()` |
 | One-bounce GI (ReSTIR GI) | `RestirGlobalIllumination` → `setIndirectDiffuse()` | null (irradiance map) | same | `campello::indirectIrradiance()` |
-| Real-time denoiser | `RealtimeDenoiser` | not run | Metal | — |
+| Real-time denoiser | `RealtimeDenoiser` | not run | Metal, Vulkan | — |
 
 The ray traced effects are classes you create and run. The renderer never runs them itself. Each one reads the G-buffer and writes a texture, and you hand that texture to the renderer. A frame with all of them looks like this:
 
@@ -167,4 +167,4 @@ desc.metalGBufferFragmentEntryPoint = "gbufferFragmentMain";
 
 - **Ray traced passes shade with the built-in material model.** The path tracer, reflections and probe GI see glTF PBR materials, so a custom material looks like its `GpuMaterial` PBR parameters there.
 - **The frame order is fixed:** shadows, opaque, transmission copy, transparent, post-processing, overlay. You can't insert a pass between built-in passes. The overlay callback runs at the end, and the building blocks above run outside `render()`.
-- **Backends:** the lighting inputs and G-buffer stages are Metal only, like the effects themselves. The Slang, GLSL, HLSL and WGSL headers carry the vertex and transform contract only.
+- **Backends:** the lighting inputs and app G-buffer stages are Metal only, like the ray traced effects. Vulkan has the built-in G-buffer, TAA, the built-in upscaler and the real-time denoiser, but not app G-buffer stages yet. The Slang, GLSL, HLSL and WGSL headers carry the vertex and transform contract only.

@@ -3,7 +3,6 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHADER_DIR="$SCRIPT_DIR/shaders/vulkan"
-OUT_HEADER="$SCRIPT_DIR/src/shaders/vulkan_default.h"
 
 # ---------------------------------------------------------------------------
 # Locate glslc — prefer NDK bundled version, fall back to PATH.
@@ -34,76 +33,46 @@ fi
 echo "Using glslc: $GLSLC"
 
 # ---------------------------------------------------------------------------
-# Compile GLSL → SPIR-V
+# Compile GLSL → SPIR-V and embed it. Each entry: source, .spv, C symbol
+# (the header has <symbol>[] and <symbol>Size), and the header under src/shaders/.
 # ---------------------------------------------------------------------------
-"$GLSLC" "$SHADER_DIR/default.vert" -o "$SHADER_DIR/default_vert.spv"
-echo "Compiled: default.vert → default_vert.spv"
+SHADERS=(
+    "default.vert               default_vert.spv               kDefaultVulkanVertShader               vulkan_default.h"
+    "default.frag               default_frag.spv               kDefaultVulkanFragShader               vulkan_default.h"
+    "default_lean.vert          default_lean_vert.spv          kDefaultVulkanLeanVertShader           vulkan_default.h"
+    "default_line.vert          default_line_vert.spv          kDefaultVulkanLineVertShader           vulkan_default.h"
+    "fxaa.vert                  fxaa_vert.spv                  kDefaultVulkanFxaaVertShader           vulkan_default.h"
+    "fxaa.frag                  fxaa_frag.spv                  kDefaultVulkanFxaaFragShader           vulkan_default.h"
+    "downsample.frag            downsample_frag.spv            kDefaultVulkanDownsampleFragShader     vulkan_default.h"
+    "procedural_bake.comp       procedural_bake.spv            kDefaultVulkanProceduralBakeShader     vulkan_default.h"
+    "ibl_bake.frag              ibl_bake_frag.spv              kDefaultVulkanIblBakeFragShader        vulkan_default.h"
+    "skybox.frag                skybox_frag.spv                kDefaultVulkanSkyboxFragShader         vulkan_default.h"
+    "ssao.frag                  ssao_frag.spv                  kDefaultVulkanSsaoFragShader           vulkan_default.h"
+    "ssao_apply.frag            ssao_apply_frag.spv            kDefaultVulkanSsaoApplyFragShader      vulkan_default.h"
+    "gbuffer.vert               gbuffer_vert.spv               kDefaultVulkanGBufferVertShader        vulkan_default.h"
+    "gbuffer_lean.vert          gbuffer_lean_vert.spv          kDefaultVulkanGBufferLeanVertShader    vulkan_default.h"
+    "gbuffer.frag               gbuffer_frag.spv               kDefaultVulkanGBufferFragShader        vulkan_default.h"
+    "taa.frag                   taa_frag.spv                   kDefaultVulkanTaaFragShader            vulkan_default.h"
+    "fxaa.vert                  fxaa_vert.spv                  kDenoiserVulkanVertShader              vulkan_denoiser.h"
+    "denoise_temporal.frag      denoise_temporal_frag.spv      kDenoiserVulkanTemporalShader          vulkan_denoiser.h"
+    "denoise_variance.frag      denoise_variance_frag.spv      kDenoiserVulkanVarianceShader          vulkan_denoiser.h"
+    "denoise_atrous.frag        denoise_atrous_frag.spv        kDenoiserVulkanAtrousShader            vulkan_denoiser.h"
+    "denoise_atrous_first.frag  denoise_atrous_first_frag.spv  kDenoiserVulkanAtrousFirstShader       vulkan_denoiser.h"
+    "denoise_modulate.frag      denoise_modulate_frag.spv      kDenoiserVulkanModulateShader          vulkan_denoiser.h"
+)
 
-"$GLSLC" "$SHADER_DIR/default.frag" -o "$SHADER_DIR/default_frag.spv"
-echo "Compiled: default.frag → default_frag.spv"
+ENTRIES=()
+for entry in "${SHADERS[@]}"; do
+    read -r src spv symbol header <<< "$entry"
+    "$GLSLC" "$SHADER_DIR/$src" -o "$SHADER_DIR/$spv"
+    echo "Compiled: $src → $spv"
+    ENTRIES+=("$SHADER_DIR/$spv" "$symbol" "$SCRIPT_DIR/src/shaders/$header")
+done
 
-"$GLSLC" "$SHADER_DIR/default_lean.vert" -o "$SHADER_DIR/default_lean_vert.spv"
-echo "Compiled: default_lean.vert → default_lean_vert.spv"
+python3 - "${ENTRIES[@]}" <<'PYEOF'
+import sys
 
-"$GLSLC" "$SHADER_DIR/default_line.vert" -o "$SHADER_DIR/default_line_vert.spv"
-echo "Compiled: default_line.vert → default_line_vert.spv"
-
-"$GLSLC" "$SHADER_DIR/fxaa.vert" -o "$SHADER_DIR/fxaa_vert.spv"
-echo "Compiled: fxaa.vert → fxaa_vert.spv"
-
-"$GLSLC" "$SHADER_DIR/fxaa.frag" -o "$SHADER_DIR/fxaa_frag.spv"
-echo "Compiled: fxaa.frag → fxaa_frag.spv"
-
-"$GLSLC" "$SHADER_DIR/downsample.frag" -o "$SHADER_DIR/downsample_frag.spv"
-echo "Compiled: downsample.frag → downsample_frag.spv"
-
-"$GLSLC" "$SHADER_DIR/procedural_bake.comp" -o "$SHADER_DIR/procedural_bake.spv"
-echo "Compiled: procedural_bake.comp → procedural_bake.spv"
-
-"$GLSLC" "$SHADER_DIR/ibl_bake.frag" -o "$SHADER_DIR/ibl_bake_frag.spv"
-echo "Compiled: ibl_bake.frag → ibl_bake_frag.spv"
-
-"$GLSLC" "$SHADER_DIR/skybox.frag" -o "$SHADER_DIR/skybox_frag.spv"
-echo "Compiled: skybox.frag → skybox_frag.spv"
-
-"$GLSLC" "$SHADER_DIR/ssao.frag" -o "$SHADER_DIR/ssao_frag.spv"
-echo "Compiled: ssao.frag → ssao_frag.spv"
-
-"$GLSLC" "$SHADER_DIR/ssao_apply.frag" -o "$SHADER_DIR/ssao_apply_frag.spv"
-echo "Compiled: ssao_apply.frag → ssao_apply_frag.spv"
-
-# ---------------------------------------------------------------------------
-# Helper: convert a .spv binary into a C hex byte array (12 bytes per line).
-# ---------------------------------------------------------------------------
-spv_to_c_array() {
-    local file="$1"
-    local size
-    size=$(wc -c < "$file")
-    local col=0
-    local first=1
-    local line=""
-
-    while IFS= read -r -d '' -n 1 byte || [ -n "$byte" ]; do
-        printf -v hex "0x%02x" "'$byte"
-        if [ $first -eq 0 ]; then
-            printf ", "
-            if [ $col -eq 0 ]; then printf "\n    "; fi
-        else
-            printf "    "
-            first=0
-        fi
-        printf "%s" "$hex"
-        col=$(( (col + 1) % 12 ))
-    done < "$file"
-    printf "\n"
-    echo "$size"
-}
-
-# ---------------------------------------------------------------------------
-# Generate the header using Python (available on all host platforms).
-# ---------------------------------------------------------------------------
-python3 - "$SHADER_DIR/default_vert.spv" "$SHADER_DIR/default_frag.spv" "$SHADER_DIR/fxaa_vert.spv" "$SHADER_DIR/fxaa_frag.spv" "$SHADER_DIR/downsample_frag.spv" "$SHADER_DIR/procedural_bake.spv" "$SHADER_DIR/ibl_bake_frag.spv" "$SHADER_DIR/skybox_frag.spv" "$SHADER_DIR/default_lean_vert.spv" "$SHADER_DIR/default_line_vert.spv" "$SHADER_DIR/ssao_frag.spv" "$SHADER_DIR/ssao_apply_frag.spv" "$OUT_HEADER" <<'PYEOF'
-import sys, os
+triples = list(zip(sys.argv[1::3], sys.argv[2::3], sys.argv[3::3]))
 
 def spv_to_hex_lines(path):
     data = open(path, "rb").read()
@@ -113,22 +82,11 @@ def spv_to_hex_lines(path):
         lines.append("    " + ", ".join(f"0x{b:02x}" for b in chunk) + ",")
     return "\n".join(lines), len(data)
 
-vert_path, frag_path, fxaa_vert_path, fxaa_frag_path, downsample_frag_path, procedural_bake_path, ibl_bake_frag_path, skybox_frag_path, lean_vert_path, line_vert_path, ssao_frag_path, ssao_apply_frag_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11], sys.argv[12], sys.argv[13]
-
-vert_hex, vert_size = spv_to_hex_lines(vert_path)
-frag_hex, frag_size = spv_to_hex_lines(frag_path)
-fxaa_vert_hex, fxaa_vert_size = spv_to_hex_lines(fxaa_vert_path)
-fxaa_frag_hex, fxaa_frag_size = spv_to_hex_lines(fxaa_frag_path)
-downsample_frag_hex, downsample_frag_size = spv_to_hex_lines(downsample_frag_path)
-procedural_bake_hex, procedural_bake_size = spv_to_hex_lines(procedural_bake_path)
-ibl_bake_frag_hex, ibl_bake_frag_size = spv_to_hex_lines(ibl_bake_frag_path)
-skybox_frag_hex, skybox_frag_size = spv_to_hex_lines(skybox_frag_path)
-ssao_frag_hex, ssao_frag_size = spv_to_hex_lines(ssao_frag_path)
-ssao_apply_frag_hex, ssao_apply_frag_size = spv_to_hex_lines(ssao_apply_frag_path)
-lean_vert_hex, lean_vert_size = spv_to_hex_lines(lean_vert_path)
-line_vert_hex, line_vert_size = spv_to_hex_lines(line_vert_path)
-
-header = f"""#pragma once
+headers = {}
+for path, symbol, header in triples:
+    headers.setdefault(header, []).append((path, symbol))
+for header, shaders in headers.items():
+    parts = ["""#pragma once
 
 // Auto-generated by build_vulkan_shaders.sh — do not edit.
 // Rebuild with: ./build_vulkan_shaders.sh
@@ -137,79 +95,14 @@ header = f"""#pragma once
 //   $ANDROID_NDK/shader-tools/darwin-x86_64/glslc   (macOS host)
 //   $ANDROID_NDK/shader-tools/linux-x86_64/glslc    (Linux host)
 
-namespace systems::leal::campello_renderer::shaders {{
-
-static const unsigned char kDefaultVulkanVertShader[] = {{
-{vert_hex}
-}};
-static const unsigned int kDefaultVulkanVertShaderSize = {vert_size};
-
-static const unsigned char kDefaultVulkanFragShader[] = {{
-{frag_hex}
-}};
-static const unsigned int kDefaultVulkanFragShaderSize = {frag_size};
-
-static const unsigned char kDefaultVulkanLeanVertShader[] = {{
-{lean_vert_hex}
-}};
-static const unsigned int kDefaultVulkanLeanVertShaderSize = {lean_vert_size};
-
-static const unsigned char kDefaultVulkanLineVertShader[] = {{
-{line_vert_hex}
-}};
-static const unsigned int kDefaultVulkanLineVertShaderSize = {line_vert_size};
-
-static const unsigned char kDefaultVulkanFxaaVertShader[] = {{
-{fxaa_vert_hex}
-}};
-static const unsigned int kDefaultVulkanFxaaVertShaderSize = {fxaa_vert_size};
-
-static const unsigned char kDefaultVulkanFxaaFragShader[] = {{
-{fxaa_frag_hex}
-}};
-static const unsigned int kDefaultVulkanFxaaFragShaderSize = {fxaa_frag_size};
-
-static const unsigned char kDefaultVulkanDownsampleFragShader[] = {{
-{downsample_frag_hex}
-}};
-static const unsigned int kDefaultVulkanDownsampleFragShaderSize = {downsample_frag_size};
-
-static const unsigned char kDefaultVulkanProceduralBakeShader[] = {{
-{procedural_bake_hex}
-}};
-static const unsigned int kDefaultVulkanProceduralBakeShaderSize = {procedural_bake_size};
-
-static const unsigned char kDefaultVulkanIblBakeFragShader[] = {{
-{ibl_bake_frag_hex}
-}};
-static const unsigned int kDefaultVulkanIblBakeFragShaderSize = {ibl_bake_frag_size};
-
-static const unsigned char kDefaultVulkanSkyboxFragShader[] = {{
-{skybox_frag_hex}
-}};
-static const unsigned int kDefaultVulkanSkyboxFragShaderSize = {skybox_frag_size};
-
-static const unsigned char kDefaultVulkanSsaoFragShader[] = {{
-{ssao_frag_hex}
-}};
-static const unsigned int kDefaultVulkanSsaoFragShaderSize = {ssao_frag_size};
-
-static const unsigned char kDefaultVulkanSsaoApplyFragShader[] = {{
-{ssao_apply_frag_hex}
-}};
-static const unsigned int kDefaultVulkanSsaoApplyFragShaderSize = {ssao_apply_frag_size};
-
-}} // namespace systems::leal::campello_renderer::shaders
-"""
-
-open(out_path, "w").write(header)
-print(f"Written: {out_path}")
-print(f"  vert: {vert_size} bytes")
-print(f"  frag: {frag_size} bytes")
-print(f"  fxaa_vert: {fxaa_vert_size} bytes")
-print(f"  fxaa_frag: {fxaa_frag_size} bytes")
-print(f"  downsample_frag: {downsample_frag_size} bytes")
-print(f"  procedural_bake: {procedural_bake_size} bytes")
-print(f"  ibl_bake_frag: {ibl_bake_frag_size} bytes")
-print(f"  skybox_frag: {skybox_frag_size} bytes")
+namespace systems::leal::campello_renderer::shaders {
+"""]
+    for path, symbol in shaders:
+        hex_lines, size = spv_to_hex_lines(path)
+        parts.append(f"static const unsigned char {symbol}[] = {{\n{hex_lines}\n}};\n"
+                     f"static const unsigned int {symbol}Size = {size};\n")
+        print(f"  {symbol}: {size} bytes")
+    parts.append("} // namespace systems::leal::campello_renderer::shaders\n")
+    open(header, "w").write("\n".join(parts))
+    print(f"Written: {header}")
 PYEOF

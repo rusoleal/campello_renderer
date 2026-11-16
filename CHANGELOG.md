@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+- **The games foundation on Vulkan: G-buffer, TAA, built-in upscaling and the real-time denoiser.** Until now these were Metal-only. On Vulkan `supportsGBuffer()` was false and their tests skipped. Tested on an Adreno 618 (Android 13).
+  - **G-buffer:** `renderGBuffer()` writes normal + roughness, base colour + metallic, motion and depth in one pass, using `shaders/vulkan/gbuffer.vert`, `gbuffer_lean.vert` and `gbuffer.frag`, ports of the Metal stages.
+    - The previous frame's transform and jitter, which Metal reads as a raw buffer, are a per-instance vertex buffer here (locations 20–23 and 28). Mesh pipelines for the G-buffer add it after the per-draw transforms (`MeshPipelineRecipe::gbufferPreviousTransforms`).
+    - Vulkan draws don't skin yet, so a skinned draw's motion leaves out its joints' movement.
+  - **TAA and the built-in upscaler:** `shaders/vulkan/taa.frag`, a port of `taaFragment`. At half resolution its RMS error against 4× SSAA is 10.65 levels, against 21.54 for bilinear upscaling; native TAA is 10.37.
+  - **Real-time denoiser:** `RealtimeDenoiser` runs on Vulkan with `shaders/vulkan/denoise_*.frag` (one per pass, shared code in `denoiser_common.glsl`), embedded in `src/shaders/vulkan_denoiser.h`. RMS error goes from 0.148 to 0.022 on the first frame and from 0.148 to 0.032 with a moving camera, as on Metal.
+- **`run_android_tests.sh`** builds the test suite for arm64, pushes it to the connected device with adb and runs it, optionally with a gtest filter. `CAMPELLO_GPU_SOURCE` builds against a local campello_gpu checkout.
+
+### Changed
+- **campello_gpu v0.31.0**, for multiple render targets on Vulkan (the G-buffer's three targets, TAA's two).
+- **`build_vulkan_shaders.sh` is list-driven.** Each shader is one line: source, `.spv`, C symbol and header. It writes `vulkan_default.h` and `vulkan_denoiser.h`, and resolves `#include` in GLSL.
+- **Android results:** 93 passed, 35 skipped (ray tracing), 7 failed; before, 88, 40 and 7. The 7 failures are older than this change: 6 GPU procedural bake comparisons and the SSAO crease test.
+
 ## [0.20.0] - 2026-11-16
 
 ### Added

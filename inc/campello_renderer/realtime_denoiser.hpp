@@ -17,7 +17,7 @@
 //
 // The input is demodulated by the G-buffer's base colour (filtered as
 // illumination, so texture detail isn't blurred) and multiplied back after;
-// background pixels (nothing in the G-buffer) pass through. Metal for now.
+// background pixels (nothing in the G-buffer) pass through. Metal and Vulkan.
 
 #include <campello_renderer/campello_renderer.hpp>
 #include <campello_renderer/gpu_timing.hpp>
@@ -25,11 +25,13 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace systems::leal::campello_gpu {
 class BindGroupLayout;
 class Buffer;
 class Fence;
+class PipelineLayout;
 class RenderPipeline;
 class Texture;
 class TextureView;
@@ -42,7 +44,7 @@ public:
     explicit RealtimeDenoiser(std::shared_ptr<systems::leal::campello_gpu::Device> device);
     ~RealtimeDenoiser();
 
-    /// Whether this device can run it (Metal for now).
+    /// Whether this device can run it (Metal, Vulkan).
     [[nodiscard]] bool supported() const noexcept {
         return temporalPipeline_ != nullptr;
     }
@@ -113,6 +115,7 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> atrousLayout_;
     std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> atrousFirstLayout_;
     std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> modulateLayout_;
+    std::vector<std::shared_ptr<systems::leal::campello_gpu::PipelineLayout>> pipelineLayouts_;
 
     // Textures (all width_ x height_): the history (colour + length,
     // moments, geometry) alternates between two; the frame's accumulation
