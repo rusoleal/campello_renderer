@@ -31,7 +31,13 @@ struct ProceduralBakeUniforms {
     uint   nodeCount;
     uint   outputReg;
     uint   outputComponents; // 1=float, 2=vec2, 3=vec3/color3, 4=color4
-    uint   pad[3];
+    // Scalars, not uint[3]: std140 gives array elements a 16-byte stride,
+    // which made the block 80 bytes against the 32-byte C++ struct bound to
+    // it, and Adreno then read the whole block as zeros (width 0, so every
+    // invocation returned before writing).
+    uint   pad0;
+    uint   pad1;
+    uint   pad2;
 };
 
 layout(std140, set = 0, binding = 0) uniform Uniforms {

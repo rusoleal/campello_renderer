@@ -1461,9 +1461,17 @@ protected:
 };
 
 static bool comparePixels(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, int tolerance = 2) {
-    if (a.size() != b.size()) return false;
+    if (a.size() != b.size()) {
+        std::printf("pixel count differs: %zu vs %zu\n", a.size(), b.size());
+        return false;
+    }
     for (size_t i = 0; i < a.size(); ++i) {
-        if (std::abs((int)a[i] - (int)b[i]) > tolerance) return false;
+        if (std::abs((int)a[i] - (int)b[i]) > tolerance) {
+            size_t p = i / 4 * 4;
+            std::printf("first mismatch at pixel %zu: cpu (%d %d %d %d) gpu (%d %d %d %d)\n", i / 4,
+                        a[p], a[p + 1], a[p + 2], a[p + 3], b[p], b[p + 1], b[p + 2], b[p + 3]);
+            return false;
+        }
     }
     return true;
 }
