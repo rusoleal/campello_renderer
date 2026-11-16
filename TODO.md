@@ -330,8 +330,15 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
         gathers the jittered samples by their distance in output pixels into an output-size
         history (8 / scale^2 jitter positions). At half scale: 10.7 levels RMS from a 4x SSAA
         reference, native TAA 10.4, bilinear 21.5. Without TAA: bilinear
-  - [ ] MetalFX temporal scaler (campello_gpu wrapper), then FSR / DLSS / XeSS on Vulkan /
-        DirectX, behind one interface
+  - [x] MetalFX temporal scaler — `Renderer::setUpscaler(Upscaler::metalFX)` on campello_gpu's
+        `TemporalUpscaler` (v0.30.0): the jittered frame, the G-buffer's depth and motion. Falls
+        back to the built-in one where unsupported or past MetalFX's ratio (2x on the Intel UHD 630
+        dev machine). Half scale: 16.0 levels RMS (MetalFX blends edges a little darker than a box
+        average), bilinear 21.5
+  - [ ] FSR / DLSS / XeSS on Vulkan / DirectX (campello_gpu `TemporalUpscaler` backends), as
+        further `Upscaler` values
+  - [ ] MetalFX: pass the reactive mask (transparent / particle draws) and exposure; its
+        `inputContentMinScale` / dynamic resolution
   - [ ] The upscaler works on the tone-mapped image (as TAA): a linear (HDR) path; depth-based
         disocclusion rejection; thin features in ray traced masks lose contrast at low scales
         (the denoisers run at the internal size)
