@@ -173,6 +173,8 @@ struct MaterialInfo {
     float  doubleSided;     // 1: emits from both sides (else the front only, as glTF)
     float4 normalUvRow0;    // the normal texture's own KHR_texture_transform (a, b, tx, has)
     float4 normalUvRow1;
+    float  alphaCutoff;     // glTF MASK: hits count where alpha >= it (0: opaque)
+    float  pad0, pad1, pad2;
 };
 
 constant uint MAX_TEXTURES = 64;  // base colour textures bound (path_tracer.cpp)
@@ -741,28 +743,89 @@ inline uint invertCdf(device const EnvTexel* table, uint count, float u, thread 
     return lo;
 }
 
+// Alpha-masked materials (glTF MASK; their instances aren't opaque): a
+// candidate hit counts only where the base colour's alpha reaches the
+// cutoff, as the raster shader discards.
+struct AlphaScene {
+    device const InstanceInfo* instances;
+    device const MaterialInfo* materials;
+    device const float4*       uvs;
+};
+
+inline bool alphaPasses(AlphaScene a, const array<texture2d<float>, MAX_TEXTURES> textures, uint instance, uint primitive,
+                        float2 bary) {
+    const InstanceInfo inst = a.instances[instance];
+    const MaterialInfo mat = a.materials[inst.material];
+    if (mat.alphaCutoff <= 0.0) return true;
+    float alpha = mat.baseColor.a;
+    if (mat.texture >= 0 && uint(mat.texture) < MAX_TEXTURES && mat.worldMapping <= 0.0) {
+        const uint tri = inst.normalOffset + primitive;
+        const float4 ta = a.uvs[tri * 2];
+        const float4 tb = a.uvs[tri * 2 + 1];
+        if (tb.z > 0.5) {
+            const float3 corner = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
+            float2 uv = ta.xy * corner.x + ta.zw * corner.y + tb.xy * corner.z;
+            if (mat.uvRow0.w > 0.5) uv = float2(dot(mat.uvRow0.xyz, float3(uv, 1.0)), dot(mat.uvRow1.xyz, float3(uv, 1.0)));
+            constexpr sampler alphaSampler(filter::linear, mip_filter::linear, address::repeat);
+            alpha *= textures[mat.texture].sample(alphaSampler, uv, level(0.0)).a;
+        }
+    }
+    return alpha >= mat.alphaCutoff;
+}
+
+// The intersector's result, from an intersection query that alpha tests.
+struct TraceHit {
+    intersection_type type;
+    float  distance;
+    uint   instance_id;
+    uint   primitive_id;
+    float2 triangle_barycentric_coord;
+};
+
+inline TraceHit traceRay(ray r, instance_acceleration_structure scene, uint mask, bool anyHit, AlphaScene a,
+                         const array<texture2d<float>, MAX_TEXTURES> textures) {
+    intersection_params params;
+    params.assume_geometry_type(geometry_type::triangle);
+    params.accept_any_intersection(anyHit);
+    intersection_query<triangle_data, instancing> q(r, scene, mask, params);
+    while (q.next()) {
+        if (q.get_candidate_intersection_type() == intersection_type::triangle &&
+            alphaPasses(a, textures, q.get_candidate_instance_id(), q.get_candidate_primitive_id(),
+                        q.get_candidate_triangle_barycentric_coord())) {
+            q.commit_triangle_intersection();
+        }
+    }
+    TraceHit h;
+    h.type = q.get_committed_intersection_type();
+    h.distance = 0.0;
+    h.instance_id = 0;
+    h.primitive_id = 0;
+    h.triangle_barycentric_coord = float2(0.0);
+    if (h.type == intersection_type::triangle) {
+        h.distance = q.get_committed_distance();
+        h.instance_id = q.get_committed_instance_id();
+        h.primitive_id = q.get_committed_primitive_id();
+        h.triangle_barycentric_coord = q.get_committed_triangle_barycentric_coord();
+    }
+    return h;
+}
+
 // What reaches `origin` from `maxDistance` along l: nothing past opaque
 // geometry, tinted through up to 8 panes of glass as a path crossing them
 // would be on average (Fresnel and transmission).
 inline float3 shadowTransmittance(instance_acceleration_structure scene, device const InstanceInfo* instances,
                                   device const MaterialInfo* materials, device const float4* normals, float3 origin,
-                                  float3 l, float maxDistance) {
-    intersector<triangle_data, instancing> anyHit;
-    anyHit.assume_geometry_type(geometry_type::triangle);
-    anyHit.force_opacity(forced_opacity::opaque);
-    anyHit.accept_any_intersection(true);
-    intersector<triangle_data, instancing> closest;
-    closest.assume_geometry_type(geometry_type::triangle);
-    closest.force_opacity(forced_opacity::opaque);
+                                  float3 l, float maxDistance, AlphaScene alpha,
+                                  const array<texture2d<float>, MAX_TEXTURES> textures) {
     ray s;
     s.origin = origin;
     s.direction = l;
     s.min_distance = 1e-4;
     s.max_distance = maxDistance;
-    if (anyHit.intersect(s, scene, MASK_OPAQUE).type != intersection_type::none) return float3(0.0);
+    if (traceRay(s, scene, MASK_OPAQUE, true, alpha, textures).type != intersection_type::none) return float3(0.0);
     float3 transmittance = float3(1.0);
     for (uint pane = 0; pane < 8u; ++pane) {
-        const auto g = closest.intersect(s, scene, MASK_GLASS);
+        const TraceHit g = traceRay(s, scene, MASK_GLASS, false, alpha, textures);
         if (g.type == intersection_type::none) return transmittance;
         const InstanceInfo gi = instances[g.instance_id];
         const MaterialInfo gm = materials[gi.material];
@@ -835,6 +898,7 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
     // the hit's distance go to reflectionOut's left half, the hit's normal
     // to its right half.
     const bool gi = u.size.w == 4u;
+    const AlphaScene alphaScene{instances, materials, uvs};
     const bool fromGBuffer = reflections || gi;
     float3 firstHitNormal = float3(0.0);
     float3 firstDirection = float3(0.0);
@@ -1025,7 +1089,7 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
             r.direction = direction;
             r.min_distance = 1e-4;
             r.max_distance = 1e30;
-            const auto hit = isect.intersect(r, scene, MASK_OPAQUE | MASK_GLASS);
+            const TraceHit hit = traceRay(r, scene, MASK_OPAQUE | MASK_GLASS, false, alphaScene, textures);
             if (pathVertex == 0u && hit.type != intersection_type::none) firstHitDistance = min(hit.distance, 65000.0);
             if (hit.type == intersection_type::none) {
                 if (bounce == 0 && u.size.z == 0u) {
@@ -1204,7 +1268,7 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
                     s.direction = l;
                     s.min_distance = 1e-4;
                     s.max_distance = 1e30;
-                    const auto blocked = shadowIsect.intersect(s, scene, MASK_OPAQUE);
+                    const TraceHit blocked = traceRay(s, scene, MASK_OPAQUE, true, alphaScene, textures);
                     if (blocked.type == intersection_type::none) {
                         addLight(radiance, throughput * brdf(n, v, l, albedo, metallic, alpha, f0) * u.sunRadiance[light].rgb * NdotL,
                                  scatters + 1u, indirectClamp);
@@ -1223,7 +1287,7 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
                 const float3 l = sampleSkyLight(skyLights, shadingOrigin, sample2D(rs, vertexDim(pathVertex, DIM_ENV)), envPdf);
                 const float NdotL = dot(n, l);
                 if (NdotL > 0.0 && dot(ng, l) > 0.0 && envPdf > 0.0) {
-                    const float3 transmittance = shadowTransmittance(scene, instances, materials, normals, shadingOrigin, l, 1e30);
+                    const float3 transmittance = shadowTransmittance(scene, instances, materials, normals, shadingOrigin, l, 1e30, alphaScene, textures);
                     if (any(transmittance > 0.0)) {
                         const float weight =
                             bounce == maxBounces ? 1.0 : powerHeuristic(envPdf, bsdfPdf(n, v, l, alpha, specularWeight));
@@ -1255,7 +1319,8 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
                 if (NdotL > 0.0 && dot(ng, l) > 0.0 && cosL > 1e-6 && e.radiance.w > 0.0 && dist > 1e-4) {
                     const float lightPdf = lightTable[index].pdf / e.radiance.w * dist2 / cosL;
                     const float3 transmittance =
-                        shadowTransmittance(scene, instances, materials, normals, shadingOrigin, l, dist * (1.0 - 1e-4) - 1e-4);
+                        shadowTransmittance(scene, instances, materials, normals, shadingOrigin, l, dist * (1.0 - 1e-4) - 1e-4, alphaScene,
+                                            textures);
                     if (any(transmittance > 0.0) && lightPdf > 0.0) {
                         const float weight =
                             bounce == maxBounces ? 1.0 : powerHeuristic(lightPdf, bsdfPdf(n, v, l, alpha, specularWeight));

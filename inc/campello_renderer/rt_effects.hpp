@@ -41,6 +41,7 @@
 namespace systems::leal::campello_gpu {
 class AccelerationStructure;
 class Buffer;
+class ComputePipeline;
 class Fence;
 class RayTracingPipeline;
 class BindGroupLayout;
@@ -48,6 +49,48 @@ class Texture;
 } // namespace systems::leal::campello_gpu
 
 namespace systems::leal::campello_renderer {
+
+/// Skinned draws posed for ray tracing: each frame a compute pass applies a
+/// skinned draw's joint matrices (DrawCall::jointMatrixBuffer) to its
+/// mesh's positions and normals, as the raster vertex stage does, into a
+/// posed copy of the mesh (same indices and other attributes, no joints or
+/// weights) that acceleration structures are built from. Joint and weight
+/// formats come from the mesh's layout, or from the buffers' sizes for the
+/// standard layout (uint8 / uint16 / uint32 joints; float / unorm8 /
+/// unorm16 weights). RayTracingScene and PathTracer use one each.
+/// Morph targets aren't applied (RenderScene draws don't carry them).
+class SkinnedMeshes {
+public:
+    explicit SkinnedMeshes(std::shared_ptr<systems::leal::campello_gpu::Device> device);
+    ~SkinnedMeshes();
+    [[nodiscard]] bool supported() const noexcept {
+        return pipeline_ != nullptr;
+    }
+    /// `scene` with every skinned draw's mesh replaced by its posed copy
+    /// (and its joints cleared), posed now (submitted; work submitted
+    /// later on the device's queue sees it). Other draws are unchanged.
+    /// Copies are kept per (mesh, joint buffer) while they're in use.
+    RenderScene pose(const RenderScene& scene);
+    /// Whether `mesh` is one of the posed copies.
+    [[nodiscard]] bool isPosed(const GpuMesh* mesh) const;
+    /// Skinned draws posed by the last pose().
+    [[nodiscard]] uint32_t posedDraws() const noexcept {
+        return posedDraws_;
+    }
+
+private:
+    struct Posed {
+        std::unique_ptr<GpuMesh> mesh;
+        bool used = false;
+    };
+    std::shared_ptr<systems::leal::campello_gpu::Device> device_;
+    std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> layout_;
+    std::shared_ptr<systems::leal::campello_gpu::ComputePipeline> pipeline_;
+    std::map<std::pair<const GpuMesh*, const void*>, Posed> posed_;
+    std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;
+    std::vector<std::shared_ptr<systems::leal::campello_gpu::Buffer>> keepAlive_;
+    uint32_t posedDraws_ = 0;
+};
 
 class RayTracingScene {
 public:
@@ -71,6 +114,28 @@ public:
     [[nodiscard]] uint32_t transformRebuilds() const noexcept {
         return transformRebuilds_;
     }
+    /// Frames whose skinned draws were posed and their structures rebuilt
+    /// (every update() with skinned draws).
+    [[nodiscard]] uint32_t skinnedRebuilds() const noexcept {
+        return skinnedRebuilds_;
+    }
+    /// Alpha-masked casters (GpuMaterial::alphaMask): per instance its
+    /// cutoff, base alpha, texture and first triangle in alphaUvs(), for
+    /// the effects' alpha tests (rt_effects.metal, buffers 10 and 11 and
+    /// textures 16 .. 31). Always valid after a successful update().
+    [[nodiscard]] const std::shared_ptr<systems::leal::campello_gpu::Buffer>& alphaInstances() const noexcept {
+        return alphaInstances_;
+    }
+    [[nodiscard]] const std::shared_ptr<systems::leal::campello_gpu::Buffer>& alphaUvs() const noexcept {
+        return alphaUvs_;
+    }
+    [[nodiscard]] const std::vector<std::shared_ptr<systems::leal::campello_gpu::Texture>>& alphaTextures() const noexcept {
+        return alphaTextures_;
+    }
+    /// Alpha-masked instances of the current structures.
+    [[nodiscard]] uint32_t alphaTestedInstances() const noexcept {
+        return alphaTestedInstances_;
+    }
 
 private:
     bool rebuild(const RenderScene& scene);
@@ -87,6 +152,15 @@ private:
     uint64_t transformKey_ = 0;
     uint32_t fullRebuilds_ = 0;
     uint32_t transformRebuilds_ = 0;
+    uint32_t skinnedRebuilds_ = 0;
+    SkinnedMeshes skinned_;
+    std::shared_ptr<systems::leal::campello_gpu::Buffer> alphaInstances_;
+    std::shared_ptr<systems::leal::campello_gpu::Buffer> alphaUvs_;
+    std::vector<std::shared_ptr<systems::leal::campello_gpu::Texture>> alphaTextures_;
+    std::shared_ptr<systems::leal::campello_gpu::Texture> alphaPlaceholder_;
+    std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> uvLayout_;
+    std::shared_ptr<systems::leal::campello_gpu::ComputePipeline> uvPipeline_;
+    uint32_t alphaTestedInstances_ = 0;
 };
 
 /// What the effects share: a ray generation pipeline over the scene, the

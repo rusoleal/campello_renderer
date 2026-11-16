@@ -21,6 +21,85 @@ using namespace metal::raytracing;
 constant uint MASK_OPAQUE = 1u;  // as path_tracer.metal: glass (2) doesn't cast sun shadows
 constant float PI = 3.14159265358979323846;
 
+// Alpha-masked casters (glTF MASK; RayTracingScene): their instances
+// aren't opaque, and a candidate hit counts only where the base colour's
+// alpha reaches the cutoff, as the raster shader discards.
+constant uint RT_ALPHA_TEXTURES = 16;  // as rt_effects.cpp
+
+struct AlphaInstance {
+    float cutoff;     // 0: opaque
+    float baseAlpha;  // the base colour factor's alpha
+    int   texture;    // in the textures, -1 none
+    uint  uvOffset;   // the mesh's first triangle in the UV buffer; 0xFFFFFFFF: no coordinates
+};
+
+#define RT_ALPHA_PARAMETERS                                                                   \
+    device const AlphaInstance* alphaInstances [[buffer(10)]],                                \
+    device const float4*        alphaUvs       [[buffer(11)]],                                \
+    array<texture2d<float>, RT_ALPHA_TEXTURES> alphaTextures [[texture(16)]]
+
+inline bool rtAlphaPasses(device const AlphaInstance* instances, device const float4* uvs,
+                          const array<texture2d<float>, RT_ALPHA_TEXTURES> textures, uint instance, uint primitive,
+                          float2 bary) {
+    const AlphaInstance a = instances[instance];
+    if (a.cutoff <= 0.0) return true;
+    float alpha = a.baseAlpha;
+    if (a.texture >= 0 && uint(a.texture) < RT_ALPHA_TEXTURES && a.uvOffset != 0xFFFFFFFFu) {
+        const uint tri = a.uvOffset + primitive;
+        const float4 ta = uvs[tri * 2];
+        const float4 tb = uvs[tri * 2 + 1];
+        const float3 corner = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
+        const float2 uv = ta.xy * corner.x + ta.zw * corner.y + tb.xy * corner.z;
+        constexpr sampler alphaSampler(filter::linear, mip_filter::linear, address::repeat);
+        alpha *= textures[a.texture].sample(alphaSampler, uv, level(0.0)).a;
+    }
+    return alpha >= a.cutoff;
+}
+
+// Nothing (opaque, or alpha-masked where its alpha passes) along the ray.
+inline bool rtVisible(ray r, instance_acceleration_structure scene, device const AlphaInstance* instances,
+                      device const float4* uvs, const array<texture2d<float>, RT_ALPHA_TEXTURES> textures) {
+    intersection_params params;
+    params.assume_geometry_type(geometry_type::triangle);
+    params.accept_any_intersection(true);
+    intersection_query<triangle_data, instancing> q(r, scene, 1u, params);
+    while (q.next()) {
+        if (q.get_candidate_intersection_type() == intersection_type::triangle &&
+            rtAlphaPasses(instances, uvs, textures, q.get_candidate_instance_id(), q.get_candidate_primitive_id(),
+                          q.get_candidate_triangle_barycentric_coord())) {
+            q.commit_triangle_intersection();
+        }
+    }
+    return q.get_committed_intersection_type() == intersection_type::none;
+}
+
+// Per-triangle texture coordinates of an alpha-masked mesh (float2
+// TEXCOORD_0): two float4s per triangle (corners 0, 1 | 2).
+struct UvGatherParams {
+    uint triangleCount;
+    uint outOffset;
+    uint indexFormat;  // 0 none, 1 uint16, 2 uint32
+    uint pad;
+};
+
+kernel void gatherTriangleUVs(device const uchar*   indices   [[buffer(0)]],
+                              device const float2*  texcoords [[buffer(1)]],
+                              device float4*        uvs       [[buffer(2)]],
+                              constant UvGatherParams& p      [[buffer(3)]],
+                              uint id [[thread_position_in_grid]])
+{
+    if (id >= p.triangleCount) return;
+    uint v[3];
+    for (uint k = 0; k < 3; ++k) {
+        const uint i = id * 3 + k;
+        v[k] = p.indexFormat == 1u ? uint(((device const ushort*)indices)[i])
+             : p.indexFormat == 2u ? ((device const uint*)indices)[i]
+                                   : i;
+    }
+    uvs[(p.outOffset + id) * 2] = float4(texcoords[v[0]], texcoords[v[1]]);
+    uvs[(p.outOffset + id) * 2 + 1] = float4(texcoords[v[2]], 0.0, 0.0);
+}
+
 struct EffectUniforms {
     float4x4 invViewProj;   // clip -> world (the G-buffer's camera)
     float4   eye;           // xyz: the camera position
@@ -65,6 +144,7 @@ kernel void rayTracedShadows(instance_acceleration_structure scene          [[bu
                              texture2d<float>                normalRoughness [[texture(0)]],
                              depth2d<float>                  depthTexture   [[texture(1)]],
                              texture2d<float, access::write> visibility     [[texture(2)]],
+                             RT_ALPHA_PARAMETERS,
                              uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.size.x || gid.y >= u.size.y) return;
@@ -94,12 +174,7 @@ kernel void rayTracedShadows(instance_acceleration_structure scene          [[bu
     shadowRay.direction = l;
     shadowRay.min_distance = 1e-4;
     shadowRay.max_distance = 1e30;
-    intersector<instancing> isect;
-    isect.assume_geometry_type(geometry_type::triangle);
-    isect.force_opacity(forced_opacity::opaque);
-    isect.accept_any_intersection(true);
-    const auto hit = isect.intersect(shadowRay, scene, MASK_OPAQUE);
-    visibility.write(float4(hit.type == intersection_type::none ? 1.0 : 0.0), gid);
+    visibility.write(float4(rtVisible(shadowRay, scene, alphaInstances, alphaUvs, alphaTextures) ? 1.0 : 0.0), gid);
 }
 
 kernel void rayTracedAmbientOcclusion(instance_acceleration_structure scene          [[buffer(0)]],
@@ -107,6 +182,7 @@ kernel void rayTracedAmbientOcclusion(instance_acceleration_structure scene     
                                       texture2d<float>                normalRoughness [[texture(0)]],
                                       depth2d<float>                  depthTexture   [[texture(1)]],
                                       texture2d<float, access::write> visibility     [[texture(2)]],
+                                      RT_ALPHA_PARAMETERS,
                                       uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.size.x || gid.y >= u.size.y) return;
@@ -129,12 +205,7 @@ kernel void rayTracedAmbientOcclusion(instance_acceleration_structure scene     
     aoRay.direction = l;
     aoRay.min_distance = 1e-4;
     aoRay.max_distance = u.params.x;
-    intersector<instancing> isect;
-    isect.assume_geometry_type(geometry_type::triangle);
-    isect.force_opacity(forced_opacity::opaque);
-    isect.accept_any_intersection(true);
-    const auto hit = isect.intersect(aoRay, scene, MASK_OPAQUE);
-    visibility.write(float4(hit.type == intersection_type::none ? 1.0 : 0.0), gid);
+    visibility.write(float4(rtVisible(aoRay, scene, alphaInstances, alphaUvs, alphaTextures) ? 1.0 : 0.0), gid);
 }
 
 // ---------------------------------------------------------------------------
@@ -297,18 +368,16 @@ inline float3 lightContribution(RestirLight light, Surface s, thread float3& l, 
     return (diffuse + F * D * V) * NdotL * Lc;
 }
 
-inline bool visible(instance_acceleration_structure scene, Surface s, float3 l, float distance, constant RestirUniforms& u) {
+inline bool visible(instance_acceleration_structure scene, Surface s, float3 l, float distance, constant RestirUniforms& u,
+                    device const AlphaInstance* alphaInstances, device const float4* alphaUvs,
+                    const array<texture2d<float>, RT_ALPHA_TEXTURES> alphaTextures) {
     const float offset = max(1e-3, 2e-4 * s.viewDepth);
     ray r;
     r.origin = s.p + s.n * offset;
     r.direction = l;
     r.min_distance = 1e-4;
     r.max_distance = isinf(distance) ? 1e30 : max(distance - 2.0 * offset, 1e-4);
-    intersector<instancing> isect;
-    isect.assume_geometry_type(geometry_type::triangle);
-    isect.force_opacity(forced_opacity::opaque);
-    isect.accept_any_intersection(true);
-    return isect.intersect(r, scene, MASK_OPAQUE).type == intersection_type::none;
+    return rtVisible(r, scene, alphaInstances, alphaUvs, alphaTextures);
 }
 
 // A light by the lights' power (binary search in the CDF).
@@ -351,6 +420,7 @@ inline bool similar(float3 n0, float d0, float3 n1, float d1) {
     texture2d<float, access::write> reservoirOut     [[texture(6)]],              \
     texture2d<float, access::write> surfaceOut       [[texture(7)]],              \
     texture2d<float, access::write> radianceOut      [[texture(8)]],              \
+    RT_ALPHA_PARAMETERS,                                                          \
     uint2 gid [[thread_position_in_grid]]
 
 kernel void restirInitial(RESTIR_PARAMETERS)
@@ -379,7 +449,7 @@ kernel void restirInitial(RESTIR_PARAMETERS)
         float3 l;
         float distance;
         lightContribution(lights[r.light], s, l, distance);
-        if (!visible(scene, s, l, distance, u)) r.W = 0.0;
+        if (!visible(scene, s, l, distance, u, alphaInstances, alphaUvs, alphaTextures)) r.W = 0.0;
     }
     // Temporal: the previous frame's reservoir where this surface was.
     if (u.params.y > 0.5 && u.counts.w != 0) {
@@ -450,7 +520,7 @@ kernel void restirSpatial(RESTIR_PARAMETERS)
         float3 l;
         float distance;
         const float3 contribution = lightContribution(lights[r.light], s, l, distance);
-        if (visible(scene, s, l, distance, u)) {
+        if (visible(scene, s, l, distance, u, alphaInstances, alphaUvs, alphaTextures)) {
             radiance = contribution * r.W;
         } else {
             r.W = 0.0;
@@ -475,7 +545,7 @@ kernel void restirReference(RESTIR_PARAMETERS)
         float3 l;
         float distance;
         const float3 contribution = lightContribution(lights[i], s, l, distance);
-        if (any(contribution > 0.0) && visible(scene, s, l, distance, u)) radiance += contribution;
+        if (any(contribution > 0.0) && visible(scene, s, l, distance, u, alphaInstances, alphaUvs, alphaTextures)) radiance += contribution;
     }
     radianceOut.write(float4(radiance, 1.0), gid);
 }
@@ -586,6 +656,7 @@ inline bool giSurface(uint2 gid, constant GiUniforms& u, texture2d<float> normal
     texture2d<float, access::write> normalOut        [[texture(10)]],             \
     texture2d<float, access::write> surfaceOut       [[texture(11)]],             \
     texture2d<float, access::write> irradianceOut    [[texture(12)]],             \
+    RT_ALPHA_PARAMETERS,                                                          \
     uint2 gid [[thread_position_in_grid]]
 
 // Reservoirs: point (xyz, W), radiance (rgb, M), normal (xyz, pHat).
@@ -724,11 +795,7 @@ kernel void restirGiSpatial(RESTIR_GI_PARAMETERS)
         v.direction = toSample / max(distance, 1e-6);
         v.min_distance = 1e-4;
         v.max_distance = max(distance - 2.0 * offset, 1e-4);
-        intersector<instancing> isect;
-        isect.assume_geometry_type(geometry_type::triangle);
-        isect.force_opacity(forced_opacity::opaque);
-        isect.accept_any_intersection(true);
-        if (isect.intersect(v, scene, MASK_OPAQUE).type != intersection_type::none) {
+        if (!rtVisible(v, scene, alphaInstances, alphaUvs, alphaTextures)) {
             r = own;
             r.M = max(own.M, 1.0);
         }
@@ -740,4 +807,75 @@ kernel void restirGiSpatial(RESTIR_GI_PARAMETERS)
     }
     writeGiReservoir(gid, r, pointOut, radianceOut, normalOut);
     irradianceOut.write(float4(irradiance, 1.0), gid);
+}
+
+// ---------------------------------------------------------------------------
+// Skinning for ray tracing (SkinnedMeshes): a skinned draw's positions and
+// normals posed by its joint matrices, as the raster vertex stage does
+// (pbrVertex in default.metal), into packed float3 buffers its
+// acceleration structures are built from.
+// ---------------------------------------------------------------------------
+
+struct SkinParams {
+    uint vertexCount;
+    uint jointsFormat;   // 0 uint8 x 4, 1 uint16 x 4, 2 uint32 x 4
+    uint weightsFormat;  // 0 float x 4, 1 unorm8 x 4, 2 unorm16 x 4
+    uint hasNormals;     // float3 normals in buffer 1
+    uint jointCount;
+    uint pad0, pad1, pad2;
+};
+
+kernel void skinVertices(device const uchar*    positions     [[buffer(0)]],
+                         device const uchar*    normals       [[buffer(1)]],
+                         device const uchar*    joints        [[buffer(2)]],
+                         device const uchar*    weights       [[buffer(3)]],
+                         device const float4x4* jointMatrices [[buffer(4)]],
+                         device float*          outPositions  [[buffer(5)]],
+                         device float*          outNormals    [[buffer(6)]],
+                         constant SkinParams&   p             [[buffer(7)]],
+                         uint id [[thread_position_in_grid]])
+{
+    if (id >= p.vertexCount) return;
+    const float3 position = float3(*(device const packed_float3*)(positions + id * 12u));
+    const float3 normal = p.hasNormals != 0u ? float3(*(device const packed_float3*)(normals + id * 12u)) : float3(0.0);
+    uint4 j;
+    if (p.jointsFormat == 0u) {
+        j = uint4(joints[id * 4u], joints[id * 4u + 1u], joints[id * 4u + 2u], joints[id * 4u + 3u]);
+    } else if (p.jointsFormat == 1u) {
+        const device ushort* s = (const device ushort*)(joints) + id * 4u;
+        j = uint4(s[0], s[1], s[2], s[3]);
+    } else {
+        const device uint* s = (const device uint*)(joints) + id * 4u;
+        j = uint4(s[0], s[1], s[2], s[3]);
+    }
+    float4 w;
+    if (p.weightsFormat == 0u) {
+        w = float4(*(device const packed_float4*)(weights + id * 16u));
+    } else if (p.weightsFormat == 1u) {
+        w = float4(weights[id * 4u], weights[id * 4u + 1u], weights[id * 4u + 2u], weights[id * 4u + 3u]) / 255.0;
+    } else {
+        const device ushort* s = (const device ushort*)(weights) + id * 4u;
+        w = float4(s[0], s[1], s[2], s[3]) / 65535.0;
+    }
+    float4 posed = float4(position, 1.0);
+    float3 posedNormal = normal;
+    if (w.x + w.y + w.z + w.w > 0.001) {
+        posed = float4(0.0);
+        posedNormal = float3(0.0);
+        for (uint i = 0; i < 4u; ++i) {
+            if (w[i] <= 0.0 || j[i] >= p.jointCount) continue;
+            const float4x4 m = jointMatrices[j[i]];
+            posed += w[i] * (m * float4(position, 1.0));
+            posedNormal += w[i] * (m * float4(normal, 0.0)).xyz;
+        }
+    }
+    outPositions[id * 3u] = posed.x;
+    outPositions[id * 3u + 1u] = posed.y;
+    outPositions[id * 3u + 2u] = posed.z;
+    if (p.hasNormals != 0u) {
+        const float3 n = length(posedNormal) > 1e-12 ? normalize(posedNormal) : normal;
+        outNormals[id * 3u] = n.x;
+        outNormals[id * 3u + 1u] = n.y;
+        outNormals[id * 3u + 2u] = n.z;
+    }
 }
