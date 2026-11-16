@@ -13,9 +13,6 @@
   - The effects (shadows, AO, ReSTIR DI and GI visibility) use `RayTracingScene`'s per-instance alpha data, triangle UVs gathered on the GPU, and up to 16 textures.
   - `GpuMaterial::alphaCutoff` and `baseColorAlpha` are new.
   - In the test, a plate whose texture is transparent on one half shadows the ground only with its opaque half: visibility 1.00 against 0.00, and the same in the path tracer.
-
-### Fixed
-- **BLAS geometry is built non-opaque.** The instance now decides opacity. On Metal an opaque geometry overrides a non-opaque instance, which kept the alpha tests from running.
 - **Quality presets: `RealtimeEffects`** (new header `realtime_effects.hpp`). It runs the Games track's effect chain for an app: the G-buffer, then the enabled ray traced effects, each denoised and handed to the renderer, then the frame with TAA at the render scale.
   - `EffectQuality` presets:
     - `off`: raster only.
@@ -88,6 +85,9 @@
 - **Denoising on the GPU**: `PathTracer::denoise()` uses a GPU device of Open Image Denoise where the library has one (the macOS arm64 package ships its Metal device, `libOpenImageDenoise_device_metal`; CUDA, HIP and SYCL builds elsewhere), else the CPU as before. `PathTracer::setDenoiserDevice(automatic | cpu | gpu)`, `denoiserDeviceType()`. Apps bundling the denoiser ship the device module next to the core library (`CAMPELLO_RENDERER_DENOISER_LIBRARY_DIR`).
 - **Denoiser quality**: `PathTracer::setDenoiserQuality(fast | balanced | high)` (default high, as before) and `setDenoiserPrefilter()` (denoises the albedo and normal guides with their own filters first, `cleanAux`, so noise in them isn't kept as detail; for stills). On the CPU at 64 x 64, 2 samples: fast 4 ms, high 7 ms, high with prefiltered guides 27 ms; error against the converged image 5.6, 2.9 and 2.0 levels of 255 (14.3 noisy).
 - **`PathTracer::stats()`**: GPU time of the last sample and the mean over the image (command buffer GPU time), the last scene rebuild and `denoise()` (wall clock), time from an image's first sample to its first denoised result, and the traced triangle and instance counts. Doesn't wait for the GPU.
+
+### Fixed
+- **BLAS geometry is built non-opaque.** The instance now decides opacity. On Metal an opaque geometry overrides a non-opaque instance, which kept the alpha tests from running.
 
 ### Changed
 - campello_gpu v0.29.0 -> v0.30.1 (`TemporalUpscaler`).
