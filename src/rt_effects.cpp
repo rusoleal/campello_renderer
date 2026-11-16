@@ -320,4 +320,262 @@ bool RayTracedAmbientOcclusion::trace(const RenderScene& scene, const GBufferTar
     return dispatch(scene, gbuffer, parameters);
 }
 
+// ---------------------------------------------------------------------------
+// RestirDirectLighting
+// ---------------------------------------------------------------------------
+
+namespace rt_effects_detail {
+
+// As RestirUniforms / RestirLight in rt_effects.metal.
+struct RestirUniforms {
+    float invViewProj[16];  // column-major
+    float eye[4];
+    uint32_t size[4];    // width, height, frame, light count
+    uint32_t counts[4];  // candidates, temporal cap, spatial samples, history valid
+    float params[4];     // spatial radius, temporal on, spatial on, spatial below this fraction of the cap
+};
+struct RestirLight {
+    float position[4];
+    float color[4];
+    float direction[4];
+    float extra[4];
+};
+
+} // namespace rt_effects_detail
+
+RestirDirectLighting::RestirDirectLighting(std::shared_ptr<GPU::Device> device, std::shared_ptr<RayTracingScene> scene)
+    : device_(std::move(device)), scene_(std::move(scene)) {
+    if (!scene_ && device_) scene_ = std::make_shared<RayTracingScene>(device_);
+#if defined(__APPLE__) && !TARGET_OS_SIMULATOR
+    if (!device_ || !device_->getFeatures().count(GPU::Feature::raytracing)) return;
+    auto module = device_->createShaderModule(shaders::kRtEffectsMetalShader, shaders::kRtEffectsMetalShaderSize);
+    if (!module) return;
+    // The scene (buffer 0), uniforms (1), lights (2); textures: normal +
+    // roughness, depth, albedo + metallic, motion, reservoirs in, surfaces
+    // in, reservoirs out, surfaces out, radiance out.
+    GPU::BindGroupLayoutDescriptor desc{};
+    GPU::EntryObject sceneEntry{};
+    sceneEntry.binding = 0;
+    sceneEntry.type = GPU::EntryObjectType::accelerationStructure;
+    sceneEntry.visibility = GPU::ShaderStage::rayGeneration;
+    desc.entries.push_back(sceneEntry);
+    for (uint32_t binding = 1; binding <= 2; ++binding) {
+        GPU::EntryObject buffer{};
+        buffer.binding = binding;
+        buffer.type = GPU::EntryObjectType::buffer;
+        buffer.visibility = GPU::ShaderStage::rayGeneration;
+        buffer.data.buffer.hasDinamicOffaset = false;
+        buffer.data.buffer.minBindingSize = 0;
+        buffer.data.buffer.type = binding == 1 ? GPU::EntryObjectBufferType::uniform : GPU::EntryObjectBufferType::readOnlyStorage;
+        desc.entries.push_back(buffer);
+    }
+    for (uint32_t binding = 0; binding < 9; ++binding) {
+        GPU::EntryObject texture{};
+        texture.binding = binding;
+        texture.type = GPU::EntryObjectType::texture;
+        texture.visibility = GPU::ShaderStage::rayGeneration;
+        texture.data.texture = {false, binding == 1 ? GPU::EntryObjectTextureType::ttDepth : GPU::EntryObjectTextureType::ttFloat,
+                                GPU::TextureType::tt2d};
+        desc.entries.push_back(texture);
+    }
+    layout_ = device_->createBindGroupLayout(desc);
+    if (!layout_) return;
+    GPU::PipelineLayoutDescriptor pl{};
+    pl.bindGroupLayouts = {layout_};
+    auto pipelineLayout = device_->createPipelineLayout(pl);
+    for (auto [pipeline, entry] :
+         {std::pair{&initial_, "restirInitial"}, {&spatial_, "restirSpatial"}, {&reference_, "restirReference"}}) {
+        GPU::RayTracingPipelineDescriptor rt{};
+        rt.rayGeneration = {module, entry};
+        rt.layout = pipelineLayout;
+        rt.maxRecursionDepth = 1;
+        *pipeline = device_->createRayTracingPipeline(rt);
+    }
+    if (!initial_ || !spatial_ || !reference_) {
+        initial_ = nullptr;
+        spatial_ = nullptr;
+        reference_ = nullptr;
+    }
+#endif
+}
+
+RestirDirectLighting::~RestirDirectLighting() {
+    if (pending_) pending_->wait();
+}
+
+bool RestirDirectLighting::ensureTargets(uint32_t width, uint32_t height) {
+    if (radiance_ && radiance_->getWidth() == width && radiance_->getHeight() == height) return true;
+    const auto make = [&](GPU::PixelFormat format) {
+        return device_->createTexture(GPU::TextureType::tt2d, format, width, height, 1, 1, 1,
+                                      (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::storageBinding) |
+                                                          uint32_t(GPU::TextureUsage::textureBinding) |
+                                                          uint32_t(GPU::TextureUsage::copySrc)));
+    };
+    reservoirs_[0] = make(GPU::PixelFormat::rgba32float);
+    reservoirs_[1] = make(GPU::PixelFormat::rgba32float);
+    final_ = make(GPU::PixelFormat::rgba32float);
+    surfaces_[0] = make(GPU::PixelFormat::rgba32float);
+    surfaces_[1] = make(GPU::PixelFormat::rgba32float);
+    radiance_ = make(GPU::PixelFormat::rgba16float);
+    historyValid_ = false;
+    return reservoirs_[0] && reservoirs_[1] && final_ && surfaces_[0] && surfaces_[1] && radiance_;
+}
+
+bool RestirDirectLighting::render(const RenderScene& scene, const GBufferTargets& gbuffer) {
+    return frame(scene, gbuffer, false);
+}
+
+bool RestirDirectLighting::renderReference(const RenderScene& scene, const GBufferTargets& gbuffer) {
+    return frame(scene, gbuffer, true);
+}
+
+bool RestirDirectLighting::frame(const RenderScene& scene, const GBufferTargets& gbuffer, bool reference) {
+    namespace D = rt_effects_detail;
+    if (!supported() || !scene_ || !gbuffer.normalRoughness || !gbuffer.depth || !gbuffer.albedoMetallic || !gbuffer.motion ||
+        gbuffer.width == 0 || gbuffer.height == 0 || scene.lights.empty()) {
+        return false;
+    }
+    if (pending_) {
+        pending_->wait();  // its uniforms and lights are rewritten below
+        pending_.reset();
+    }
+    if (!scene_->update(scene) || !scene_->tlas()) return false;
+    const uint32_t w = gbuffer.width, h = gbuffer.height;
+    if (!ensureTargets(w, h)) return false;
+
+    // The lights, with a CDF by power (luminance x intensity).
+    std::vector<D::RestirLight> lights;
+    lights.reserve(scene.lights.size());
+    double total = 0.0;
+    std::vector<double> power;
+    for (const auto& light : scene.lights) {
+        D::RestirLight l{};
+        if (light.type == 0) {
+            const double len = std::sqrt(light.direction.x() * light.direction.x() + light.direction.y() * light.direction.y() +
+                                         light.direction.z() * light.direction.z());
+            if (len < 1e-12) continue;
+            l.position[0] = static_cast<float>(-light.direction.x() / len);
+            l.position[1] = static_cast<float>(-light.direction.y() / len);
+            l.position[2] = static_cast<float>(-light.direction.z() / len);
+            l.position[3] = 0.0f;
+        } else {
+            l.position[0] = static_cast<float>(light.position.x());
+            l.position[1] = static_cast<float>(light.position.y());
+            l.position[2] = static_cast<float>(light.position.z());
+            l.position[3] = static_cast<float>(light.type == 2 ? 2 : 1);
+            const double len = std::sqrt(light.direction.x() * light.direction.x() + light.direction.y() * light.direction.y() +
+                                         light.direction.z() * light.direction.z());
+            if (len > 1e-12) {
+                l.direction[0] = static_cast<float>(light.direction.x() / len);
+                l.direction[1] = static_cast<float>(light.direction.y() / len);
+                l.direction[2] = static_cast<float>(light.direction.z() / len);
+            }
+            l.direction[3] = std::cos(light.outerConeAngle);
+            l.extra[0] = std::cos(light.innerConeAngle);
+        }
+        l.color[0] = static_cast<float>(light.color.x()) * light.intensity;
+        l.color[1] = static_cast<float>(light.color.y()) * light.intensity;
+        l.color[2] = static_cast<float>(light.color.z()) * light.intensity;
+        l.color[3] = light.range;
+        const double p = std::max(0.0, 0.2126 * l.color[0] + 0.7152 * l.color[1] + 0.0722 * l.color[2]);
+        power.push_back(p);
+        total += p;
+        lights.push_back(l);
+    }
+    if (lights.empty() || total <= 0.0) return false;
+    double running = 0.0;
+    for (size_t i = 0; i < lights.size(); ++i) {
+        running += power[i];
+        lights[i].extra[1] = i + 1 == lights.size() ? 1.0f : static_cast<float>(running / total);
+        lights[i].extra[2] = static_cast<float>(power[i] / total);
+    }
+    const uint64_t lightBytes = lights.size() * sizeof(D::RestirLight);
+    if (!lights_ || lights_->getLength() < lightBytes) {
+        lights_ = device_->createBuffer(lightBytes, GPU::BufferUsage::storage);
+        if (!lights_) return false;
+    }
+    lights_->upload(0, lightBytes, lights.data());
+
+    D::RestirUniforms u{};
+    const auto invViewProj = (scene.camera.projection * scene.camera.view).inverted();
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) u.invViewProj[c * 4 + r] = static_cast<float>(invViewProj.data[r * 4 + c]);
+    }
+    const auto eye = scene.camera.view.inverted() * VM::Vector4<double>(0.0, 0.0, 0.0, 1.0);
+    u.eye[0] = static_cast<float>(eye.x() / eye.w());
+    u.eye[1] = static_cast<float>(eye.y() / eye.w());
+    u.eye[2] = static_cast<float>(eye.z() / eye.w());
+    u.size[0] = w;
+    u.size[1] = h;
+    u.size[2] = frame_++;
+    u.size[3] = static_cast<uint32_t>(lights.size());
+    u.counts[0] = std::max(1u, settings_.candidates);
+    u.counts[1] = std::max(1u, settings_.temporalCap);
+    u.counts[2] = settings_.spatialSamples;
+    u.counts[3] = historyValid_ ? 1u : 0u;
+    u.params[0] = settings_.spatialRadius > 0.0f ? std::max(1.0f, settings_.spatialRadius)
+                                                  : std::max(2.0f, 0.01f * static_cast<float>(w));
+    u.params[1] = settings_.temporal ? 1.0f : 0.0f;
+    u.params[2] = settings_.spatial && settings_.spatialSamples > 0 ? 1.0f : 0.0f;
+    u.params[3] = std::clamp(settings_.spatialHistory, 0.0f, 1.0f);
+    if (!uniforms_) uniforms_ = device_->createBuffer(sizeof(u), GPU::BufferUsage::uniform);
+    if (!uniforms_) return false;
+    uniforms_->upload(0, sizeof(u), &u);
+
+    const auto& current = surfaces_[surfaceIndex_];
+    const auto& previous = surfaces_[1 - surfaceIndex_];
+    const auto& reservoirs = reservoirs_[surfaceIndex_];
+    const auto& previousReservoirs = reservoirs_[1 - surfaceIndex_];
+    const auto group = [&](const std::shared_ptr<GPU::Texture>& reservoirIn, const std::shared_ptr<GPU::Texture>& surfaceIn,
+                           const std::shared_ptr<GPU::Texture>& reservoirOut, const std::shared_ptr<GPU::Texture>& surfaceOut) {
+        GPU::BindGroupDescriptor desc{};
+        desc.layout = layout_;
+        desc.entries = {{0, scene_->tlas()},
+                        {1, GPU::BufferBinding{uniforms_, 0, sizeof(u)}},
+                        {2, GPU::BufferBinding{lights_, 0, lightBytes}},
+                        {0, gbuffer.normalRoughness},
+                        {1, gbuffer.depth},
+                        {2, gbuffer.albedoMetallic},
+                        {3, gbuffer.motion},
+                        {4, reservoirIn},
+                        {5, surfaceIn},
+                        {6, reservoirOut},
+                        {7, surfaceOut},
+                        {8, radiance_}};
+        return device_->createBindGroup(desc);
+    };
+    // Initial + temporal: last frame's reservoirs and surfaces in, this
+    // frame's out. Spatial: those in, the radiance out. The history is the
+    // temporal pass's reservoirs: fed back, the spatial pass's would carry
+    // its bias (neighbours' samples without their visibility) from frame to
+    // frame (the error grew with it in the test). Its own reservoir output
+    // (final_) and surface output aren't read.
+    auto initialGroup = group(previousReservoirs, previous, reservoirs, current);
+    auto spatialGroup = group(reservoirs, current, final_, previous);
+    auto encoder = device_->createCommandEncoder();
+    if (!initialGroup || !spatialGroup || !encoder) return false;
+    std::vector<std::pair<std::shared_ptr<GPU::RayTracingPipeline>, std::shared_ptr<GPU::BindGroup>>> passes;
+    if (reference) {
+        passes = {{reference_, spatialGroup}};
+    } else {
+        passes = {{initial_, initialGroup}, {spatial_, spatialGroup}};
+    }
+    for (const auto& [pipeline, bindGroup] : passes) {
+        if (auto pass = encoder->beginRayTracingPass()) {
+            pass->setPipeline(pipeline);
+            pass->setBindGroup(0, bindGroup);
+            pass->traceRays(w, h, 1);
+            pass->end();
+        }
+    }
+    auto fence = device_->createFence();
+    device_->submit(encoder->finish(), fence);
+    pending_ = fence;
+    if (!reference) {
+        surfaceIndex_ = 1 - surfaceIndex_;
+        historyValid_ = true;
+    }
+    return true;
+}
+
 } // namespace systems::leal::campello_renderer

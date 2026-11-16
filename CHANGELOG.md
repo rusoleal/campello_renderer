@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Added
+- **ReSTIR DI: many dynamic lights** (Metal, `Feature::raytracing`). `RestirDirectLighting` (`rt_effects.hpp`), after Bitterli et al. 2020, lights every pixel from all of `RenderScene::lights` (directional, point, spot; every light casts shadows) with one shadow ray per pixel.
+  - Each pixel draws 32 candidates by light power and resamples them by their unshadowed contribution, using the raster BRDF from the G-buffer. It traces the winner's visibility, then reuses the previous frame's reservoir along the motion vectors (M capped at 20 frames of candidates).
+  - While a pixel's history is short, it also reuses neighbours' reservoirs (radius: 1% of the width). It then traces one shadow ray for the result.
+  - The history is the temporal pass's reservoirs: feeding back the spatial ones compounded their bias in the test.
+  - `renderReference()` is the ground truth: every light with its own shadow ray.
+  - `Settings` covers candidates, temporal reuse and its cap, and spatial reuse with its samples, radius and history limit.
+  - In the test, 64 coloured point lights shine over a ground plane with a plate shadowing it. Relative RMS error against the ground truth is 1.66 with one light sample, 0.37 resampling 32 candidates and 0.10 after 16 frames of reuse (0.23 with a moving camera). The mean is within 0.1% and the plate's shadow is exact (0.2392 vs 0.2393).
+- **`Renderer::setDirectLighting(radiance)`** (Metal): a direct light texture (ReSTIR's, denoised) replaces the raster light loop, which handles 4 lights with sun shadows only, for opaque, non-transmissive surfaces. The screen lighting texture now holds three columns: reflections, indirect diffuse and direct light. For app programs: `campello::hasDirectLighting()` / `directRadiance()` in `program_interface.metal.h`. With one sun, the frame matches the light loop within 1 level of 255.
 - **Lighting inputs for app shader programs** (Metal): `program_interface.metal.h` now exposes what the renderer's effects give the built-in PBR shader, as structs (`campello::CameraUniforms`, `Light`, `LightsUniform`), binding constants and helpers:
   - `campello::sunVisibility()` for the shadow maps, or the ray traced mask when `setShadowMask()` is set.
   - `hasReflections()`, `reflectedRadiance()` and `reflectionWeight()` for ray traced reflections.

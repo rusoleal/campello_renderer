@@ -1347,6 +1347,12 @@ fragment float4 fragmentMain_textured(
     float3 totalClearcoat = float3(0.0);
 
     uint32_t lightCount = lights.count;
+    // Direct light from the screen lighting (Renderer::setDirectLighting(),
+    // e.g. ReSTIR DI) instead of the loop, for opaque, non-transmissive draws.
+    if (campello::hasDirectLighting(camera, mat.alphaMode < 1.5 && mat.transmissionFactor <= 0.0)) {
+        totalDiffuse = campello::directRadiance(camera, sceneColorTexture, inRaw.clipPosition);
+        lightCount = 0;
+    }
 
     for (uint32_t i = 0; i < lightCount && i < 4; i++) {
         Light light = lights.lights[i];

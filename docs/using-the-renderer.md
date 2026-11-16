@@ -62,6 +62,7 @@ use(tracer.output());
 | Ray traced AO | `RayTracedAmbientOcclusion` → `setAmbientOcclusionMask()` | null (SSAO) | same | automatic |
 | Ray traced reflections | `PathTracer::traceReflections()` → `setReflections()` | null (environment) | same | `campello::reflectedRadiance()` |
 | Probe GI (DDGI) | `DdgiVolume` → `setIndirectDiffuse()` | null (irradiance map) | same | `campello::indirectIrradiance()` |
+| Many lights (ReSTIR DI) | `RestirDirectLighting` → `setDirectLighting()` | null (4-light loop) | same | `campello::directRadiance()` |
 | Real-time denoiser | `RealtimeDenoiser` | not run | Metal | — |
 
 The ray traced effects are classes you create and run. The renderer never runs them itself. Each one reads the G-buffer and writes a texture, and you hand that texture to the renderer. A frame with all of them looks like this:
@@ -81,6 +82,9 @@ renderer.setReflections(reflectionDenoiser.output());
 ddgi.update(tracer, scene, renderer);
 ddgi.resolve(g, scene.camera);
 renderer.setIndirectDiffuse(ddgi.irradiance());
+restir.render(scene, g);
+directDenoiser.denoise(restir.output(), g, scene.camera.projection);
+renderer.setDirectLighting(directDenoiser.output());
 renderer.render(scene, colorView);
 ```
 
@@ -109,6 +113,7 @@ fragment float4 fragmentMain(VertexOut in [[stage_in]], CAMPELLO_LIGHTING_PARAME
 ```
 
 - `sunVisibility()` uses the ray traced mask when `setShadowMask()` is set, otherwise the shadow-map cascades, and returns 1 when shadows are off.
+- `hasDirectLighting()` / `directRadiance()` give ReSTIR's direct light (every light, every shadow) to use in place of your own light loop.
 - The reflection helpers (`hasReflections()`, `reflectedRadiance()`, `reflectionWeight(roughness)`) and the indirect diffuse helpers (`hasIndirectDiffuse()`, `indirectIrradiance()`) return the effects' textures. These exist for opaque draws only, because the transparent pass binds the scene colour in the same slot. Pass `opaqueDraw = false` from blended programs.
 - `CAMPELLO_ENVIRONMENT_TEXTURE`, `CAMPELLO_IRRADIANCE_TEXTURE` and `CAMPELLO_BRDF_LUT_TEXTURE` are the image-based lighting textures, for your own fallback.
 - `campello::Light` and `LightsUniform` give the frame's lights, at most 4.

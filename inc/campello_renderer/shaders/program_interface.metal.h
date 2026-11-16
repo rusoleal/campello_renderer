@@ -64,13 +64,16 @@ struct NodeTransforms {
 //    environment lookup (environment / irradiance / BRDF LUT textures).
 //  - Indirect diffuse: campello::hasIndirectDiffuse() / indirectIrradiance()
 //    (Renderer::setIndirectDiffuse(), e.g. DDGI).
+//  - Direct light: campello::hasDirectLighting() / directRadiance()
+//    (Renderer::setDirectLighting(), e.g. ReSTIR DI): in place of your
+//    light loop.
 //  - Ambient occlusion (SSAO or Renderer::setAmbientOcclusionMask()) is
 //    applied to the whole frame after shading: app programs get it with no
 //    code.
 //  - Exposure: campello::exposureScale(); multiply the colour by it before
 //    tone mapping, as the built-in shader does.
 //
-// Screen lighting (reflections, indirect diffuse) exists for opaque draws
+// Screen lighting (reflections, indirect diffuse, direct light) exists for opaque draws
 // only: the transparent pass binds the scene colour (for refraction) in the
 // same slot. Pass opaqueDraw = false from programs drawn with alpha blending.
 // ===========================================================================
@@ -102,8 +105,9 @@ struct CameraUniforms {
     metal::float4   clipPlanes[6];  // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
     // Shadow and effect block: read through the helpers below.
     metal::float4x4 shadowViewProj;  // world -> the shadow map's clip space
-    metal::float4   shadowParams;    // x = on, y = one texel in uv, z = indirect diffuse in the screen lighting's right half
-    metal::float4   viewParams;      // x = exposure in EV; y = reflections in the screen lighting's left half,
+    metal::float4   shadowParams;    // x = on, y = one texel in uv, z = indirect diffuse (screen lighting, 2nd third),
+                                     // w = direct light (3rd third)
+    metal::float4   viewParams;      // x = exposure in EV; y = reflections (screen lighting, 1st third),
                                      // z = their roughness cut-off, w = their pixels per target pixel
     metal::float4x4 shadowNearViewProj;  // world -> the near cascade's clip space
     metal::float4   shadowNearParams;    // x = near cascade on; y = the near map is a visibility mask, zw = its
@@ -181,11 +185,15 @@ inline float sunVisibility(constant CameraUniforms &camera, metal::depth2d<float
     return shadowLookup(shadowMap, camera.shadowViewProj, camera.shadowParams.y, worldPos, N, L, inside);
 }
 
-// The screen lighting texel for this fragment (reflections: left half;
-// indirect diffuse: right half).
+// The screen lighting texel for this fragment in its first third
+// (reflections; indirect diffuse and direct light follow, each as wide).
+inline metal::uint2 screenLightingSize(metal::texture2d<float> screenLighting) {
+    return metal::uint2(screenLighting.get_width() / 3, screenLighting.get_height());
+}
+
 inline metal::uint2 screenLightingPixel(constant CameraUniforms &camera, metal::texture2d<float> screenLighting,
                                         metal::float4 fragPosition) {
-    const metal::uint2 size = metal::uint2(screenLighting.get_width() / 2, screenLighting.get_height());
+    const metal::uint2 size = screenLightingSize(screenLighting);
     return metal::min(metal::uint2(fragPosition.xy * camera.viewParams.w), size - 1);
 }
 
@@ -219,8 +227,24 @@ inline bool hasIndirectDiffuse(constant CameraUniforms &camera, bool opaqueDraw)
 // of the irradiance cube map.
 inline metal::float3 indirectIrradiance(constant CameraUniforms &camera, metal::texture2d<float> screenLighting,
                                         metal::float4 fragPosition) {
-    const metal::uint2 size = metal::uint2(screenLighting.get_width() / 2, screenLighting.get_height());
+    const metal::uint2 size = screenLightingSize(screenLighting);
     return screenLighting.read(screenLightingPixel(camera, screenLighting, fragPosition) + metal::uint2(size.x, 0)).rgb;
+}
+
+// Direct light (Renderer::setDirectLighting(), e.g. ReSTIR DI) for this
+// draw: when on, it replaces the light loop (campelloLights) and the sun's
+// visibility; it already holds the shadows of every light.
+inline bool hasDirectLighting(constant CameraUniforms &camera, bool opaqueDraw) {
+    return opaqueDraw && camera.shadowParams.w > 0.5;
+}
+
+// The direct light reflected towards the camera at this pixel (diffuse and
+// specular of the G-buffer's material, linear, before exposure), when
+// hasDirectLighting().
+inline metal::float3 directRadiance(constant CameraUniforms &camera, metal::texture2d<float> screenLighting,
+                                    metal::float4 fragPosition) {
+    const metal::uint2 size = screenLightingSize(screenLighting);
+    return screenLighting.read(screenLightingPixel(camera, screenLighting, fragPosition) + metal::uint2(2 * size.x, 0)).rgb;
 }
 
 } // namespace campello

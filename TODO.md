@@ -360,8 +360,21 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
   - [ ] With SSAA; motion from the main pass instead of an extra G-buffer pass (MRT)
 
 **Light sampling**
-- [ ] **ReSTIR DI** — many dynamic lights (hundreds to thousands) with one or few shadow rays per
-      pixel, reservoirs reused over neighbors and frames
+- [x] **ReSTIR DI** (Metal) — `RestirDirectLighting` (`rt_effects.hpp`): 32 candidates by power,
+      resampled by their contribution (the raster BRDF), visibility reuse, temporal reuse along the
+      motion vectors (M capped at 20 frames), spatial reuse while a history is short (radius 1% of
+      the width); one shadow ray per pixel for the result. `Renderer::setDirectLighting()` replaces
+      the 4-light raster loop; `renderReference()` is the ground truth. 64 point lights in the
+      test: relative error 1.66 with one light sample, 0.37 resampling 32, 0.10 after 16 frames of
+      reuse (moving camera 0.23); shadows exact (0.2392 vs 0.2393)
+  - [ ] Emissive triangles as lights (the path tracer's light list); an alias table instead of the
+        CDF search; area / sphere lights (a point per sample, not just the light index)
+  - [ ] Unbiased reuse (visibility in the spatial weights, pairwise MIS) instead of feeding back
+        the temporal reservoirs and limiting spatial reuse to short histories; the history's
+        surface checks against the G-buffer's own previous frame rather than ReSTIR's copy
+  - [ ] Sheen, clearcoat and anisotropy in the target function (they lose their direct light
+        while `setDirectLighting()` is on); the transparent pass (still the light loop)
+  - [ ] Light culling for thousands of lights (a light BVH or grid, see "Light lists")
 - [ ] **ReSTIR GI** — reuse of indirect light samples for one-bounce GI at about 1 sample per pixel
 - [ ] **Light lists / light BVH** for many-light sampling (point, spot, area, emissive meshes)
 
