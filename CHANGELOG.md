@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-16
+
 ### Added
 - **Skinned meshes in ray tracing.** `SkinnedMeshes` (`rt_effects.hpp`) runs a compute pass that poses each skinned draw's positions and normals with its joint matrices, as the raster vertex stage does, into a posed copy of its mesh.
   - `RayTracingScene` and `PathTracer` trace these copies, so every ray traced effect, the reflections, ReSTIR GI and DDGI probes see characters where they're posed. Before, the bind pose was traced.
