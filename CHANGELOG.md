@@ -32,7 +32,7 @@
 - **`PathTracer::stats()`**: GPU time of the last sample and the mean over the image (command buffer GPU time), the last scene rebuild and `denoise()` (wall clock), time from an image's first sample to its first denoised result, and the traced triangle and instance counts. Doesn't wait for the GPU.
 
 ### Changed
-- campello_gpu v0.29.0 -> v0.30.0 (`TemporalUpscaler`).
+- campello_gpu v0.29.0 -> v0.30.1 (`TemporalUpscaler`).
 - **TAA's resolve** gathers each output pixel's 3 x 3 nearest samples weighted by their jittered distance (it took the pixel's own sample before), the neighbourhood clamp widened to 1.5 standard deviations: smoother edges (the test triangle's partly covered edge pixels 94 -> 137).
 - SSAO's apply pass reads its AO texture at the texture's own size (a mask or the internal size).
 - The intermediate scene textures follow the scene target's size (SSAA or a render scale), not only SSAA's.
