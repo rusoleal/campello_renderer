@@ -1,4 +1,5 @@
 #include <campello_renderer/path_tracer.hpp>
+#include <campello_renderer/rt_effects.hpp>
 
 #include <campello_gpu/acceleration_structure.hpp>
 #include <campello_gpu/bind_group.hpp>
@@ -176,8 +177,10 @@ struct MaterialInfo {
     float doubleSided;
     float normalUvRow0[4];
     float normalUvRow1[4];
+    float alphaCutoff;  // glTF MASK: hits count where alpha >= it (0: opaque)
+    float pad[3];
 };
-static_assert(sizeof(MaterialInfo) == 160, "MaterialInfo must match path_tracer.metal");
+static_assert(sizeof(MaterialInfo) == 176, "MaterialInfo must match path_tracer.metal");
 
 /// How a mesh's NORMAL is stored, for the faceNormals kernel (0: none or not float3).
 uint32_t normalFormat(const GpuMesh& mesh, uint32_t& stride) {
@@ -401,14 +404,18 @@ bool PathTracer::rebuild(const RenderScene& scene, const Renderer& renderer, boo
         if (meshes.count(draw.mesh)) continue;
         const void* positions = draw.mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION].get();
         const void* indices = draw.mesh->indexBuffer.get();
-        if (auto it = meshes_.find(draw.mesh);
-            it != meshes_.end() && it->second.positions == positions && it->second.indices == indices) {
+        if (auto it = meshes_.find(draw.mesh); !(skinned_ && skinned_->isPosed(draw.mesh)) && it != meshes_.end() &&
+                                              it->second.positions == positions && it->second.indices == indices) {
             meshes.emplace(draw.mesh, it->second);
             continue;
         }
         GPU::AccelerationStructureGeometryDescriptor geometry{};
         geometry.type = GPU::AccelerationStructureGeometryType::triangles;
-        geometry.opaque = true;
+        // Not opaque at the geometry level: the instance decides (opaque
+        // instances are forced opaque; alpha-masked ones get candidate
+        // hits to test). On Metal a non-opaque instance has no option of
+        // its own, so an opaque geometry would win.
+        geometry.opaque = false;
         geometry.vertexBuffer = draw.mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION];
         geometry.vertexStride = 12;
         geometry.vertexCount = draw.mesh->vertexCount;
@@ -504,6 +511,8 @@ bool PathTracer::rebuild(const RenderScene& scene, const Renderer& renderer, boo
                 for (int c = 0; c < 3; ++c) info.emissive[c] = slot[24 + c];
                 info.ior = slot[28] > 1.0f ? slot[28] : 1.5f;
                 info.transmission = draw.material->alphaBlend ? slot[57] : 0.0f;
+                // Alpha-masked (slot 15: alpha mode 1): alpha-tested hits.
+                info.alphaCutoff = std::abs(slot[15] - 1.0f) < 0.5f ? std::max(slot[16], 1e-4f) : 0.0f;
             }
             materials.push_back(info);
         }
@@ -515,7 +524,8 @@ bool PathTracer::rebuild(const RenderScene& scene, const Renderer& renderer, boo
         instance.instanceId = static_cast<uint32_t>(instanceInfo.size());
         const bool glass = materials[matIt->second].transmission > 0.0f;
         instance.mask = glass ? 2 : 1;
-        instance.opaque = true;
+        // Alpha-masked: candidate hits are alpha tested in the kernel.
+        instance.opaque = materials[matIt->second].alphaCutoff <= 0.0f;
         instance.blas = meshIt->second.blas;
         tlasDesc.instances.push_back(instance);
 
@@ -906,8 +916,13 @@ bool PathTracer::traceProbeRays(const RenderScene& scene, const Renderer& render
     return ok;
 }
 
-bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint32_t width, uint32_t height) {
+bool PathTracer::render(const RenderScene& sceneIn, const Renderer& renderer, uint32_t width, uint32_t height) {
     if (!supported() || width == 0 || height == 0) return false;
+    // Skinned draws posed this frame (SkinnedMeshes): their meshes change
+    // every frame, so the structures and normals are rebuilt.
+    if (!skinned_) skinned_ = std::make_unique<SkinnedMeshes>(device_);
+    const RenderScene scene = skinned_->pose(sceneIn);
+    const bool posed = skinned_->posedDraws() > 0;
     // Reflections and probe rays (one sample, their own output; the
     // progressive image's state untouched).
     const bool reflectionPass = reflectionGBuffer_ != nullptr || probeRequest_ != nullptr;
@@ -935,6 +950,10 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
         mix(geometryKey, textures, sizeof(textures));
         if (const float* slot = renderer.materialUniforms(draw.material)) mix(geometryKey, slot, 93 * sizeof(float));
         mix(transformKey, draw.worldTransform.data, sizeof(double) * 16);
+    }
+    if (posed) {
+        ++posedFrame_;
+        mix(geometryKey, &posedFrame_, sizeof(posedFrame_));
     }
     uint64_t lightingKey = 1469598103934665603ull;
     for (const auto& light : scene.lights) {

@@ -5111,6 +5111,249 @@ TEST_F(OffscreenRenderTest, RealtimeEffectsRunPresetsWithTimingsAndBudget) {
     EXPECT_FLOAT_EQ(renderer->getRenderScale(), 1.0f);
 }
 
+// Skinned meshes in ray tracing (SkinnedMeshes): a plate whose joint
+// moves it 1 m along x casts its shadow where it's posed, not where its
+// rest pose is, in the ray traced shadows (RayTracingScene) and in the path
+// tracer. The sun comes from +x at 45 degrees, so the plate (0.5 m up)
+// shadows the ground 0.5 m towards -x of it: x -0.8 .. -0.2 at rest,
+// 0.2 .. 0.8 posed; seen from straight above, both are open to view.
+TEST_F(OffscreenRenderTest, SkinnedMeshesCastRayTracedShadowsWhereTheyArePosed) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer on this backend";
+    RayTracedShadows shadows(device);
+    PathTracer tracer(device);
+    if (!shadows.supported() || !tracer.supported()) GTEST_SKIP() << "No ray tracing on this device";
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.0f);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.8, 0.8, 1], "metallicFactor": 0, "roughnessFactor": 1}, "doubleSided": true}]})",
+                                    kNoOpLoader);
+    GpuMaterial* grey = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    ASSERT_NE(grey, nullptr);
+    std::vector<float> groundPositions = {-3, 0, -3, -3, 0, 3, 3, 0, 3, 3, 0, -3};
+    std::vector<uint32_t> quadIndices = {0, 1, 2, 0, 2, 3};
+    GpuMesh ground;
+    ground.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(groundPositions.size() * 4, GPU::BufferUsage::vertex, groundPositions.data());
+    ground.indexBuffer = device->createBuffer(quadIndices.size() * 4, GPU::BufferUsage::index, quadIndices.data());
+    ground.indexCount = 6;
+    ground.indexFormat = GPU::IndexFormat::uint32;
+    ground.vertexCount = 4;
+    ground.layout = &VertexLayout::positionOnly();
+    ground.setBoundsFromPositions(groundPositions.data(), 4);
+    // The plate: 0.6 x 0.6 at y = 0.5 around x = 0, the standard layout,
+    // every vertex on joint 0 with weight 1.
+    std::vector<float> platePositions = {-0.3f, 0.5f, -0.3f, -0.3f, 0.5f, 0.3f, 0.3f, 0.5f, 0.3f, 0.3f, 0.5f, -0.3f};
+    std::vector<float> plateNormals = {0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0};
+    std::vector<uint8_t> joints(16, 0);
+    std::vector<float> weights = {1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0};
+    GpuMesh plate;
+    plate.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(platePositions.size() * 4, GPU::BufferUsage::vertex, platePositions.data());
+    plate.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+        device->createBuffer(plateNormals.size() * 4, GPU::BufferUsage::vertex, plateNormals.data());
+    plate.vertexBuffers[Renderer::VERTEX_SLOT_JOINTS] = device->createBuffer(joints.size(), GPU::BufferUsage::vertex, joints.data());
+    plate.vertexBuffers[Renderer::VERTEX_SLOT_WEIGHTS] =
+        device->createBuffer(weights.size() * 4, GPU::BufferUsage::vertex, weights.data());
+    plate.indexBuffer = device->createBuffer(quadIndices.size() * 4, GPU::BufferUsage::index, quadIndices.data());
+    plate.indexCount = 6;
+    plate.indexFormat = GPU::IndexFormat::uint32;
+    plate.vertexCount = 4;
+    plate.setBoundsFromPositions(platePositions.data(), 4);
+    // Joint 0: 1 m along x (column-major).
+    float moved[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1};
+    auto jointMatrices = device->createBuffer(sizeof(moved), GPU::BufferUsage::storage, moved);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 4.0, 0.01), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 0.0, -1.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 4.0, 0.01);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(-1.0, -1.0, 0.0);  // from +x, 45 degrees up
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    sun.castShadows = true;
+    scene.lights.push_back(sun);
+    DrawCall g;
+    g.mesh = &ground;
+    g.material = grey;
+    g.worldTransform = VM::Matrix4<double>::identity();
+    DrawCall p = g;
+    p.mesh = &plate;
+    p.jointMatrixBuffer = jointMatrices;
+    p.jointCount = 1;
+    scene.opaque = {g, p};
+    // Looking down from 4 m (60 degrees): about 13.9 pixels per metre, x = 0
+    // at column 32: x = -0.5 is column 25, x = 0.5 column 39.
+    const auto region = [](const std::function<double(int, int)>& value, int column) {
+        double s = 0.0;
+        for (int y = 30; y <= 34; ++y) {
+            for (int x = column - 1; x <= column + 1; ++x) s += value(x, y);
+        }
+        return s / 15.0;
+    };
+    const auto halfToFloat = [](uint16_t h) {
+        const uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+        float v = exponent == 0 ? std::ldexp(float(mantissa), -24) : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+        return sign ? -v : v;
+    };
+    renderer->renderGBuffer(scene);
+    std::vector<double> visibility(size_t(64) * 64, 0.0);
+    for (int f = 0; f < 8; ++f) {
+        ASSERT_TRUE(shadows.trace(scene, renderer->gBuffer()));
+        device->waitForIdle();
+        std::vector<uint16_t> raw(size_t(64) * 64 * 4);
+        ASSERT_TRUE(shadows.output()->download(0, 0, raw.data(), raw.size() * 2));
+        for (size_t i = 0; i < visibility.size(); ++i) visibility[i] += halfToFloat(raw[i * 4]) / 8.0;
+    }
+    const auto at = [&](int x, int y) { return visibility[size_t(y) * 64 + size_t(x)]; };
+    const double restShadow = region(at, 25), posedShadow = region(at, 39);
+    std::printf("[Skinning] RT shadows: visibility where the rest pose would shadow %.2f, where the posed plate does %.2f; "
+                "skinned rebuilds %u\n",
+                restShadow, posedShadow, shadows.scene()->skinnedRebuilds());
+    EXPECT_GT(restShadow, 0.9) << "no shadow of the rest pose";
+    EXPECT_LT(posedShadow, 0.1) << "the posed plate's shadow";
+    // Every frame rebuilt: the first fully (the ground too), then the posed plate.
+    EXPECT_EQ(shadows.scene()->fullRebuilds() + shadows.scene()->skinnedRebuilds(), 8u) << "posed every frame";
+    EXPECT_EQ(shadows.scene()->skinnedRebuilds(), 7u) << "the ground's structure kept";
+
+    // The path tracer: the same.
+    for (int i = 0; i < 16; ++i) ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+    const auto image = readBackPixels(tracer.output());
+    const auto red = [&](int x, int y) { return double(image[(size_t(y) * 64 + size_t(x)) * 4]); };
+    const double restTraced = region(red, 25), posedTraced = region(red, 39);
+    std::printf("[Skinning] path tracer: where the rest pose would shadow %.0f, where the posed plate does %.0f\n", restTraced,
+                posedTraced);
+    EXPECT_GT(restTraced, posedTraced * 3.0) << "the shadow follows the pose";
+}
+
+// Alpha-tested casters (glTF MASK): a plate whose base colour texture is
+// transparent on its left half shadows the ground only with its right
+// half, in the ray traced shadows (RayTracingScene's alpha tests) and in
+// the path tracer. Sun from +x at 45 degrees, the plate 0.5 m up at
+// x -0.3 .. 0.3: its opaque half (x 0 .. 0.3) shadows x -0.5 .. -0.2, its
+// transparent half would shadow x -0.8 .. -0.5.
+TEST_F(OffscreenRenderTest, AlphaTestedCastersShadowOnlyWhereOpaque) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer on this backend";
+    RayTracedShadows shadows(device);
+    PathTracer tracer(device);
+    if (!shadows.supported() || !tracer.supported()) GTEST_SKIP() << "No ray tracing on this device";
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.0f);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.8, 0.8, 1], "metallicFactor": 0, "roughnessFactor": 1}, "doubleSided": true},
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.8, 0.8, 1], "metallicFactor": 0, "roughnessFactor": 1},
+         "alphaMode": "MASK", "alphaCutoff": 0.5, "doubleSided": true}]})",
+                                    kNoOpLoader);
+    GpuMaterial* grey = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    GpuMaterial* masked = renderer->uploadMaterial((*materials->materials)[1], *materials);
+    ASSERT_NE(grey, nullptr);
+    ASSERT_NE(masked, nullptr);
+    EXPECT_TRUE(masked->alphaMask);
+    EXPECT_FLOAT_EQ(masked->alphaCutoff, 0.5f);
+    // 4 x 1: transparent, transparent, opaque, opaque (u across x).
+    uint8_t texels[16] = {255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 255, 255, 255, 255, 255};
+    auto texture = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm, 4, 1, 1, 1, 1,
+                                         (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
+                                                             uint32_t(GPU::TextureUsage::copyDst)));
+    ASSERT_TRUE(texture->upload(0, sizeof(texels), texels));
+    masked->baseColorTexture = texture;
+    std::vector<float> groundPositions = {-3, 0, -3, -3, 0, 3, 3, 0, 3, 3, 0, -3};
+    std::vector<uint32_t> quadIndices = {0, 1, 2, 0, 2, 3};
+    GpuMesh ground;
+    ground.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(groundPositions.size() * 4, GPU::BufferUsage::vertex, groundPositions.data());
+    ground.indexBuffer = device->createBuffer(quadIndices.size() * 4, GPU::BufferUsage::index, quadIndices.data());
+    ground.indexCount = 6;
+    ground.indexFormat = GPU::IndexFormat::uint32;
+    ground.vertexCount = 4;
+    ground.layout = &VertexLayout::positionOnly();
+    ground.setBoundsFromPositions(groundPositions.data(), 4);
+    std::vector<float> platePositions = {-0.3f, 0.5f, -0.3f, -0.3f, 0.5f, 0.3f, 0.3f, 0.5f, 0.3f, 0.3f, 0.5f, -0.3f};
+    std::vector<float> plateNormals = {0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0};
+    std::vector<float> plateUvs = {0, 0, 0, 1, 1, 1, 1, 0};  // u = 0 at x = -0.3, 1 at x = 0.3
+    GpuMesh plate;
+    plate.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(platePositions.size() * 4, GPU::BufferUsage::vertex, platePositions.data());
+    plate.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+        device->createBuffer(plateNormals.size() * 4, GPU::BufferUsage::vertex, plateNormals.data());
+    plate.vertexBuffers[Renderer::VERTEX_SLOT_TEXCOORD0] =
+        device->createBuffer(plateUvs.size() * 4, GPU::BufferUsage::vertex, plateUvs.data());
+    plate.indexBuffer = device->createBuffer(quadIndices.size() * 4, GPU::BufferUsage::index, quadIndices.data());
+    plate.indexCount = 6;
+    plate.indexFormat = GPU::IndexFormat::uint32;
+    plate.vertexCount = 4;
+    plate.setBoundsFromPositions(platePositions.data(), 4);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 4.0, 0.01), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 0.0, -1.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 4.0, 0.01);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(-1.0, -1.0, 0.0);
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    sun.castShadows = true;
+    scene.lights.push_back(sun);
+    DrawCall g;
+    g.mesh = &ground;
+    g.material = grey;
+    g.worldTransform = VM::Matrix4<double>::identity();
+    DrawCall p = g;
+    p.mesh = &plate;
+    p.material = masked;
+    scene.opaque = {g, p};
+    // x = -0.65 (the transparent half's shadow) is column 23, x = -0.4 (the
+    // opaque half's) column 26 (13.9 pixels per metre, x = 0 at column 32).
+    const auto region = [](const std::function<double(int, int)>& value, int column) {
+        double s = 0.0;
+        for (int y = 30; y <= 34; ++y) s += value(column, y);
+        return s / 5.0;
+    };
+    const auto halfToFloat = [](uint16_t h) {
+        const uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+        float v = exponent == 0 ? std::ldexp(float(mantissa), -24) : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+        return sign ? -v : v;
+    };
+    renderer->renderGBuffer(scene);
+    ASSERT_TRUE(shadows.trace(scene, renderer->gBuffer()));
+    device->waitForIdle();
+    EXPECT_EQ(shadows.scene()->alphaTestedInstances(), 1u);
+    std::vector<uint16_t> raw(size_t(64) * 64 * 4);
+    ASSERT_TRUE(shadows.output()->download(0, 0, raw.data(), raw.size() * 2));
+    const auto visibility = [&](int x, int y) { return double(halfToFloat(raw[(size_t(y) * 64 + size_t(x)) * 4])); };
+    const double underTransparent = region(visibility, 23), underOpaque = region(visibility, 26);
+    std::printf("[AlphaTest] RT shadows: visibility under the transparent half %.2f, the opaque half %.2f\n",
+                underTransparent, underOpaque);
+    EXPECT_GT(underTransparent, 0.9) << "light through the cut-out";
+    EXPECT_LT(underOpaque, 0.1) << "the opaque half shadows";
+
+    for (int i = 0; i < 16; ++i) ASSERT_TRUE(tracer.render(scene, *renderer, 64, 64));
+    const auto image = readBackPixels(tracer.output());
+    const auto red = [&](int x, int y) { return double(image[(size_t(y) * 64 + size_t(x)) * 4]); };
+    const double tracedTransparent = region(red, 23), tracedOpaque = region(red, 26);
+    std::printf("[AlphaTest] path tracer: under the transparent half %.0f, the opaque half %.0f\n", tracedTransparent,
+                tracedOpaque);
+    EXPECT_GT(tracedTransparent, tracedOpaque * 3.0) << "the cut-out lets the sun through";
+}
+
 TEST_F(OffscreenRenderTest, DdgiDoesNotLeakThroughWalls) {
     if (!device) GTEST_SKIP() << "No GPU device available";
     namespace GPU = systems::leal::campello_gpu;

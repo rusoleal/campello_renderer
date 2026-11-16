@@ -64,6 +64,8 @@ class Fence;
 
 namespace systems::leal::campello_renderer {
 
+class SkinnedMeshes;
+
 class PathTracer {
 public:
     enum class Projection {
@@ -501,6 +503,10 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::Texture> probeRayTarget_;
     uint32_t probeBounces_ = 1;
     std::shared_ptr<void> denoiser_;  // Open Image Denoise device, filter and buffers (path_tracer.cpp)
+    // Skinned draws posed for tracing (rt_effects.hpp), and a counter that
+    // makes each frame with posed draws new geometry.
+    std::unique_ptr<SkinnedMeshes> skinned_;
+    uint64_t posedFrame_ = 0;
     DenoiserDevice denoiserDevice_ = DenoiserDevice::automatic;
     DenoiserQuality denoiserQuality_ = DenoiserQuality::high;
     bool denoiserPrefilter_ = false;

@@ -101,6 +101,10 @@ namespace systems::leal::campello_renderer {
         bool doubleSided = false;
         bool alphaBlend = false;
         bool alphaMask = false;
+        // alphaMask: the cutoff, and the base colour factor's alpha (the
+        // ray traced effects alpha test with them: RayTracingScene).
+        float alphaCutoff = 0.5f;
+        float baseColorAlpha = 1.0f;
         bool transmission = false; // true if KHR_materials_transmission is active
         // The base colour texture's average colour (linear), white without
         // one: the path tracer shades with it (PathTracer).

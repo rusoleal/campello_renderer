@@ -76,20 +76,319 @@ std::vector<DrawCall> casters(const RenderScene& scene) {
 // RayTracingScene
 // ---------------------------------------------------------------------------
 
-RayTracingScene::RayTracingScene(std::shared_ptr<GPU::Device> device)
-    : device_(std::move(device)) {}
+// ---------------------------------------------------------------------------
+// SkinnedMeshes
+// ---------------------------------------------------------------------------
 
-bool RayTracingScene::update(const RenderScene& scene) {
+namespace rt_effects_detail {
+
+// As SkinParams in rt_effects.metal.
+struct SkinParams {
+    uint32_t vertexCount;
+    uint32_t jointsFormat;
+    uint32_t weightsFormat;
+    uint32_t hasNormals;
+    uint32_t jointCount;
+    uint32_t pad[3];
+};
+
+// The joints' and weights' formats (kernel codes): the layout's, else by
+// the buffers' bytes per vertex. False if unreadable.
+bool skinFormats(const GpuMesh& mesh, uint32_t& joints, uint32_t& weights) {
+    const auto& jb = mesh.vertexBuffers[Renderer::VERTEX_SLOT_JOINTS];
+    const auto& wb = mesh.vertexBuffers[Renderer::VERTEX_SLOT_WEIGHTS];
+    if (!jb || !wb || mesh.vertexCount == 0) return false;
+    if (mesh.layout) {
+        joints = weights = 99;
+        for (const auto& a : mesh.layout->attributes) {
+            if (a.semantic == VertexSemantic::joints) {
+                joints = a.componentType == GPU::ComponentType::ctUnsignedByte    ? 0u
+                         : a.componentType == GPU::ComponentType::ctUnsignedShort ? 1u
+                         : a.componentType == GPU::ComponentType::ctUnsignedInt   ? 2u
+                                                                                  : 99u;
+            } else if (a.semantic == VertexSemantic::weights) {
+                weights = a.componentType == GPU::ComponentType::ctFloat                         ? 0u
+                          : a.componentType == GPU::ComponentType::ctUnsignedByte && a.normalized  ? 1u
+                          : a.componentType == GPU::ComponentType::ctUnsignedShort && a.normalized ? 2u
+                                                                                                   : 99u;
+            }
+        }
+        return joints != 99 && weights != 99;
+    }
+    const uint64_t jointBytes = jb->getLength() / mesh.vertexCount, weightBytes = wb->getLength() / mesh.vertexCount;
+    joints = jointBytes >= 16 ? 2u : jointBytes >= 8 ? 1u : 0u;
+    weights = weightBytes >= 16 ? 0u : weightBytes >= 8 ? 2u : 1u;
+    return jointBytes >= 4 && weightBytes >= 4;
+}
+
+constexpr uint32_t RT_ALPHA_TEXTURES = 16;  // as rt_effects.metal
+
+// As AlphaInstance / UvGatherParams in rt_effects.metal.
+struct AlphaInstance {
+    float cutoff;
+    float baseAlpha;
+    int32_t texture;
+    uint32_t uvOffset;
+};
+struct UvGatherParams {
+    uint32_t triangleCount;
+    uint32_t outOffset;
+    uint32_t indexFormat;
+    uint32_t pad;
+};
+
+// A mesh's TEXCOORD_0 as float2 (what the alpha test reads), or null.
+std::shared_ptr<GPU::Buffer> floatTexcoords(const GpuMesh& mesh) {
+    const auto& t = mesh.vertexBuffers[Renderer::VERTEX_SLOT_TEXCOORD0];
+    if (!t || t->getLength() < uint64_t(mesh.vertexCount) * 8) return nullptr;
+    if (mesh.layout) {
+        for (const auto& a : mesh.layout->attributes) {
+            if (a.semantic == VertexSemantic::texcoord0) {
+                return a.componentType == GPU::ComponentType::ctFloat && a.accessorType == GPU::AccessorType::acVec2 ? t : nullptr;
+            }
+        }
+        return nullptr;
+    }
+    return t;  // the standard layout: float2
+}
+
+// The effects' alpha test bindings: buffers 10 (instances), 11 (UVs),
+// textures 16 .. 31.
+void appendAlphaLayout(GPU::BindGroupLayoutDescriptor& desc, GPU::ShaderStage stage) {
+    for (uint32_t binding = 10; binding <= 11; ++binding) {
+        GPU::EntryObject buffer{};
+        buffer.binding = binding;
+        buffer.type = GPU::EntryObjectType::buffer;
+        buffer.visibility = stage;
+        buffer.data.buffer.hasDinamicOffaset = false;
+        buffer.data.buffer.minBindingSize = 0;
+        buffer.data.buffer.type = GPU::EntryObjectBufferType::readOnlyStorage;
+        desc.entries.push_back(buffer);
+    }
+    for (uint32_t i = 0; i < RT_ALPHA_TEXTURES; ++i) {
+        GPU::EntryObject texture{};
+        texture.binding = 16 + i;
+        texture.type = GPU::EntryObjectType::texture;
+        texture.visibility = stage;
+        texture.data.texture = {false, GPU::EntryObjectTextureType::ttFloat, GPU::TextureType::tt2d};
+        desc.entries.push_back(texture);
+    }
+}
+
+void appendAlphaEntries(std::vector<GPU::BindGroupEntryDescriptor>& entries, const RayTracingScene& scene) {
+    const auto& instances = scene.alphaInstances();
+    const auto& uvs = scene.alphaUvs();
+    entries.push_back({10, GPU::BufferBinding{instances, 0, instances->getLength()}});
+    entries.push_back({11, GPU::BufferBinding{uvs, 0, uvs->getLength()}});
+    const auto& textures = scene.alphaTextures();
+    for (uint32_t i = 0; i < RT_ALPHA_TEXTURES; ++i) entries.push_back({16 + i, textures[i]});
+}
+
+} // namespace rt_effects_detail
+
+SkinnedMeshes::SkinnedMeshes(std::shared_ptr<GPU::Device> device) : device_(std::move(device)) {
+#if defined(__APPLE__) && !TARGET_OS_SIMULATOR
+    if (!device_) return;
+    auto module = device_->createShaderModule(shaders::kRtEffectsMetalShader, shaders::kRtEffectsMetalShaderSize);
+    if (!module) return;
+    // positions, normals, joints, weights, joint matrices, out positions,
+    // out normals (storage), parameters (uniform).
+    GPU::BindGroupLayoutDescriptor desc{};
+    for (uint32_t binding = 0; binding <= 7; ++binding) {
+        GPU::EntryObject buffer{};
+        buffer.binding = binding;
+        buffer.type = GPU::EntryObjectType::buffer;
+        buffer.visibility = GPU::ShaderStage::compute;
+        buffer.data.buffer.hasDinamicOffaset = false;
+        buffer.data.buffer.minBindingSize = 0;
+        buffer.data.buffer.type = binding == 7 ? GPU::EntryObjectBufferType::uniform : GPU::EntryObjectBufferType::storage;
+        desc.entries.push_back(buffer);
+    }
+    layout_ = device_->createBindGroupLayout(desc);
+    if (!layout_) return;
+    GPU::PipelineLayoutDescriptor pl{};
+    pl.bindGroupLayouts = {layout_};
+    GPU::ComputePipelineDescriptor cd{};
+    cd.compute = {module, "skinVertices"};
+    cd.layout = device_->createPipelineLayout(pl);
+    pipeline_ = device_->createComputePipeline(cd);
+#endif
+}
+
+SkinnedMeshes::~SkinnedMeshes() {
+    if (pending_) pending_->wait();
+}
+
+bool SkinnedMeshes::isPosed(const GpuMesh* mesh) const {
+    for (const auto& [key, posed] : posed_) {
+        if (posed.mesh.get() == mesh) return true;
+    }
+    return false;
+}
+
+RenderScene SkinnedMeshes::pose(const RenderScene& scene) {
+    namespace D = rt_effects_detail;
+    posedDraws_ = 0;
+    const auto skinned = [](const DrawCall& d) {
+        return d.mesh && d.jointMatrixBuffer && d.jointCount > 0 && d.mesh->vertexBuffers[Renderer::VERTEX_SLOT_JOINTS] &&
+               d.mesh->vertexBuffers[Renderer::VERTEX_SLOT_WEIGHTS] && d.mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION];
+    };
+    bool any = false;
+    for (const auto* list : {&scene.opaque, &scene.transparent, &scene.shadowCasters}) {
+        for (const auto& d : *list) any = any || skinned(d);
+    }
+    if (!any || !supported()) {
+        posed_.clear();
+        return scene;
+    }
+    if (pending_) {
+        pending_->wait();  // its parameter buffers are released below
+        pending_.reset();
+    }
+    keepAlive_.clear();
+    for (auto& [key, p] : posed_) p.used = false;
+    RenderScene out = scene;
+    auto encoder = device_->createCommandEncoder();
+    if (!encoder) return scene;
+    std::vector<std::shared_ptr<GPU::BindGroup>> groups;
+    auto pass = encoder->beginComputePass();
+    if (!pass) return scene;
+    pass->setPipeline(pipeline_);
+    // Each (mesh, joints) once, however many lists it's in.
+    std::map<std::pair<const GpuMesh*, const void*>, GpuMesh*> done;
+    for (auto* list : {&out.opaque, &out.transparent, &out.shadowCasters}) {
+        for (auto& d : *list) {
+            if (!skinned(d)) continue;
+            const auto key = std::make_pair(static_cast<const GpuMesh*>(d.mesh), static_cast<const void*>(d.jointMatrixBuffer.get()));
+            if (auto it = done.find(key); it != done.end()) {
+                d.mesh = it->second;
+                d.jointMatrixBuffer = nullptr;
+                d.jointCount = 0;
+                continue;
+            }
+            uint32_t jointsFormat = 0, weightsFormat = 0;
+            if (!D::skinFormats(*d.mesh, jointsFormat, weightsFormat)) continue;
+            const GpuMesh& source = *d.mesh;
+            Posed& p = posed_[key];
+            const uint64_t bytes = uint64_t(source.vertexCount) * 12;
+            const bool hasNormals = source.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] &&
+                                    source.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL]->getLength() >= bytes;
+            if (!p.mesh || p.mesh->vertexCount != source.vertexCount || p.mesh->indexBuffer != source.indexBuffer) {
+                p.mesh = std::make_unique<GpuMesh>(source);
+                const auto usage = (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::storage) | uint32_t(GPU::BufferUsage::vertex));
+                p.mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] = device_->createBuffer(bytes, usage);
+                p.mesh->vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] = hasNormals ? device_->createBuffer(bytes, usage) : nullptr;
+                p.mesh->vertexBuffers[Renderer::VERTEX_SLOT_JOINTS] = nullptr;
+                p.mesh->vertexBuffers[Renderer::VERTEX_SLOT_WEIGHTS] = nullptr;
+            }
+            for (size_t s = 0; s < kVertexSemanticCount; ++s) {
+                if (s != Renderer::VERTEX_SLOT_POSITION && s != Renderer::VERTEX_SLOT_NORMAL && s != Renderer::VERTEX_SLOT_JOINTS &&
+                    s != Renderer::VERTEX_SLOT_WEIGHTS) {
+                    p.mesh->vertexBuffers[s] = source.vertexBuffers[s];
+                }
+            }
+            p.used = true;
+            const auto& outPositions = p.mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION];
+            const auto& outNormals = hasNormals ? p.mesh->vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] : outPositions;
+            if (!outPositions) continue;
+            D::SkinParams params{source.vertexCount, jointsFormat, weightsFormat, hasNormals ? 1u : 0u, d.jointCount, {0, 0, 0}};
+            auto paramsBuffer = device_->createBuffer(sizeof(params), GPU::BufferUsage::uniform, &params);
+            keepAlive_.push_back(paramsBuffer);
+            const auto& positions = source.vertexBuffers[Renderer::VERTEX_SLOT_POSITION];
+            const auto& normals = hasNormals ? source.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] : positions;
+            const auto& joints = source.vertexBuffers[Renderer::VERTEX_SLOT_JOINTS];
+            const auto& weights = source.vertexBuffers[Renderer::VERTEX_SLOT_WEIGHTS];
+            GPU::BindGroupDescriptor bg{};
+            bg.layout = layout_;
+            bg.entries = {{0, GPU::BufferBinding{positions, 0, positions->getLength()}},
+                          {1, GPU::BufferBinding{normals, 0, normals->getLength()}},
+                          {2, GPU::BufferBinding{joints, 0, joints->getLength()}},
+                          {3, GPU::BufferBinding{weights, 0, weights->getLength()}},
+                          {4, GPU::BufferBinding{d.jointMatrixBuffer, 0, d.jointMatrixBuffer->getLength()}},
+                          {5, GPU::BufferBinding{outPositions, 0, outPositions->getLength()}},
+                          {6, GPU::BufferBinding{outNormals, 0, outNormals->getLength()}},
+                          {7, GPU::BufferBinding{paramsBuffer, 0, sizeof(params)}}};
+            auto group = device_->createBindGroup(bg);
+            if (!group) continue;
+            groups.push_back(group);
+            pass->setBindGroup(0, group, {}, 0, 0);
+            pass->dispatchWorkgroups((source.vertexCount + 63) / 64, 1, 1);
+            done[key] = p.mesh.get();
+            d.mesh = p.mesh.get();
+            d.jointMatrixBuffer = nullptr;
+            d.jointCount = 0;
+            ++posedDraws_;
+        }
+    }
+    pass->end();
+    auto fence = device_->createFence();
+    device_->submit(encoder->finish(), fence);
+    pending_ = fence;
+    for (auto it = posed_.begin(); it != posed_.end();) {
+        it = it->second.used ? std::next(it) : posed_.erase(it);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// RayTracingScene
+// ---------------------------------------------------------------------------
+
+RayTracingScene::RayTracingScene(std::shared_ptr<GPU::Device> device)
+    : device_(device), skinned_(device) {
+#if defined(__APPLE__) && !TARGET_OS_SIMULATOR
+    if (!device_) return;
+    auto module = device_->createShaderModule(shaders::kRtEffectsMetalShader, shaders::kRtEffectsMetalShaderSize);
+    if (!module) return;
+    // Triangle UVs of alpha-masked meshes: indices, texcoords, out (storage), parameters.
+    GPU::BindGroupLayoutDescriptor desc{};
+    for (uint32_t binding = 0; binding <= 3; ++binding) {
+        GPU::EntryObject buffer{};
+        buffer.binding = binding;
+        buffer.type = GPU::EntryObjectType::buffer;
+        buffer.visibility = GPU::ShaderStage::compute;
+        buffer.data.buffer.hasDinamicOffaset = false;
+        buffer.data.buffer.minBindingSize = 0;
+        buffer.data.buffer.type = binding == 3 ? GPU::EntryObjectBufferType::uniform : GPU::EntryObjectBufferType::storage;
+        desc.entries.push_back(buffer);
+    }
+    uvLayout_ = device_->createBindGroupLayout(desc);
+    if (!uvLayout_) return;
+    GPU::PipelineLayoutDescriptor pl{};
+    pl.bindGroupLayouts = {uvLayout_};
+    GPU::ComputePipelineDescriptor cd{};
+    cd.compute = {module, "gatherTriangleUVs"};
+    cd.layout = device_->createPipelineLayout(pl);
+    uvPipeline_ = device_->createComputePipeline(cd);
+    const uint8_t white[4] = {255, 255, 255, 255};
+    alphaPlaceholder_ = device_->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm, 1, 1, 1, 1, 1,
+                                               (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
+                                                                   uint32_t(GPU::TextureUsage::copyDst)));
+    if (alphaPlaceholder_) alphaPlaceholder_->upload(0, sizeof(white), const_cast<uint8_t*>(white));
+#endif
+}
+
+bool RayTracingScene::update(const RenderScene& sceneIn) {
     if (!device_) return false;
+    // Skinned draws posed this frame: their structures are rebuilt.
+    const RenderScene scene = skinned_.pose(sceneIn);
+    const bool posed = skinned_.posedDraws() > 0;
     uint64_t geometryKey = 1469598103934665603ull, transformKey = 1469598103934665603ull;
     for (const auto& draw : rt_effects_detail::casters(scene)) {
         rt_effects_detail::mix(geometryKey, &draw.mesh, sizeof(draw.mesh));
         const void* buffers[2] = {draw.mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION].get(), draw.mesh->indexBuffer.get()};
         rt_effects_detail::mix(geometryKey, buffers, sizeof(buffers));
         rt_effects_detail::mix(geometryKey, &draw.mesh->indexCount, sizeof(draw.mesh->indexCount));
+        // Alpha-masked materials: their tests change with them.
+        if (draw.material && draw.material->alphaMask) {
+            const float alpha[2] = {draw.material->alphaCutoff, draw.material->baseColorAlpha};
+            const void* texture = draw.material->baseColorTexture.get();
+            rt_effects_detail::mix(geometryKey, alpha, sizeof(alpha));
+            rt_effects_detail::mix(geometryKey, &texture, sizeof(texture));
+        }
         rt_effects_detail::mix(transformKey, draw.worldTransform.data, sizeof(double) * 16);
     }
-    if (tlas_ && geometryKey == geometryKey_ && transformKey == transformKey_) return true;
+    if (tlas_ && !posed && geometryKey == geometryKey_ && transformKey == transformKey_) return true;
     if (!rebuild(scene)) {
         tlas_.reset();
         return false;
@@ -109,14 +408,20 @@ bool RayTracingScene::rebuild(const RenderScene& scene) {
         if (meshes.count(draw.mesh)) continue;
         const void* positions = draw.mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION].get();
         const void* indices = draw.mesh->indexBuffer.get();
+        // (Posed copies change every frame: always rebuilt.)
+        const bool posedMesh = skinned_.isPosed(draw.mesh);
         if (auto it = meshes_.find(draw.mesh);
-            it != meshes_.end() && it->second.positions == positions && it->second.indices == indices) {
+            !posedMesh && it != meshes_.end() && it->second.positions == positions && it->second.indices == indices) {
             meshes.emplace(draw.mesh, it->second);
             continue;
         }
         GPU::AccelerationStructureGeometryDescriptor geometry{};
         geometry.type = GPU::AccelerationStructureGeometryType::triangles;
-        geometry.opaque = true;
+        // Not opaque at the geometry level: the instance decides (opaque
+        // instances are forced opaque; alpha-masked ones get candidate
+        // hits to test). On Metal a non-opaque instance has no option of
+        // its own, so an opaque geometry would win.
+        geometry.opaque = false;
         geometry.vertexBuffer = draw.mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION];
         geometry.vertexStride = 12;
         geometry.vertexCount = draw.mesh->vertexCount;
@@ -128,7 +433,8 @@ bool RayTracingScene::rebuild(const RenderScene& scene) {
         }
         GPU::BottomLevelAccelerationStructureDescriptor blasDesc{};
         blasDesc.geometries = {geometry};
-        blasDesc.buildFlags = GPU::AccelerationStructureBuildFlag::preferFastTrace;
+        blasDesc.buildFlags = posedMesh ? GPU::AccelerationStructureBuildFlag::preferFastBuild
+                                        : GPU::AccelerationStructureBuildFlag::preferFastTrace;
         auto blas = device_->createBottomLevelAccelerationStructure(blasDesc);
         if (!blas) continue;
         meshes.emplace(draw.mesh, MeshEntry{blas, positions, indices});
@@ -138,6 +444,12 @@ bool RayTracingScene::rebuild(const RenderScene& scene) {
 
     GPU::TopLevelAccelerationStructureDescriptor tlasDesc{};
     tlasDesc.buildFlags = GPU::AccelerationStructureBuildFlag::preferFastTrace;
+    // Alpha tests: per instance, the textures, each masked mesh's first triangle in the UVs.
+    std::vector<rt_effects_detail::AlphaInstance> alphaInstances;
+    std::vector<std::shared_ptr<GPU::Texture>> textures;
+    std::map<const GpuMesh*, uint32_t> uvOffsets;
+    uint32_t uvTriangles = 0;
+    uint32_t alphaTested = 0;
     for (const auto& draw : draws) {
         const auto it = meshes_.find(draw.mesh);
         if (it == meshes_.end()) continue;
@@ -147,8 +459,32 @@ bool RayTracingScene::rebuild(const RenderScene& scene) {
             for (int c = 0; c < 4; ++c) instance.transform[r][c] = static_cast<float>(m[r * 4 + c]);
         }
         instance.instanceId = static_cast<uint32_t>(tlasDesc.instances.size());
-        instance.mask = 1;  // opaque (as the path tracer's MASK_OPAQUE)
-        instance.opaque = true;
+        instance.mask = 1;  // (as the path tracer's MASK_OPAQUE)
+        // Alpha-masked: candidate hits alpha tested (rtVisible()).
+        const bool masked = draw.material && draw.material->alphaMask;
+        instance.opaque = !masked;
+        rt_effects_detail::AlphaInstance alpha{0.0f, 1.0f, -1, 0xFFFFFFFFu};
+        if (masked) {
+            alpha.cutoff = std::max(draw.material->alphaCutoff, 1e-4f);
+            alpha.baseAlpha = draw.material->baseColorAlpha;
+            if (const auto& texture = draw.material->baseColorTexture) {
+                const auto found = std::find(textures.begin(), textures.end(), texture);
+                if (found != textures.end()) {
+                    alpha.texture = static_cast<int32_t>(found - textures.begin());
+                } else if (textures.size() < rt_effects_detail::RT_ALPHA_TEXTURES) {
+                    alpha.texture = static_cast<int32_t>(textures.size());
+                    textures.push_back(texture);
+                }
+            }
+            if (alpha.texture >= 0 && rt_effects_detail::floatTexcoords(*draw.mesh)) {
+                auto [uvIt, added] = uvOffsets.emplace(draw.mesh, uvTriangles);
+                if (added) uvTriangles += (draw.mesh->indexBuffer && draw.mesh->indexCount > 0 ? draw.mesh->indexCount
+                                                                                                 : draw.mesh->vertexCount) / 3;
+                alpha.uvOffset = uvIt->second;
+            }
+            ++alphaTested;
+        }
+        alphaInstances.push_back(alpha);
         instance.blas = it->second.blas;
         tlasDesc.instances.push_back(instance);
     }
@@ -166,10 +502,57 @@ bool RayTracingScene::rebuild(const RenderScene& scene) {
     auto scratch = device_->createBuffer(std::max<uint64_t>(tlas_->getBuildScratchSize(), 16), GPU::BufferUsage::storage);
     keepAlive.push_back(scratch);
     encoder->buildAccelerationStructure(tlas_, tlasDesc, scratch);
+    // The alpha tests' data (placeholders where there's none).
+    alphaTestedInstances_ = alphaTested;
+    alphaInstances_ = device_->createBuffer(alphaInstances.size() * sizeof(rt_effects_detail::AlphaInstance),
+                                            GPU::BufferUsage::storage, alphaInstances.data());
+    alphaUvs_ = device_->createBuffer(std::max<uint64_t>(uint64_t(uvTriangles) * 32, 32), GPU::BufferUsage::storage);
+    alphaTextures_ = textures;
+    while (alphaTextures_.size() < rt_effects_detail::RT_ALPHA_TEXTURES) alphaTextures_.push_back(alphaPlaceholder_);
+    if (!alphaInstances_ || !alphaUvs_ || !alphaPlaceholder_) return false;
+    std::vector<std::shared_ptr<GPU::BindGroup>> uvGroups;
+    if (!uvOffsets.empty() && uvPipeline_) {
+        if (auto pass = encoder->beginComputePass()) {
+            pass->setPipeline(uvPipeline_);
+            for (const auto& [mesh, offset] : uvOffsets) {
+                const bool indexed = mesh->indexBuffer && mesh->indexCount > 0;
+                rt_effects_detail::UvGatherParams params{(indexed ? mesh->indexCount : mesh->vertexCount) / 3, offset,
+                                                         !indexed ? 0u : (mesh->indexFormat == GPU::IndexFormat::uint16 ? 1u : 2u), 0};
+                auto paramsBuffer = device_->createBuffer(sizeof(params), GPU::BufferUsage::uniform, &params);
+                keepAlive.push_back(paramsBuffer);
+                const auto texcoords = rt_effects_detail::floatTexcoords(*mesh);
+                const auto& indices = indexed ? mesh->indexBuffer : texcoords;
+                GPU::BindGroupDescriptor bg{};
+                bg.layout = uvLayout_;
+                bg.entries = {{0, GPU::BufferBinding{indices, 0, indices->getLength()}},
+                              {1, GPU::BufferBinding{texcoords, 0, texcoords->getLength()}},
+                              {2, GPU::BufferBinding{alphaUvs_, 0, alphaUvs_->getLength()}},
+                              {3, GPU::BufferBinding{paramsBuffer, 0, sizeof(params)}}};
+                auto group = device_->createBindGroup(bg);
+                if (!group) continue;
+                uvGroups.push_back(group);
+                pass->setBindGroup(0, group, {}, 0, 0);
+                pass->dispatchWorkgroups((params.triangleCount + 63) / 64, 1, 1);
+            }
+            pass->end();
+        }
+    }
     auto fence = device_->createFence();
     device_->submit(encoder->finish(), fence);
     if (fence) fence->wait();
-    ++(builds.empty() ? transformRebuilds_ : fullRebuilds_);
+    bool onlyPosed = !builds.empty();
+    for (const auto& [blas, desc] : builds) {
+        bool isPosedBuild = false;
+        for (const auto& [mesh, entry] : meshes_) {
+            if (entry.blas == blas) isPosedBuild = skinned_.isPosed(mesh);
+        }
+        onlyPosed = onlyPosed && isPosedBuild;
+    }
+    if (onlyPosed) {
+        ++skinnedRebuilds_;
+    } else {
+        ++(builds.empty() ? transformRebuilds_ : fullRebuilds_);
+    }
     return true;
 }
 
@@ -210,6 +593,7 @@ RayTracedEffect::RayTracedEffect(std::shared_ptr<GPU::Device> device, std::share
                                 GPU::TextureType::tt2d};
         desc.entries.push_back(texture);
     }
+    rt_effects_detail::appendAlphaLayout(desc, GPU::ShaderStage::rayGeneration);
     layout_ = device_->createBindGroupLayout(desc);
     if (!layout_) return;
     GPU::PipelineLayoutDescriptor pl{};
@@ -269,6 +653,7 @@ bool RayTracedEffect::dispatch(const RenderScene& scene, const GBufferTargets& g
                     {0, gbuffer.normalRoughness},
                     {1, gbuffer.depth},
                     {2, output_}};
+    rt_effects_detail::appendAlphaEntries(desc.entries, *scene_);
     auto group = device_->createBindGroup(desc);
     auto encoder = device_->createCommandEncoder();
     if (!group || !encoder) return false;
@@ -381,6 +766,7 @@ RestirDirectLighting::RestirDirectLighting(std::shared_ptr<GPU::Device> device, 
                                 GPU::TextureType::tt2d};
         desc.entries.push_back(texture);
     }
+    rt_effects_detail::appendAlphaLayout(desc, GPU::ShaderStage::rayGeneration);
     layout_ = device_->createBindGroupLayout(desc);
     if (!layout_) return;
     GPU::PipelineLayoutDescriptor pl{};
@@ -545,6 +931,7 @@ bool RestirDirectLighting::frame(const RenderScene& scene, const GBufferTargets&
                         {6, reservoirOut},
                         {7, surfaceOut},
                         {8, radiance_}};
+        rt_effects_detail::appendAlphaEntries(desc.entries, *scene_);
         return device_->createBindGroup(desc);
     };
     // Initial + temporal: last frame's reservoirs and surfaces in, this
@@ -632,6 +1019,7 @@ RestirGlobalIllumination::RestirGlobalIllumination(std::shared_ptr<GPU::Device> 
                                 GPU::TextureType::tt2d};
         desc.entries.push_back(texture);
     }
+    rt_effects_detail::appendAlphaLayout(desc, GPU::ShaderStage::rayGeneration);
     layout_ = device_->createBindGroupLayout(desc);
     if (!layout_) return;
     GPU::PipelineLayoutDescriptor pl{};
@@ -743,6 +1131,7 @@ bool RestirGlobalIllumination::render(const RenderScene& scene, const Renderer& 
                         {10, out[2]},
                         {11, surfaceOut},
                         {12, irradiance_}};
+        rt_effects_detail::appendAlphaEntries(desc.entries, *scene_);
         return device_->createBindGroup(desc);
     };
     // Initial + temporal: the history in, this frame's reservoirs out.

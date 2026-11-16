@@ -405,17 +405,31 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
       GPUs and on WebGPU. Complements the compute BVH emulation in campello_gpu
 
 **Dynamic scenes**
-- [ ] **TLAS rebuilt every frame** (cheap, instances only), BLASes built once per mesh and reused
-- [ ] **Skinned and morphing meshes** — skin in compute into a vertex buffer, refit their BLAS
-      every frame (rebuild every N frames or on large deformation to keep BVH quality)
+- [x] **TLAS rebuilt when transforms change** (instances only), BLASes built once per mesh and
+      reused (`RayTracingScene`, `PathTracer`)
+- [x] **Skinned meshes** — `SkinnedMeshes` (`rt_effects.hpp`): a compute pass poses each skinned
+      draw's positions and normals (joint matrices, as the raster vertex stage) into a posed copy
+      of its mesh; `RayTracingScene` and `PathTracer` trace the posed copies (every ray traced
+      effect, reflections, ReSTIR GI, DDGI probes). Joint / weight formats from the layout or
+      the buffer sizes. In the test the shadow follows the pose (visibility 0.00 vs 1.00)
+  - [ ] Refit instead of rebuilding posed BLASes every frame (campello_gpu's Metal refit passes
+        a nil descriptor: needs the geometry descriptor), full rebuild every N frames
+  - [ ] Morph targets (RenderScene draws don't carry their weights / deltas yet); posing once
+        per frame shared by the renderer's consumers instead of one SkinnedMeshes each
 - [ ] **Instancing at scale** — thousands of instances (vegetation, props) sharing BLASes,
       `EXT_mesh_gpu_instancing` into the TLAS
 - [ ] **Async compute** — acceleration structure builds and denoising overlapped with raster work
       where the backend has a separate compute queue
 - [ ] **LOD for ray tracing** — lower-detail BLASes for distant objects and for secondary rays
       (ties into the LOD item in Rendering Performance)
-- [ ] **Alpha-tested geometry** (foliage, fences) — any-hit / alpha testing in ray queries, with
-      opacity micromaps where the hardware supports them
+- [x] **Alpha-tested geometry** (foliage, fences) — glTF MASK materials' instances aren't opaque
+      and `intersection_query` loops alpha test candidate hits (base colour factor x texture alpha
+      against the cutoff): `PathTracer` (its UVs and textures, KHR_texture_transform) and the
+      effects (`RayTracingScene`: per-instance alpha data, gathered triangle UVs, up to 16
+      textures). In the test only the opaque half of a cut-out plate shadows. BLAS geometry is
+      built non-opaque (Metal: an opaque geometry overrides a non-opaque instance)
+  - [ ] Opacity micromaps where the hardware has them; more than 16 alpha textures in the
+        effects; the texture transform in the effects' test; alpha-blended (not masked) casters
 
 **Budgets and scaling**
 - [x] **Quality presets** — `RealtimeEffects` (`realtime_effects.hpp`): `EffectQuality` off / low /

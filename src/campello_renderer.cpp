@@ -9292,6 +9292,8 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
         mat->doubleSided   = material.doubleSided;
         mat->alphaBlend    = (material.alphaMode == systems::leal::gltf::AlphaMode::blend);
         mat->alphaMask     = (material.alphaMode == systems::leal::gltf::AlphaMode::mask);
+        mat->alphaCutoff   = (float)material.alphaCutoff;
+        mat->baseColorAlpha = material.pbrMetallicRoughness ? (float)material.pbrMetallicRoughness->baseColorFactor.w() : 1.0f;
         mat->transmission  = (material.khrMaterialsTransmission && material.khrMaterialsTransmission->transmissionFactor > 0.0f);
         GpuMaterial* result = mat.get();
         materialCache[materialIndex] = result;
@@ -9763,6 +9765,8 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     mat->doubleSided   = material.doubleSided;
     mat->alphaBlend    = (material.alphaMode == systems::leal::gltf::AlphaMode::blend);
     mat->alphaMask     = (material.alphaMode == systems::leal::gltf::AlphaMode::mask);
+    mat->alphaCutoff   = (float)material.alphaCutoff;
+    mat->baseColorAlpha = material.pbrMetallicRoughness ? (float)material.pbrMetallicRoughness->baseColorFactor.w() : 1.0f;
     mat->transmission  = (material.khrMaterialsTransmission && material.khrMaterialsTransmission->transmissionFactor > 0.0f);
     if (const auto it = textureAverages.find(baseColorTex.get()); it != textureAverages.end()) {
         mat->baseColorTextureAverage = it->second;
