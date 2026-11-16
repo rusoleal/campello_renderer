@@ -6,15 +6,28 @@
 - **The games foundation on Vulkan: G-buffer, TAA, built-in upscaling and the real-time denoiser.** Until now these were Metal-only. On Vulkan `supportsGBuffer()` was false and their tests skipped. Tested on an Adreno 618 (Android 13).
   - **G-buffer:** `renderGBuffer()` writes normal + roughness, base colour + metallic, motion and depth in one pass, using `shaders/vulkan/gbuffer.vert`, `gbuffer_lean.vert` and `gbuffer.frag`, ports of the Metal stages.
     - The previous frame's transform and jitter, which Metal reads as a raw buffer, are a per-instance vertex buffer here (locations 20–23 and 28). Mesh pipelines for the G-buffer add it after the per-draw transforms (`MeshPipelineRecipe::gbufferPreviousTransforms`).
-    - Vulkan draws don't skin yet, so a skinned draw's motion leaves out its joints' movement.
+    - Skinned draws have skinned motion: the previous joint palette places the previous position (see skinning below).
   - **TAA and the built-in upscaler:** `shaders/vulkan/taa.frag`, a port of `taaFragment`. At half resolution its RMS error against 4× SSAA is 10.65 levels, against 21.54 for bilinear upscaling; native TAA is 10.37.
   - **Real-time denoiser:** `RealtimeDenoiser` runs on Vulkan with `shaders/vulkan/denoise_*.frag` (one per pass, shared code in `denoiser_common.glsl`), embedded in `src/shaders/vulkan_denoiser.h`. RMS error goes from 0.148 to 0.022 on the first frame and from 0.148 to 0.032 with a moving camera, as on Metal.
+- **Skinning on Vulkan.** Skinned meshes are posed by their joints on Vulkan, as on Metal: glTF skins and `DrawCall::jointMatrixBuffer`. Before, Vulkan drew every mesh in its bind pose.
+  - New vertex stages `default_skinned.vert` and `gbuffer_skinned.vert` (shared code in `skinning.glsl`; the unskinned stages are the same sources without `SKINNED`). They read JOINTS_0 and WEIGHTS_0 and blend up to four joint matrices; weights summing to zero leave a vertex unskinned.
+  - The joint palette is a storage buffer at set 2 of the mesh pipelines (binding 0). The G-buffer stage also reads the previous palette (binding 1, `DrawCall::previousJointMatrixBuffer`), so a moving skin has motion vectors.
+  - `meshPipeline()` picks the skinning stage only for draws with a skin, so other meshes keep the lighter stage even though the glTF standard layout always has joints. `createDefaultPipelines()` prewarms the unskinned pipelines; a skinned one is made on first use.
+  - Bind groups for the palettes are cached per buffer and range (`bindVulkanSkin()`). The joint buffers the renderer creates are storage buffers on Vulkan.
+  - New tests: a glTF skin and a `DrawCall` palette each pose a quad where its joint puts it (Metal and Vulkan). `GBufferHoldsSurfacesAndMotion` checks skinned motion on Vulkan too. All three fail with the skinning stage disabled.
+  - No morph targets on Vulkan yet.
 - **`run_android_tests.sh`** builds the test suite for arm64, pushes it to the connected device with adb and runs it, optionally with a gtest filter. `CAMPELLO_GPU_SOURCE` builds against a local campello_gpu checkout.
 
 ### Changed
 - **campello_gpu v0.31.0**, for multiple render targets on Vulkan (the G-buffer's three targets, TAA's two).
 - **`build_vulkan_shaders.sh` is list-driven.** Each shader is one line: source, `.spv`, C symbol and header. It writes `vulkan_default.h` and `vulkan_denoiser.h`, and resolves `#include` in GLSL.
-- **Android results:** 93 passed, 35 skipped (ray tracing), 7 failed; before, 88, 40 and 7. The 7 failures are older than this change: 6 GPU procedural bake comparisons and the SSAO crease test.
+- **campello_gpu v0.31.1**, Vulkan fixes behind the last Android failures (storage buffer bindings, depth kept across passes, compute barriers).
+- **Android results:** 102 passed, 35 skipped (ray tracing), 0 failed. Before this release, 88 passed, 40 skipped and 7 failed.
+
+### Fixed
+- **GPU procedural bakes on Vulkan** (`bakeProceduralTextureGPU()`). They returned all zeros because campello_gpu left the shader's storage buffers unbound; fixed in campello_gpu v0.31.1. The bake shader's uniform block also padded with `uint[3]`, which std140 lays out with 16-byte strides (80 bytes, against the 32-byte struct bound to it); it pads with scalars now. The 6 bake comparisons pass on Android.
+- **Screen-space AO on Vulkan devices without dynamic rendering** (Vulkan 1.1, e.g. Adreno 618). Their render passes discarded the scene's depth, so SSAO sampled nothing and had no effect; fixed in campello_gpu v0.31.1.
+- The GPU bake comparison tests print the first mismatching pixel.
 
 ## [0.20.0] - 2026-11-16
 

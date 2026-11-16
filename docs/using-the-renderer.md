@@ -57,7 +57,7 @@ use(tracer.output());
 | Clip planes | `setClipPlanes()` | off | Metal, Vulkan | clip in your fragment shader (`CameraUniforms::clipPlanes`) |
 | TAA | `setTemporalAntiAliasing(true)` | off | Metal, Vulkan | automatic (with your G-buffer stages if you move geometry) |
 | Render scale + upscaling | `setRenderScale()`, `setUpscaler()` | 1, built-in | Metal, Vulkan (built-in); MetalFX on macOS 13 / iOS 16 | automatic |
-| G-buffer | `renderGBuffer()` | not run | Metal, Vulkan (no skinned motion yet) | your own G-buffer stages (see 3) |
+| G-buffer | `renderGBuffer()` | not run | Metal, Vulkan | your own G-buffer stages (see 3) |
 | Ray traced shadows | `RayTracedShadows` → `setShadowMask()` | null (shadow maps) | Metal + `Feature::raytracing` | `campello::sunVisibility()` |
 | Ray traced AO | `RayTracedAmbientOcclusion` → `setAmbientOcclusionMask()` | null (SSAO) | same | automatic |
 | Ray traced reflections | `PathTracer::traceReflections()` → `setReflections()` | null (environment) | same | `campello::reflectedRadiance()` |
