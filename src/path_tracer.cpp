@@ -887,6 +887,16 @@ bool PathTracer::traceReflections(const RenderScene& scene, const Renderer& rend
     return ok;
 }
 
+bool PathTracer::traceGlobalIllumination(const RenderScene& scene, const Renderer& renderer, const GBufferTargets& gbuffer) {
+    if (!supported() || !gbuffer.normalRoughness || !gbuffer.depth || gbuffer.width == 0 || gbuffer.height == 0) return false;
+    reflectionGBuffer_ = &gbuffer;
+    giRequest_ = true;
+    const bool ok = render(scene, renderer, gbuffer.width, gbuffer.height);
+    giRequest_ = false;
+    reflectionGBuffer_ = nullptr;
+    return ok;
+}
+
 bool PathTracer::traceProbeRays(const RenderScene& scene, const Renderer& renderer, const ProbeRays& rays) {
     const uint32_t probes = rays.count[0] * rays.count[1] * rays.count[2];
     if (!supported() || probes == 0 || rays.raysPerProbe == 0) return false;
@@ -1056,13 +1066,14 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
     // Fewer bounces for the first samples (setProgressiveBounces()).
     const uint32_t bounces = samples_ < progressiveSamples_ ? std::min(progressiveBounces_, maxBounces_) : maxBounces_;
     u.params[2] = static_cast<float>(probeRequest_     ? probeBounces_ + 1
+                                     : giRequest_     ? giBounces_ + 1
                                      : reflectionPass ? reflectionBounces_ + 1
                                                       : bounces);
     u.params[3] = static_cast<float>(reflectionPass ? reflectionFrame_++ : samples_);
     u.size[0] = traceWidth_;
     u.size[1] = traceHeight_;
     u.size[2] = renderer.getSkyboxEnabled() ? 1u : 0u;
-    u.size[3] = probeRequest_ ? 3u : reflectionPass ? 2u : (projection_ == Projection::panorama ? 1u : 0u);
+    u.size[3] = probeRequest_ ? 3u : giRequest_ ? 4u : reflectionPass ? 2u : (projection_ == Projection::panorama ? 1u : 0u);
     if (probeRequest_) {
         const auto& r = *probeRequest_;
         u.probeOrigin[0] = static_cast<float>(r.origin.x());
@@ -1227,6 +1238,17 @@ bool PathTracer::render(const RenderScene& scene, const Renderer& renderer, uint
         desc.entries.push_back({66, placeholderReflection_});
         desc.entries.push_back({67, placeholderDepth_});
         desc.entries.push_back({68, probeRayTarget_});
+    } else if (giRequest_) {
+        if (!giTarget_ || giTarget_->getWidth() != 2 * width || giTarget_->getHeight() != height) {
+            giTarget_ = device_->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba16float, 2 * width, height, 1, 1, 1,
+                                               (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::storageBinding) |
+                                                                   uint32_t(GPU::TextureUsage::textureBinding) |
+                                                                   uint32_t(GPU::TextureUsage::copySrc)));
+            if (!giTarget_) return false;
+        }
+        desc.entries.push_back({66, reflectionGBuffer_->normalRoughness});
+        desc.entries.push_back({67, reflectionGBuffer_->depth});
+        desc.entries.push_back({68, giTarget_});
     } else if (reflectionPass) {
         if (!reflectionTarget_ || reflectionTarget_->getWidth() != width || reflectionTarget_->getHeight() != height) {
             reflectionTarget_ = device_->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba16float, width, height, 1, 1, 1,

@@ -171,6 +171,24 @@ public:
     [[nodiscard]] std::shared_ptr<systems::leal::campello_gpu::Texture> reflections() const noexcept {
         return reflectionTarget_;
     }
+    /// Indirect light samples for RestirGlobalIllumination (the Games
+    /// track): for each pixel of `gbuffer`, one path from its surface in a
+    /// cosine-weighted direction of its hemisphere, shaded as this tracer
+    /// shades (setGlobalIlluminationBounces() bounces after the hit).
+    /// globalIlluminationSamples() is 2 x the G-buffer's width: on the
+    /// left, rgb the radiance leaving the hit towards the surface (linear,
+    /// before exposure) and a the hit's distance (65000: the sky); on the
+    /// right, octahedral unit vectors: xy the direction, zw the hit's
+    /// geometric normal (facing the surface; the sky: the reverse
+    /// direction). Use a PathTracer of its own. Submitted, not waited for.
+    bool traceGlobalIllumination(const RenderScene& scene, const Renderer& renderer, const GBufferTargets& gbuffer);
+    [[nodiscard]] std::shared_ptr<systems::leal::campello_gpu::Texture> globalIlluminationSamples() const noexcept {
+        return giTarget_;
+    }
+    /// Bounces after the hit (default 1: its direct light and one more).
+    void setGlobalIlluminationBounces(uint32_t bounces) noexcept {
+        giBounces_ = bounces;
+    }
     /// Probe rays (DdgiVolume): from each probe of a grid, `raysPerProbe`
     /// rays along spherical Fibonacci directions turned by `rotation`
     /// (column-major 4 x 4, its 3 x 3 part), shaded as this tracer shades
@@ -465,6 +483,11 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::Texture> placeholderReflection_;
     uint32_t reflectionFrame_ = 0;
     uint32_t reflectionBounces_ = 1;
+    // Indirect light samples (traceGlobalIllumination()): with
+    // reflectionGBuffer_, mode 4; its output.
+    bool giRequest_ = false;
+    std::shared_ptr<systems::leal::campello_gpu::Texture> giTarget_;
+    uint32_t giBounces_ = 1;
     // Probe rays (traceProbeRays()): the request in progress, its output.
     const ProbeRays* probeRequest_ = nullptr;
     std::shared_ptr<systems::leal::campello_gpu::Texture> probeRayTarget_;

@@ -4803,6 +4803,174 @@ TEST_F(OffscreenRenderTest, DdgiBleedsColourOntoTheGround) {
 // Probe-based GI doesn't leak through walls: a sealed 1 m box on sunlit
 // ground. Its floor's irradiance (from the probes inside it, which see only
 // its dark walls) stays near zero, while ground outside gets bounced light.
+// ReSTIR GI (RestirGlobalIllumination): the DDGI test's red wall beside
+// white ground under the sun. Against the average of 256 frames of raw
+// one-path samples (unbiased): one path per pixel is very noisy, reuse over
+// frames and neighbours much less so, at about the same brightness; the
+// wall's red reaches the ground near it.
+TEST_F(OffscreenRenderTest, RestirGlobalIlluminationConverges) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer on this backend";
+    RestirGlobalIllumination gi(device);
+    if (!gi.supported()) GTEST_SKIP() << "No ray tracing on this device";
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.0f);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.8, 0.8, 1], "metallicFactor": 0, "roughnessFactor": 1}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.9, 0.05, 0.05, 1], "metallicFactor": 0, "roughnessFactor": 1}}]})",
+                                    kNoOpLoader);
+    GpuMaterial* white = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    GpuMaterial* red = renderer->uploadMaterial((*materials->materials)[1], *materials);
+    white->doubleSided = red->doubleSided = true;
+    const auto mesh = [&](std::vector<float> positions) {
+        std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+        auto m = std::make_unique<GpuMesh>();
+        m->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        m->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        m->indexCount = 6;
+        m->indexFormat = GPU::IndexFormat::uint32;
+        m->vertexCount = 4;
+        m->layout = &VertexLayout::positionOnly();
+        m->setBoundsFromPositions(positions.data(), 4);
+        return m;
+    };
+    auto ground = mesh({-3, 0, -3, -3, 0, 3, 3, 0, 3, 3, 0, -3});
+    auto wall = mesh({-1, 0, -3, -1, 0, 3, -1, 1.5f, 3, -1, 1.5f, -3});
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.5, 4.0, 0.01), VM::Vector3<double>(0.5, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 0.0, -1.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.5, 4.0, 0.01);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(-0.5, -1.0, 0.0);
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    scene.lights.push_back(sun);
+    DrawCall g;
+    g.mesh = ground.get();
+    g.material = white;
+    g.worldTransform = VM::Matrix4<double>::identity();
+    DrawCall w = g;
+    w.mesh = wall.get();
+    w.material = red;
+    scene.opaque = {g, w};
+    const auto halfToFloat = [](uint16_t h) {
+        const uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+        float v = exponent == 0 ? std::ldexp(float(mantissa), -24)
+                                : exponent == 31 ? INFINITY : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+        return sign ? -v : v;
+    };
+    // rgb per pixel of the left 64 x 64 of a texture.
+    const auto readRgb = [&](const std::shared_ptr<GPU::Texture>& texture) {
+        device->waitForIdle();
+        const size_t tw = texture->getWidth();
+        std::vector<uint16_t> raw(tw * 64 * 4);
+        EXPECT_TRUE(texture->download(0, 0, raw.data(), raw.size() * 2));
+        std::vector<float> out(size_t(64) * 64 * 3);
+        for (size_t y = 0; y < 64; ++y) {
+            for (size_t x = 0; x < 64; ++x) {
+                for (size_t c = 0; c < 3; ++c) out[(y * 64 + x) * 3 + c] = halfToFloat(raw[(y * tw + x) * 4 + c]);
+            }
+        }
+        return out;
+    };
+    renderer->renderGBuffer(scene);
+    const auto& gbuffer = renderer->gBuffer();
+    // The reference: raw samples' radiance averaged (one cosine-weighted
+    // path per pixel: its radiance is the irradiance estimate).
+    PathTracer& tracer = gi.tracer();
+    std::vector<double> truth(size_t(64) * 64 * 3, 0.0);
+    constexpr int kReferenceFrames = 256;
+    std::vector<float> oneRaw;
+    for (int f = 0; f < kReferenceFrames; ++f) {
+        ASSERT_TRUE(tracer.traceGlobalIllumination(scene, *renderer, gbuffer));
+        const auto raw = readRgb(tracer.globalIlluminationSamples());
+        if (f == 0) oneRaw = raw;
+        for (size_t i = 0; i < raw.size(); ++i) truth[i] += raw[i] / kReferenceFrames;
+    }
+    const auto compare = [&](const std::vector<float>& x, double& meanRatio) {
+        double err = 0.0, sum = 0.0, sumRef = 0.0;
+        for (size_t i = 0; i < x.size(); i += 3) {
+            const double lx = 0.2126 * x[i] + 0.7152 * x[i + 1] + 0.0722 * x[i + 2];
+            const double lr = 0.2126 * truth[i] + 0.7152 * truth[i + 1] + 0.0722 * truth[i + 2];
+            err += (lx - lr) * (lx - lr);
+            sum += lx;
+            sumRef += lr;
+        }
+        const double n = double(x.size() / 3);
+        meanRatio = sum / std::max(sumRef, 1e-9);
+        return std::sqrt(err / n) / std::max(sumRef / n, 1e-9);
+    };
+    const auto frames = [&](const RestirGlobalIllumination::Settings& settings, int n) {
+        gi.setSettings(settings);
+        gi.reset();
+        for (int f = 0; f < n; ++f) EXPECT_TRUE(gi.render(scene, *renderer, gbuffer));
+        return readRgb(gi.output());
+    };
+    double ratioRaw, ratioSpatial, ratioFull;
+    const double errorRaw = compare(oneRaw, ratioRaw);
+    RestirGlobalIllumination::Settings spatialOnly;
+    spatialOnly.temporal = false;
+    const double errorSpatial = compare(frames(spatialOnly, 1), ratioSpatial);
+    const auto full = frames(RestirGlobalIllumination::Settings{}, 16);
+    const double errorFull = compare(full, ratioFull);
+    std::printf("[ReSTIR GI] relative RMS error (mean ratio): 1 path %.3f (%.3f), spatial reuse %.3f (%.3f), "
+                "16 frames %.3f (%.3f)\n",
+                errorRaw, ratioRaw, errorSpatial, ratioSpatial, errorFull, ratioFull);
+    EXPECT_LT(errorSpatial, errorRaw) << "neighbours help the first frame";
+    EXPECT_LT(errorFull, errorRaw * 0.35) << "reuse over frames helps much more";
+    EXPECT_NEAR(ratioFull, 1.0, 0.1) << "about the right brightness";
+    // The wall's red on the ground near it (column 15; as the DDGI test).
+    const auto band = [](const std::vector<float>& img, int x, int c) {
+        double s = 0.0;
+        for (int y = 26; y < 38; ++y) s += img[(size_t(y) * 64 + size_t(x)) * 3 + size_t(c)];
+        return s / 12.0;
+    };
+    std::printf("[ReSTIR GI] near the wall r %.3f g %.3f (truth r %.3f g %.3f); far r %.3f\n", band(full, 15, 0),
+                band(full, 15, 1), [&] { double s = 0; for (int y = 26; y < 38; ++y) s += truth[(size_t(y) * 64 + 15) * 3]; return s / 12; }(),
+                [&] { double s = 0; for (int y = 26; y < 38; ++y) s += truth[(size_t(y) * 64 + 15) * 3 + 1]; return s / 12; }(),
+                band(full, 47, 0));
+    EXPECT_GT(band(full, 15, 0), band(full, 15, 1) * 1.5) << "red light from the wall";
+    EXPECT_LT(band(full, 47, 0), band(full, 15, 0) * 0.5) << "weaker far from it";
+
+    // Denoised into the raster frame (Renderer::setIndirectDiffuse()): the
+    // ground near the wall turns redder.
+    RealtimeDenoiser denoiser(device);
+    ASSERT_TRUE(denoiser.supported());
+    RealtimeDenoiser::Settings denoise;
+    denoise.demodulate = false;  // irradiance: no albedo in it
+    denoiser.setSettings(denoise);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    renderer->render(scene, view);
+    const auto plain = readBackPixels(tex);
+    gi.setSettings(RestirGlobalIllumination::Settings{});
+    gi.reset();
+    for (int f = 0; f < 8; ++f) {
+        renderer->renderGBuffer(scene);
+        ASSERT_TRUE(gi.render(scene, *renderer, renderer->gBuffer()));
+        ASSERT_TRUE(denoiser.denoise(gi.output(), renderer->gBuffer(), scene.camera.projection));
+        renderer->setIndirectDiffuse(denoiser.output());
+        renderer->render(scene, view);
+    }
+    const auto lit = readBackPixels(tex);
+    renderer->setIndirectDiffuse(nullptr);
+    const auto pixel = [](const std::vector<uint8_t>& p, int x, int y, int c) { return int(p[(size_t(y) * 64 + size_t(x)) * 4 + c]); };
+    std::printf("[ReSTIR GI] raster ground near the wall: red %d -> %d, green %d -> %d\n", pixel(plain, 15, 32, 0),
+                pixel(lit, 15, 32, 0), pixel(plain, 15, 32, 1), pixel(lit, 15, 32, 1));
+    EXPECT_GT(pixel(lit, 15, 32, 0), pixel(plain, 15, 32, 0) + 5) << "the bounced red light";
+    EXPECT_NEAR(pixel(lit, 15, 32, 1), pixel(plain, 15, 32, 1), 4) << "little green";
+}
+
 TEST_F(OffscreenRenderTest, DdgiDoesNotLeakThroughWalls) {
     if (!device) GTEST_SKIP() << "No GPU device available";
     namespace GPU = systems::leal::campello_gpu;
