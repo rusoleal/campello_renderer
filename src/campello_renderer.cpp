@@ -3483,7 +3483,7 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     const ProgramState* programPtr = programState(programHandle);
     if (!meshRecipe.ready || !device || !programPtr) return nullptr;
     const ProgramState& program = *programPtr;
-    const bool gbuffer = programHandle == kGBufferProgram;
+    const bool gbuffer = isGBufferProgram(programHandle);
     // Wide lines: their own vertex and fragment stages, always blended
     // (coverage antialiasing) and double-sided.
     if (wideLines) {
@@ -4215,6 +4215,14 @@ ProgramHandle Renderer::registerProgram(const ShaderProgramDesc& desc) {
     program.vertexStages.push_back({desc.vertexReads, library, desc.metalVertexEntryPoint});
     program.fragmentModule = library;
     program.fragmentEntries[(size_t)MeshProgram::textured] = desc.metalFragmentEntryPoint;
+    if (!desc.metalGBufferVertexEntryPoint.empty() && !desc.metalGBufferFragmentEntryPoint.empty()) {
+        auto gbuffer = std::make_shared<ProgramState>();
+        gbuffer->name = desc.name + " (G-buffer)";
+        gbuffer->vertexStages.push_back({desc.vertexReads, library, desc.metalGBufferVertexEntryPoint});
+        gbuffer->fragmentModule = library;
+        gbuffer->fragmentEntries[(size_t)MeshProgram::textured] = desc.metalGBufferFragmentEntryPoint;
+        program.gbuffer = std::move(gbuffer);
+    }
 #elif defined(__EMSCRIPTEN__)
     // WGSL: one module with both entry points (compiled by the browser).
     if (desc.wgsl.empty()) return kInvalidProgram;
@@ -11088,7 +11096,13 @@ void Renderer::renderPrimitive(
     // The material's program, or the program pass's for every draw
     // (renderProgramPass()); an unknown handle falls back to PBR.
     ProgramHandle program = activeProgramPass ? activeProgramPass->program : draw.material->program;
-    if (program != kGBufferProgram && program >= programs.size()) program = kPbrProgram;
+    // The G-buffer pass: an app program's own G-buffer stages for its
+    // materials, where it has them.
+    if (program == kGBufferProgram && draw.material->program != kPbrProgram && draw.material->program < programs.size() &&
+        programs[draw.material->program].gbuffer) {
+        program = kAppGBufferProgramBase + draw.material->program;
+    }
+    if (!isGBufferProgram(program) && program >= programs.size()) program = kPbrProgram;
     const auto colorFormat = activeProgramPass ? activeProgramPass->colorFormat : GPU::PixelFormat::invalid;
     bool debugView = program == kPbrProgram && viewMode == ViewMode::worldNormal && !customLayout &&
                      draw.mesh->topology == GPU::PrimitiveTopology::triangleList;

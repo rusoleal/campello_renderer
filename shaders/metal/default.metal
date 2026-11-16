@@ -1,4 +1,12 @@
 #include <metal_stdlib>
+// The app program contract (inc/campello_renderer/shaders/): the camera,
+// light and G-buffer structs and the effect helpers come from it, so app
+// programs see exactly what the built-in shaders use.
+#include "campello_renderer/shaders/program_interface.metal.h"
+using CameraUniforms = campello::CameraUniforms;
+using Light = campello::Light;
+using LightsUniform = campello::LightsUniform;
+using GBufferTransforms = campello::GBufferTransforms;
 using namespace metal;
 
 // ---------------------------------------------------------------------------
@@ -240,27 +248,6 @@ inline float3 linearToSRGBFast(float3 color) {
     return pow(color, float3(1.0f / 2.2f));
 }
 
-struct CameraUniforms {
-    float4   cameraPos;
-    float4x4 viewMatrix;
-    float4x4 projMatrix;
-    float2   screenSize;
-    float2   lineParams;     // x: the SSAA scale the scene is drawn at (wide lines); y: unused
-    // Clip block (Renderer::uploadClipUniforms()).
-    uint4    clipInfo;       // x = plane count, y = section caps on
-    float4   capColor;
-    float4   clipPlanes[6];  // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
-    // Shadow block (Renderer: sun shadows).
-    float4x4 shadowViewProj;  // world -> the shadow map's clip space
-    float4   shadowParams;    // x = on, y = one texel in uv, z = indirect diffuse (Renderer::setIndirectDiffuse()) in
-                              // sceneColorTexture's right half
-    float4   viewParams;      // x = exposure in EV (0: unchanged; colour x 2^EV before tone mapping); y = ray traced
-                              // reflections in sceneColorTexture (Renderer::setReflections()), z = their roughness
-                              // cut-off, w = their pixels per target pixel
-    float4x4 shadowNearViewProj;  // world -> the near cascade's clip space
-    float4   shadowNearParams;    // x = near cascade on; y = shadowMapNear is a screen-space visibility mask
-                                  // (Renderer::setShadowMask()), zw = its pixels per target pixel
-};
 
 constant float VIEW_MODE_NORMAL       = 0.0;
 constant float VIEW_MODE_WORLD_NORMAL = 1.0;
@@ -665,20 +652,7 @@ fragment float4 fragmentMain_debug(
 // ---------------------------------------------------------------------------
 // Fragment variant: textured — PBR metallic-roughness with normal mapping.
 // ---------------------------------------------------------------------------
-struct Light {
-    float4 position;   // xyz = position/dir, w = type (0=dir, 1=point, 2=spot)
-    float4 color;      // xyz = rgb, w = intensity
-    float4 direction;  // xyz = spot dir, w = range
-    float4 spotAngles; // x = innerCone, y = outerCone, zw = padding
-};
 
-struct LightsUniform {
-    uint32_t count;
-    uint32_t _pad0;
-    uint32_t _pad1;
-    uint32_t _pad2;
-    Light lights[4];
-};
 
 // ---------------------------------------------------------------------------
 // GGX BRDF helpers — KHR_materials_clearcoat
@@ -861,54 +835,9 @@ float3 iblGGXFresnel(float NdotV, float roughness, float3 F0,
 // against self-shadowing ("acne"), sized to one texel of this map in world
 // units (the orthographic scales are the matrix rows' lengths): along the
 // normal, more at grazing light, plus a texel of depth.
-inline float shadowLookup(depth2d<float> shadowMap, float4x4 M, float texel, float3 worldPos, float3 N, float3 L,
-                          thread bool &inside) {
-    constexpr sampler shadowSampler(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);
-    const float worldTexel = 2.0 * texel / max(length(float3(M[0][0], M[1][0], M[2][0])), 1e-6);
-    const float depthPerWorld = length(float3(M[0][2], M[1][2], M[2][2]));
-    const float NdotL = clamp(dot(N, L), 0.0, 1.0);
-    const float slope = sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.2);
-    const float4 clip = M * float4(worldPos + N * worldTexel * (1.0 + slope), 1.0);
-    float3 ndc = clip.xyz / clip.w;
-    ndc.z -= depthPerWorld * worldTexel;
-    const float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    inside = all(uv >= float2(2.0 * texel)) && all(uv <= float2(1.0 - 2.0 * texel)) && ndc.z <= 1.0;
-    if (!inside) {
-        return 1.0;
-    }
-    float lit = 0.0;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-            lit += shadowMap.sample_compare(shadowSampler, uv + float2(x, y) * texel, ndc.z);
-        }
-    }
-    return lit / 9.0;
-}
-
-// How lit `worldPos` is by the shadow-casting light: 1 lit .. 0 shadowed.
-// Two cascades: the near map (the part of the view closest to the camera,
-// finer) where it covers the point, else the far map (the whole scene).
-// Outside both: lit.
 inline float sunShadow(constant CameraUniforms &camera, depth2d<float> shadowMap, depth2d<float> shadowMapNear,
                        float3 worldPos, float3 N, float3 L, float4 fragPosition) {
-    // A visibility mask (ray traced shadows) in place of the shadow maps:
-    // read at this pixel.
-    if (camera.shadowNearParams.y > 0.5) {
-        const uint2 size = uint2(shadowMapNear.get_width(), shadowMapNear.get_height());
-        const uint2 pixel = min(uint2(fragPosition.xy * camera.shadowNearParams.zw), size - 1);
-        return saturate(shadowMapNear.read(pixel));
-    }
-    if (camera.shadowParams.x < 0.5) {
-        return 1.0;
-    }
-    bool inside = false;
-    if (camera.shadowNearParams.x > 0.5) {
-        const float lit = shadowLookup(shadowMapNear, camera.shadowNearViewProj, camera.shadowParams.y, worldPos, N, L, inside);
-        if (inside) {
-            return lit;
-        }
-    }
-    return shadowLookup(shadowMap, camera.shadowViewProj, camera.shadowParams.y, worldPos, N, L, inside);
+    return campello::sunVisibility(camera, shadowMap, shadowMapNear, worldPos, N, L, fragPosition);
 }
 
 // World-space box mapping (Renderer::setMaterialWorldMapping()), for
@@ -1225,13 +1154,10 @@ fragment float4 fragmentMain_textured(
         // Screen-space lighting (opaque, non-transmissive surfaces): the
         // scene colour slot holds reflections (left) and indirect diffuse
         // light (right), each at the frame's size.
-        const bool screenLighting = (camera.viewParams.y > 0.5 || camera.shadowParams.z > 0.5) && mat.alphaMode < 1.5 &&
-                                    mat.transmissionFactor <= 0.0;
-        const uint2 lightingSize = uint2(sceneColorTexture.get_width() / 2, sceneColorTexture.get_height());
-        const uint2 lightingPixel = min(uint2(inRaw.clipPosition.xy * camera.viewParams.w), lightingSize - 1);
-        if (screenLighting && camera.shadowParams.z > 0.5) {
+        const bool screenLighting = mat.alphaMode < 1.5 && mat.transmissionFactor <= 0.0;  // an opaque draw
+        if (campello::hasIndirectDiffuse(camera, screenLighting)) {
             // Probe-based GI (DdgiVolume): the irradiance at this surface.
-            diffuseIrradiance = sceneColorTexture.read(lightingPixel + uint2(lightingSize.x, 0)).rgb;
+            diffuseIrradiance = campello::indirectIrradiance(camera, sceneColorTexture, inRaw.clipPosition);
         }
         iblDiffuse = baseColor.rgb * (1.0 - metallic) * diffuseIrradiance;
 
@@ -1259,10 +1185,9 @@ fragment float4 fragmentMain_textured(
         // transparent pass has the scene colour in that slot): the radiance
         // traced along this pixel's GGX lobe instead of the prefiltered sky,
         // fading back to it towards the roughness cut-off.
-        if (screenLighting && camera.viewParams.y > 0.5) {
-            const float3 traced = sceneColorTexture.read(lightingPixel).rgb;
-            const float cutoff = camera.viewParams.z;
-            specularRadiance = mix(specularRadiance, traced, 1.0 - smoothstep(0.75 * cutoff, cutoff, roughness));
+        if (campello::hasReflections(camera, screenLighting)) {
+            const float3 traced = campello::reflectedRadiance(camera, sceneColorTexture, inRaw.clipPosition);
+            specularRadiance = mix(specularRadiance, traced, campello::reflectionWeight(camera, roughness));
         }
         iblSpecular = specularRadiance * F;
 
@@ -1569,7 +1494,7 @@ fragment float4 fragmentMain_textured(
                          + emissive + transmitted * transmittance) * ccAmbientAtten
                         + totalClearcoat + iblClearcoat;
 
-    finalColor *= exp2(camera.viewParams.x);  // exposure
+    finalColor *= campello::exposureScale(camera);  // exposure
     finalColor = toneMapKhronosPbrNeutral(finalColor);
     finalColor = linearToSRGBFast(finalColor);
 
@@ -1593,11 +1518,6 @@ struct SkyboxOut {
 // ---------------------------------------------------------------------------
 // The previous frame's clip transform per draw, at the draw's transform
 // offset (same 128-byte stride as NodeTransforms).
-struct GBufferTransforms {
-    float4x4 previousMvp;
-    float4   jitter;  // xy: this frame's projection jitter (clip x / w), removed from the motion (TAA)
-    float4   pad[3];
-};
 
 struct GBufferVertexOut {
     float4 clipPosition [[position]];

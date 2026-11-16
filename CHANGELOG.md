@@ -3,6 +3,20 @@
 ## [Unreleased]
 
 ### Added
+- **Lighting inputs for app shader programs** (Metal): `program_interface.metal.h` now exposes what the renderer's effects give the built-in PBR shader, as structs (`campello::CameraUniforms`, `Light`, `LightsUniform`), binding constants and helpers:
+  - `campello::sunVisibility()` for the shadow maps, or the ray traced mask when `setShadowMask()` is set.
+  - `hasReflections()`, `reflectedRadiance()` and `reflectionWeight()` for ray traced reflections.
+  - `hasIndirectDiffuse()` and `indirectIrradiance()` for indirect diffuse light, such as DDGI.
+  - `exposureScale()`, and `CAMPELLO_LIGHTING_PARAMETERS` to declare the inputs in a fragment function.
+  - The built-in `default.metal` includes the same header, so app programs see exactly what PBR uses. The effects' internal packing stays behind the helpers.
+- **App programs' own G-buffer stages** (Metal): `ShaderProgramDesc::metalGBufferVertexEntryPoint` / `metalGBufferFragmentEntryPoint`. `renderGBuffer()` draws a program's materials with its own stages, so geometry its vertex shader moves, and normals its fragment shader computes, reach TAA, the upscalers, the denoisers and the ray traced effects. The header adds `campello::GBufferTransforms`, `unjitteredClip()`, `GBufferOut` and `gbufferOutput()`.
+  - Without these stages, the built-in G-buffer stages draw the program's meshes as before.
+  - In the test, a program that moves its geometry 0.4 sideways gets its G-buffer albedo and motion at the moved place (motion −0.0549 against an expected −0.0549). The built-in stages put it at the unmoved place.
+- **`docs/using-the-renderer.md`** covers:
+  - the ways to use the renderer (glTF viewer, your own `RenderScene`, offline path tracing, building blocks);
+  - every feature's switch, default and backends, and what custom programs get from it;
+  - a full ray traced effect chain;
+  - custom shading, and what doesn't carry over yet.
 - **MetalFX upscaling** (Metal, macOS 13 / iOS 16 and later): `Renderer::setUpscaler(Upscaler::metalFX)` makes TAA, and TAA with a render scale, use Apple's MetalFX temporal scaler (campello_gpu's new `TemporalUpscaler`) in place of the built-in resolve.
   - MetalFX takes the jittered frame, the G-buffer's depth and its motion vectors.
   - `supportsUpscaler()` tells which upscalers the device supports. `activeUpscaler()` gives the one the last frame used.

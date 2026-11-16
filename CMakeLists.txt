@@ -202,6 +202,12 @@ if(CAMPELLO_RENDERER_BUILD_TEST)
         VULKAN_VERTEX test/shaders/element_id.vert
         VULKAN_FRAGMENT test/shaders/element_id.frag
         VERTEX_READS "semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::custom0)")
+    # App program using the lighting inputs and its own G-buffer stages (Metal).
+    campello_renderer_add_shader_program(
+        TARGET ${PROJECT_NAME}_test
+        NAME custom_lit
+        METAL test/shaders/custom_lit.metal
+        VERTEX_READS "semanticBit(VertexSemantic::position)")
     if(EMSCRIPTEN)
         # WebGPU: the suite is a web page, run in headless Chrome by
         # campello_gpu's tests/webgpu/run_in_browser.mjs (see test/webgpu/).

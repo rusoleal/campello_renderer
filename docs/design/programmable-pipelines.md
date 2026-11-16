@@ -185,6 +185,9 @@ The helper embeds the binaries in a header, as the library does for its own shad
 | FXAA | internal | — |
 | Depth-only (future: prepass, shadows) | — | needs a position-only version, which any position-carrying layout already allows |
 | Id (future: GPU picking) | — | separate target, own program |
+| G-buffer (`renderGBuffer()`, Metal) | built-in G-buffer stages | the program's own G-buffer stages if it has them (`ShaderProgramDesc::metalGBuffer*EntryPoint`), else the built-in ones |
+
+Lighting inputs: the effects the built-in PBR shader reads (sun visibility from the shadow maps or a ray traced mask, ray traced reflections, indirect diffuse, exposure) are exposed to app programs as structs and helpers in `program_interface.metal.h`, which `default.metal` includes too. See `docs/using-the-renderer.md`.
 
 - Programs with a non-default color target (an id program) are drawn in their own render call (`renderIds(target, ...)`), not mixed into the lit frame.
 - Culling (frustum, size), batching and transparency sorting stay program-agnostic. They only use bounds and the material's blend flag.
