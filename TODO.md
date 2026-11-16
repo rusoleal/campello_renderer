@@ -325,6 +325,16 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
 - [ ] **Upscaling** — temporal upscaling behind one interface: MetalFX (Apple), FSR (all GPUs),
       DLSS / XeSS where available; a built-in TAA-upscale fallback. Ray tracing at a lower
       internal resolution depends on it
+  - [x] Built-in temporal upscaler (Metal) — `Renderer::setRenderScale(0.25 .. 1)` with TAA: the
+        scene, G-buffer, ray traced effects and denoisers at the internal size; the TAA resolve
+        gathers the jittered samples by their distance in output pixels into an output-size
+        history (8 / scale^2 jitter positions). At half scale: 10.7 levels RMS from a 4x SSAA
+        reference, native TAA 10.4, bilinear 21.5. Without TAA: bilinear
+  - [ ] MetalFX temporal scaler (campello_gpu wrapper), then FSR / DLSS / XeSS on Vulkan /
+        DirectX, behind one interface
+  - [ ] The upscaler works on the tone-mapped image (as TAA): a linear (HDR) path; depth-based
+        disocclusion rejection; thin features in ray traced masks lose contrast at low scales
+        (the denoisers run at the internal size)
 - [ ] **Denoise-aware upscaling** (longer term) — DLSS Ray Reconstruction-style combined
       denoise + upscale where available
 - [x] **TAA** (Metal) — `setTemporalAntiAliasing()`: Halton(2, 3) jitter, the G-buffer's motion,

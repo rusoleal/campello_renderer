@@ -2023,15 +2023,22 @@ struct FxaaUniforms {
 };
 
 // ---------------------------------------------------------------------------
-// TAA resolve (Renderer::setTemporalAntiAliasing()): the history reprojected
-// by the G-buffer's motion, clamped to the current 3x3 neighbourhood's
-// spread in YCoCg (variance clipping, against ghosting), blended with the
-// current jittered frame. Writes the output and the next history.
+// TAA / temporal upscaling resolve (Renderer::setTemporalAntiAliasing(),
+// setRenderScale()): each output pixel gathers the 3 x 3 nearest pixels of
+// the frame (rendered at the internal size, jittered), each weighted by the
+// distance from its jittered sample to the output pixel's centre (Karis
+// 2014's Gaussian fit); the history (output size) reprojected along the
+// G-buffer's motion and clamped to the gathered neighbourhood's spread in
+// YCoCg (variance clipping, against ghosting); blended, the frame weighing
+// less where no sample fell near the pixel. At the same size, TAA. Writes
+// the output and the next history.
 // ---------------------------------------------------------------------------
 struct TaaUniforms {
-    float2 rcpFrame;
-    float  blend;         // the current frame's weight (e.g. 0.1)
+    float2 inputSize;     // the frame's (internal) size in pixels
+    float2 jitter;        // how far this frame's jitter moved the geometry, in input pixels (x right, y down)
+    float  blend;         // the frame's weight where a sample is at the pixel (e.g. 0.1)
     float  historyValid;  // 0: no history (first frame, cut, resize)
+    float2 outputSize;    // the output's size in pixels
 };
 
 struct TaaOut {
@@ -2053,23 +2060,43 @@ fragment TaaOut taaFragment(FxaaOut in [[stage_in]],
                             sampler linearSampler    [[sampler(3)]],
                             constant TaaUniforms &u  [[buffer(4)]])
 {
-    const float3 c = current.sample(linearSampler, in.uv).rgb;
-    float3 m1 = float3(0.0), m2 = float3(0.0);
+    // The output pixel's centre in input pixels, and the input pixel it's in.
+    const float2 p = in.uv * u.inputSize;
+    const int2 centre = int2(floor(p));
+    const int2 limit = int2(u.inputSize) - 1;
+    float3 sum = float3(0.0), m1 = float3(0.0), m2 = float3(0.0);
+    float weights = 0.0, nearest = 0.0;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
-            const float3 t = rgbToYCoCg(current.sample(linearSampler, in.uv + float2(dx, dy) * u.rcpFrame).rgb);
+            const int2 q = clamp(centre + int2(dx, dy), int2(0), limit);
+            const float3 c = current.read(uint2(q)).rgb;
+            // Where its sample was in the unjittered image: the jitter moved
+            // the geometry by +jitter, so the pixel saw what was at -jitter.
+            // The distance in output pixels: each frame contributes the
+            // samples that fell within about half an output pixel, and the
+            // history gathers them over the jitter sequence (sharp, not a
+            // blur of blurs).
+            const float2 d = (float2(q) + 0.5 - u.jitter - p) * (u.outputSize / u.inputSize);
+            const float w = exp(-2.29 * dot(d, d));
+            sum += w * c;
+            weights += w;
+            nearest = max(nearest, w);
+            const float3 t = rgbToYCoCg(c);
             m1 += t;
             m2 += t * t;
         }
     }
+    const float3 c = weights > 1e-6 ? sum / weights : current.read(uint2(clamp(centre, int2(0), limit))).rgb;
     const float3 mean = m1 / 9.0;
     const float3 sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
-    const uint2 pixel = min(uint2(in.position.xy), uint2(motion.get_width() - 1, motion.get_height() - 1));
-    const float2 previousUV = in.uv + motion.read(pixel).xy;
+    const uint2 motionPixel = min(uint2(in.uv * float2(motion.get_width(), motion.get_height())),
+                                  uint2(motion.get_width() - 1, motion.get_height() - 1));
+    const float2 previousUV = in.uv + motion.read(motionPixel).xy;
     float3 result = c;
     if (u.historyValid > 0.5 && all(previousUV >= 0.0) && all(previousUV <= 1.0)) {
-        const float3 h = clamp(rgbToYCoCg(history.sample(linearSampler, previousUV).rgb), mean - sigma, mean + sigma);
-        result = mix(yCoCgToRgb(h), c, u.blend);
+        const float3 h = clamp(rgbToYCoCg(history.sample(linearSampler, previousUV).rgb), mean - 1.5 * sigma, mean + 1.5 * sigma);
+        // Less of this frame where its nearest sample is far from the pixel.
+        result = mix(yCoCgToRgb(h), c, clamp(u.blend * nearest * 2.0, 0.0, 1.0));
     }
     return TaaOut{float4(result, 1.0), float4(result, 1.0)};
 }
@@ -2245,9 +2272,12 @@ fragment float4 ssaoApplyFragment(FxaaOut in [[stage_in]],
         return float4(1.0);
     }
     const float z = aoViewPos(u, in.uv, depth).z;
-    const int2 centre = int2(in.uv * u.size.zw);
-    const int2 limit = int2(u.size.zw) - 1;
-    const float2 px = 1.0 / u.size.zw;
+    // The AO texture at its own size (the frame's internal size with a
+    // render scale, or a mask's: setAmbientOcclusionMask()).
+    const float2 aoSize = float2(aoTex.get_width(), aoTex.get_height());
+    const int2 centre = int2(in.uv * aoSize);
+    const int2 limit = int2(aoSize) - 1;
+    const float2 px = 1.0 / aoSize;
     float sum = 0.0;
     float weight = 0.0;
     for (int y = -2; y < 2; ++y) {

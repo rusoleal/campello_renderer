@@ -659,6 +659,7 @@ namespace systems::leal::campello_renderer {
         OverlayCallback overlayCallback;
         bool fxaaEnabled = false;
         float ssaaScale = 1.0f;
+        float renderScale = 1.0f;  // setRenderScale()
 
         // IBL precompute outputs (Vulkan) — see bakeIblResources(). Sampled by
         // the PBR fragment shader in place of a raw environmentMap sample
@@ -1455,6 +1456,20 @@ namespace systems::leal::campello_renderer {
         bool isFxaaEnabled() const;
 
         void setSsaaScale(float scale);
+        /// Render scale (0.25 .. 1, default 1): the scene (and the G-buffer,
+        /// so the ray traced effects and denoisers that use it) is drawn at
+        /// this fraction of renderWidth x renderHeight in each direction and
+        /// scaled up to the output: with setTemporalAntiAliasing() on, by
+        /// the temporal upscaler (the frames' jittered samples accumulated at
+        /// the output size along the motion vectors: detail close to native
+        /// resolution after a few frames), else bilinearly. Ignored while
+        /// SSAA is on (setSsaaScale() > 1).
+        void setRenderScale(float scale);
+        float getRenderScale() const { return renderScale; }
+        /// The size the scene is drawn at (renderWidth x renderHeight times the
+        /// render scale; the G-buffer's size).
+        uint32_t internalWidth() const;
+        uint32_t internalHeight() const;
         /// Sun shadows: the first directional light with castShadows casts a
         /// shadow map over the opaque draws (Metal for now; supportsShadows()).
         /// On by default.
