@@ -375,7 +375,17 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
   - [ ] Sheen, clearcoat and anisotropy in the target function (they lose their direct light
         while `setDirectLighting()` is on); the transparent pass (still the light loop)
   - [ ] Light culling for thousands of lights (a light BVH or grid, see "Light lists")
-- [ ] **ReSTIR GI** — reuse of indirect light samples for one-bounce GI at about 1 sample per pixel
+- [x] **ReSTIR GI** (Metal) — `RestirGlobalIllumination` (`rt_effects.hpp`): one cosine-weighted
+      path per pixel from its own `PathTracer` (`traceGlobalIllumination()`, mode 4: the hit,
+      its normal, the radiance leaving it), resampled by the irradiance it brings, temporal reuse
+      (M capped at 30), spatial reuse while a history is short (reconnection Jacobian, a
+      visibility test for borrowed samples); irradiance for `setIndirectDiffuse()`. The DDGI
+      test's scene: relative error 2.31 with one path, 0.31 after 16 frames (reference: 256
+      frames of raw paths); the wall's red on the ground r 0.256 vs 0.241
+  - [ ] Specular indirect from the same samples (a glossy target function), replacing the
+        reflections pass for rough surfaces; a moving-camera test; temporal Jacobian
+  - [ ] Combine with DDGI: probes for the samples' further bounces and as a fallback where a
+        history is short
 - [ ] **Light lists / light BVH** for many-light sampling (point, spot, area, emissive meshes)
 
 **Global illumination without per-pixel path tracing**

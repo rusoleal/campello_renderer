@@ -31,6 +31,7 @@
 // Metal, where campello_gpu reports Feature::raytracing.
 
 #include <campello_renderer/campello_renderer.hpp>
+#include <campello_renderer/path_tracer.hpp>
 
 #include <cstdint>
 #include <map>
@@ -274,6 +275,93 @@ private:
     Settings settings_;
     uint32_t frame_ = 0;
     uint32_t surfaceIndex_ = 0;
+    bool historyValid_ = false;
+};
+
+/// One-bounce indirect light at one path per pixel: ReSTIR GI (Ouyang et
+/// al. 2021). Each frame its PathTracer traces one cosine-weighted path
+/// from every G-buffer pixel (PathTracer::traceGlobalIllumination(): the
+/// hit, its normal, the light leaving it, with the tracer's materials, sun,
+/// sky and emitters); the hits are resampled by the irradiance they bring,
+/// reused along the motion vectors and, while a pixel's history is short,
+/// from neighbours (with the reconnection's Jacobian and a visibility
+/// test). output() is the irradiance (rgba16float, the G-buffer's size:
+/// what a white diffuse surface reflects, linear, before exposure; noisy),
+/// for RealtimeDenoiser (demodulate off) and Renderer::setIndirectDiffuse()
+/// (as DdgiVolume's).
+///
+///   RestirGlobalIllumination gi(device, rtScene);
+///   // each frame:
+///   renderer.renderGBuffer(scene);
+///   gi.render(scene, renderer, renderer.gBuffer());
+///   denoiser.denoise(gi.output(), renderer.gBuffer(), scene.camera.projection);
+///   renderer.setIndirectDiffuse(denoiser.output());
+///
+/// Biased in the same, small ways as RestirDirectLighting. Metal,
+/// Feature::raytracing.
+class RestirGlobalIllumination {
+public:
+    struct Settings {
+        bool     temporal = true;        ///< Reuse the previous frame's reservoirs.
+        uint32_t temporalCap = 30;       ///< The history's weight, at most this many frames.
+        bool     spatial = true;         ///< Reuse neighbours' reservoirs while a history is short.
+        uint32_t spatialSamples = 4;     ///< Neighbours per pixel.
+        float    spatialRadius = 0.0f;   ///< In pixels; 0: 1% of the width, at least 2.
+        float    spatialHistory = 0.25f; ///< Neighbours only below this fraction of the cap.
+        uint32_t bounces = 1;            ///< The tracer's bounces after the hit.
+    };
+
+    /// `scene`: structures shared with other effects, for the visibility
+    /// tests (null: its own). The paths use the tracer's own structures.
+    explicit RestirGlobalIllumination(std::shared_ptr<systems::leal::campello_gpu::Device> device,
+                                      std::shared_ptr<RayTracingScene> scene = nullptr);
+    ~RestirGlobalIllumination();
+
+    [[nodiscard]] bool supported() const noexcept;
+
+    /// One frame for `gbuffer` (rendered this frame from `scene`).
+    /// Submitted, not waited for. Returns false without a G-buffer or
+    /// support.
+    bool render(const RenderScene& scene, const Renderer& renderer, const GBufferTargets& gbuffer);
+
+    [[nodiscard]] std::shared_ptr<systems::leal::campello_gpu::Texture> output() const noexcept {
+        return irradiance_;
+    }
+    void setSettings(const Settings& settings) noexcept {
+        settings_ = settings;
+    }
+    [[nodiscard]] const Settings& settings() const noexcept {
+        return settings_;
+    }
+    void reset() noexcept {
+        historyValid_ = false;
+    }
+    /// The tracer of the samples (its settings: sky and emitter sampling,
+    /// clamping, ...).
+    [[nodiscard]] PathTracer& tracer() noexcept {
+        return *tracer_;
+    }
+
+private:
+    bool ensureTargets(uint32_t width, uint32_t height);
+
+    std::shared_ptr<systems::leal::campello_gpu::Device> device_;
+    std::shared_ptr<RayTracingScene> scene_;
+    std::unique_ptr<PathTracer> tracer_;
+    std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> layout_;
+    std::shared_ptr<systems::leal::campello_gpu::RayTracingPipeline> initial_;
+    std::shared_ptr<systems::leal::campello_gpu::RayTracingPipeline> spatial_;
+    std::shared_ptr<systems::leal::campello_gpu::Buffer> uniforms_;
+    // Reservoirs (point, radiance, normal): this frame's and the last (the
+    // history), and the spatial pass's (not read back); surfaces.
+    std::shared_ptr<systems::leal::campello_gpu::Texture> reservoirs_[2][3];
+    std::shared_ptr<systems::leal::campello_gpu::Texture> scratch_[3];
+    std::shared_ptr<systems::leal::campello_gpu::Texture> surfaces_[2];
+    std::shared_ptr<systems::leal::campello_gpu::Texture> irradiance_;
+    std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;
+    Settings settings_;
+    uint32_t frame_ = 0;
+    uint32_t index_ = 0;
     bool historyValid_ = false;
 };
 

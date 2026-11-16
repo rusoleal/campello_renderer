@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### Added
+- **ReSTIR GI: one-bounce indirect light** (Metal, `Feature::raytracing`). `RestirGlobalIllumination` (`rt_effects.hpp`), after Ouyang et al. 2021, traces one cosine-weighted path per pixel from the G-buffer with its own `PathTracer`. The paths see the tracer's materials, sun, sky and emitters.
+  - The samples are resampled by the irradiance they bring and reused along the motion vectors (M capped at 30).
+  - While a pixel's history is short, neighbours' samples are reused too, with the reconnection's Jacobian and a visibility test.
+  - The output is irradiance, the same quantity as `DdgiVolume`'s, for `Renderer::setIndirectDiffuse()`. Denoise it with demodulation off.
+  - `Settings` covers temporal reuse and its cap, spatial reuse with its samples, radius and history limit, and bounces.
+  - In the DDGI test's scene (a red wall beside white ground under the sun), the relative error against 256 frames of raw paths is 2.31 with one path per pixel and 0.31 after 16 frames. The wall's red on the ground near it is r 0.256 against 0.241. Through the denoiser into the raster frame, that ground goes from red 206 to 232 with green unchanged.
+- **`PathTracer::traceGlobalIllumination()`** (mode 4): one cosine-weighted path per G-buffer pixel. `globalIlluminationSamples()` holds the radiance leaving the hit, its distance, and the direction and hit normal (octahedral); `setGlobalIlluminationBounces()` sets the bounces.
 - **ReSTIR DI: many dynamic lights** (Metal, `Feature::raytracing`). `RestirDirectLighting` (`rt_effects.hpp`), after Bitterli et al. 2020, lights every pixel from all of `RenderScene::lights` (directional, point, spot; every light casts shadows) with one shadow ray per pixel.
   - Each pixel draws 32 candidates by light power and resamples them by their unshadowed contribution, using the raster BRDF from the G-buffer. It traces the winner's visibility, then reuses the previous frame's reservoir along the motion vectors (M capped at 20 frames of candidates).
   - While a pixel's history is short, it also reuses neighbours' reservoirs (radius: 1% of the width). It then traces one shadow ray for the result.

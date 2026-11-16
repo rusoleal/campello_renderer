@@ -479,3 +479,265 @@ kernel void restirReference(RESTIR_PARAMETERS)
     }
     radianceOut.write(float4(radiance, 1.0), gid);
 }
+
+// ---------------------------------------------------------------------------
+// ReSTIR GI (RestirGlobalIllumination): one-bounce indirect light, after
+// Ouyang et al. 2021, "ReSTIR GI: Path Resampling for Real-Time Path
+// Tracing". A sample is a path's second vertex: its point, normal and the
+// radiance leaving it towards the pixel's surface (PathTracer::
+// traceGlobalIllumination(), one cosine-weighted ray per pixel). Reservoirs
+// keep one sample, resampled by the irradiance it brings (luminance x
+// cosine), reused over frames and, while a history is short, from
+// neighbours (with the reconnection's Jacobian and a visibility test).
+// Output: the irradiance (what a white diffuse surface reflects: the
+// irradiance map's and DdgiVolume's quantity), for Renderer::
+// setIndirectDiffuse().
+// ---------------------------------------------------------------------------
+
+struct GiUniforms {
+    float4x4 invViewProj;  // clip -> world (the G-buffer's camera)
+    float4   eye;          // xyz the camera
+    uint4    size;         // width, height, frame index, history valid
+    uint4    counts;       // x temporal M cap, y spatial samples
+    float4   params;       // x spatial radius (pixels), y temporal on, z spatial on, w spatial below this M
+};
+
+inline float3 giOctDecode(float2 p) {
+    float3 n = float3(p, 1.0 - abs(p.x) - abs(p.y));
+    if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return normalize(n);
+}
+
+struct GiSample {
+    float3 x;   // the second vertex
+    float3 n;   // its normal
+    float3 L;   // radiance leaving it towards the first
+};
+
+struct GiReservoir {
+    GiSample s;
+    float wSum;
+    float M;
+    float W;
+    float pHat;
+    bool  valid;
+};
+
+inline GiReservoir emptyGiReservoir() {
+    GiReservoir r;
+    r.s.x = float3(0.0);
+    r.s.n = float3(0.0);
+    r.s.L = float3(0.0);
+    r.wSum = 0.0;
+    r.M = 0.0;
+    r.W = 0.0;
+    r.pHat = 0.0;
+    r.valid = false;
+    return r;
+}
+
+// The sample's target at a surface (point p, normal n): the irradiance it
+// brings, as luminance.
+inline float giTarget(float3 p, float3 n, GiSample s) {
+    const float3 d = normalize(s.x - p);
+    return restirLuminance(s.L) * max(dot(n, d), 0.0);
+}
+
+inline void giAdd(thread GiReservoir& r, GiSample s, float weight, float pHat, float u) {
+    if (!(weight > 0.0)) return;
+    r.wSum += weight;
+    if (u * r.wSum < weight) {
+        r.s = s;
+        r.pHat = pHat;
+        r.valid = true;
+    }
+}
+
+inline void giFinalize(thread GiReservoir& r) {
+    r.W = (r.valid && r.pHat > 0.0 && r.M > 0.0) ? r.wSum / (r.M * r.pHat) : 0.0;
+}
+
+// The G-buffer's surface point and normal at a pixel; false: background.
+inline bool giSurface(uint2 gid, constant GiUniforms& u, texture2d<float> normalRoughness, depth2d<float> depthTexture,
+                      thread float3& p, thread float3& n) {
+    const float d = depthTexture.read(gid);
+    if (d >= 1.0) return false;
+    const float2 ndc = float2((float(gid.x) + 0.5) / float(u.size.x) * 2.0 - 1.0,
+                              1.0 - (float(gid.y) + 0.5) / float(u.size.y) * 2.0);
+    const float4 h = u.invViewProj * float4(ndc, d, 1.0);
+    p = h.xyz / h.w;
+    n = normalize(normalRoughness.read(gid).xyz);
+    return true;
+}
+
+#define RESTIR_GI_PARAMETERS                                                      \
+    instance_acceleration_structure scene            [[buffer(0)]],               \
+    constant GiUniforms&            u                [[buffer(1)]],               \
+    texture2d<float>                normalRoughness  [[texture(0)]],              \
+    depth2d<float>                  depthTexture     [[texture(1)]],              \
+    texture2d<float>                motion           [[texture(2)]],              \
+    texture2d<float>                samples          [[texture(3)]],              \
+    texture2d<float>                pointIn          [[texture(4)]],              \
+    texture2d<float>                radianceIn       [[texture(5)]],              \
+    texture2d<float>                normalIn         [[texture(6)]],              \
+    texture2d<float>                surfaceIn        [[texture(7)]],              \
+    texture2d<float, access::write> pointOut         [[texture(8)]],              \
+    texture2d<float, access::write> radianceOut      [[texture(9)]],              \
+    texture2d<float, access::write> normalOut        [[texture(10)]],             \
+    texture2d<float, access::write> surfaceOut       [[texture(11)]],             \
+    texture2d<float, access::write> irradianceOut    [[texture(12)]],             \
+    uint2 gid [[thread_position_in_grid]]
+
+// Reservoirs: point (xyz, W), radiance (rgb, M), normal (xyz, pHat).
+inline GiReservoir readGiReservoir(uint2 q, texture2d<float> pointIn, texture2d<float> radianceIn, texture2d<float> normalIn) {
+    const float4 a = pointIn.read(q), b = radianceIn.read(q), c = normalIn.read(q);
+    GiReservoir r = emptyGiReservoir();
+    r.s.x = a.xyz;
+    r.W = a.w;
+    r.s.L = b.rgb;
+    r.M = b.a;
+    r.s.n = c.xyz;
+    r.pHat = c.w;
+    r.valid = r.M > 0.0 && r.W > 0.0;
+    return r;
+}
+
+inline void writeGiReservoir(uint2 q, GiReservoir r, texture2d<float, access::write> pointOut,
+                             texture2d<float, access::write> radianceOut, texture2d<float, access::write> normalOut) {
+    pointOut.write(float4(r.s.x, r.valid ? r.W : 0.0), q);
+    radianceOut.write(float4(r.s.L, r.M), q);
+    normalOut.write(float4(r.s.n, r.pHat), q);
+}
+
+kernel void restirGiInitial(RESTIR_GI_PARAMETERS)
+{
+    if (gid.x >= u.size.x || gid.y >= u.size.y) return;
+    float3 p, n;
+    if (!giSurface(gid, u, normalRoughness, depthTexture, p, n)) {
+        writeGiReservoir(gid, emptyGiReservoir(), pointOut, radianceOut, normalOut);
+        surfaceOut.write(float4(0.0, 0.0, 0.0, -1.0), gid);
+        return;
+    }
+    // This frame's sample (cosine-weighted: pdf cos / pi).
+    const float4 a = samples.read(gid);
+    const float4 b = samples.read(gid + uint2(u.size.x, 0));
+    const float3 direction = giOctDecode(b.xy);
+    GiSample s;
+    s.x = p + direction * a.w;
+    s.n = giOctDecode(b.zw);
+    s.L = a.rgb;
+    GiReservoir r = emptyGiReservoir();
+    const float pHat = giTarget(p, n, s);
+    const float pdf = max(dot(n, direction), 0.0) / PI;
+    giAdd(r, s, pdf > 0.0 ? pHat / pdf : 0.0, pHat, 0.0);
+    r.M = 1.0;
+    giFinalize(r);
+    const float viewDepth = length(p - u.eye.xyz);
+    // Temporal: the previous frame's reservoir where this surface was.
+    if (u.params.y > 0.5 && u.size.w != 0) {
+        const float2 uv = (float2(gid) + 0.5) / float2(u.size.xy) + motion.read(gid).xy;
+        const int2 q = int2(floor(uv * float2(u.size.xy)));
+        if (all(q >= 0) && all(q < int2(u.size.xy))) {
+            const float4 previousSurface = surfaceIn.read(uint2(q));
+            if (previousSurface.w > 0.0 && similar(n, viewDepth, previousSurface.xyz, previousSurface.w)) {
+                GiReservoir prev = readGiReservoir(uint2(q), pointIn, radianceIn, normalIn);
+                if (prev.M > 0.0) {
+                    prev.M = min(prev.M, float(u.counts.x));
+                    GiReservoir c = emptyGiReservoir();
+                    if (r.valid) giAdd(c, r.s, r.pHat * r.W * r.M, r.pHat, 0.0);
+                    if (prev.valid) {
+                        const float prevPHat = giTarget(p, n, prev.s);
+                        giAdd(c, prev.s, prevPHat * prev.W * prev.M, prevPHat, random1(gid, u.size.z, 5001u));
+                    }
+                    c.M = r.M + prev.M;
+                    giFinalize(c);
+                    r = c;
+                }
+            }
+        }
+    }
+    writeGiReservoir(gid, r, pointOut, radianceOut, normalOut);
+    surfaceOut.write(float4(n, viewDepth), gid);
+}
+
+// The Jacobian of moving a sample's first vertex from `from` to `to`
+// (solid angle at the first vertex): the second vertex's cosine and
+// distance from each.
+inline float giJacobian(GiSample s, float3 from, float3 to) {
+    const float3 dTo = to - s.x, dFrom = from - s.x;
+    const float lenTo = length(dTo), lenFrom = length(dFrom);
+    const float cosTo = abs(dot(s.n, dTo / max(lenTo, 1e-6)));
+    const float cosFrom = abs(dot(s.n, dFrom / max(lenFrom, 1e-6)));
+    if (cosFrom <= 1e-4) return 0.0;
+    return (cosTo / cosFrom) * (lenFrom * lenFrom) / max(lenTo * lenTo, 1e-8);
+}
+
+kernel void restirGiSpatial(RESTIR_GI_PARAMETERS)
+{
+    if (gid.x >= u.size.x || gid.y >= u.size.y) return;
+    float3 p, n;
+    if (!giSurface(gid, u, normalRoughness, depthTexture, p, n)) {
+        writeGiReservoir(gid, emptyGiReservoir(), pointOut, radianceOut, normalOut);
+        irradianceOut.write(float4(0.0, 0.0, 0.0, 1.0), gid);
+        return;
+    }
+    const float viewDepth = length(p - u.eye.xyz);
+    const GiReservoir own = readGiReservoir(gid, pointIn, radianceIn, normalIn);
+    GiReservoir r = emptyGiReservoir();
+    if (own.valid) giAdd(r, own.s, own.pHat * own.W * own.M, own.pHat, 0.0);
+    r.M = own.M;
+    bool borrowed = false;
+    // Neighbours while the history is short (as ReSTIR DI).
+    if (u.params.z > 0.5 && own.M < u.params.w) {
+        for (uint k = 0; k < u.counts.y; ++k) {
+            const float angle = 2.0 * PI * random1(gid, u.size.z, 6000u + 2u * k);
+            const float radius = u.params.x * sqrt(random1(gid, u.size.z, 6001u + 2u * k));
+            const int2 q = int2(gid) + int2(round(float2(cos(angle), sin(angle)) * radius));
+            if (any(q < 0) || any(q >= int2(u.size.xy)) || all(q == int2(gid))) continue;
+            const float4 other = surfaceIn.read(uint2(q));
+            if (other.w <= 0.0 || !similar(n, viewDepth, other.xyz, other.w)) continue;
+            float3 pq, nq;
+            if (!giSurface(uint2(q), u, normalRoughness, depthTexture, pq, nq)) continue;
+            const GiReservoir nr = readGiReservoir(uint2(q), pointIn, radianceIn, normalIn);
+            if (!nr.valid) {
+                r.M += nr.M;
+                continue;
+            }
+            // The sample seen from here: its density changes by the Jacobian.
+            const float jacobian = giJacobian(nr.s, pq, p);
+            if (!(jacobian > 0.1 && jacobian < 10.0)) continue;
+            const float pHat = giTarget(p, n, nr.s);
+            const float before = r.wSum;
+            giAdd(r, nr.s, pHat / jacobian * nr.W * nr.M, pHat, random1(gid, u.size.z, 7000u + k));
+            if (r.wSum != before && r.s.x.x == nr.s.x.x && r.s.x.y == nr.s.x.y && r.s.x.z == nr.s.x.z) borrowed = true;
+            r.M += nr.M;
+        }
+    }
+    giFinalize(r);
+    // A neighbour's sample may be hidden from here: check, else keep our own.
+    if (borrowed && r.valid) {
+        const float3 toSample = r.s.x - p;
+        const float distance = length(toSample);
+        const float offset = max(1e-3, 2e-4 * viewDepth);
+        ray v;
+        v.origin = p + n * offset;
+        v.direction = toSample / max(distance, 1e-6);
+        v.min_distance = 1e-4;
+        v.max_distance = max(distance - 2.0 * offset, 1e-4);
+        intersector<instancing> isect;
+        isect.assume_geometry_type(geometry_type::triangle);
+        isect.force_opacity(forced_opacity::opaque);
+        isect.accept_any_intersection(true);
+        if (isect.intersect(v, scene, MASK_OPAQUE).type != intersection_type::none) {
+            r = own;
+            r.M = max(own.M, 1.0);
+        }
+    }
+    float3 irradiance = float3(0.0);
+    if (r.valid && r.W > 0.0) {
+        const float3 d = normalize(r.s.x - p);
+        irradiance = r.s.L * max(dot(n, d), 0.0) / PI * r.W;
+    }
+    writeGiReservoir(gid, r, pointOut, radianceOut, normalOut);
+    irradianceOut.write(float4(irradiance, 1.0), gid);
+}

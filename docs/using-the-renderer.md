@@ -63,6 +63,7 @@ use(tracer.output());
 | Ray traced reflections | `PathTracer::traceReflections()` → `setReflections()` | null (environment) | same | `campello::reflectedRadiance()` |
 | Probe GI (DDGI) | `DdgiVolume` → `setIndirectDiffuse()` | null (irradiance map) | same | `campello::indirectIrradiance()` |
 | Many lights (ReSTIR DI) | `RestirDirectLighting` → `setDirectLighting()` | null (4-light loop) | same | `campello::directRadiance()` |
+| One-bounce GI (ReSTIR GI) | `RestirGlobalIllumination` → `setIndirectDiffuse()` | null (irradiance map) | same | `campello::indirectIrradiance()` |
 | Real-time denoiser | `RealtimeDenoiser` | not run | Metal | — |
 
 The ray traced effects are classes you create and run. The renderer never runs them itself. Each one reads the G-buffer and writes a texture, and you hand that texture to the renderer. A frame with all of them looks like this:
@@ -85,6 +86,10 @@ renderer.setIndirectDiffuse(ddgi.irradiance());
 restir.render(scene, g);
 directDenoiser.denoise(restir.output(), g, scene.camera.projection);
 renderer.setDirectLighting(directDenoiser.output());
+// Indirect diffuse: DDGI (above) or ReSTIR GI, one of the two.
+// restirGi.render(scene, renderer, g);
+// giDenoiser.denoise(restirGi.output(), g, scene.camera.projection);  // demodulate off
+// renderer.setIndirectDiffuse(giDenoiser.output());
 renderer.render(scene, colorView);
 ```
 

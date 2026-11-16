@@ -791,6 +791,13 @@ inline void addLight(thread float3& radiance, float3 c, uint depth, float clampM
     radiance += c;
 }
 
+// Unit vector <-> [-1, 1]^2 (octahedral), as giOctDecode() in rt_effects.metal.
+inline float2 giOctEncode(float3 n) {
+    n /= abs(n.x) + abs(n.y) + abs(n.z);
+    const float2 s = float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return n.z >= 0.0 ? n.xy : (1.0 - abs(n.yx)) * s;
+}
+
 kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
                       device float4*                  accum      [[buffer(1)]],
                       constant TraceUniforms&         u          [[buffer(2)]],
@@ -823,12 +830,21 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
     // Probe rays (mode 3): x a ray, y a probe; the radiance and the first
     // hit's distance go to reflectionOut.
     const bool probes = u.size.w == 3u;
+    // Indirect light samples (PathTracer::traceGlobalIllumination(), mode
+    // 4): as reflections, the direction cosine-weighted; the radiance and
+    // the hit's distance go to reflectionOut's left half, the hit's normal
+    // to its right half.
+    const bool gi = u.size.w == 4u;
+    const bool fromGBuffer = reflections || gi;
+    float3 firstHitNormal = float3(0.0);
+    float3 firstDirection = float3(0.0);
     float3 surfaceP = float3(0.0), surfaceN = float3(0.0), surfaceV = float3(0.0);
     float surfaceAlpha = 0.0;
-    if (reflections) {
+    if (fromGBuffer) {
         const float d = gbufferDepth.read(gid);
         if (d >= 1.0) {
             reflectionOut.write(float4(0.0), gid);  // background: no surface
+            if (gi) reflectionOut.write(float4(0.0), gid + uint2(u.size.x, 0));
             return;
         }
         const float2 ndc0 = float2((float(gid.x) + 0.5) / float(u.size.x) * 2.0 - 1.0,
@@ -847,7 +863,7 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
     const uint firstSample = uint(u.params.w);
     const uint pixel = gid.y * u.size.x + gid.x;
     // (The other modes don't accumulate: their grids aren't the image's.)
-    const bool accumulates = !reflections && !probes;
+    const bool accumulates = !fromGBuffer && !probes;
     const float4 before = firstSample == 0 || !accumulates ? float4(0.0) : accum[pixel];
     const float momentBefore = firstSample == 0 || !accumulates ? 0.0 : moments[pixel];
     // Adaptive sampling (setNoiseTarget()): a pixel whose average's
@@ -885,7 +901,19 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
                                   1.0 - (float(gid.y) + jitter.y) / float(u.size.y) * 2.0);
         float3 origin;
         float3 direction;
-        if (reflections) {
+        if (gi) {
+            // Cosine-weighted about the surface's normal.
+            const float2 l = sample2D(rs, DIM_LENS);
+            float3 t, b;
+            const float3 helper = abs(surfaceN.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+            t = normalize(cross(helper, surfaceN));
+            b = cross(surfaceN, t);
+            const float radial = sqrt(l.x);
+            const float phi = 2.0 * PI * l.y;
+            direction = normalize(t * (radial * cos(phi)) + b * (radial * sin(phi)) + surfaceN * sqrt(max(0.0, 1.0 - l.x)));
+            firstDirection = direction;
+            origin = surfaceP + surfaceN * max(1e-3, 2e-4 * length(surfaceP - u.cameraPos.xyz));
+        } else if (reflections) {
             // A GGX half vector (the surface's roughness) mirrors the view
             // direction; directions under the surface take the mirror one.
             const float2 l = sample2D(rs, DIM_LENS);
@@ -991,7 +1019,7 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
         float3 misOrigin = float3(0.0);  // that vertex (the sky's light density depends on where from)
         uint pathVertex = 0u;
         // (Reflections and probes: indirect light, as from a bounce.)
-        for (uint bounce = reflections || probes ? 1u : 0u; bounce <= maxBounces; ++bounce, ++pathVertex) {
+        for (uint bounce = fromGBuffer || probes ? 1u : 0u; bounce <= maxBounces; ++bounce, ++pathVertex) {
             ray r;
             r.origin = origin;
             r.direction = direction;
@@ -1025,6 +1053,7 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
                                                 dot(inst.normalMatrix2.xyz, objectNormal)));
             const bool backFace = dot(ng0, direction) > 0.0;
             const float3 ng = backFace ? -ng0 : ng0;  // geometric, two-sided: towards the incoming ray
+            if (pathVertex == 0u) firstHitNormal = ng;
             const float3 p = origin + direction * hit.distance;
             const float3 v = -direction;
             const uint tri = inst.normalOffset + hit.primitive_id;
@@ -1302,6 +1331,13 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
         normalSum += firstNormal;
     }
 
+    if (gi) {
+        reflectionOut.write(float4(radianceSum, firstHitDistance), gid);
+        // Unit vectors, octahedral: the direction, the hit's normal (the sky: facing back).
+        const float3 hitNormal = any(firstHitNormal != 0.0) ? firstHitNormal : -firstDirection;
+        reflectionOut.write(float4(giOctEncode(firstDirection), giOctEncode(hitNormal)), gid + uint2(u.size.x, 0));
+        return;
+    }
     if (reflections || probes) {
         reflectionOut.write(float4(radianceSum, probes ? firstHitDistance : 1.0), gid);
         return;
