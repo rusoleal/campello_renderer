@@ -9871,7 +9871,7 @@ void Renderer::render(const RenderScene& scene,
 #else
         // Completed (fence waited): its GPU time is available now.
         if (const uint64_t ns = frame.commandBuffer->getGPUExecutionTime()) {
-            gpuFrameTimeMs = static_cast<double>(ns) / 1.0e6;
+            (frame.gbuffer ? gbufferGpuTimeMs : gpuFrameTimeMs) = static_cast<double>(ns) / 1.0e6;
         }
 #endif
         frame.commandBuffer.reset();
@@ -11056,6 +11056,7 @@ void Renderer::render(const RenderScene& scene,
     encodeAmbientOcclusion(encoder, colorView, scene.camera.projection);
 
     frame.commandBuffer = encoder->finish();
+    frame.gbuffer = gbufferPassActive;
     device->submit(frame.commandBuffer, frame.fence);
 #if defined(__EMSCRIPTEN__)
     if (frame.commandBuffer) {
@@ -11068,6 +11069,7 @@ void Renderer::render(const RenderScene& scene,
 
     // Stats
     lastFrameStats.gpuFrameTimeMs = gpuFrameTimeMs;
+    lastFrameStats.gbufferGpuTimeMs = gbufferGpuTimeMs;
     lastFrameStats.opaqueDrawCount = (uint32_t)scene.opaque.size();
     lastFrameStats.transparentDrawCount = (uint32_t)scene.transparent.size();
     lastFrameStats.totalDrawCount = lastFrameStats.opaqueDrawCount + lastFrameStats.transparentDrawCount;

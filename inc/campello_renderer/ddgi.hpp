@@ -22,6 +22,7 @@
 // Metal, where PathTracer is supported.
 
 #include <campello_renderer/campello_renderer.hpp>
+#include <campello_renderer/gpu_timing.hpp>
 
 #include <array>
 #include <cstdint>
@@ -101,6 +102,11 @@ public:
     void reset() noexcept {
         historyValid_ = false;
     }
+    /// GPU time of the last finished update() and resolve() (ms; the probe
+    /// rays are the PathTracer's: its stats()).
+    [[nodiscard]] double gpuTimeMs() const {
+        return updateTiming_.ms() + resolveTiming_.ms();
+    }
     /// update() calls so far.
     [[nodiscard]] uint32_t frames() const noexcept {
         return frame_;
@@ -125,6 +131,7 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::Texture> irradiance_;
     std::shared_ptr<systems::leal::campello_gpu::Buffer> updateUniforms_, resolveUniforms_;
     std::shared_ptr<systems::leal::campello_gpu::Fence> pendingUpdate_, pendingResolve_;
+    GpuTiming updateTiming_, resolveTiming_;
     Grid grid_;
     float rotation_[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};  // this frame's ray rotation
     uint32_t historyIndex_ = 0;

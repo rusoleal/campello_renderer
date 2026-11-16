@@ -20,6 +20,7 @@
 // background pixels (nothing in the G-buffer) pass through. Metal for now.
 
 #include <campello_renderer/campello_renderer.hpp>
+#include <campello_renderer/gpu_timing.hpp>
 
 #include <array>
 #include <cstdint>
@@ -63,6 +64,10 @@ public:
     /// Forgets the history (a camera cut, a new scene).
     void reset() noexcept {
         historyValid_ = false;
+    }
+    /// GPU time of the last finished denoise() (ms; 0 before one finishes).
+    [[nodiscard]] double gpuTimeMs() const {
+        return timing_.ms();
     }
 
     struct Settings {
@@ -121,6 +126,7 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::Texture> output_;
     std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, 8> uniforms_;  // per pass of a frame
     std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;                 // the last frame's work
+    GpuTiming timing_;
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     uint32_t historyIndex_ = 0;  // the history being read this frame

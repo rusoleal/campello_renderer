@@ -418,10 +418,20 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
       opacity micromaps where the hardware supports them
 
 **Budgets and scaling**
-- [ ] **Quality presets** (off / low / medium / high / path traced) mapping to effects, rays per
-      pixel, internal resolution and denoiser settings
-- [ ] **Per-effect GPU timing** (timestamp queries) in `RenderStats`, and dynamic resolution
-      driven by frame time
+- [x] **Quality presets** — `RealtimeEffects` (`realtime_effects.hpp`): `EffectQuality` off / low /
+      medium / high / ultra choosing the ray traced effects (each denoised and handed to the
+      renderer) and the render scale; `Settings` changes them one by one; raster only without
+      `Feature::raytracing`
+  - [ ] A "path traced" preset (ReSTIR DI + GI with more bounces, no raster lighting); DDGI as an
+        alternative to ReSTIR GI (needs a grid: a scene-bounds fit); per-effect resolution
+        (reflections / GI at half the internal size)
+- [x] **Per-effect GPU timing and dynamic resolution** — `gpuTimeMs()` on every effect and the
+      denoiser (`GpuTiming`: command buffer GPU time, not waiting), `PathTracer::passGpuTimeMs()`,
+      `RenderStats::gbufferGpuTimeMs`; `RealtimeEffects::timings()` and `setFrameBudget(ms,
+      minScale)` (render scale steps of 0.05, at most every 8 frames). Ultra at 64 x 64 on the
+      UHD 630: 6.9 ms (denoising 2.3, GI 1.4, reflections 1.1)
+  - [ ] Timestamp queries inside one command buffer (per pass rather than per submission), on
+        every backend; budget per effect (lower rays / candidates before the resolution)
 - [ ] **Stable frame pacing** — fixed cost per frame (no work that grows with time spent still,
       unlike the viewer's accumulation); BLAS builds spread over frames when streaming geometry
 

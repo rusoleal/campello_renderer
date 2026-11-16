@@ -32,6 +32,7 @@
 
 #include <campello_renderer/campello_renderer.hpp>
 #include <campello_renderer/path_tracer.hpp>
+#include <campello_renderer/gpu_timing.hpp>
 
 #include <cstdint>
 #include <map>
@@ -112,6 +113,10 @@ public:
     [[nodiscard]] uint32_t transformRebuilds() const noexcept {
         return scene_ ? scene_->transformRebuilds() : 0;
     }
+    /// GPU time of the last finished trace() (ms; 0 before one finishes).
+    [[nodiscard]] double gpuTimeMs() const {
+        return timing_.ms();
+    }
 
 protected:
     RayTracedEffect(std::shared_ptr<systems::leal::campello_gpu::Device> device, std::shared_ptr<RayTracingScene> scene,
@@ -127,6 +132,7 @@ protected:
     std::shared_ptr<systems::leal::campello_gpu::Buffer> uniforms_;
     std::shared_ptr<systems::leal::campello_gpu::Texture> output_;
     std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;
+    GpuTiming timing_;
     uint32_t frame_ = 0;
 };
 
@@ -251,6 +257,10 @@ public:
     void reset() noexcept {
         historyValid_ = false;
     }
+    /// GPU time of the last finished render() (ms; 0 before one finishes).
+    [[nodiscard]] double gpuTimeMs() const {
+        return timing_.ms();
+    }
     [[nodiscard]] const std::shared_ptr<RayTracingScene>& scene() const noexcept {
         return scene_;
     }
@@ -272,6 +282,7 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::Texture> surfaces_[2];  // normal + view depth, this frame's and the last
     std::shared_ptr<systems::leal::campello_gpu::Texture> radiance_;
     std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;
+    GpuTiming timing_;
     Settings settings_;
     uint32_t frame_ = 0;
     uint32_t surfaceIndex_ = 0;
@@ -336,6 +347,11 @@ public:
     void reset() noexcept {
         historyValid_ = false;
     }
+    /// GPU time of the last finished render() (ms; 0 before one finishes):
+    /// its paths and its resampling.
+    [[nodiscard]] double gpuTimeMs() const {
+        return timing_.ms() + (tracer_ ? tracer_->passGpuTimeMs() : 0.0);
+    }
     /// The tracer of the samples (its settings: sky and emitter sampling,
     /// clamping, ...).
     [[nodiscard]] PathTracer& tracer() noexcept {
@@ -359,6 +375,7 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::Texture> surfaces_[2];
     std::shared_ptr<systems::leal::campello_gpu::Texture> irradiance_;
     std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;
+    GpuTiming timing_;
     Settings settings_;
     uint32_t frame_ = 0;
     uint32_t index_ = 0;

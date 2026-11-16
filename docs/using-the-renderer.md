@@ -95,6 +95,29 @@ renderer.render(scene, colorView);
 
 Leave any line out and that effect falls back to its classic version. Shadows, AO and the path tracer's effects can share acceleration structures through one `RayTracingScene`.
 
+### The same chain with presets
+
+`RealtimeEffects` (`realtime_effects.hpp`) runs this chain for you. `EffectQuality` chooses the effects and the render scale:
+
+| Preset | Effects | Render scale |
+|---|---|---|
+| `off` | raster only (shadow maps, SSAO if on, the environment) | 1 |
+| `low` | ray traced sun shadows | 0.5 |
+| `medium` | + ray traced AO | 0.58 |
+| `high` | AO, reflections, ReSTIR DI (every light shadowed) | 0.67 |
+| `ultra` | + ReSTIR GI | 0.75 |
+
+```cpp
+RealtimeEffects effects(renderer);
+effects.setQuality(EffectQuality::high);   // or setSettings() effect by effect
+effects.setFrameBudget(16.0);              // dynamic resolution: render scale down to 0.5 to fit
+// each frame
+effects.render(scene, colorView);
+auto t = effects.timings();                // GPU ms per effect, the last finished frame
+```
+
+Without `Feature::raytracing` the presets fall back to raster only. MetalFX is the upscaler wherever it's supported. While `RealtimeEffects` is in use it owns the renderer's effect inputs (`setShadowMask()` and the rest). Each effect also reports its own `gpuTimeMs()`.
+
 ## 3. Custom shading
 
 `registerProgram(desc)` loads your shaders (`program.hpp`) and returns a handle. Set `GpuMaterial::program` to that handle to draw the material with them. You can write one source in Slang for every backend, or one file per backend, and compile it with `campello_renderer_add_shader_program()` (CMake). Programs draw in the opaque and transparent passes, follow the material's culling and blending, and can read the built-in material and frame bindings.

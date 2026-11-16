@@ -7,6 +7,7 @@
 #include <campello_renderer/path_tracer.hpp>
 #include <campello_renderer/realtime_denoiser.hpp>
 #include <campello_renderer/rt_effects.hpp>
+#include <campello_renderer/realtime_effects.hpp>
 #include <campello_renderer/ddgi.hpp>
 #include <gltf/gltf.hpp>
 #include <algorithm>
@@ -4969,6 +4970,145 @@ TEST_F(OffscreenRenderTest, RestirGlobalIlluminationConverges) {
                 pixel(lit, 15, 32, 0), pixel(plain, 15, 32, 1), pixel(lit, 15, 32, 1));
     EXPECT_GT(pixel(lit, 15, 32, 0), pixel(plain, 15, 32, 0) + 5) << "the bounced red light";
     EXPECT_NEAR(pixel(lit, 15, 32, 1), pixel(plain, 15, 32, 1), 4) << "little green";
+}
+
+// Quality presets: each level adds effects (none at off), the render
+// scale grows with the level.
+TEST(RealtimeEffects, PresetsAddEffectsLevelByLevel) {
+    using S = RealtimeEffects::Settings;
+    const auto count = [](const S& s) {
+        return int(s.shadows) + int(s.ambientOcclusion) + int(s.reflections) + int(s.directLighting) + int(s.globalIllumination);
+    };
+    const EffectQuality levels[] = {EffectQuality::off, EffectQuality::low, EffectQuality::medium, EffectQuality::high,
+                                    EffectQuality::ultra};
+    EXPECT_EQ(count(RealtimeEffects::settingsFor(EffectQuality::off)), 0);
+    EXPECT_EQ(RealtimeEffects::settingsFor(EffectQuality::off).renderScale, 1.0f);
+    for (int i = 1; i < 5; ++i) {
+        const S lower = RealtimeEffects::settingsFor(levels[i - 1]), higher = RealtimeEffects::settingsFor(levels[i]);
+        if (i > 1) EXPECT_GE(higher.renderScale, lower.renderScale);
+        EXPECT_GE(count(higher), count(lower)) << "level " << i;
+        EXPECT_TRUE(higher.temporalAntiAliasing);
+    }
+    EXPECT_TRUE(RealtimeEffects::settingsFor(EffectQuality::high).directLighting);
+    EXPECT_TRUE(RealtimeEffects::settingsFor(EffectQuality::ultra).globalIllumination);
+}
+
+// RealtimeEffects end to end: the preset's effects run and report GPU
+// times (the off ones 0), the frame is drawn; a tiny frame budget lowers
+// the render scale to its minimum, a generous one raises it back.
+TEST_F(OffscreenRenderTest, RealtimeEffectsRunPresetsWithTimingsAndBudget) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setSkyboxEnabled(false);
+    RealtimeEffects effects(*renderer);
+    if (!effects.raytracingSupported()) {
+        effects.setQuality(EffectQuality::ultra);
+        EXPECT_FALSE(effects.settings().shadows || effects.settings().directLighting) << "no ray tracing: raster only";
+        GTEST_SKIP() << "No ray tracing on this device";
+    }
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.8, 0.8, 1], "metallicFactor": 0, "roughnessFactor": 0.6}}]})",
+                                    kNoOpLoader);
+    GpuMaterial* grey = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    grey->doubleSided = true;
+    const auto quad = [&](float y, float half) {
+        std::vector<float> positions = {-half, y, -half, half, y, -half, half, y, half, -half, y, half};
+        std::vector<float> normals = {0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0};
+        std::vector<uint32_t> indices = {0, 2, 1, 0, 3, 2};
+        auto mesh = std::make_unique<GpuMesh>();
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+            device->createBuffer(normals.size() * 4, GPU::BufferUsage::vertex, normals.data());
+        mesh->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh->indexCount = 6;
+        mesh->indexFormat = GPU::IndexFormat::uint32;
+        mesh->vertexCount = 4;
+        mesh->setBoundsFromPositions(positions.data(), 4);
+        return mesh;
+    };
+    auto ground = quad(0.0f, 2.0f);
+    auto plate = quad(0.5f, 0.4f);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 2.5, 2.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 2.5, 2.5);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.2, -1.0, -0.1);
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 2.0f;
+    sun.castShadows = true;
+    scene.lights.push_back(sun);
+    for (GpuMesh* mesh : {ground.get(), plate.get()}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = grey;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    const auto frames = [&](int n) {
+        for (int i = 0; i < n; ++i) effects.render(scene, view);
+        device->waitForIdle();
+        return effects.timings();
+    };
+    const auto print = [](const char* name, const RealtimeEffects::Timings& t) {
+        std::printf("[RealtimeEffects] %s: gbuffer %.3f shadows %.3f ao %.3f reflections %.3f direct %.3f gi %.3f "
+                    "denoise %.3f raster %.3f total %.3f ms\n",
+                    name, t.gbuffer, t.shadows, t.ambientOcclusion, t.reflections, t.directLighting, t.globalIllumination,
+                    t.denoise, t.raster, t.total);
+    };
+    effects.setQuality(EffectQuality::medium);
+    EXPECT_EQ(renderer->getRenderScale(), 1.0f) << "applied at render()";
+    auto t = frames(4);
+    print("medium", t);
+    EXPECT_FLOAT_EQ(renderer->getRenderScale(), 0.58f);
+    EXPECT_GT(t.shadows, 0.0);
+    EXPECT_GT(t.ambientOcclusion, 0.0);
+    EXPECT_GT(t.denoise, 0.0);
+    EXPECT_GT(t.gbuffer, 0.0);
+    EXPECT_GT(t.raster, 0.0);
+    EXPECT_EQ(t.directLighting, 0.0) << "off at medium";
+    EXPECT_EQ(t.globalIllumination, 0.0);
+    const auto image = readBackPixels(tex);
+    int lit = 0;
+    for (size_t i = 0; i < image.size(); i += 4) lit += image[i] > 30;
+    EXPECT_GT(lit, 1000) << "the frame is drawn";
+
+    effects.setQuality(EffectQuality::ultra);
+    t = frames(4);
+    print("ultra", t);
+    EXPECT_GT(t.reflections, 0.0);
+    EXPECT_GT(t.directLighting, 0.0);
+    EXPECT_GT(t.globalIllumination, 0.0);
+    EXPECT_EQ(t.shadows, 0.0) << "ReSTIR DI shadows every light instead";
+    EXPECT_NEAR(t.total, t.gbuffer + t.shadows + t.ambientOcclusion + t.reflections + t.directLighting + t.globalIllumination +
+                             t.denoise + t.raster, 1e-9);
+
+    // Dynamic resolution.
+    effects.setFrameBudget(0.001, 0.5f);  // unreachable
+    frames(64);
+    std::printf("[RealtimeEffects] tiny budget: scale %.2f; ", effects.renderScale());
+    EXPECT_FLOAT_EQ(effects.renderScale(), 0.5f) << "down to the minimum";
+    effects.setFrameBudget(10000.0, 0.5f);
+    frames(64);
+    std::printf("generous budget: scale %.2f\n", effects.renderScale());
+    EXPECT_FLOAT_EQ(effects.renderScale(), 0.75f) << "back up to the preset's";
+
+    effects.setQuality(EffectQuality::off);
+    effects.setFrameBudget(0.0);
+    t = frames(2);
+    EXPECT_EQ(t.shadows + t.ambientOcclusion + t.reflections + t.directLighting + t.globalIllumination + t.denoise, 0.0);
+    EXPECT_FLOAT_EQ(renderer->getRenderScale(), 1.0f);
 }
 
 TEST_F(OffscreenRenderTest, DdgiDoesNotLeakThroughWalls) {
