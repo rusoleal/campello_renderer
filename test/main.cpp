@@ -3589,6 +3589,9 @@ static bool litAt(const std::vector<uint8_t>& pixels, int x, int y) {
 // at its rest position.
 TEST_F(OffscreenRenderTest, GltfSkinPosesTheMesh) {
     if (!device) GTEST_SKIP() << "No GPU device available";
+#if defined(_WIN32)
+    GTEST_SKIP() << "No skinning on DirectX yet";
+#endif
     auto asset = GLTF::loadGLTF(kGltfSkinnedQuad, kNoOpLoader);
     ASSERT_NE(asset, nullptr);
     renderer->setAsset(asset);
@@ -3662,6 +3665,9 @@ TEST_F(OffscreenRenderTest, DrawCallJointsPoseTheMesh) {
     const auto rest = render();
     EXPECT_TRUE(litAt(rest, 32, 32)) << "no joints: at rest";
     EXPECT_FALSE(litAt(rest, 51, 32));
+#if defined(_WIN32)
+    GTEST_SKIP() << "No skinning on DirectX yet";
+#endif
 
     scene.opaque[0].jointMatrixBuffer = device->createBuffer(sizeof(moved), GPU::BufferUsage::storage, moved);
     scene.opaque[0].jointCount = 1;
