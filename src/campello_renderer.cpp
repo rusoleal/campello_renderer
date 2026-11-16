@@ -5887,6 +5887,7 @@ void Renderer::resize(uint32_t width, uint32_t height) {
     }
     std::cout << "[Renderer::resize] " << renderWidth << "x" << renderHeight
               << " → " << width << "x" << height << std::endl;
+    metalFxFailed = false;  // (new sizes: setUpscaler()'s MetalFX may take them)
     renderWidth  = width;
     renderHeight = height;
 
@@ -5929,6 +5930,14 @@ uint32_t Renderer::sceneTargetWidth() const {
         return std::max(1u, (uint32_t)((float)renderWidth * ssaaScale));
     }
     return internalWidth();
+}
+
+bool Renderer::supportsUpscaler(Upscaler value) const {
+    switch (value) {
+        case Upscaler::builtin: return pipelineTaa != nullptr;
+        case Upscaler::metalFX: return device && device->supportsTemporalUpscaler() && pipelineTaa != nullptr;
+    }
+    return false;
 }
 
 uint32_t Renderer::internalWidth() const {
@@ -8649,6 +8658,7 @@ void Renderer::setRenderScale(float scale) {
     if (scale == renderScale) return;
     renderScale = scale;
     taaHistoryValid = false;
+    metalFxFailed = false;
     // As setSsaaScale(): the scene target's size changed.
     invalidatePostProcessBindGroups();
     ensureDepthTexture();
@@ -10899,7 +10909,82 @@ void Renderer::render(const RenderScene& scene,
     // TAA resolve (when enabled): the frame and the reprojected history into
     // colorView and the next history.
     // ------------------------------------------------------------------
-    if (useTaa) {
+    bool upscaledByMetalFx = false;
+    if (useTaa && upscaler == Upscaler::metalFX && !metalFxFailed && device->supportsTemporalUpscaler() &&
+        gbufferTargets.depth && pipelineDownsample && downsampleBindGroupLayout) {
+        // MetalFX: the jittered frame, the G-buffer's depth (drawn with the
+        // same jitter) and motion (uv units, pointing to the previous
+        // position) into its output at the target size, then copied to it.
+        const uint32_t iw = sceneTargetWidth(), ih = sceneTargetHeight();
+        const auto& current = metalFxUpscaler ? metalFxUpscaler->getDescriptor() : GPU::TemporalUpscalerDescriptor{};
+        if (!metalFxUpscaler || current.inputWidth != iw || current.inputHeight != ih || current.outputWidth != renderWidth ||
+            current.outputHeight != renderHeight || current.colorFormat != cachedColorFormat) {
+            GPU::TemporalUpscalerDescriptor d;
+            d.inputWidth = iw;
+            d.inputHeight = ih;
+            d.outputWidth = renderWidth;
+            d.outputHeight = renderHeight;
+            d.colorFormat = cachedColorFormat;
+            d.outputFormat = cachedColorFormat;
+            d.depthFormat = GPU::PixelFormat::depth32float;
+            d.motionFormat = GPU::PixelFormat::rg16float;
+            metalFxUpscaler = device->createTemporalUpscaler(d);
+            metalFxOutput = metalFxUpscaler
+                                ? device->createTexture(GPU::TextureType::tt2d, cachedColorFormat, renderWidth, renderHeight, 1, 1,
+                                                        1,
+                                                        (GPU::TextureUsage)(uint32_t(metalFxUpscaler->outputUsage()) |
+                                                                            uint32_t(GPU::TextureUsage::textureBinding)))
+                                : nullptr;
+            if (!metalFxUpscaler || !metalFxOutput) {
+                metalFxUpscaler = nullptr;
+                metalFxOutput = nullptr;
+                metalFxFailed = true;  // (until setUpscaler() again)
+            }
+            taaHistoryValid = false;
+        }
+        if (metalFxUpscaler) {
+            GPU::TemporalUpscaleInputs inputs;
+            inputs.color = sceneColorTexture[currentFrameIndex];
+            inputs.depth = gbufferTargets.depth;
+            inputs.motion = gbufferTargets.motion;
+            inputs.output = metalFxOutput;
+            // The jitter in input pixels, y down (as the built-in resolve's).
+            inputs.jitterX = (float)(taaJitter[0] * iw * 0.5);
+            inputs.jitterY = (float)(-taaJitter[1] * ih * 0.5);
+            inputs.motionScaleX = (float)iw;
+            inputs.motionScaleY = (float)ih;
+            inputs.reset = !taaHistoryValid || lastUpscaler != Upscaler::metalFX;
+            encoder->encodeTemporalUpscale(metalFxUpscaler, inputs);
+            GPU::BindGroupDescriptor cDesc{};
+            cDesc.layout = downsampleBindGroupLayout;
+            cDesc.entries = {{0, metalFxOutput}, {1, fxaaSampler}};
+            auto group = device->createBindGroup(cDesc);
+            GPU::ColorAttachment ca{};
+            ca.view = colorView;
+            ca.loadOp = GPU::LoadOp::clear;
+            ca.storeOp = GPU::StoreOp::store;
+            ca.depthSlice = 0;
+            GPU::BeginRenderPassDescriptor cRpDesc{};
+            cRpDesc.colorAttachments = {ca};
+            if (group) {
+                if (auto cRpe = encoder->beginRenderPass(cRpDesc)) {
+                    cRpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
+                    cRpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
+                    cRpe->setPipeline(pipelineDownsample);
+                    cRpe->setBindGroup(0, group);
+                    cRpe->draw(3);
+                    cRpe->end();
+                }
+            }
+            taaHistoryValid = true;
+            upscaledByMetalFx = true;
+            lastUpscaler = Upscaler::metalFX;
+            ++taaFrame;
+        }
+    }
+    if (useTaa && !upscaledByMetalFx) {
+        if (lastUpscaler != Upscaler::builtin) taaHistoryValid = false;
+        lastUpscaler = Upscaler::builtin;
         const uint32_t w = renderWidth, h = renderHeight;
         if (!taaHistory[0] || taaHistory[0]->getWidth() != w || taaHistory[0]->getHeight() != h) {
             for (size_t k = 0; k < 2; ++k) {

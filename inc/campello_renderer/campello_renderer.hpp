@@ -213,6 +213,12 @@ namespace systems::leal::campello_renderer {
     /// in submission order (most desktop GPUs; tile-based Apple GPUs remove
     /// hidden surfaces themselves).
     enum class OpaqueOrder { byState, frontToBack };
+    /// The temporal anti-aliasing / upscaling implementation
+    /// (Renderer::setUpscaler()). `builtin`: the renderer's own resolve
+    /// (every backend with a G-buffer). `metalFX`: Apple's MetalFX temporal
+    /// scaler (Metal, macOS 13 / iOS 16 and later; campello_gpu's
+    /// TemporalUpscaler).
+    enum class Upscaler { builtin, metalFX };
     struct RenderStats {
         uint32_t opaqueDrawCount = 0;
         uint32_t transparentDrawCount = 0;
@@ -612,6 +618,14 @@ namespace systems::leal::campello_renderer {
         bool taaJitterActive = false;  // this frame's draws (main and G-buffer pass) are jittered
         double taaJitter[2] = {0.0, 0.0};  // clip x / w, clip y / w
         uint32_t taaFrame = 0;
+        // setUpscaler(): the selected implementation; MetalFX's scaler (made
+        // for the current sizes and format) and the output it writes, copied
+        // to the frame's target.
+        Upscaler upscaler = Upscaler::builtin;
+        std::shared_ptr<systems::leal::campello_gpu::TemporalUpscaler> metalFxUpscaler;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> metalFxOutput;
+        bool metalFxFailed = false;  // the scaler couldn't be made for these sizes: builtin (until they change)
+        Upscaler lastUpscaler = Upscaler::builtin;
 
         // SSAA downsample pipeline — bilinear downsample from scaled scene texture.
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> pipelineDownsample;
@@ -1453,6 +1467,24 @@ namespace systems::leal::campello_renderer {
         /// The current frame's weight in the TAA history (0..1, default 0.1):
         /// lower is smoother and slower to follow change.
         void setTemporalAntiAliasingBlend(float blend) { taaBlend = std::clamp(blend, 0.01f, 1.0f); }
+        /// The temporal anti-aliasing / upscaling implementation used while
+        /// setTemporalAntiAliasing() is on (default Upscaler::builtin). One
+        /// the device doesn't support (supportsUpscaler()), or that refuses
+        /// the current sizes (MetalFX: up to Device::
+        /// getTemporalUpscalerMaxScale() per axis, 2 or 3 by GPU, so render
+        /// scales down to 0.5 or 0.34), falls back to the built-in resolve. The
+        /// history restarts when it changes. setTemporalAntiAliasingBlend()
+        /// applies to the built-in one only.
+        void setUpscaler(Upscaler value) {
+            if (value != upscaler) taaHistoryValid = false;
+            upscaler = value;
+            metalFxFailed = false;
+        }
+        Upscaler getUpscaler() const { return upscaler; }
+        bool supportsUpscaler(Upscaler value) const;
+        /// The implementation the last frame used (getUpscaler(), or builtin
+        /// after a fallback).
+        Upscaler activeUpscaler() const { return lastUpscaler; }
         bool isFxaaEnabled() const;
 
         void setSsaaScale(float scale);

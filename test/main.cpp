@@ -1992,6 +1992,7 @@ class OffscreenRenderTest : public testing::Test {
 protected:
     std::shared_ptr<systems::leal::campello_gpu::Device> device;
     std::unique_ptr<Renderer> renderer;
+    void temporalUpscalingRecoversDetail(Upscaler upscaler);
 
     void SetUp() override {
         device = systems::leal::campello_gpu::Device::createDefaultDevice(nullptr);
@@ -4667,6 +4668,85 @@ TEST_F(OffscreenRenderTest, DdgiDoesNotLeakThroughWalls) {
 // close to native resolution TAA's. A moving triangle leaves no trail.
 TEST_F(OffscreenRenderTest, TemporalUpscalingRecoversDetail) {
     if (!device) GTEST_SKIP() << "No GPU device available";
+    temporalUpscalingRecoversDetail(Upscaler::builtin);
+}
+
+TEST_F(OffscreenRenderTest, MetalFxUpscalingRecoversDetail) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    if (!device->supportsTemporalUpscaler()) GTEST_SKIP() << "No MetalFX on this device";
+    temporalUpscalingRecoversDetail(Upscaler::metalFX);
+}
+
+// Upscaler::metalFX where it isn't supported, or at a ratio MetalFX
+// refuses (4x): the built-in upscaler instead, still drawing the frame.
+TEST_F(OffscreenRenderTest, UpscalerFallsBackToTheBuiltinOne) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer (TAA) on this backend";
+    EXPECT_TRUE(renderer->supportsUpscaler(Upscaler::builtin));
+    EXPECT_EQ(renderer->supportsUpscaler(Upscaler::metalFX), device->supportsTemporalUpscaler());
+    renderer->setSkyboxEnabled(false);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    namespace VM = systems::leal::vector_math;
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "extensionsUsed": ["KHR_materials_unlit"],
+        "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1]}, "extensions": {"KHR_materials_unlit": {}}}]})",
+                                    kNoOpLoader);
+    GpuMaterial* white = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    white->doubleSided = true;
+    std::vector<float> positions = {-0.6f, -0.5f, 0.0f, 0.55f, -0.35f, 0.0f, -0.1f, 0.6f, 0.0f};
+    std::vector<uint32_t> indices = {0, 1, 2};
+    GpuMesh triangle;
+    triangle.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    triangle.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    triangle.indexCount = 3;
+    triangle.indexFormat = GPU::IndexFormat::uint32;
+    triangle.vertexCount = 3;
+    triangle.layout = &VertexLayout::positionOnly();
+    triangle.setBoundsFromPositions(positions.data(), 3);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 2.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(40.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 2.5);
+    DrawCall draw;
+    draw.mesh = &triangle;
+    draw.material = white;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(draw);
+    renderer->setUpscaler(Upscaler::metalFX);
+    EXPECT_EQ(renderer->getUpscaler(), Upscaler::metalFX);
+    renderer->setTemporalAntiAliasing(true);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    for (float scale : {1.0f, 0.25f}) {
+        renderer->setRenderScale(scale);
+        for (int i = 0; i < 8; ++i) renderer->render(scene, view);
+        const auto pixels = readBackPixels(tex);
+        uint64_t lit = 0;
+        for (size_t i = 0; i < pixels.size(); i += 4) lit += pixels[i] > 20 ? 1 : 0;
+        std::printf("[Upscaler] scale %.2f: %s, %llu lit pixels\n", scale,
+                    renderer->activeUpscaler() == Upscaler::metalFX ? "MetalFX" : "builtin", (unsigned long long)lit);
+        EXPECT_GT(lit, 100u) << "the frame is drawn either way";
+        if (!device->supportsTemporalUpscaler()) EXPECT_EQ(renderer->activeUpscaler(), Upscaler::builtin);
+    }
+    if (device->supportsTemporalUpscaler()) {
+        renderer->setRenderScale(1.0f);
+        renderer->render(scene, view);
+        EXPECT_EQ(renderer->activeUpscaler(), Upscaler::metalFX) << "MetalFX at 1x where supported";
+    }
+    renderer->setTemporalAntiAliasing(false);
+    renderer->setUpscaler(Upscaler::builtin);
+    white->doubleSided = false;
+}
+
+// TemporalUpscalingRecoversDetail with either upscaler.
+void OffscreenRenderTest::temporalUpscalingRecoversDetail(Upscaler upscaler) {
     namespace GPU = systems::leal::campello_gpu;
     namespace VM = systems::leal::vector_math;
     auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
@@ -4719,21 +4799,27 @@ TEST_F(OffscreenRenderTest, TemporalUpscalingRecoversDetail) {
     const auto reference = frames(1);
     renderer->setSsaaScale(1.0f);
     // Native resolution TAA; half resolution bilinear; half resolution temporal.
+    renderer->setUpscaler(upscaler);
     renderer->setTemporalAntiAliasing(true);
     const auto native = frames(32);
+    EXPECT_EQ(renderer->activeUpscaler(), upscaler);
     renderer->setTemporalAntiAliasing(false);
     renderer->setRenderScale(0.5f);
     EXPECT_EQ(renderer->internalWidth(), 32u);
     const auto bilinear = frames(1);
     renderer->setTemporalAntiAliasing(true);
     const auto upscaled = frames(64);
+    EXPECT_EQ(renderer->activeUpscaler(), upscaler);
     EXPECT_EQ(renderer->gBuffer().width, 32u) << "the G-buffer at the internal size";
     const double nativeError = rms(native, reference), bilinearError = rms(bilinear, reference),
                  upscaledError = rms(upscaled, reference);
-    std::printf("[Upscaling] RMS error against 4x SSAA (levels): native TAA %.2f, half resolution bilinear %.2f, "
+    std::printf("[Upscaling %s] RMS error against 4x SSAA (levels): native TAA %.2f, half resolution bilinear %.2f, "
                 "half resolution temporal %.2f\n",
-                nativeError, bilinearError, upscaledError);
-    EXPECT_LT(upscaledError, bilinearError * 0.6) << "the temporal upscaler recovers the edges";
+                upscaler == Upscaler::metalFX ? "MetalFX" : "builtin", nativeError, bilinearError, upscaledError);
+    // (MetalFX blends edges a little darker than a box average: its error
+    // against SSAA is higher, though the edges are where they should be.)
+    EXPECT_LT(upscaledError, bilinearError * (upscaler == Upscaler::metalFX ? 0.85 : 0.6))
+        << "the temporal upscaler recovers the edges";
     EXPECT_LT(upscaledError, nativeError * 1.5) << "close to native resolution";
 
     // Moving at half resolution: no trail where it started.
@@ -4747,11 +4833,13 @@ TEST_F(OffscreenRenderTest, TemporalUpscalingRecoversDetail) {
     }
     const auto moved = readBackPixels(tex);
     const auto at = [&](const std::vector<uint8_t>& p, int x, int y) { return int(p[(size_t(y) * 64 + size_t(x)) * 4]); };
-    std::printf("[Upscaling] after moving: old place %d, new middle %d\n", at(moved, 30, 35), at(moved, 58, 35));
+    std::printf("[Upscaling %s] after moving: old place %d, new middle %d\n",
+                upscaler == Upscaler::metalFX ? "MetalFX" : "builtin", at(moved, 30, 35), at(moved, 58, 35));
     EXPECT_LT(at(moved, 30, 35), 25) << "no trail where it was";
     EXPECT_GT(at(moved, 58, 35), 180) << "the moving object stays solid";
     renderer->setTemporalAntiAliasing(false);
     renderer->setRenderScale(1.0f);
+    renderer->setUpscaler(Upscaler::builtin);
     white->doubleSided = false;
 }
 
