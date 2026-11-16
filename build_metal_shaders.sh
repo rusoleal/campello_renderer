@@ -9,15 +9,15 @@ OUT_HEADER="$SCRIPT_DIR/src/shaders/metal_default.h"
 # Compile Metal → AIR → metallib for three SDK targets
 # ---------------------------------------------------------------------------
 echo "Compiling: default.metal → macOS"
-xcrun -sdk macosx metal -c "$SHADER_DIR/default.metal" -o "$SHADER_DIR/default_macos.air"
+xcrun -sdk macosx metal -I "$SCRIPT_DIR/inc" -c "$SHADER_DIR/default.metal" -o "$SHADER_DIR/default_macos.air"
 xcrun -sdk macosx metallib "$SHADER_DIR/default_macos.air" -o "$SHADER_DIR/default_macos.metallib"
 
 echo "Compiling: default.metal → iOS simulator"
-xcrun -sdk iphonesimulator metal -c "$SHADER_DIR/default.metal" -o "$SHADER_DIR/default_iossim.air"
+xcrun -sdk iphonesimulator metal -I "$SCRIPT_DIR/inc" -c "$SHADER_DIR/default.metal" -o "$SHADER_DIR/default_iossim.air"
 xcrun -sdk iphonesimulator metallib "$SHADER_DIR/default_iossim.air" -o "$SHADER_DIR/default_iossim.metallib"
 
 echo "Compiling: default.metal → iOS device"
-xcrun -sdk iphoneos metal -c "$SHADER_DIR/default.metal" -o "$SHADER_DIR/default_ios.air"
+xcrun -sdk iphoneos metal -I "$SCRIPT_DIR/inc" -c "$SHADER_DIR/default.metal" -o "$SHADER_DIR/default_ios.air"
 xcrun -sdk iphoneos metallib "$SHADER_DIR/default_ios.air" -o "$SHADER_DIR/default_ios.metallib"
 
 # ---------------------------------------------------------------------------

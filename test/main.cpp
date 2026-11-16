@@ -1,4 +1,5 @@
 #include "element_id_shaders.h"
+#include "custom_lit_shaders.h"
 #include <gtest/gtest.h>
 #include <campello_renderer/campello_renderer.hpp>
 #include <campello_renderer/procedural_texture_baker.hpp>
@@ -6665,6 +6666,198 @@ TEST(ClipPlanes, IsClippedAwayTestsTheBoxInLocalSpace) {
 // discarded; with section caps, the back face of a single-sided quad (no
 // longer culled while clipping) takes the cap colour, a double-sided one
 // doesn't.
+// An app program using the lighting inputs (program_interface.metal.h):
+// the sun with campello::sunVisibility() follows Renderer::setShadowMask(),
+// and campello::indirectIrradiance() adds Renderer::setIndirectDiffuse().
+TEST_F(OffscreenRenderTest, CustomProgramUsesTheLightingInputs) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    const ProgramHandle lit = renderer->registerProgram(custom_lit_shaders::desc());
+    if (lit == kInvalidProgram) GTEST_SKIP() << "custom_lit program not compiled for this backend";
+    renderer->setSkyboxEnabled(false);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [{"pbrMetallicRoughness": {}}]})",
+                                    kNoOpLoader);
+    GpuMaterial* material = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    ASSERT_NE(material, nullptr);
+    material->program = lit;
+    material->doubleSided = true;
+    // Ground: a 3 x 3 quad at y = 0, seen from above at 45 degrees.
+    std::vector<float> positions = {-1.5f, 0.0f, -1.5f, 1.5f, 0.0f, -1.5f, 1.5f, 0.0f, 1.5f, -1.5f, 0.0f, 1.5f};
+    std::vector<uint32_t> indices = {0, 2, 1, 0, 3, 2};
+    GpuMesh ground;
+    ground.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    ground.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    ground.indexCount = 6;
+    ground.indexFormat = GPU::IndexFormat::uint32;
+    ground.vertexCount = 4;
+    ground.layout = &VertexLayout::positionOnly();
+    ground.setBoundsFromPositions(positions.data(), 4);
+    ASSERT_TRUE(renderer->supportsProgram(lit, VertexLayout::positionOnly()));
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 2.5, 2.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 2.5, 2.5);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.0, -1.0, 0.0);
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 2.0f;  // white x 2 / pi: 0.64
+    sun.castShadows = true;
+    scene.lights.push_back(sun);
+    DrawCall draw;
+    draw.mesh = &ground;
+    draw.material = material;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(draw);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    const auto at = [](const std::vector<uint8_t>& p, int x, int y, int c) { return int(p[(size_t(y) * 64 + size_t(x)) * 4 + c]); };
+
+    renderer->render(scene, view);
+    const auto plain = readBackPixels(tex);
+    std::printf("[CustomProgram] sun only: left %d, right %d\n", at(plain, 16, 40, 0), at(plain, 48, 40, 0));
+    EXPECT_NEAR(at(plain, 16, 40, 0), 163, 4) << "lit by the sun (white x 2 / pi)";
+    EXPECT_NEAR(at(plain, 48, 40, 0), 163, 4);
+
+    // A visibility mask: shadowed left half, lit right half.
+    std::vector<uint8_t> mask(size_t(64) * 64 * 4, 255);
+    for (int y = 0; y < 64; ++y) {
+        for (int x = 0; x < 32; ++x) mask[(size_t(y) * 64 + size_t(x)) * 4] = 0;
+    }
+    auto maskTexture = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm, 64, 64, 1, 1, 1,
+                                             (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
+                                                                 uint32_t(GPU::TextureUsage::copyDst)));
+    ASSERT_TRUE(maskTexture->upload(0, mask.size(), mask.data()));
+    renderer->setShadowMask(maskTexture);
+    renderer->render(scene, view);
+    const auto masked = readBackPixels(tex);
+    std::printf("[CustomProgram] shadow mask: left %d, right %d\n", at(masked, 16, 40, 0), at(masked, 48, 40, 0));
+    EXPECT_LT(at(masked, 16, 40, 0), 5) << "shadowed by the mask";
+    EXPECT_NEAR(at(masked, 48, 40, 0), 163, 4) << "lit where the mask is";
+    renderer->setShadowMask(nullptr);
+
+    // Indirect diffuse: a uniform (0.3, 0, 0) irradiance.
+    std::vector<uint16_t> irradiance(size_t(64) * 64 * 4, 0);
+    for (size_t i = 0; i < irradiance.size(); i += 4) {
+        irradiance[i] = 0x34CD;  // 0.3 as a half
+        irradiance[i + 3] = 0x3C00;
+    }
+    auto irradianceTexture = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba16float, 64, 64, 1, 1, 1,
+                                                   (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
+                                                                       uint32_t(GPU::TextureUsage::copyDst) |
+                                                                       uint32_t(GPU::TextureUsage::copySrc)));
+    ASSERT_TRUE(irradianceTexture->upload(0, irradiance.size() * 2, irradiance.data()));
+    renderer->setIndirectDiffuse(irradianceTexture);
+    renderer->render(scene, view);
+    const auto indirect = readBackPixels(tex);
+    std::printf("[CustomProgram] indirect diffuse: red %d, green %d\n", at(indirect, 32, 40, 0), at(indirect, 32, 40, 1));
+    EXPECT_NEAR(at(indirect, 32, 40, 0), 163 + 77, 5) << "the irradiance added";
+    EXPECT_NEAR(at(indirect, 32, 40, 1), 163, 4) << "only red";
+    renderer->setIndirectDiffuse(nullptr);
+    material->program = kPbrProgram;
+}
+
+// An app program's own G-buffer stages: the geometry its vertex stage
+// moves is where the G-buffer has it (with its albedo and motion); without
+// them, the built-in stages draw the unmoved mesh.
+TEST_F(OffscreenRenderTest, CustomProgramWritesItsOwnGBuffer) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer on this backend";
+    auto desc = custom_lit_shaders::desc();
+    const ProgramHandle plain = renderer->registerProgram(desc);
+    if (plain == kInvalidProgram) GTEST_SKIP() << "custom_lit program not compiled for this backend";
+    desc.metalGBufferVertexEntryPoint = "gbufferVertexMain";
+    desc.metalGBufferFragmentEntryPoint = "gbufferFragmentMain";
+    const ProgramHandle withGBuffer = renderer->registerProgram(desc);
+    ASSERT_NE(withGBuffer, kInvalidProgram);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [{"pbrMetallicRoughness": {}}]})",
+                                    kNoOpLoader);
+    GpuMaterial* material = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    ASSERT_NE(material, nullptr);
+    material->doubleSided = true;
+    std::vector<float> positions = {-0.6f, -0.5f, 0.0f, 0.55f, -0.35f, 0.0f, -0.1f, 0.6f, 0.0f};
+    std::vector<uint32_t> indices = {0, 1, 2};
+    GpuMesh triangle;
+    triangle.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    triangle.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    triangle.indexCount = 3;
+    triangle.indexFormat = GPU::IndexFormat::uint32;
+    triangle.vertexCount = 3;
+    triangle.layout = &VertexLayout::positionOnly();
+    triangle.setBoundsFromPositions(positions.data(), 3);
+    constexpr double kFov = 40.0 * 3.14159265358979323846 / 180.0;
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 0.0, 2.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(kFov, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 2.5);
+    DrawCall draw;
+    draw.mesh = &triangle;
+    draw.material = material;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    // Moving right 0.1 a frame: it was 0.1 to the left.
+    draw.worldTransform.data[3] = 0.1;
+    draw.previousWorldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(draw);
+    const auto halfToFloat = [](uint16_t h) {
+        const uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+        float v = exponent == 0 ? std::ldexp(float(mantissa), -24) : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+        return sign ? -v : v;
+    };
+    // Pixels: a point only the moved triangle covers (world x 0.7, y -0.2),
+    // and one only the unmoved one covers (world x -0.35, y -0.3).
+    const size_t moved = size_t(39) * 64 + 56, unmoved = size_t(42) * 64 + 20;
+    const auto gbuffer = [&](ProgramHandle program, std::vector<uint8_t>& albedo, std::vector<float>& motion) {
+        material->program = program;
+        renderer->resetMotionHistory();
+        renderer->renderGBuffer(scene);
+        renderer->renderGBuffer(scene);  // (the camera's history)
+        device->waitForIdle();
+        const auto& g = renderer->gBuffer();
+        albedo.assign(size_t(64) * 64 * 4, 0);
+        ASSERT_TRUE(g.albedoMetallic->download(0, 0, albedo.data(), albedo.size()));
+        std::vector<uint16_t> raw(size_t(64) * 64 * 2);
+        ASSERT_TRUE(g.motion->download(0, 0, raw.data(), raw.size() * 2));
+        motion.resize(raw.size());
+        for (size_t i = 0; i < raw.size(); ++i) motion[i] = halfToFloat(raw[i]);
+    };
+    std::vector<uint8_t> albedo;
+    std::vector<float> motion;
+    gbuffer(withGBuffer, albedo, motion);
+    const double expected = -0.1 / (2.0 * 2.5 * std::tan(kFov / 2.0));
+    std::printf("[CustomProgram] own G-buffer: moved albedo g %d, unmoved albedo g %d, motion %.4f (expected %.4f)\n",
+                int(albedo[moved * 4 + 1]), int(albedo[unmoved * 4 + 1]), motion[moved * 2], expected);
+    EXPECT_EQ(albedo[moved * 4 + 0], 0) << "the program's albedo (green) where its vertex stage put the geometry";
+    EXPECT_EQ(albedo[moved * 4 + 1], 255);
+    EXPECT_EQ(albedo[unmoved * 4 + 1], 0) << "nothing where the unmoved mesh would be";
+    EXPECT_NEAR(motion[moved * 2], expected, 0.004) << "its motion";
+    EXPECT_NEAR(motion[moved * 2 + 1], 0.0, 0.002);
+
+    gbuffer(plain, albedo, motion);
+    std::printf("[CustomProgram] built-in G-buffer stages: moved albedo %d, unmoved albedo %d\n",
+                int(albedo[moved * 4 + 1]), int(albedo[unmoved * 4 + 1]));
+    EXPECT_EQ(albedo[moved * 4 + 1], 0) << "without its stages: the unmoved mesh";
+    EXPECT_GT(albedo[unmoved * 4 + 1], 200);
+    material->program = kPbrProgram;
+}
+
 TEST_F(OffscreenRenderTest, ClipPlanesDiscardAndCapBackFaces) {
     if (!device) GTEST_SKIP() << "No GPU device available";
     namespace GPU = systems::leal::campello_gpu;

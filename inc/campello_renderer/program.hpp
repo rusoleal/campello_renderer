@@ -21,6 +21,11 @@
 //    headers); they don't have to.
 //  - Culling follows GpuMaterial::doubleSided; blending follows
 //    GpuMaterial::alphaBlend only if ShaderProgramDesc::blending is set.
+//  - Metal: the renderer's effects (sun shadows or a ray traced shadow mask,
+//    ray traced reflections, indirect diffuse, exposure) through the
+//    lighting inputs in program_interface.metal.h, and optional G-buffer
+//    stages (ShaderProgramDesc::metalGBuffer*EntryPoint). See
+//    docs/using-the-renderer.md.
 
 #include <campello_renderer/vertex_layout.hpp>
 
@@ -69,6 +74,16 @@ namespace systems::leal::campello_renderer {
         /// Whether alpha-blended materials draw with blending (the color
         /// target must be blendable, e.g. not an integer format).
         bool blending = false;
+        /// Optional G-buffer stages (Renderer::renderGBuffer(); Metal), in
+        /// metalLibrary: drawn for this program's materials instead of the
+        /// built-in G-buffer stages, so geometry the vertex shader moves and
+        /// normals the fragment shader computes reach TAA, the upscalers,
+        /// the denoisers and the ray traced effects. They read the same
+        /// vertex attributes (vertexReads). See program_interface.metal.h
+        /// ("G-buffer") for the contract. Both empty: the built-in stages
+        /// draw this program's meshes as plain PBR geometry.
+        std::string metalGBufferVertexEntryPoint;
+        std::string metalGBufferFragmentEntryPoint;
     };
 
     /// Renderer::renderProgramPass(): one program for every draw, into a

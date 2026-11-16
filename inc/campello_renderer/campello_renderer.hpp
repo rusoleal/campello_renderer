@@ -502,6 +502,9 @@ namespace systems::leal::campello_renderer {
             std::array<std::string, 3> fragmentEntries;
             bool supportsBlend = false;  // false: blend draws use the opaque state
             std::string wideLineFragment;  // fragment entry for wide lines; empty: none
+            // App programs: their own G-buffer stages (ShaderProgramDesc::
+            // metalGBuffer*EntryPoint), behind appGBufferProgram(handle).
+            std::shared_ptr<ProgramState> gbuffer;
         };
         std::vector<ProgramState> programs;
         // Shared by all programs on this backend.
@@ -572,6 +575,11 @@ namespace systems::leal::campello_renderer {
         // its targets, the previous transforms per frame in flight and the
         // previous camera.
         static constexpr ProgramHandle kGBufferProgram = 0xFFFFFFFEu;
+        // An app program's own G-buffer stages: kAppGBufferProgramBase + its handle.
+        static constexpr ProgramHandle kAppGBufferProgramBase = 0xF0000000u;
+        static bool isGBufferProgram(ProgramHandle program) {
+            return program >= kAppGBufferProgramBase && program <= kGBufferProgram;
+        }
         ProgramState gbufferProgram;
         bool gbufferPassActive = false;
         GBufferTargets gbufferTargets;
@@ -581,6 +589,10 @@ namespace systems::leal::campello_renderer {
         bool gbufferHistoryValid = false;
         const ProgramState* programState(ProgramHandle program) const {
             if (program == kGBufferProgram) return &gbufferProgram;
+            if (program >= kAppGBufferProgramBase && program < kGBufferProgram) {
+                const size_t app = program - kAppGBufferProgramBase;
+                return app < programs.size() ? programs[app].gbuffer.get() : nullptr;
+            }
             return program < programs.size() ? &programs[program] : nullptr;
         }
         // Clip planes (setClipPlanes()); uploaded after the camera block.

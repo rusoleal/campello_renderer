@@ -124,6 +124,8 @@ Two variants are created by `createDefaultPipelines()`:
 ### Key Files
 
 - `inc/campello_renderer/campello_renderer.hpp` — public API
+- `inc/campello_renderer/shaders/program_interface.*` — the app shader program contract; the Metal one also holds the lighting inputs (camera/light/G-buffer structs, effect helpers) and is included by `shaders/metal/default.metal` (`build_metal_shaders.sh` passes `-I inc`)
+- `docs/using-the-renderer.md` — usage levels, per-feature switches, custom shading
 - `inc/campello_renderer/image.hpp` — legacy `Image` struct (not used by renderer internals; kept for API compatibility)
 - `src/campello_renderer.cpp` — full implementation (~1050 lines)
 - `src/shaders/metal_default.h` — embedded Metal shader library

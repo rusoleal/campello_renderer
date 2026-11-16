@@ -305,6 +305,15 @@ structure cost, hybrid raster + rays, richer materials, camera effects.
   - [ ] Vulkan / DirectX / WebGPU G-buffer shaders (`supportsGBuffer()` is false there)
   - [ ] Morph target motion (the previous weights; motion ignores morphing today), per-instance
         previous transforms (EXT_mesh_gpu_instancing instances are assumed static)
+  - [x] App programs: their own G-buffer stages (`ShaderProgramDesc::metalGBuffer*EntryPoint`) so
+        geometry their vertex shader moves reaches TAA, denoisers and ray traced effects; the
+        lighting inputs (`program_interface.metal.h`: sun visibility / shadow mask, reflections,
+        indirect diffuse, exposure) shared with the built-in PBR shader. See
+        `docs/using-the-renderer.md`
+  - [ ] App programs on Vulkan / DirectX / WebGPU: the lighting inputs and G-buffer stages in
+        the other interface headers (with the effects themselves); ray traced passes shading
+        app materials (today they see the GpuMaterial's PBR parameters); a pass hook between
+        built-in passes
   - [ ] Write the G-buffer from the main pass (multiple render targets) instead of a separate
         geometry pass, once a deferred or hybrid frame needs it every frame
   - [ ] Projection jitter support (TAA / upscalers): a jittered projection with unjittered motion
