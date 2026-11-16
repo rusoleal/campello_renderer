@@ -930,9 +930,12 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::Texture> reflections;
         float reflectionMaxRoughness = 0.6f;
         std::shared_ptr<systems::leal::campello_gpu::BindGroup> reflectionFrameBindGroup;
-        // setIndirectDiffuse(); and the texture both go into each frame
-        // (reflections left, indirect diffuse right), bound for the opaque draws.
+        // setIndirectDiffuse(), setDirectLighting(); the texture they go
+        // into each frame side by side (reflections, indirect diffuse, direct
+        // light), bound for the opaque draws.
         std::shared_ptr<systems::leal::campello_gpu::Texture> indirectDiffuse;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> directLighting;
+        bool screenLightingActive() const { return reflections || indirectDiffuse || directLighting; }
         std::shared_ptr<systems::leal::campello_gpu::Texture> screenLighting;
         bool shadowCascades = true;
         bool shadowNearValid = false;
@@ -1475,6 +1478,16 @@ namespace systems::leal::campello_renderer {
         /// side into one texture the shaders read.)
         void setIndirectDiffuse(std::shared_ptr<systems::leal::campello_gpu::Texture> irradiance) {
             indirectDiffuse = std::move(irradiance);
+        }
+        /// Direct light (Metal): `radiance` (rgba16float, the same size as
+        /// the other screen lighting textures, linear, before exposure; e.g.
+        /// RestirDirectLighting's, denoised) replaces the punctual light loop
+        /// (at most 4 lights, sun shadows only) in opaque, non-transmissive
+        /// surfaces: their diffuse and specular direct light. Sheen and
+        /// clearcoat lose their direct term while it's on. Null: off. Kept
+        /// until replaced.
+        void setDirectLighting(std::shared_ptr<systems::leal::campello_gpu::Texture> radiance) {
+            directLighting = std::move(radiance);
         }
         /// The current frame's weight in the TAA history (0..1, default 0.1):
         /// lower is smoother and slower to follow change.

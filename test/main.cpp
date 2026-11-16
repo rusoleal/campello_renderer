@@ -4183,6 +4183,246 @@ TEST_F(OffscreenRenderTest, RayTracedShadowsDarkenTheRasterFrame) {
 // radius occludes more. Shadows and AO sharing one RayTracingScene build it
 // once. Denoised into Renderer::setAmbientOcclusionMask(), the raster frame
 // is darker by the wall.
+// ReSTIR DI (RestirDirectLighting): 64 coloured point lights over a ground
+// plane, a plate shadowing part of it. Against the ground truth (every
+// light, every shadow ray): one light sample per pixel is noisy, resampling
+// 32 candidates is better, and reusing over frames and neighbours is much
+// better, at about the same brightness and with the plate's shadow kept;
+// still so with a moving camera.
+TEST_F(OffscreenRenderTest, RestirDirectLightingConvergesToTheReference) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer on this backend";
+    RestirDirectLighting restir(device);
+    if (!restir.supported()) GTEST_SKIP() << "No ray tracing on this device";
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.8, 0.8, 1], "metallicFactor": 0, "roughnessFactor": 0.7}, "doubleSided": true}]})",
+                                    kNoOpLoader);
+    GpuMaterial* grey = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    ASSERT_NE(grey, nullptr);
+    const auto quad = [&](float y, float half) {
+        std::vector<float> positions = {-half, y, -half, half, y, -half, half, y, half, -half, y, half};
+        std::vector<float> normals = {0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0};
+        std::vector<uint32_t> indices = {0, 2, 1, 0, 3, 2};
+        auto mesh = std::make_unique<GpuMesh>();
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+        mesh->vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] =
+            device->createBuffer(normals.size() * 4, GPU::BufferUsage::vertex, normals.data());
+        mesh->indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh->indexCount = 6;
+        mesh->indexFormat = GPU::IndexFormat::uint32;
+        mesh->vertexCount = 4;
+        mesh->setBoundsFromPositions(positions.data(), 4);
+        return mesh;
+    };
+    auto ground = quad(0.0f, 2.0f);
+    auto plate = quad(0.35f, 0.35f);
+    RenderScene scene;
+    const auto camera = [&](double x) {
+        scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(x, 2.5, 2.5), VM::Vector3<double>(x, 0.0, 0.0),
+                                                        VM::Vector3<double>(0.0, 1.0, 0.0));
+        scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+        scene.camera.position = VM::Vector3<double>(x, 2.5, 2.5);
+    };
+    camera(0.0);
+    // 8 x 8 point lights 0.6 above the ground, colours varying.
+    for (int i = 0; i < 64; ++i) {
+        LightData light;
+        light.type = 1;
+        light.position = VM::Vector3<double>(-1.4 + 0.4 * (i % 8), 0.6, -1.4 + 0.4 * (i / 8));
+        light.color = VM::Vector3<double>(0.4 + 0.6 * ((i * 37) % 11) / 10.0, 0.4 + 0.6 * ((i * 53) % 7) / 6.0,
+                                          0.4 + 0.6 * ((i * 71) % 5) / 4.0);
+        light.intensity = 0.05f + 0.25f * float((i * 29) % 13) / 12.0f;
+        scene.lights.push_back(light);
+    }
+    for (GpuMesh* mesh : {ground.get(), plate.get()}) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = grey;
+        draw.worldTransform = VM::Matrix4<double>::identity();
+        scene.opaque.push_back(draw);
+    }
+    const auto halfToFloat = [](uint16_t h) {
+        const uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+        float v = exponent == 0 ? std::ldexp(float(mantissa), -24) : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+        return sign ? -v : v;
+    };
+    const auto luminance = [&]() {
+        device->waitForIdle();
+        std::vector<uint16_t> raw(size_t(64) * 64 * 4);
+        EXPECT_TRUE(restir.output()->download(0, 0, raw.data(), raw.size() * 2));
+        std::vector<float> out(size_t(64) * 64);
+        for (size_t i = 0; i < out.size(); ++i) {
+            out[i] = 0.2126f * halfToFloat(raw[i * 4]) + 0.7152f * halfToFloat(raw[i * 4 + 1]) + 0.0722f * halfToFloat(raw[i * 4 + 2]);
+        }
+        return out;
+    };
+    const auto reference = [&]() {
+        renderer->renderGBuffer(scene);
+        EXPECT_TRUE(restir.renderReference(scene, renderer->gBuffer()));
+        return luminance();
+    };
+    const auto frames = [&](const RestirDirectLighting::Settings& settings, int n) {
+        restir.setSettings(settings);
+        restir.reset();
+        for (int f = 0; f < n; ++f) {
+            renderer->renderGBuffer(scene);
+            EXPECT_TRUE(restir.render(scene, renderer->gBuffer()));
+        }
+        return luminance();
+    };
+    // Relative RMS error and mean ratio over the lit pixels.
+    const auto compare = [](const std::vector<float>& x, const std::vector<float>& ref, double& meanRatio) {
+        double err = 0.0, sum = 0.0, sumRef = 0.0;
+        int n = 0;
+        for (size_t i = 0; i < x.size(); ++i) {
+            if (ref[i] <= 0.0f) continue;
+            err += double(x[i] - ref[i]) * double(x[i] - ref[i]);
+            sum += x[i];
+            sumRef += ref[i];
+            ++n;
+        }
+        meanRatio = sum / std::max(sumRef, 1e-9);
+        return std::sqrt(err / std::max(n, 1)) / std::max(sumRef / std::max(n, 1), 1e-9);
+    };
+    const auto truth = reference();
+    RestirDirectLighting::Settings one;
+    one.candidates = 1;
+    one.temporal = false;
+    one.spatial = false;
+    RestirDirectLighting::Settings ris = one;
+    ris.candidates = 32;
+    double ratioOne, ratioRis, ratioFull;
+    const double errorOne = compare(frames(one, 1), truth, ratioOne);
+    const double errorRis = compare(frames(ris, 1), truth, ratioRis);
+    const auto full = frames(RestirDirectLighting::Settings{}, 16);
+    const double errorFull = compare(full, truth, ratioFull);
+    std::printf("[ReSTIR] relative RMS error (mean ratio): 1 sample %.3f (%.3f), RIS 32 %.3f (%.3f), "
+                "spatiotemporal after 16 frames %.3f (%.3f)\n",
+                errorOne, ratioOne, errorRis, ratioRis, errorFull, ratioFull);
+    EXPECT_LT(errorRis, errorOne * 0.5) << "resampling by contribution helps";
+    EXPECT_LT(errorFull, errorRis * 0.4) << "reuse helps much more";
+    EXPECT_NEAR(ratioFull, 1.0, 0.05) << "about the right brightness";
+
+    // Shadows: the darkest tenth of the lit pixels in the ground truth (the
+    // plate's shadow) keeps its darkness: no light leaks into it.
+    std::vector<float> sorted;
+    for (float v : truth) {
+        if (v > 0.0f) sorted.push_back(v);
+    }
+    std::sort(sorted.begin(), sorted.end());
+    const float dark = sorted[sorted.size() / 10];
+    double darkTruth = 0.0, darkFull = 0.0, allTruth = 0.0;
+    int darkCount = 0;
+    for (size_t i = 0; i < truth.size(); ++i) {
+        if (truth[i] <= 0.0f) continue;
+        allTruth += truth[i];
+        if (truth[i] > dark) continue;
+        darkTruth += truth[i];
+        darkFull += full[i];
+        ++darkCount;
+    }
+    std::printf("[ReSTIR] darkest tenth (%d px): truth %.4f, ReSTIR %.4f (all lit: %.4f)\n", darkCount,
+                darkTruth / darkCount, darkFull / darkCount, allTruth / sorted.size());
+    EXPECT_LT(darkTruth / darkCount, 0.6 * allTruth / sorted.size()) << "the scene has a shadow";
+    EXPECT_NEAR(darkFull / darkCount, darkTruth / darkCount, 0.15 * darkTruth / darkCount) << "no light leaks into it";
+
+    // A moving camera: the history follows the motion vectors.
+    restir.setSettings(RestirDirectLighting::Settings{});
+    restir.reset();
+    for (int f = 0; f < 16; ++f) {
+        camera(0.02 * f);
+        renderer->renderGBuffer(scene);
+        ASSERT_TRUE(restir.render(scene, renderer->gBuffer()));
+    }
+    const auto moving = luminance();
+    double ratioMoving;
+    const double errorMoving = compare(moving, reference(), ratioMoving);
+    std::printf("[ReSTIR] moving camera after 16 frames: %.3f (%.3f)\n", errorMoving, ratioMoving);
+    EXPECT_LT(errorMoving, errorRis) << "still better than resampling alone";
+    EXPECT_NEAR(ratioMoving, 1.0, 0.05);
+}
+
+// Renderer::setDirectLighting(): the raster frame lit by a direct light
+// texture in place of its light loop. One sun: the loop and the ground
+// truth (RestirDirectLighting::renderReference()) give the same image.
+TEST_F(OffscreenRenderTest, DirectLightingReplacesTheLightLoop) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    if (!renderer->supportsGBuffer()) GTEST_SKIP() << "No G-buffer on this backend";
+    RestirDirectLighting restir(device);
+    if (!restir.supported()) GTEST_SKIP() << "No ray tracing on this device";
+    renderer->setSkyboxEnabled(false);
+    renderer->setIBLEnabled(false);
+    renderer->setShadowsEnabled(false);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    auto materials = GLTF::loadGLTF(R"({"asset": {"version": "2.0"}, "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.5, 0.3, 1], "metallicFactor": 0, "roughnessFactor": 0.5}}]})",
+                                    kNoOpLoader);
+    GpuMaterial* material = renderer->uploadMaterial((*materials->materials)[0], *materials);
+    ASSERT_NE(material, nullptr);
+    std::vector<float> positions = {-2.0f, 0.0f, -2.0f, 2.0f, 0.0f, -2.0f, 2.0f, 0.0f, 2.0f, -2.0f, 0.0f, 2.0f};
+    std::vector<float> normals = {0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0};
+    std::vector<uint32_t> indices = {0, 2, 1, 0, 3, 2};
+    GpuMesh ground;
+    ground.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] = device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    ground.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] = device->createBuffer(normals.size() * 4, GPU::BufferUsage::vertex, normals.data());
+    ground.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    ground.indexCount = 6;
+    ground.indexFormat = GPU::IndexFormat::uint32;
+    ground.vertexCount = 4;
+    ground.setBoundsFromPositions(positions.data(), 4);
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 2.5, 2.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                    VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = VM::Vector3<double>(0.0, 2.5, 2.5);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.3, -1.0, -0.2);
+    sun.color = VM::Vector3<double>(1.0, 0.95, 0.9);
+    sun.intensity = 2.0f;
+    scene.lights.push_back(sun);
+    DrawCall draw;
+    draw.mesh = &ground;
+    draw.material = material;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(draw);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    renderer->render(scene, view);
+    const auto loop = readBackPixels(tex);
+    renderer->renderGBuffer(scene);
+    ASSERT_TRUE(restir.renderReference(scene, renderer->gBuffer()));
+    device->waitForIdle();
+    renderer->setDirectLighting(restir.output());
+    renderer->render(scene, view);
+    const auto texture = readBackPixels(tex);
+    renderer->setDirectLighting(nullptr);
+    int maxDiff = 0, lit = 0;
+    for (size_t i = 0; i < loop.size(); i += 4) {
+        if (loop[i] > 10) ++lit;
+        for (int c = 0; c < 3; ++c) maxDiff = std::max(maxDiff, std::abs(int(loop[i + c]) - int(texture[i + c])));
+    }
+    std::printf("[DirectLighting] loop vs texture: centre %d/%d, max difference %d over %d lit pixels\n",
+                int(loop[(32 * 64 + 32) * 4]), int(texture[(32 * 64 + 32) * 4]), maxDiff, lit);
+    EXPECT_GT(lit, 1000);
+    EXPECT_LE(maxDiff, 4) << "the same BRDF and lights";
+}
+
 TEST_F(OffscreenRenderTest, RayTracedAmbientOcclusionDarkensCreases) {
     if (!device) GTEST_SKIP() << "No GPU device available";
     namespace GPU = systems::leal::campello_gpu;

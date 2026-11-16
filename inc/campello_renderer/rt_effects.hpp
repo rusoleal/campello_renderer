@@ -170,4 +170,111 @@ private:
     float radius_ = 1.0f;
 };
 
+/// Direct light from many dynamic lights (hundreds to thousands) with one
+/// shadow ray per pixel: ReSTIR DI (Bitterli et al. 2020). Each pixel picks
+/// a light from candidates drawn by power and resampled by their
+/// contribution there, reuses the previous frame's choice along the motion
+/// vectors and its neighbours' choices, and traces one shadow ray for the
+/// winner. output() is the pixel's direct light (rgba16float, the
+/// G-buffer's size, linear, before exposure; noisy), for RealtimeDenoiser
+/// and Renderer::setDirectLighting(), which uses it in place of the raster
+/// light loop (whose limit is 4 lights).
+///
+///   RestirDirectLighting restir(device, rtScene);
+///   RealtimeDenoiser denoiser(device);  // demodulate on (the default)
+///   // each frame:
+///   renderer.renderGBuffer(scene);
+///   restir.render(scene, renderer.gBuffer());
+///   denoiser.denoise(restir.output(), renderer.gBuffer(), scene.camera.projection);
+///   renderer.setDirectLighting(denoiser.output());
+///   renderer.render(scene, view);
+///
+/// Lights: RenderScene::lights (directional, point, spot; every one casts
+/// shadows). The BRDF is the raster PBR shader's base layer (Lambert +
+/// GGX) from the G-buffer; sheen, clearcoat and anisotropy aren't in it.
+/// Biased, with the bias kept small: the candidates' visibility is traced
+/// before reuse, the history is the temporal pass's reservoirs (the spatial
+/// pass's, whose neighbour samples carry no visibility at the pixel, aren't
+/// fed back) and neighbours are used only while a pixel's history is
+/// short; the final shadow ray keeps shadows exact. Metal,
+/// Feature::raytracing.
+class RestirDirectLighting {
+public:
+    struct Settings {
+        uint32_t candidates = 32;      ///< Lights considered per pixel and frame.
+        bool     temporal = true;      ///< Reuse the previous frame's reservoirs.
+        uint32_t temporalCap = 20;     ///< The history's weight, at most this many frames of candidates.
+        bool     spatial = true;       ///< Reuse neighbours' reservoirs.
+        uint32_t spatialSamples = 4;   ///< Neighbours per pixel.
+        /// Neighbours' radius in pixels; 0: automatic, 1% of the G-buffer's
+        /// width, at least 2 (about 19 at 1920). Larger reaches further
+        /// but blends surfaces lit differently (bias).
+        float    spatialRadius = 0.0f;
+        /// Neighbours are reused only while a pixel's history is shorter
+        /// than this fraction of the temporal cap (0..1; 1: always while
+        /// under the cap): a long history is better on its own, as the
+        /// neighbours' samples carry no visibility at the pixel (bias).
+        float    spatialHistory = 0.25f;
+    };
+
+    /// `scene`: structures shared with other effects (null: its own).
+    explicit RestirDirectLighting(std::shared_ptr<systems::leal::campello_gpu::Device> device,
+                                  std::shared_ptr<RayTracingScene> scene = nullptr);
+    ~RestirDirectLighting();
+
+    [[nodiscard]] bool supported() const noexcept {
+        return initial_ != nullptr && spatial_ != nullptr && reference_ != nullptr;
+    }
+
+    /// One frame for `gbuffer` (rendered this frame from `scene`).
+    /// Submitted, not waited for (the next render() waits). Returns false
+    /// without lights, a G-buffer or support.
+    bool render(const RenderScene& scene, const GBufferTargets& gbuffer);
+    /// Ground truth into output(): every light with its own shadow ray (as
+    /// many rays per pixel as lights; for tuning and tests). Leaves the
+    /// reservoirs alone.
+    bool renderReference(const RenderScene& scene, const GBufferTargets& gbuffer);
+
+    /// The direct light of the last render() (see the class comment).
+    [[nodiscard]] std::shared_ptr<systems::leal::campello_gpu::Texture> output() const noexcept {
+        return radiance_;
+    }
+
+    void setSettings(const Settings& settings) noexcept {
+        settings_ = settings;
+    }
+    [[nodiscard]] const Settings& settings() const noexcept {
+        return settings_;
+    }
+    /// Forgets the reservoirs (a camera cut); the next frame starts afresh.
+    void reset() noexcept {
+        historyValid_ = false;
+    }
+    [[nodiscard]] const std::shared_ptr<RayTracingScene>& scene() const noexcept {
+        return scene_;
+    }
+
+private:
+    bool ensureTargets(uint32_t width, uint32_t height);
+    bool frame(const RenderScene& scene, const GBufferTargets& gbuffer, bool reference);
+
+    std::shared_ptr<systems::leal::campello_gpu::Device> device_;
+    std::shared_ptr<RayTracingScene> scene_;
+    std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> layout_;
+    std::shared_ptr<systems::leal::campello_gpu::RayTracingPipeline> initial_;
+    std::shared_ptr<systems::leal::campello_gpu::RayTracingPipeline> spatial_;
+    std::shared_ptr<systems::leal::campello_gpu::RayTracingPipeline> reference_;
+    std::shared_ptr<systems::leal::campello_gpu::Buffer> uniforms_;
+    std::shared_ptr<systems::leal::campello_gpu::Buffer> lights_;
+    std::shared_ptr<systems::leal::campello_gpu::Texture> reservoirs_[2];  // restirInitial's, this frame's and the last (the history)
+    std::shared_ptr<systems::leal::campello_gpu::Texture> final_;          // restirSpatial's (not read back)
+    std::shared_ptr<systems::leal::campello_gpu::Texture> surfaces_[2];  // normal + view depth, this frame's and the last
+    std::shared_ptr<systems::leal::campello_gpu::Texture> radiance_;
+    std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;
+    Settings settings_;
+    uint32_t frame_ = 0;
+    uint32_t surfaceIndex_ = 0;
+    bool historyValid_ = false;
+};
+
 } // namespace systems::leal::campello_renderer
