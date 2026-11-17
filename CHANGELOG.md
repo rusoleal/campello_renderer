@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-11-17
+
+### Fixed
+- **IBL bake on Apple GPUs in the browser.** The bake (BRDF LUT, prefiltered specular mips, irradiance; ~370M environment samples with the built-in sky) went out as one command buffer and ran past the command buffer watchdog on an M2 in Chrome (Dawn/Metal): "Caused GPU Hang Error", WebGPU device lost on the first frame. Each face of each mip is now its own command buffer, with one wait after the last.
+
 ## [0.22.0] - 2026-11-17
 
 ### Added
