@@ -334,6 +334,7 @@ inline VertexOut pbrVertex(
     device const packed_float3 *morphPositions,
     device const packed_float3 *morphNormals,
     uint vertexID,
+    uint instanceID,
     thread float3 &morphedPositionOut)
 {
     // Apply KHR_texture_transform when hasUVTransform flag (row0.w) is set.
@@ -409,9 +410,9 @@ inline VertexOut pbrVertex(
     float4x4 mvp   = nodeTransforms[0].mvp;
     float4x4 model = nodeTransforms[0].model;
 
-    // EXT_mesh_gpu_instancing: apply per-instance transform if available.
-    // instanceMatrices is a per-instance buffer (stepMode=instance).
-    float4x4 instM = instanceMatrices[0];
+    // EXT_mesh_gpu_instancing: this instance's transform (the renderer binds
+    // one identity matrix for draws without instances).
+    float4x4 instM = instanceMatrices[instanceID];
     float4 localPos = instM * skinnedPos;
     float3 localNormal = (instM * float4(skinnedNormal, 0.0)).xyz;
     float3 localTangent = (instM * float4(skinnedTangent, 0.0)).xyz;
@@ -460,11 +461,12 @@ vertex VertexOut vertexMain(
     // not float3 (16-byte stride in device memory).
     device const packed_float3 *morphPositions   [[buffer(22)]],
     device const packed_float3 *morphNormals     [[buffer(23)]],
-    uint                       vertexID          [[vertex_id]])
+    uint                       vertexID          [[vertex_id]],
+    uint                       instanceID        [[instance_id]])
 {
     float3 morphed;
     return pbrVertex(in, nodeTransforms, mat, instanceMatrices, jointMatrices, morph, morphPositions, morphNormals,
-                     vertexID, morphed);
+                     vertexID, instanceID, morphed);
 }
 
 // ---------------------------------------------------------------------------
@@ -1567,11 +1569,12 @@ vertex GBufferVertexOut gbufferVertex(
     device const packed_float3 *morphNormals     [[buffer(23)]],
     device const GBufferTransforms *previous     [[buffer(27)]],
     device const float4x4    *previousJoints     [[buffer(28)]],
-    uint                       vertexID          [[vertex_id]])
+    uint                       vertexID          [[vertex_id]],
+    uint                       instanceID        [[instance_id]])
 {
     float3 morphed;
     const VertexOut v = pbrVertex(in, nodeTransforms, mat, instanceMatrices, jointMatrices, morph, morphPositions,
-                                  morphNormals, vertexID, morphed);
+                                  morphNormals, vertexID, instanceID, morphed);
     // Where this vertex was: the previous joints (the current ones when the
     // draw has none) and the previous transform.
     float4 skinned = float4(morphed, 1.0);
@@ -1581,7 +1584,7 @@ vertex GBufferVertexOut gbufferVertex(
             if (in.weights[i] > 0.0) skinned += in.weights[i] * (previousJoints[in.joints[i]] * float4(morphed, 1.0));
         }
     }
-    return gbufferOut(v, previous[0].previousMvp * (instanceMatrices[0] * skinned), previous[0].jitter.xy);
+    return gbufferOut(v, previous[0].previousMvp * (instanceMatrices[instanceID] * skinned), previous[0].jitter.xy);
 }
 
 vertex GBufferVertexOut gbufferVertexLean(

@@ -547,8 +547,9 @@ namespace systems::leal::campello_renderer {
             std::array<int8_t, kLogicalSlotCount> slots{};
             // MeshPipelineRecipe::gbufferPreviousTransforms' vertex buffer slot (-1: none).
             int8_t previousTransformSlot = -1;
-            // The vertex stage reads JOINTS_0/WEIGHTS_0 (skins). On Vulkan the
-            // draw binds its joint palette at set 2 (bindVulkanSkin()).
+            // The vertex stage reads JOINTS_0/WEIGHTS_0 (skins). On Vulkan it
+            // also morphs: the draw binds its joint palette at set 2
+            // (bindVulkanSkin()) and its morph targets at set 3 (bindVulkanMorph()).
             bool skinned = false;
         };
         MeshPipelineRecipe meshRecipe;
@@ -600,6 +601,21 @@ namespace systems::leal::campello_renderer {
         std::unordered_map<uint64_t, VulkanSkinBindGroup> vulkanSkinBindGroups;
         // Set 2 of the Vulkan mesh pipelines: the joint palettes (storage buffers).
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> vulkanSkinBindGroupLayout;
+        // Vulkan: binds a morphed draw's MorphInfo and POSITION/NORMAL deltas
+        // (whole buffers) as set 3 of the deforming stages; cached per buffers.
+        void bindVulkanMorph(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+                             const std::shared_ptr<systems::leal::campello_gpu::Buffer> &info,
+                             const std::shared_ptr<systems::leal::campello_gpu::Buffer> &positions,
+                             const std::shared_ptr<systems::leal::campello_gpu::Buffer> &normals);
+        struct VulkanMorphBindGroup {
+            std::weak_ptr<systems::leal::campello_gpu::Buffer> info;
+            std::weak_ptr<systems::leal::campello_gpu::Buffer> positions;
+            std::weak_ptr<systems::leal::campello_gpu::Buffer> normals;
+            std::shared_ptr<systems::leal::campello_gpu::BindGroup> group;
+        };
+        std::unordered_map<uint64_t, VulkanMorphBindGroup> vulkanMorphBindGroups;
+        // Set 3 of the Vulkan mesh pipelines: the morph targets (storage buffers).
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> vulkanMorphBindGroupLayout;
         void prewarmMeshPipelines();
         // True when the backend has a separate flat fragment shader (Metal);
         // elsewhere "flat" draws use the textured shader and its bind group.
