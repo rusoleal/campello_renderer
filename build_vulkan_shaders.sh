@@ -38,6 +38,7 @@ echo "Using glslc: $GLSLC"
 # ---------------------------------------------------------------------------
 SHADERS=(
     "default.vert               default_vert.spv               kDefaultVulkanVertShader               vulkan_default.h"
+    "default_skinned.vert       default_skinned_vert.spv       kDefaultVulkanSkinnedVertShader        vulkan_default.h"
     "default.frag               default_frag.spv               kDefaultVulkanFragShader               vulkan_default.h"
     "default_lean.vert          default_lean_vert.spv          kDefaultVulkanLeanVertShader           vulkan_default.h"
     "default_line.vert          default_line_vert.spv          kDefaultVulkanLineVertShader           vulkan_default.h"
@@ -50,6 +51,7 @@ SHADERS=(
     "ssao.frag                  ssao_frag.spv                  kDefaultVulkanSsaoFragShader           vulkan_default.h"
     "ssao_apply.frag            ssao_apply_frag.spv            kDefaultVulkanSsaoApplyFragShader      vulkan_default.h"
     "gbuffer.vert               gbuffer_vert.spv               kDefaultVulkanGBufferVertShader        vulkan_default.h"
+    "gbuffer_skinned.vert       gbuffer_skinned_vert.spv       kDefaultVulkanGBufferSkinnedVertShader vulkan_default.h"
     "gbuffer_lean.vert          gbuffer_lean_vert.spv          kDefaultVulkanGBufferLeanVertShader    vulkan_default.h"
     "gbuffer.frag               gbuffer_frag.spv               kDefaultVulkanGBufferFragShader        vulkan_default.h"
     "taa.frag                   taa_frag.spv                   kDefaultVulkanTaaFragShader            vulkan_default.h"

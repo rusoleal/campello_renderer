@@ -547,6 +547,9 @@ namespace systems::leal::campello_renderer {
             std::array<int8_t, kLogicalSlotCount> slots{};
             // MeshPipelineRecipe::gbufferPreviousTransforms' vertex buffer slot (-1: none).
             int8_t previousTransformSlot = -1;
+            // The vertex stage reads JOINTS_0/WEIGHTS_0 (skins). On Vulkan the
+            // draw binds its joint palette at set 2 (bindVulkanSkin()).
+            bool skinned = false;
         };
         MeshPipelineRecipe meshRecipe;
         std::unordered_map<uint64_t, MeshPipelineEntry> meshPipelineCache;
@@ -564,19 +567,39 @@ namespace systems::leal::campello_renderer {
         bool quantizedLayoutDetected = false;
         VertexLayout standardLayout = VertexLayout::standard();
 
+        // excludeMask: semantics the layout has that the stage mustn't read
+        // (an unskinned draw's JOINTS_0/WEIGHTS_0 on Vulkan).
         const MeshVertexStage* vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines = false,
-                                              bool wide = false) const;
+                                              bool wide = false, uint32_t excludeMask = 0) const;
         // colorFormat: invalid = the recipe's (createDefaultPipelines()) format.
         const MeshPipelineEntry* meshPipeline(
             ProgramHandle program, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
             systems::leal::campello_gpu::PixelFormat colorFormat = systems::leal::campello_gpu::PixelFormat::invalid,
             systems::leal::campello_gpu::PrimitiveTopology topology =
                 systems::leal::campello_gpu::PrimitiveTopology::triangleList,
-            bool wideLines = false);
+            bool wideLines = false, bool skinned = true);
         const MeshPipelineEntry* meshPipeline(
-            MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend) {
-            return meshPipeline(kPbrProgram, variant, layout, doubleSided, blend);
+            MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend, bool skinned = true) {
+            return meshPipeline(kPbrProgram, variant, layout, doubleSided, blend,
+                                systems::leal::campello_gpu::PixelFormat::invalid,
+                                systems::leal::campello_gpu::PrimitiveTopology::triangleList, false, skinned);
         }
+        // Vulkan: binds a skinned draw's joint palettes (this frame's and the
+        // previous frame's, for G-buffer motion) as set 2. A size of 0 binds
+        // the rest of the buffer from the offset. Bind groups are cached per
+        // (buffers, ranges).
+        void bindVulkanSkin(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+                            const std::shared_ptr<systems::leal::campello_gpu::Buffer> &current, uint64_t currentOffset,
+                            uint64_t currentSize, const std::shared_ptr<systems::leal::campello_gpu::Buffer> &previous,
+                            uint64_t previousOffset, uint64_t previousSize);
+        struct VulkanSkinBindGroup {
+            std::weak_ptr<systems::leal::campello_gpu::Buffer> current;
+            std::weak_ptr<systems::leal::campello_gpu::Buffer> previous;
+            std::shared_ptr<systems::leal::campello_gpu::BindGroup> group;
+        };
+        std::unordered_map<uint64_t, VulkanSkinBindGroup> vulkanSkinBindGroups;
+        // Set 2 of the Vulkan mesh pipelines: the joint palettes (storage buffers).
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> vulkanSkinBindGroupLayout;
         void prewarmMeshPipelines();
         // True when the backend has a separate flat fragment shader (Metal);
         // elsewhere "flat" draws use the textured shader and its bind group.
@@ -1403,8 +1426,7 @@ namespace systems::leal::campello_renderer {
         void renderProgramPass(const RenderScene& scene,
                                std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView,
                                const ProgramPassOptions& options);
-        /// Whether renderGBuffer() works on this backend (Metal, Vulkan;
-        /// Vulkan draws don't skin yet, so skinned draws have no skinned motion).
+        /// Whether renderGBuffer() works on this backend (Metal, Vulkan).
         bool supportsGBuffer() const { return gbufferProgram.fragmentModule != nullptr && meshRecipe.ready; }
         /// Draws the scene's opaque draws into the G-buffer (gBuffer()) at
         /// renderWidth x renderHeight (resize()): normals, roughness, base

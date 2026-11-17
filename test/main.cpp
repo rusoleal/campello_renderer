@@ -1461,9 +1461,17 @@ protected:
 };
 
 static bool comparePixels(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, int tolerance = 2) {
-    if (a.size() != b.size()) return false;
+    if (a.size() != b.size()) {
+        std::printf("pixel count differs: %zu vs %zu\n", a.size(), b.size());
+        return false;
+    }
     for (size_t i = 0; i < a.size(); ++i) {
-        if (std::abs((int)a[i] - (int)b[i]) > tolerance) return false;
+        if (std::abs((int)a[i] - (int)b[i]) > tolerance) {
+            size_t p = i / 4 * 4;
+            std::printf("first mismatch at pixel %zu: cpu (%d %d %d %d) gpu (%d %d %d %d)\n", i / 4,
+                        a[p], a[p + 1], a[p + 2], a[p + 3], b[p], b[p + 1], b[p + 2], b[p + 3]);
+            return false;
+        }
     }
     return true;
 }
@@ -3537,6 +3545,137 @@ TEST_F(OffscreenRenderTest, ThinGlassShowsTheBackgroundAtItsBrightness) {
     EXPECT_LT(at(32, 32, 2), 20);
 }
 
+// Skinning: a 0.5 x 0.5 quad at the origin, every vertex on joint 0 (weight 1),
+// whose joint node sits 0.6 along x (identity inverse bind matrix), so the
+// posed quad is centred at x = 0.6. Emissive white, double-sided.
+static const char *kGltfSkinnedQuad = R"({
+    "asset": {"version": "2.0"},
+    "scene": 0,
+    "scenes": [{"nodes": [0, 1]}],
+    "nodes": [{"mesh": 0, "skin": 0}, {"translation": [0.6, 0, 0]}],
+    "skins": [{"joints": [1], "inverseBindMatrices": 4}],
+    "materials": [{"doubleSided": true, "emissiveFactor": [1, 1, 1],
+                   "pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1]}}],
+    "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "JOINTS_0": 2, "WEIGHTS_0": 3},
+                                "indices": 5, "material": 0}]}],
+    "accessors": [
+        {"bufferView": 0, "componentType": 5126, "count": 4, "type": "VEC3",
+         "max": [0.25, 0.25, 0], "min": [-0.25, -0.25, 0]},
+        {"bufferView": 1, "componentType": 5126, "count": 4, "type": "VEC3"},
+        {"bufferView": 2, "componentType": 5121, "count": 4, "type": "VEC4"},
+        {"bufferView": 3, "componentType": 5126, "count": 4, "type": "VEC4"},
+        {"bufferView": 4, "componentType": 5126, "count": 1, "type": "MAT4"},
+        {"bufferView": 5, "componentType": 5123, "count": 6, "type": "SCALAR"}
+    ],
+    "bufferViews": [
+        {"buffer": 0, "byteOffset": 0, "byteLength": 48},
+        {"buffer": 0, "byteOffset": 48, "byteLength": 48},
+        {"buffer": 0, "byteOffset": 96, "byteLength": 16},
+        {"buffer": 0, "byteOffset": 112, "byteLength": 64},
+        {"buffer": 0, "byteOffset": 176, "byteLength": 64},
+        {"buffer": 0, "byteOffset": 240, "byteLength": 12}
+    ],
+    "buffers": [{"uri": "data:application/octet-stream;base64,AACAvgAAgL4AAAAAAACAPgAAgL4AAAAAAACAPgAAgD4AAAAAAACAvgAAgD4AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAAAAAAIA/AAABAAIAAAACAAMA", "byteLength": 252}]
+})";
+
+// With an identity camera clip space is world space: x in [-1, 1] across the
+// 64 pixel columns, so x = 0.6 lands near column 51 and the origin at 32.
+static bool litAt(const std::vector<uint8_t>& pixels, int x, int y) {
+    const size_t i = (size_t(y) * 64 + x) * 4;
+    return pixels[i] + pixels[i + 1] + pixels[i + 2] > 60;
+}
+
+// A glTF skin poses its mesh: the quad renders where its joint puts it, not
+// at its rest position.
+TEST_F(OffscreenRenderTest, GltfSkinPosesTheMesh) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+#if defined(_WIN32)
+    GTEST_SKIP() << "No skinning on DirectX yet";
+#endif
+    auto asset = GLTF::loadGLTF(kGltfSkinnedQuad, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    renderer->setCameraMatrices(identity, identity);
+
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+    renderer->render(view);
+    const auto pixels = readBackPixels(tex);
+    EXPECT_TRUE(litAt(pixels, 51, 32)) << "the posed quad (x = 0.6)";
+    EXPECT_FALSE(litAt(pixels, 32, 32)) << "the rest position (x = 0)";
+    renderer->clearCameraOverride();
+}
+
+// A RenderScene draw with a joint palette (DrawCall::jointMatrixBuffer) is
+// posed by it; the same mesh without one renders at rest.
+TEST_F(OffscreenRenderTest, DrawCallJointsPoseTheMesh) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfSkinnedQuad, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    GpuMaterial* material = renderer->uploadMaterial((*asset->materials)[0], *asset);
+    ASSERT_NE(material, nullptr);
+
+    std::vector<float> positions = {-0.25f, -0.25f, 0.0f, 0.25f, -0.25f, 0.0f, 0.25f, 0.25f, 0.0f, -0.25f, 0.25f, 0.0f};
+    std::vector<float> normals = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    std::vector<uint8_t> joints(16, 0);
+    std::vector<float> weights = {1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0};
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] = device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] = device->createBuffer(normals.size() * 4, GPU::BufferUsage::vertex, normals.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_JOINTS] = device->createBuffer(joints.size(), GPU::BufferUsage::vertex, joints.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_WEIGHTS] = device->createBuffer(weights.size() * 4, GPU::BufferUsage::vertex, weights.data());
+    quad.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = nullptr;
+    quad.setBoundsFromPositions(positions.data(), 4);
+    // Joint 0: 0.6 along x (column-major).
+    float moved[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.6f, 0, 0, 1};
+
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::identity();
+    scene.camera.projection = VM::Matrix4<double>::identity();
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 1.0);
+    DrawCall draw;
+    draw.mesh = &quad;
+    draw.material = material;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(draw);
+    const auto render = [&]() {
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        return readBackPixels(tex);
+    };
+
+    const auto rest = render();
+    EXPECT_TRUE(litAt(rest, 32, 32)) << "no joints: at rest";
+    EXPECT_FALSE(litAt(rest, 51, 32));
+#if defined(_WIN32)
+    GTEST_SKIP() << "No skinning on DirectX yet";
+#endif
+
+    scene.opaque[0].jointMatrixBuffer = device->createBuffer(sizeof(moved), GPU::BufferUsage::storage, moved);
+    scene.opaque[0].jointCount = 1;
+    const auto posed = render();
+    EXPECT_TRUE(litAt(posed, 51, 32)) << "posed by its joint (x = 0.6)";
+    EXPECT_FALSE(litAt(posed, 32, 32)) << "not at rest";
+}
+
 // G-buffer (Renderer::renderGBuffer()): a quad facing the camera fills it
 // with its normal, roughness, base colour and metallic, depth in front of
 // the cleared background; motion from the camera moving, the object moving
@@ -3657,15 +3796,13 @@ TEST_F(OffscreenRenderTest, GBufferHoldsSurfacesAndMotion) {
     EXPECT_NEAR(motion[centre * 2 + 1], expected, expected * 0.05) << "object motion";
     scene.opaque[0].previousWorldTransform.reset();
 
-    // Its skin was 0.1 lower (Metal: the Vulkan shaders don't skin yet).
-#if defined(__APPLE__)
+    // Its skin was 0.1 lower.
     float jointBefore[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, -0.1f, 0, 1};  // column-major translation
     scene.opaque[0].previousJointMatrixBuffer = device->createBuffer(sizeof(jointBefore), GPU::BufferUsage::storage, jointBefore);
     renderer->renderGBuffer(scene);
     motion = readHalf(g.motion, 2);
     EXPECT_NEAR(motion[centre * 2 + 1], expected, expected * 0.05) << "skinned motion";
     scene.opaque[0].previousJointMatrixBuffer.reset();
-#endif
 
     // A camera cut: no camera motion reported.
     scene.camera = camera(0.5);

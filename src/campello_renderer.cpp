@@ -43,6 +43,22 @@
 #else
 #define CAMPELLO_RENDERER_VK_BINDINGS 0
 #endif
+// The Vulkan backend itself (not the web build).
+#if (defined(ANDROID) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
+#define CAMPELLO_RENDERER_VULKAN 1
+#else
+#define CAMPELLO_RENDERER_VULKAN 0
+#endif
+
+// Joint palettes: vertex (raw) buffers on Metal, storage buffers on Vulkan
+// (set 2 of the mesh pipelines, bindVulkanSkin()).
+#if CAMPELLO_RENDERER_VULKAN
+static constexpr auto kJointBufferUsage = static_cast<systems::leal::campello_gpu::BufferUsage>(
+    static_cast<int>(systems::leal::campello_gpu::BufferUsage::vertex) |
+    static_cast<int>(systems::leal::campello_gpu::BufferUsage::storage));
+#else
+static constexpr auto kJointBufferUsage = systems::leal::campello_gpu::BufferUsage::vertex;
+#endif
 
 // Per-draw transform buffers: vertex buffers everywhere, also storage
 // buffers on WebGPU (read through group 2 there, see bindWebGpuTransforms()).
@@ -3310,7 +3326,7 @@ void Renderer::setScene(uint32_t index) {
             0, 0, 0, 1   // column 3
         };
         defaultJointMatrixBuffer = device->createBuffer(
-            64, GPU::BufferUsage::vertex, reinterpret_cast<uint8_t*>(identity));
+            64, kJointBufferUsage, reinterpret_cast<uint8_t*>(identity));
     }
 
     // Per-frame joint matrix buffers.
@@ -3318,7 +3334,7 @@ void Renderer::setScene(uint32_t index) {
         jointMatrixData.resize(totalJointMatrixBytes / sizeof(float));
         for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
             frameResources[f].jointMatrixBuffer = device->createBuffer(
-                totalJointMatrixBytes, GPU::BufferUsage::vertex);
+                totalJointMatrixBytes, kJointBufferUsage);
         }
     }
 
@@ -3459,13 +3475,13 @@ void Renderer::detectQuantizedLayout() {
 }
 
 const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines,
-                                                          bool wide) const {
+                                                          bool wide, uint32_t excludeMask) const {
     const ProgramState* state = programState(program);
     if (!state) return nullptr;
     // The stage that reads the most attributes among those reading only
     // attributes the layout has (the full shader for glTF meshes, the lean
     // one for position-only meshes). Ties: the first listed.
-    const uint32_t has = layout.semanticMask();
+    const uint32_t has = layout.semanticMask() & ~excludeMask;
     const MeshVertexStage* best = nullptr;
     for (const auto& stage : state->vertexStages) {
         if (stage.lines != lines || stage.wide != wide) continue;
@@ -3478,7 +3494,7 @@ const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program,
 const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     ProgramHandle programHandle, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
     systems::leal::campello_gpu::PixelFormat colorFormat, systems::leal::campello_gpu::PrimitiveTopology topology,
-    bool wideLines) {
+    bool wideLines, bool skinned) {
     namespace GPU = systems::leal::campello_gpu;
     const ProgramState* programPtr = programState(programHandle);
     if (!meshRecipe.ready || !device || !programPtr) return nullptr;
@@ -3503,7 +3519,11 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     const bool lines = topology != GPU::PrimitiveTopology::triangleList &&
                        topology != GPU::PrimitiveTopology::triangleStrip;
     if (lines) doubleSided = true;  // no faces to cull
-    const MeshVertexStage* stage = vertexStageFor(programHandle, layout, lines, wideLines);
+    // An unskinned draw doesn't take a skinning stage even when its layout
+    // has joints (the glTF standard layout always does).
+    const uint32_t skinSemantics = semanticBit(VertexSemantic::joints) | semanticBit(VertexSemantic::weights);
+    const MeshVertexStage* stage =
+        vertexStageFor(programHandle, layout, lines, wideLines, skinned ? 0u : skinSemantics);
     if (!stage) return nullptr;
 
     // Only the attributes the stage reads shape the pipeline.
@@ -3536,6 +3556,7 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     // logical slot (VERTEX_SLOT_*) goes.
     MeshPipelineEntry entry;
     entry.slots.fill(-1);
+    entry.skinned = (stage->readMask & semanticBit(VertexSemantic::joints)) != 0;
     d.vertex.buffers.clear();
     for (const auto& a : read.attributes) {
         GPU::VertexLayout buffer{};
@@ -4141,15 +4162,17 @@ void Renderer::bindWebGpuTransforms(const std::shared_ptr<systems::leal::campell
 
 void Renderer::prewarmMeshPipelines() {
     // The combinations the built-in draw paths use, created now rather than
-    // on the first frame that needs them.
+    // on the first frame that needs them. On Vulkan, the unskinned ones: a
+    // skinned draw's pipeline (the skinning stage) is made on first use.
+    constexpr bool skinned = !CAMPELLO_RENDERER_VULKAN;
     for (const MeshProgram program : {MeshProgram::flat, MeshProgram::textured}) {
         for (const bool doubleSided : {false, true}) {
             for (const bool blend : {false, true}) {
-                meshPipeline(program, standardLayout, doubleSided, blend);
+                meshPipeline(program, standardLayout, doubleSided, blend, skinned);
             }
         }
     }
-    meshPipeline(MeshProgram::debug, standardLayout, false, false);
+    meshPipeline(MeshProgram::debug, standardLayout, false, false, skinned);
     if (vertexStageFor(kPbrProgram, VertexLayout::positionOnly())) {
         for (const bool doubleSided : {false, true}) {
             for (const bool blend : {false, true}) {
@@ -4820,6 +4843,25 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     plDesc.bindGroupLayouts = { vulkanMaterialBindGroupLayout, vulkanFrameBindGroupLayout };
 #if defined(__EMSCRIPTEN__)
     plDesc.bindGroupLayouts.push_back(webgpuDrawBindGroupLayout);
+#else
+    // Set 2: skinned draws' joint palettes (default_skinned.vert,
+    // gbuffer_skinned.vert): this frame's at binding 0, the previous frame's
+    // at 1 (G-buffer motion). Unskinned pipelines leave it unbound.
+    if (!vulkanSkinBindGroupLayout) {
+        GPU::BindGroupLayoutDescriptor skinDesc{};
+        for (uint32_t binding : {0u, 1u}) {
+            GPU::EntryObject e{};
+            e.binding = binding;
+            e.visibility = GPU::ShaderStage::vertex;
+            e.type = GPU::EntryObjectType::buffer;
+            e.data.buffer.hasDinamicOffaset = false;
+            e.data.buffer.minBindingSize = 64;  // one joint
+            e.data.buffer.type = GPU::EntryObjectBufferType::readOnlyStorage;
+            skinDesc.entries.push_back(e);
+        }
+        vulkanSkinBindGroupLayout = device->createBindGroupLayout(skinDesc);
+    }
+    if (vulkanSkinBindGroupLayout) plDesc.bindGroupLayouts.push_back(vulkanSkinBindGroupLayout);
 #endif
     vulkanDefaultPipelineLayout = device->createPipelineLayout(plDesc);
     desc.layout = vulkanDefaultPipelineLayout;
@@ -4861,10 +4903,10 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         GPU::ComponentType::ctFloat, GPU::AccessorType::acVec4,
         16.0, GPU::StepMode::vertex, VERTEX_SLOT_TANGENT));
 
-    // Slots 4–5 (JOINTS_0/WEIGHTS_0 — skinning): unused placeholders.
-    // Skinning is deferred (see ensureVulkanPbrBindGroupLayouts()'s doc
-    // comment area / plan notes) — not wired on Vulkan today either, so this
-    // isn't a regression.
+    // Slots 4–5 (JOINTS_0/WEIGHTS_0): placeholders in this base descriptor.
+    // Mesh pipelines take their vertex buffers from the mesh's layout
+    // (meshPipeline()); the skinning stage reads these two, with the joint
+    // palette at set 2.
     for (int i = 4; i <= (int)VERTEX_SLOT_WEIGHTS; i++) {
         GPU::VertexLayout empty{};
         empty.arrayStride = 0;
@@ -5004,6 +5046,16 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         meshRecipe.perDrawBuffers.clear();  // transforms: storage buffer, group 2
 #else
         programs[kPbrProgram].vertexStages.push_back({standardReads, vertModule, "main"});
+        // Skinned draws: the same stage with JOINTS_0/WEIGHTS_0 and the joint
+        // palette (set 2); meshPipeline() picks it only for draws with a skin.
+        const uint32_t skinnedReads =
+            standardReads | semanticBit(VertexSemantic::joints) | semanticBit(VertexSemantic::weights);
+        if (vulkanSkinBindGroupLayout) {
+            if (auto skinnedModule = device->createShaderModule(kDefaultVulkanSkinnedVertShader,
+                                                                kDefaultVulkanSkinnedVertShaderSize)) {
+                programs[kPbrProgram].vertexStages.push_back({skinnedReads, skinnedModule, "main"});
+            }
+        }
         if (auto leanModule = device->createShaderModule(kDefaultVulkanLeanVertShader,
                                                          kDefaultVulkanLeanVertShaderSize)) {
             programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), leanModule, "main"});
@@ -5042,6 +5094,12 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
                     {standardReads, gbufferVert, "main"},
                     {semanticBit(VertexSemantic::position), gbufferLean, "main"},
                 };
+                if (vulkanSkinBindGroupLayout) {
+                    if (auto gbufferSkinned = device->createShaderModule(kDefaultVulkanGBufferSkinnedVertShader,
+                                                                         kDefaultVulkanGBufferSkinnedVertShaderSize)) {
+                        gbufferProgram.vertexStages.push_back({skinnedReads, gbufferSkinned, "main"});
+                    }
+                }
                 gbufferProgram.fragmentModule = gbufferFrag;
                 gbufferProgram.fragmentEntries = {"", "main", ""};
             }
@@ -5575,8 +5633,8 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         GPU::ComponentType::ctFloat, GPU::AccessorType::acVec4,
         16.0, GPU::StepMode::vertex, VERTEX_SLOT_TANGENT));
 
-    // Slots 4–5 (JOINTS_0/WEIGHTS_0 — skinning): unused placeholders, matching
-    // Vulkan's pipeline (skinning isn't wired on either backend yet).
+    // Slots 4–5 (JOINTS_0/WEIGHTS_0 — skinning): unused placeholders
+    // (skinning isn't wired on DirectX yet).
     for (int i = 4; i <= (int)VERTEX_SLOT_WEIGHTS; i++) {
         GPU::VertexLayout empty{};
         empty.arrayStride = 0;
@@ -7881,10 +7939,16 @@ void Renderer::renderPrimitive(
     // Clip planes: the clip test is in the textured shader, and without
     // culling the back faces seen through the cut become section caps.
     const bool clipping = clippingActive();
+    // The node's skin (step 5b binds its joints). Vulkan takes the skinning
+    // vertex stage only for skinned nodes; Metal's one stage does both.
+    const int64_t nodeSkin = (nodeIndex < nodeSkinIndex.size()) ? nodeSkinIndex[nodeIndex] : -1;
+    const bool hasSkin = nodeSkin >= 0 && (size_t)nodeSkin < skinData.size() &&
+                         frameResources[currentFrameIndex].jointMatrixBuffer;
+    const bool skinnedStage = !CAMPELLO_RENDERER_VULKAN || hasSkin;
     const MeshPipelineEntry* entry = debugView
-        ? meshPipeline(MeshProgram::debug, *layout, false, false)
+        ? meshPipeline(MeshProgram::debug, *layout, false, false, skinnedStage)
         : meshPipeline((hasTexture || clipping) ? MeshProgram::textured : MeshProgram::flat, *layout,
-                       doubleSided || clipping, useBlend);
+                       doubleSided || clipping, useBlend, skinnedStage);
     if (!entry) return;
     activeMeshSlots = &entry->slots;
     if (entry->pipeline.get() != currentPipelineObject) {
@@ -7994,6 +8058,17 @@ void Renderer::renderPrimitive(
         bindMeshBuffer(
             rpe, VERTEX_SLOT_JOINT_MATRICES, defaultJointMatrixBuffer, 0);
     }
+#if CAMPELLO_RENDERER_VULKAN
+    if (entry->skinned) {
+        if (hasSkin) {
+            const auto& sd = skinData[(size_t)nodeSkin];
+            const auto& joints = frameResources[currentFrameIndex].jointMatrixBuffer;
+            bindVulkanSkin(rpe, joints, sd.gpuOffset, sd.jointCount * 64, joints, sd.gpuOffset, sd.jointCount * 64);
+        } else {
+            bindVulkanSkin(rpe, defaultJointMatrixBuffer, 0, 64, defaultJointMatrixBuffer, 0, 64);
+        }
+    }
+#endif
 
     // --- 6. Check for Draco-compressed buffers ---
     auto dracoIt = dracoPrimitiveBuffers.find(&primitive);
@@ -11182,6 +11257,48 @@ void Renderer::render(const RenderScene& scene,
 }
 
 
+#if CAMPELLO_RENDERER_VULKAN
+void Renderer::bindVulkanSkin(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+                              const std::shared_ptr<systems::leal::campello_gpu::Buffer> &current, uint64_t currentOffset,
+                              uint64_t currentSize, const std::shared_ptr<systems::leal::campello_gpu::Buffer> &previous,
+                              uint64_t previousOffset, uint64_t previousSize) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!vulkanSkinBindGroupLayout || !current || !previous) return;
+    const auto range = [](const std::shared_ptr<GPU::Buffer>& buffer, uint64_t offset, uint64_t size) {
+        const uint64_t length = buffer->getLength();
+        if (offset >= length) return (uint64_t)0;
+        return size == 0 ? length - offset : std::min(size, length - offset);
+    };
+    currentSize = range(current, currentOffset, currentSize);
+    previousSize = range(previous, previousOffset, previousSize);
+    if (currentSize == 0 || previousSize == 0) return;
+    uint64_t key = 0;
+    for (uint64_t v : {(uint64_t)(uintptr_t)current.get(), currentOffset, currentSize, (uint64_t)(uintptr_t)previous.get(),
+                       previousOffset, previousSize}) {
+        key ^= std::hash<uint64_t>{}(v) + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    }
+    // A cached group is only reused while its buffers are the same live ones
+    // (an address can be reused by a new buffer once the old one is gone).
+    auto it = vulkanSkinBindGroups.find(key);
+    if (it == vulkanSkinBindGroups.end() || it->second.current.lock() != current ||
+        it->second.previous.lock() != previous) {
+        if (vulkanSkinBindGroups.size() > 256) vulkanSkinBindGroups.clear();
+        GPU::BindGroupDescriptor desc{};
+        desc.layout = vulkanSkinBindGroupLayout;
+        desc.entries = {{0, GPU::BufferBinding{current, currentOffset, currentSize}},
+                        {1, GPU::BufferBinding{previous, previousOffset, previousSize}}};
+        auto group = device->createBindGroup(desc);
+        if (!group) return;
+        it = vulkanSkinBindGroups.insert_or_assign(key, VulkanSkinBindGroup{current, previous, group}).first;
+    }
+    rpe->setBindGroup(2, it->second.group);
+}
+#else
+void Renderer::bindVulkanSkin(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &,
+                              const std::shared_ptr<systems::leal::campello_gpu::Buffer> &, uint64_t, uint64_t,
+                              const std::shared_ptr<systems::leal::campello_gpu::Buffer> &, uint64_t, uint64_t) {}
+#endif
+
 void Renderer::renderPrimitive(
     const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
     const systems::leal::campello_renderer::DrawCall &draw,
@@ -11213,12 +11330,16 @@ void Renderer::renderPrimitive(
     bool debugView = program == kPbrProgram && viewMode == ViewMode::worldNormal && !customLayout &&
                      draw.mesh->topology == GPU::PrimitiveTopology::triangleList;
     const bool wideLines = draw.mesh->wideLines;
+    // Vulkan takes the skinning vertex stage only for draws with joints
+    // (step 6 binds them); Metal's one stage does both.
+    const bool skinnedStage = !CAMPELLO_RENDERER_VULKAN || draw.jointMatrixBuffer || draw.previousJointMatrixBuffer;
     const MeshPipelineEntry* entry = wideLines
         ? meshPipeline(program, MeshProgram::textured, layout, true, true, colorFormat, draw.mesh->topology, true)
         : debugView
-        ? meshPipeline(program, MeshProgram::debug, layout, false, false, colorFormat)
+        ? meshPipeline(program, MeshProgram::debug, layout, false, false, colorFormat,
+                       GPU::PrimitiveTopology::triangleList, false, skinnedStage)
         : meshPipeline(program, MeshProgram::textured, layout, doubleSided || (program == kPbrProgram && clippingActive()),
-                       useBlend, colorFormat, draw.mesh->topology);
+                       useBlend, colorFormat, draw.mesh->topology, false, skinnedStage);
     if (!entry) return;
     activeMeshSlots = &entry->slots;
     // Wide lines expand in screen space: their vertex stage reads the camera
@@ -11312,6 +11433,19 @@ void Renderer::renderPrimitive(
     } else if (defaultJointMatrixBuffer) {
         bindMeshBuffer(rpe, VERTEX_SLOT_JOINT_MATRICES, defaultJointMatrixBuffer, 0);
     }
+#if CAMPELLO_RENDERER_VULKAN
+    if (entry->skinned) {
+        // Set 2: this frame's palette and (G-buffer motion) the previous
+        // one, which is this frame's when the draw has none.
+        const auto& joints = draw.jointMatrixBuffer ? draw.jointMatrixBuffer
+                             : draw.previousJointMatrixBuffer ? draw.previousJointMatrixBuffer
+                                                              : defaultJointMatrixBuffer;
+        const auto& previousJoints = draw.previousJointMatrixBuffer ? draw.previousJointMatrixBuffer : joints;
+        const uint64_t bytes = draw.jointCount > 0 ? (uint64_t)draw.jointCount * 64 : 0;
+        bindVulkanSkin(rpe, joints, 0, joints == defaultJointMatrixBuffer ? 64 : bytes, previousJoints, 0,
+                       previousJoints == defaultJointMatrixBuffer ? 64 : bytes);
+    }
+#endif
 
     // --- 6. Bind vertex attributes ---
     auto &vb = draw.mesh->vertexBuffers;
