@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+- **Morph targets on Vulkan.** POSITION and NORMAL targets blend on Vulkan as on Metal (up to 8 targets, with the same weights: node, mesh, animation).
+  - They're in the deforming vertex stages (`default_skinned.vert`, `gbuffer_skinned.vert`, shared code in `skinning.glsl`), which now morph and then skin, in glTF's order. `meshPipeline()` picks them for draws with a skin or morph targets.
+  - The node's `MorphInfo` and the primitive's deltas are storage buffers at set 3 of the mesh pipelines, bound by `bindVulkanMorph()` (cached per buffers). The renderer's morph and fallback buffers are storage buffers on Vulkan.
+  - `MorphTargetMovesEveryVertex` runs on Vulkan now.
+- **EXT_mesh_gpu_instancing on Vulkan.** Each instance's matrix is a per-instance vertex attribute (locations 12-15) of the PBR and G-buffer stages. The per-draw transforms (and the G-buffer's previous transforms) have stride 0, so every instance of a draw reads the draw's own; before, instance *n* read the transforms of the *n*th next draw.
+- New test `GltfInstancesDrawAtTheirTransforms`: a glTF node with two instances draws a quad at each instance's translation.
+
+### Fixed
+- **EXT_mesh_gpu_instancing on Metal.** The vertex stages read the first instance's matrix for every instance, so all instances were drawn on top of each other. They index the instance matrices by `[[instance_id]]` now (`vertexMain`, `gbufferVertex`).
+
+### Changed
+- **Android results:** 104 passed, 34 skipped (ray tracing), 0 failed.
+
 ## [0.21.0] - 2026-11-17
 
 ### Added

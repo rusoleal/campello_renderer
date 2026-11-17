@@ -2949,8 +2949,8 @@ static const char *kGltfMorphTriangleTemplate = R"({
 // shader reading them at another stride moves only the first vertex).
 TEST_F(OffscreenRenderTest, MorphTargetMovesEveryVertex) {
     if (!device) GTEST_SKIP() << "No GPU device available";
-#if !defined(__APPLE__)
-    GTEST_SKIP() << "morph targets are Metal-only so far";
+#if defined(_WIN32)
+    GTEST_SKIP() << "No morph targets on DirectX yet";
 #endif
     const auto render = [&](double weight) -> std::vector<uint8_t> {
         renderer = std::make_unique<systems::leal::campello_renderer::Renderer>(device);
@@ -3608,6 +3608,60 @@ TEST_F(OffscreenRenderTest, GltfSkinPosesTheMesh) {
     const auto pixels = readBackPixels(tex);
     EXPECT_TRUE(litAt(pixels, 51, 32)) << "the posed quad (x = 0.6)";
     EXPECT_FALSE(litAt(pixels, 32, 32)) << "the rest position (x = 0)";
+    renderer->clearCameraOverride();
+}
+
+// EXT_mesh_gpu_instancing: the same 0.5 x 0.5 quad drawn twice, its
+// instances translated to x = -0.6 and x = 0.6. Emissive white, double-sided.
+static const char *kGltfInstancedQuad = R"({
+    "asset": {"version": "2.0"},
+    "extensionsUsed": ["EXT_mesh_gpu_instancing"],
+    "scene": 0,
+    "scenes": [{"nodes": [0]}],
+    "nodes": [{"mesh": 0, "extensions": {"EXT_mesh_gpu_instancing": {"attributes": {"TRANSLATION": 2}}}}],
+    "materials": [{"doubleSided": true, "emissiveFactor": [1, 1, 1],
+                   "pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1]}}],
+    "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 3, "material": 0}]}],
+    "accessors": [
+        {"bufferView": 0, "componentType": 5126, "count": 4, "type": "VEC3",
+         "max": [0.25, 0.25, 0], "min": [-0.25, -0.25, 0]},
+        {"bufferView": 1, "componentType": 5126, "count": 4, "type": "VEC3"},
+        {"bufferView": 2, "componentType": 5126, "count": 2, "type": "VEC3"},
+        {"bufferView": 3, "componentType": 5123, "count": 6, "type": "SCALAR"}
+    ],
+    "bufferViews": [
+        {"buffer": 0, "byteOffset": 0, "byteLength": 48},
+        {"buffer": 0, "byteOffset": 48, "byteLength": 48},
+        {"buffer": 0, "byteOffset": 96, "byteLength": 24},
+        {"buffer": 0, "byteOffset": 120, "byteLength": 12}
+    ],
+    "buffers": [{"uri": "data:application/octet-stream;base64,AACAvgAAgL4AAAAAAACAPgAAgL4AAAAAAACAPgAAgD4AAAAAAACAvgAAgD4AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/mpkZvwAAAAAAAAAAmpkZPwAAAAAAAAAAAAABAAIAAAACAAMA", "byteLength": 132}]
+})";
+
+// Each instance renders at its own transform: two quads (x = -0.6 near
+// column 13, x = 0.6 near column 51), nothing at the mesh's own position.
+TEST_F(OffscreenRenderTest, GltfInstancesDrawAtTheirTransforms) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+#if defined(_WIN32)
+    GTEST_SKIP() << "No EXT_mesh_gpu_instancing on DirectX yet";
+#endif
+    auto asset = GLTF::loadGLTF(kGltfInstancedQuad, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    renderer->setCameraMatrices(identity, identity);
+
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+    renderer->render(view);
+    const auto pixels = readBackPixels(tex);
+    EXPECT_TRUE(litAt(pixels, 13, 32)) << "instance 0 (x = -0.6)";
+    EXPECT_TRUE(litAt(pixels, 51, 32)) << "instance 1 (x = 0.6)";
+    EXPECT_FALSE(litAt(pixels, 32, 32)) << "the mesh's own position (x = 0)";
     renderer->clearCameraOverride();
 }
 

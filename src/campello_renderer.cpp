@@ -50,14 +50,15 @@
 #define CAMPELLO_RENDERER_VULKAN 0
 #endif
 
-// Joint palettes: vertex (raw) buffers on Metal, storage buffers on Vulkan
-// (set 2 of the mesh pipelines, bindVulkanSkin()).
+// Joint palettes and morph target data: vertex (raw) buffers on Metal,
+// storage buffers on Vulkan (sets 2 and 3 of the mesh pipelines,
+// bindVulkanSkin() and bindVulkanMorph()).
 #if CAMPELLO_RENDERER_VULKAN
-static constexpr auto kJointBufferUsage = static_cast<systems::leal::campello_gpu::BufferUsage>(
+static constexpr auto kDeformBufferUsage = static_cast<systems::leal::campello_gpu::BufferUsage>(
     static_cast<int>(systems::leal::campello_gpu::BufferUsage::vertex) |
     static_cast<int>(systems::leal::campello_gpu::BufferUsage::storage));
 #else
-static constexpr auto kJointBufferUsage = systems::leal::campello_gpu::BufferUsage::vertex;
+static constexpr auto kDeformBufferUsage = systems::leal::campello_gpu::BufferUsage::vertex;
 #endif
 
 // Per-draw transform buffers: vertex buffers everywhere, also storage
@@ -1876,10 +1877,10 @@ void Renderer::setScene(uint32_t index) {
                 gpuData.targetCount = (uint32_t)targetCount;
                 gpuData.vertexCount = vertexCount;
                 gpuData.positionDeltas = device->createBuffer(
-                    posDeltas.size() * sizeof(float), GPU::BufferUsage::vertex, posDeltas.data());
+                    posDeltas.size() * sizeof(float), kDeformBufferUsage, posDeltas.data());
                 if (allHaveNormal) {
                     gpuData.normalDeltas = device->createBuffer(
-                        normDeltas.size() * sizeof(float), GPU::BufferUsage::vertex, normDeltas.data());
+                        normDeltas.size() * sizeof(float), kDeformBufferUsage, normDeltas.data());
                 }
                 morphBuffers[&primitive] = gpuData;
             }
@@ -1887,8 +1888,7 @@ void Renderer::setScene(uint32_t index) {
     }
     if (!defaultMorphInfoBuffer) {
         float zero[11] = {0};
-        defaultMorphInfoBuffer = device->createBuffer(
-            sizeof(zero), systems::leal::campello_gpu::BufferUsage::vertex, zero);
+        defaultMorphInfoBuffer = device->createBuffer(sizeof(zero), kDeformBufferUsage, zero);
     }
 
     // Scan ALL materials in the asset to determine which image indices carry
@@ -3326,7 +3326,7 @@ void Renderer::setScene(uint32_t index) {
             0, 0, 0, 1   // column 3
         };
         defaultJointMatrixBuffer = device->createBuffer(
-            64, kJointBufferUsage, reinterpret_cast<uint8_t*>(identity));
+            64, kDeformBufferUsage, reinterpret_cast<uint8_t*>(identity));
     }
 
     // Per-frame joint matrix buffers.
@@ -3334,7 +3334,7 @@ void Renderer::setScene(uint32_t index) {
         jointMatrixData.resize(totalJointMatrixBytes / sizeof(float));
         for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
             frameResources[f].jointMatrixBuffer = device->createBuffer(
-                totalJointMatrixBytes, kJointBufferUsage);
+                totalJointMatrixBytes, kDeformBufferUsage);
         }
     }
 
@@ -4861,7 +4861,26 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         }
         vulkanSkinBindGroupLayout = device->createBindGroupLayout(skinDesc);
     }
-    if (vulkanSkinBindGroupLayout) plDesc.bindGroupLayouts.push_back(vulkanSkinBindGroupLayout);
+    // Set 3: morph targets (the same stages): the node's MorphInfo at
+    // binding 0, the primitive's POSITION and NORMAL deltas at 1 and 2.
+    if (!vulkanMorphBindGroupLayout) {
+        GPU::BindGroupLayoutDescriptor morphDesc{};
+        for (uint32_t binding : {0u, 1u, 2u}) {
+            GPU::EntryObject e{};
+            e.binding = binding;
+            e.visibility = GPU::ShaderStage::vertex;
+            e.type = GPU::EntryObjectType::buffer;
+            e.data.buffer.hasDinamicOffaset = false;
+            e.data.buffer.minBindingSize = binding == 0 ? 44 : 12;  // MorphInfo; one delta
+            e.data.buffer.type = GPU::EntryObjectBufferType::readOnlyStorage;
+            morphDesc.entries.push_back(e);
+        }
+        vulkanMorphBindGroupLayout = device->createBindGroupLayout(morphDesc);
+    }
+    if (vulkanSkinBindGroupLayout && vulkanMorphBindGroupLayout) {
+        plDesc.bindGroupLayouts.push_back(vulkanSkinBindGroupLayout);
+        plDesc.bindGroupLayouts.push_back(vulkanMorphBindGroupLayout);
+    }
 #endif
     vulkanDefaultPipelineLayout = device->createPipelineLayout(plDesc);
     desc.layout = vulkanDefaultPipelineLayout;
@@ -4936,9 +4955,12 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     // before); the model matrix (needed for world-space position/normal/
     // tangent, i.e. real lighting) now occupies locations 24-27, previously
     // unused after removing the vertex-attribute-smuggled material data below.
+    // Stride 0: every instance of a draw reads the draw's transforms (the
+    // binding offset selects them), so instanced draws (EXT_mesh_gpu_instancing)
+    // differ only by their instance matrix, as Metal's nodeTransforms[0].
     {
         GPU::VertexLayout mvpLayout{};
-        mvpLayout.arrayStride = 128; // sizeof(NodeTransforms) = 2 * sizeof(float4x4)
+        mvpLayout.arrayStride = 0;  // one NodeTransforms (128 bytes) per draw
         mvpLayout.stepMode    = GPU::StepMode::instance;
         for (uint32_t col = 0; col < 4; col++) {
             GPU::VertexAttribute attr{};
@@ -5046,11 +5068,29 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         meshRecipe.perDrawBuffers.clear();  // transforms: storage buffer, group 2
 #else
         programs[kPbrProgram].vertexStages.push_back({standardReads, vertModule, "main"});
-        // Skinned draws: the same stage with JOINTS_0/WEIGHTS_0 and the joint
-        // palette (set 2); meshPipeline() picks it only for draws with a skin.
+        // EXT_mesh_gpu_instancing: the instance's transform, per instance at
+        // locations 12-15 (default.vert, gbuffer.vert; the identity for
+        // draws without instances), after the transforms.
+        {
+            GPU::VertexLayout instances{};
+            instances.arrayStride = 64;
+            instances.stepMode = GPU::StepMode::instance;
+            for (uint32_t col = 0; col < 4; ++col) {
+                GPU::VertexAttribute attr{};
+                attr.componentType = GPU::ComponentType::ctFloat;
+                attr.accessorType = GPU::AccessorType::acVec4;
+                attr.offset = col * 16;
+                attr.shaderLocation = 12 + col;
+                instances.attributes.push_back(attr);
+            }
+            meshRecipe.perDrawBuffers.push_back({VERTEX_SLOT_INSTANCE_MATRIX, instances});
+        }
+        // Skinned and morphed draws: the same stage with JOINTS_0/WEIGHTS_0,
+        // the joint palette (set 2) and the morph targets (set 3);
+        // meshPipeline() picks it only for draws with a skin or morph targets.
         const uint32_t skinnedReads =
             standardReads | semanticBit(VertexSemantic::joints) | semanticBit(VertexSemantic::weights);
-        if (vulkanSkinBindGroupLayout) {
+        if (vulkanSkinBindGroupLayout && vulkanMorphBindGroupLayout) {
             if (auto skinnedModule = device->createShaderModule(kDefaultVulkanSkinnedVertShader,
                                                                 kDefaultVulkanSkinnedVertShaderSize)) {
                 programs[kPbrProgram].vertexStages.push_back({skinnedReads, skinnedModule, "main"});
@@ -5078,7 +5118,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             auto gbufferFrag = device->createShaderModule(kDefaultVulkanGBufferFragShader, kDefaultVulkanGBufferFragShaderSize);
             if (gbufferVert && gbufferLean && gbufferFrag) {
                 GPU::VertexLayout previous{};
-                previous.arrayStride = 128;  // GBufferTransforms, NodeTransforms' stride
+                previous.arrayStride = 0;  // one GBufferTransforms per draw, as the transforms
                 previous.stepMode = GPU::StepMode::instance;
                 for (uint32_t col = 0; col < 5; ++col) {
                     GPU::VertexAttribute attr{};
@@ -5094,7 +5134,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
                     {standardReads, gbufferVert, "main"},
                     {semanticBit(VertexSemantic::position), gbufferLean, "main"},
                 };
-                if (vulkanSkinBindGroupLayout) {
+                if (vulkanSkinBindGroupLayout && vulkanMorphBindGroupLayout) {
                     if (auto gbufferSkinned = device->createShaderModule(kDefaultVulkanGBufferSkinnedVertShader,
                                                                          kDefaultVulkanGBufferSkinnedVertShaderSize)) {
                         gbufferProgram.vertexStages.push_back({skinnedReads, gbufferSkinned, "main"});
@@ -6036,8 +6076,9 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     if (!fallbackTangentBuffer) {
         constexpr uint64_t kFallbackTangentSize = 256 * 1024; // 16 384 float4 values
         std::vector<uint8_t> zeros(kFallbackTangentSize, 0);
+        // Also the morph delta fallback (a storage buffer on Vulkan).
         fallbackTangentBuffer = device->createBuffer(
-            kFallbackTangentSize, GPU::BufferUsage::vertex, zeros.data());
+            kFallbackTangentSize, kDeformBufferUsage, zeros.data());
     }
 }
 
@@ -7746,7 +7787,7 @@ void Renderer::updateMorphWeights(uint64_t nodeIndex) {
     namespace GPU = systems::leal::campello_gpu;
     auto &buf = morphNodeUniformBuffers[nodeIndex];
     if (!buf) {
-        buf = device->createBuffer(sizeof(data), GPU::BufferUsage::uniform, data);
+        buf = device->createBuffer(sizeof(data), kDeformBufferUsage, data);
     } else {
         buf->upload(0, sizeof(data), data);
     }
@@ -7939,12 +7980,15 @@ void Renderer::renderPrimitive(
     // Clip planes: the clip test is in the textured shader, and without
     // culling the back faces seen through the cut become section caps.
     const bool clipping = clippingActive();
-    // The node's skin (step 5b binds its joints). Vulkan takes the skinning
-    // vertex stage only for skinned nodes; Metal's one stage does both.
+    // The node's skin (step 5b binds its joints) and the primitive's morph
+    // targets (step 7). Vulkan takes the deforming vertex stage only for
+    // those; Metal's one stage does everything.
     const int64_t nodeSkin = (nodeIndex < nodeSkinIndex.size()) ? nodeSkinIndex[nodeIndex] : -1;
     const bool hasSkin = nodeSkin >= 0 && (size_t)nodeSkin < skinData.size() &&
                          frameResources[currentFrameIndex].jointMatrixBuffer;
-    const bool skinnedStage = !CAMPELLO_RENDERER_VULKAN || hasSkin;
+    const auto morphData = morphBuffers.find(&primitive);
+    const bool hasMorph = morphData != morphBuffers.end() && morphData->second.positionDeltas;
+    const bool skinnedStage = !CAMPELLO_RENDERER_VULKAN || hasSkin || hasMorph;
     const MeshPipelineEntry* entry = debugView
         ? meshPipeline(MeshProgram::debug, *layout, false, false, skinnedStage)
         : meshPipeline((hasTexture || clipping) ? MeshProgram::textured : MeshProgram::flat, *layout,
@@ -8066,6 +8110,15 @@ void Renderer::renderPrimitive(
             bindVulkanSkin(rpe, joints, sd.gpuOffset, sd.jointCount * 64, joints, sd.gpuOffset, sd.jointCount * 64);
         } else {
             bindVulkanSkin(rpe, defaultJointMatrixBuffer, 0, 64, defaultJointMatrixBuffer, 0, 64);
+        }
+        // Set 3: the morph targets with the node's weights, or none.
+        const auto weights = morphNodeUniformBuffers.find(nodeIndex);
+        if (hasMorph && weights != morphNodeUniformBuffers.end() && weights->second) {
+            const auto& deltas = morphData->second;
+            bindVulkanMorph(rpe, weights->second, deltas.positionDeltas,
+                            deltas.normalDeltas ? deltas.normalDeltas : deltas.positionDeltas);
+        } else {
+            bindVulkanMorph(rpe, defaultMorphInfoBuffer, fallbackTangentBuffer, fallbackTangentBuffer);
         }
     }
 #endif
@@ -11293,10 +11346,41 @@ void Renderer::bindVulkanSkin(const std::shared_ptr<systems::leal::campello_gpu:
     }
     rpe->setBindGroup(2, it->second.group);
 }
+
+void Renderer::bindVulkanMorph(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+                               const std::shared_ptr<systems::leal::campello_gpu::Buffer> &info,
+                               const std::shared_ptr<systems::leal::campello_gpu::Buffer> &positions,
+                               const std::shared_ptr<systems::leal::campello_gpu::Buffer> &normals) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!vulkanMorphBindGroupLayout || !info || !positions || !normals) return;
+    uint64_t key = 0;
+    for (const auto* buffer : {info.get(), positions.get(), normals.get()}) {
+        key ^= std::hash<uint64_t>{}((uint64_t)(uintptr_t)buffer) + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    }
+    // Reused only while its buffers are the same live ones (bindVulkanSkin()).
+    auto it = vulkanMorphBindGroups.find(key);
+    if (it == vulkanMorphBindGroups.end() || it->second.info.lock() != info ||
+        it->second.positions.lock() != positions || it->second.normals.lock() != normals) {
+        if (vulkanMorphBindGroups.size() > 1024) vulkanMorphBindGroups.clear();
+        GPU::BindGroupDescriptor desc{};
+        desc.layout = vulkanMorphBindGroupLayout;
+        desc.entries = {{0, GPU::BufferBinding{info, 0, info->getLength()}},
+                        {1, GPU::BufferBinding{positions, 0, positions->getLength()}},
+                        {2, GPU::BufferBinding{normals, 0, normals->getLength()}}};
+        auto group = device->createBindGroup(desc);
+        if (!group) return;
+        it = vulkanMorphBindGroups.insert_or_assign(key, VulkanMorphBindGroup{info, positions, normals, group}).first;
+    }
+    rpe->setBindGroup(3, it->second.group);
+}
 #else
 void Renderer::bindVulkanSkin(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &,
                               const std::shared_ptr<systems::leal::campello_gpu::Buffer> &, uint64_t, uint64_t,
                               const std::shared_ptr<systems::leal::campello_gpu::Buffer> &, uint64_t, uint64_t) {}
+void Renderer::bindVulkanMorph(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &,
+                               const std::shared_ptr<systems::leal::campello_gpu::Buffer> &,
+                               const std::shared_ptr<systems::leal::campello_gpu::Buffer> &,
+                               const std::shared_ptr<systems::leal::campello_gpu::Buffer> &) {}
 #endif
 
 void Renderer::renderPrimitive(
@@ -11444,6 +11528,7 @@ void Renderer::renderPrimitive(
         const uint64_t bytes = draw.jointCount > 0 ? (uint64_t)draw.jointCount * 64 : 0;
         bindVulkanSkin(rpe, joints, 0, joints == defaultJointMatrixBuffer ? 64 : bytes, previousJoints, 0,
                        previousJoints == defaultJointMatrixBuffer ? 64 : bytes);
+        bindVulkanMorph(rpe, defaultMorphInfoBuffer, fallbackTangentBuffer, fallbackTangentBuffer);  // no morphs
     }
 #endif
 

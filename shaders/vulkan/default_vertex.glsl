@@ -12,6 +12,9 @@
 //                                       locations 16-19)
 //   location 24  MODEL         mat4   — per-node world-space transform, same binding
 //                                       16 buffer at byte offset 64 (locations 24-27)
+//   location 12  INSTANCE      mat4   — EXT_mesh_gpu_instancing: this instance's
+//                                       transform (per instance, locations 12-15;
+//                                       the identity for other draws)
 //
 // Only geometric interpolants are output here — material data (MaterialUniforms)
 // is read directly by the fragment shader from a UBO (set 0, binding 24), matching
@@ -24,8 +27,8 @@
 // transform before or after interpolation is bit-for-bit equivalent; doing it in the
 // fragment stage means MaterialUniforms only needs fragment-stage visibility.
 //
-// Skinning: default_skinned.vert (SKINNED, skinning.glsl), the stage the renderer
-// picks for skinned draws. Morph targets are not implemented on Vulkan.
+// Morph targets and skinning: default_skinned.vert (SKINNED, skinning.glsl), the
+// stage the renderer picks for draws with a skin or morph targets.
 
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
@@ -39,6 +42,7 @@ layout(location = 7) in vec2 texcoord1;
 // A mat4 in a vertex shader input occupies 4 consecutive locations.
 layout(location = 16) in mat4 mvp;
 layout(location = 24) in mat4 model;
+layout(location = 12) in mat4 instanceMatrix;
 
 layout(location = 0) out vec3 worldPos;
 layout(location = 1) out vec3 worldNormal;
@@ -54,10 +58,14 @@ void main() {
     // layout for every backend, Metal included — so the buffer already holds M in
     // the column-major layout GLSL's mat4 expects. A standard column-vector
     // multiply is therefore correct.
-    // Skinned (SKINNED): the posed local position, normal and tangent.
-    mat4 skin = skinMatrix();
-    vec4 localPos = skin * vec4(position, 1.0);
-    vec3 localNormal = (skin * vec4(normal, 0.0)).xyz;
+    // SKINNED: morphed, then posed by the joints (glTF's order). Then the
+    // instance's transform (EXT_mesh_gpu_instancing), as Metal's pbrVertex.
+    vec3 morphedPosition = position;
+    vec3 morphedNormal = normal;
+    applyMorph(morphedPosition, morphedNormal);
+    mat4 skin = instanceMatrix * skinMatrix();
+    vec4 localPos = skin * vec4(morphedPosition, 1.0);
+    vec3 localNormal = (skin * vec4(morphedNormal, 0.0)).xyz;
     vec3 localTangent = (skin * vec4(tangent.xyz, 0.0)).xyz;
 
     gl_Position   = mvp * localPos;
