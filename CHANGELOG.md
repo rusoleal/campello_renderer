@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-17
+
 ### Added
 - **Morph targets on Vulkan.** POSITION and NORMAL targets blend on Vulkan as on Metal (up to 8 targets, with the same weights: node, mesh, animation).
   - They're in the deforming vertex stages (`default_skinned.vert`, `gbuffer_skinned.vert`, shared code in `skinning.glsl`), which now morph and then skin, in glTF's order. `meshPipeline()` picks them for draws with a skin or morph targets.
