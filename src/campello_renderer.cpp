@@ -1591,11 +1591,16 @@ void Renderer::bakeIblResources() {
         }
         iblBakeUniformBuffer->upload(0, slots.size(), slots.data());
     }
-    auto encoder = device->createCommandEncoder();
-    if (!encoder) return;
+    // One command buffer per job (a face of one mip): the whole bake is
+    // ~370M environment samples, and as one command buffer it outlasted
+    // Apple GPUs' command buffer watchdog in the browser ("Caused GPU Hang
+    // Error", device lost). Each job alone is a fraction of that.
     std::vector<std::shared_ptr<GPU::BindGroup>> groups;  // alive until the bake has run
+    std::shared_ptr<GPU::Fence> lastFence;
     for (size_t i = 0; i < jobs.size(); ++i) {
         const auto& job = jobs[i];
+        auto encoder = device->createCommandEncoder();
+        if (!encoder) return;
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = iblBakeBindGroupLayout;
         const GPU::BufferBinding uniforms{iblBakeUniformBuffer, i * kSlot, 16};
@@ -1640,10 +1645,10 @@ void Renderer::bakeIblResources() {
             rpe->draw(3);
             rpe->end();
         }
+        lastFence = device->createFence();
+        device->submit(encoder->finish(), lastFence);
     }
-    auto fence = device->createFence();
-    device->submit(encoder->finish(), fence);
-    if (fence) fence->wait();
+    if (lastFence) lastFence->wait();  // in order: the last done means all done
 #endif
 }
 
