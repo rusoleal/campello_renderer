@@ -29,6 +29,11 @@ ctest --test-dir build/macos/debug
 ./run_macos_example_debug.sh      # MTL_DEBUG_LAYER=1
 ./run_macos_example_release.sh    # no validation
 
+# Frame benchmark (Release; scenarios: draws, gltf, gbuffer, denoise)
+cmake -S . -B build/macos/release -DCAMPELLO_RENDERER_BUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build/macos/release --target campello_renderer_bench
+./build/macos/release/campello_renderer_bench [scenario] [frames]
+
 # Android (primary runtime target)
 cd examples/android
 ./gradlew build          # Debug + Release

@@ -127,8 +127,13 @@ private:
     std::array<Target, 2> historyColor_, historyMoments_, geometry_;
     Target accumulated_, pingA_, pingB_, outputTarget_;
     std::shared_ptr<systems::leal::campello_gpu::Texture> output_;
-    std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, 8> uniforms_;  // per pass of a frame
-    std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;                 // the last frame's work
+    // Uniforms per pass of a frame, one set per frame in flight (kFramesInFlight),
+    // so a frame rewrites only the set the GPU finished with (pending_ of that
+    // set) instead of waiting for the previous frame.
+    static constexpr uint32_t kFramesInFlight = 3;
+    std::array<std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, 8>, kFramesInFlight> uniforms_;
+    std::array<std::shared_ptr<systems::leal::campello_gpu::Fence>, kFramesInFlight> pending_;  // each set's last work
+    uint32_t frameSlot_ = 0;  // the set this frame writes
     GpuTiming timing_;
     uint32_t width_ = 0;
     uint32_t height_ = 0;

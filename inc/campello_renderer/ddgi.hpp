@@ -129,8 +129,13 @@ private:
     std::array<Target, 2> irradianceAtlas_, distanceAtlas_;
     Target resolveTarget_;
     std::shared_ptr<systems::leal::campello_gpu::Texture> irradiance_;
-    std::shared_ptr<systems::leal::campello_gpu::Buffer> updateUniforms_, resolveUniforms_;
-    std::shared_ptr<systems::leal::campello_gpu::Fence> pendingUpdate_, pendingResolve_;
+    // Uniforms per frame in flight (kFramesInFlight): a frame rewrites only
+    // the buffer the GPU finished with (that slot's fence), instead of
+    // waiting for the previous frame.
+    static constexpr uint32_t kFramesInFlight = 3;
+    std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, kFramesInFlight> updateUniforms_, resolveUniforms_;
+    std::array<std::shared_ptr<systems::leal::campello_gpu::Fence>, kFramesInFlight> pendingUpdate_, pendingResolve_;
+    uint32_t resolveFrame_ = 0;
     GpuTiming updateTiming_, resolveTiming_;
     Grid grid_;
     float rotation_[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};  // this frame's ray rotation
