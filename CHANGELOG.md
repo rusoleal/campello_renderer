@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-17
+
 ### Added
 - **The games foundation on Vulkan: G-buffer, TAA, built-in upscaling and the real-time denoiser.** Until now these were Metal-only. On Vulkan `supportsGBuffer()` was false and their tests skipped. Tested on an Adreno 618 (Android 13).
   - **G-buffer:** `renderGBuffer()` writes normal + roughness, base colour + metallic, motion and depth in one pass, using `shaders/vulkan/gbuffer.vert`, `gbuffer_lean.vert` and `gbuffer.frag`, ports of the Metal stages.
@@ -19,9 +21,8 @@
 - **`run_android_tests.sh`** builds the test suite for arm64, pushes it to the connected device with adb and runs it, optionally with a gtest filter. `CAMPELLO_GPU_SOURCE` builds against a local campello_gpu checkout.
 
 ### Changed
-- **campello_gpu v0.31.0**, for multiple render targets on Vulkan (the G-buffer's three targets, TAA's two).
+- **campello_gpu v0.31.1.** v0.31.0 brings multiple render targets on Vulkan (the G-buffer's three targets, TAA's two); v0.31.1 fixes the Vulkan bugs behind the last Android failures (storage buffer bindings, depth kept across passes, compute barriers).
 - **`build_vulkan_shaders.sh` is list-driven.** Each shader is one line: source, `.spv`, C symbol and header. It writes `vulkan_default.h` and `vulkan_denoiser.h`, and resolves `#include` in GLSL.
-- **campello_gpu v0.31.1**, Vulkan fixes behind the last Android failures (storage buffer bindings, depth kept across passes, compute barriers).
 - **Android results:** 102 passed, 35 skipped (ray tracing), 0 failed. Before this release, 88 passed, 40 skipped and 7 failed.
 
 ### Fixed
