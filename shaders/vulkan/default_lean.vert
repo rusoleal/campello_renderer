@@ -6,6 +6,7 @@
 // per-draw transforms arrive per instance at locations 16 (MVP) and 24 (model).
 
 layout(location = 0) in vec3 position;
+layout(location = 12) in mat4 instanceMatrix;  // per instance (identity without instances)
 layout(location = 16) in mat4 mvp;
 layout(location = 24) in mat4 model;
 
@@ -18,9 +19,10 @@ layout(location = 5) out vec2 fragTexcoord1;
 layout(location = 6) out vec4 fragColor0;
 
 void main() {
-    gl_Position   = mvp * vec4(position, 1.0);
+    vec4 localPos = instanceMatrix * vec4(position, 1.0);
+    gl_Position   = mvp * localPos;
     gl_Position.y = -gl_Position.y;  // as default.vert
-    worldPos       = (model * vec4(position, 1.0)).xyz;
+    worldPos       = (model * localPos).xyz;
     worldNormal    = vec3(0.0);
     worldTangent   = vec3(0.0);
     worldBitangent = vec3(0.0);

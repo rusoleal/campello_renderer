@@ -473,17 +473,20 @@ vertex VertexOut vertexMain(
 // Lean vertex shader: position-only meshes (GpuMesh::positionOnly). Outputs
 // a zero normal, which fragmentMain_textured replaces with the flat face
 // normal derived from screen-space derivatives of the world position; no
-// skinning, morphing or instancing.
+// skinning or morphing. Instances (EXT_mesh_gpu_instancing,
+// DrawCall::instanceTransformBuffer) as vertexMain.
 // ---------------------------------------------------------------------------
 struct VertexInLean {
     float3 position [[attribute(0)]];
 };
 
 vertex VertexOut vertexLean(
-    VertexInLean                 in             [[stage_in]],
-    device const NodeTransforms *nodeTransforms [[buffer(16)]])
+    VertexInLean                 in               [[stage_in]],
+    device const NodeTransforms *nodeTransforms   [[buffer(16)]],
+    device const float4x4       *instanceMatrices [[buffer(19)]],
+    uint                         instanceID       [[instance_id]])
 {
-    float4 localPos = float4(in.position, 1.0);
+    float4 localPos = instanceMatrices[instanceID] * float4(in.position, 1.0);
     VertexOut out;
     out.clipPosition   = nodeTransforms[0].mvp * localPos;
     out.worldPos       = (nodeTransforms[0].model * localPos).xyz;
@@ -523,6 +526,57 @@ vertex VertexOut vertexLine(
     out.normalUV       = float2(0.0);
     out.texcoord1      = float2(0.0);
     out.color0         = float4(1.0);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Sun shadow casters that deform: depth only (no fragment stage). The
+// shadow pass binds the light's clip from local as NodeTransforms::mvp
+// (encodeShadowPass()). vertexLean draws plain casters; these add the
+// draw's instance matrices ([[buffer(19)]], DrawCall::instanceTransformBuffer)
+// and, skinned, its joint palette ([[buffer(20)]]), as vertexMain does.
+// ---------------------------------------------------------------------------
+struct ShadowVertexIn {
+    float3 position [[attribute(0)]];
+};
+struct ShadowSkinnedVertexIn {
+    float3 position [[attribute(0)]];
+    uint4  joints   [[attribute(4)]];
+    float4 weights  [[attribute(5)]];
+};
+struct ShadowVertexOut {
+    float4 clipPosition [[position]];
+};
+
+vertex ShadowVertexOut shadowVertexInstanced(
+    ShadowVertexIn               in               [[stage_in]],
+    device const NodeTransforms *nodeTransforms   [[buffer(16)]],
+    device const float4x4       *instanceMatrices [[buffer(19)]],
+    uint                         instanceID       [[instance_id]])
+{
+    ShadowVertexOut out;
+    out.clipPosition = nodeTransforms[0].mvp * (instanceMatrices[instanceID] * float4(in.position, 1.0));
+    return out;
+}
+
+vertex ShadowVertexOut shadowVertexSkinned(
+    ShadowSkinnedVertexIn        in               [[stage_in]],
+    device const NodeTransforms *nodeTransforms   [[buffer(16)]],
+    device const float4x4       *instanceMatrices [[buffer(19)]],
+    device const float4x4       *jointMatrices    [[buffer(20)]],
+    uint                         instanceID       [[instance_id]])
+{
+    float4 p = float4(in.position, 1.0);
+    const float weightSum = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
+    if (weightSum > 0.001) {
+        float4 skinned = float4(0.0);
+        for (int i = 0; i < 4; i++) {
+            if (in.weights[i] > 0.0) skinned += in.weights[i] * (jointMatrices[in.joints[i]] * p);
+        }
+        p = skinned;
+    }
+    ShadowVertexOut out;
+    out.clipPosition = nodeTransforms[0].mvp * (instanceMatrices[instanceID] * p);
     return out;
 }
 
@@ -1588,11 +1642,13 @@ vertex GBufferVertexOut gbufferVertex(
 }
 
 vertex GBufferVertexOut gbufferVertexLean(
-    VertexInLean                 in             [[stage_in]],
-    device const NodeTransforms *nodeTransforms [[buffer(16)]],
-    device const GBufferTransforms *previous    [[buffer(27)]])
+    VertexInLean                 in               [[stage_in]],
+    device const NodeTransforms *nodeTransforms   [[buffer(16)]],
+    device const float4x4       *instanceMatrices [[buffer(19)]],
+    device const GBufferTransforms *previous      [[buffer(27)]],
+    uint                         instanceID       [[instance_id]])
 {
-    const float4 localPos = float4(in.position, 1.0);
+    const float4 localPos = instanceMatrices[instanceID] * float4(in.position, 1.0);
     VertexOut v;
     v.clipPosition   = nodeTransforms[0].mvp * localPos;
     v.worldPos       = (nodeTransforms[0].model * localPos).xyz;

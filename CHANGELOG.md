@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+- **`DrawCall::instanceTransformBuffer`.** A `RenderScene` draw can be instanced: one column-major float4x4 per instance, applied in model space before `worldTransform` (create it with `BufferUsage::vertex`), as glTF's EXT_mesh_gpu_instancing. Before, `DrawCall` had no way to pass instance transforms.
+- **`DrawCall::localBounds`**: model-space bounds covering a draw's instances or the poses of its skin, for fitting sun shadows; unset, the mesh's bounds.
+- **`RenderStats::shadowCastersDrawn` / `shadowCasterCount`**: the casters drawn into the far shadow map the last time it was redrawn, and how many there were.
+- New benchmark scenario `shadows`: a third-person view of one corner of the grid with one cube moving, so the shadow map is redrawn every frame.
+- New tests `DrawCallInstancesDrawAtTheirTransforms`, `SunShadowsFollowInstancesAndSkins`, `SunShadowsDrawOnlyCastersTheViewNeeds`.
+
+### Fixed
+- **Out-of-bounds reads with `DrawCall::instanceCount` above 1.** Every instance read its matrix from a buffer holding one (the identity), so instances past the first read past its end. A draw now draws no more instances than its `instanceTransformBuffer` holds, one without a buffer; `RenderStats::instanceCount` counts those.
+- **Instances of position-only meshes drew on top of each other.** The lean vertex stages (`vertexLean`, `gbufferVertexLean`, `default_lean.vert`, `gbuffer_lean.vert`) ignored the instance matrices; they apply them now, as the full stages do (glTF EXT_mesh_gpu_instancing and `DrawCall`).
+- **Sun shadows of skinned and instanced casters** (Metal and Vulkan). The shadow pass drew every caster's first instance in its rest pose, so an animated character's shadow stayed in the bind pose and an instanced mesh cast one shadow. Casters with instances or a skin are drawn with their own depth-only vertex stages (`shadowVertexInstanced` / `shadowVertexSkinned`; `shadow.vert` / `shadow_skinned.vert`), one pipeline per joint/weight format. Skinned casters redraw the shadow map every frame, since their pose changes in their buffers. WebGPU and DirectX still draw them at rest.
+
+### Changed
+- **The far shadow map draws only the casters that can shadow what's in view** (when `RenderScene::shadowCasters` is empty, so every opaque draw casts and receives). The view, cut to the draws' bounds, gives a light-view rectangle; casters whose light-view bounds miss it (plus a 25% margin) aren't drawn. The map keeps the same projection and is redrawn when the casters or the light change or the view leaves the rectangle drawn. The near cascade uses the same caster test. Benchmark `shadows` (Intel UHD 630): 644 of 4,900 casters drawn, CPU time per frame 10.6 to 9.7 ms.
+- **Test results:** macOS 141 passed (also with Metal API validation); Android (Adreno 618) 107 passed, 34 skipped (ray tracing), 0 failed.
+
 ## [0.23.0] - 2026-11-18
 
 ### Added
