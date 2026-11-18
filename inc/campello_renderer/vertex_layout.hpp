@@ -102,13 +102,18 @@ namespace systems::leal::campello_renderer {
 
         /// Stable 64-bit hash (FNV-1a over the formats), used as a pipeline
         /// cache key.
-        uint64_t hash() const {
+        uint64_t hash() const { return hash(~0u); }
+
+        /// hash() of the layout with only the attributes in `semanticMask`
+        /// (semanticBit()s), without building that layout.
+        uint64_t hash(uint32_t semanticMask) const {
             uint64_t h = 1469598103934665603ull;
             const auto mix = [&h](uint64_t v) {
                 h ^= v;
                 h *= 1099511628211ull;
             };
             for (const auto& a : attributes) {
+                if ((semanticMask & semanticBit(a.semantic)) == 0) continue;
                 mix(static_cast<uint64_t>(a.semantic));
                 mix(static_cast<uint64_t>(a.componentType));
                 mix(static_cast<uint64_t>(a.accessorType));

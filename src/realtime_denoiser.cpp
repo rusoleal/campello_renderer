@@ -159,7 +159,9 @@ RealtimeDenoiser::RealtimeDenoiser(std::shared_ptr<GPU::Device> device)
 }
 
 RealtimeDenoiser::~RealtimeDenoiser() {
-    if (pending_) pending_->wait();  // the GPU may still be using the textures
+    for (const auto& fence : pending_) {
+        if (fence) fence->wait();  // the GPU may still be using the textures
+    }
 }
 
 bool RealtimeDenoiser::ensureTargets(uint32_t width, uint32_t height) {
@@ -197,17 +199,21 @@ bool RealtimeDenoiser::denoise(const std::shared_ptr<GPU::Texture>& noisy, const
     }
     const uint32_t w = gbuffer.width, h = gbuffer.height;
     if (w == 0 || h == 0 || noisy->getWidth() != w || noisy->getHeight() != h) return false;
-    if (pending_) {
-        pending_->wait();  // its uniforms are rewritten below
-        pending_.reset();
+    // This frame's uniform set: wait only for the frame that last used it
+    // (kFramesInFlight frames ago), not for the previous one.
+    const uint32_t slot = frameSlot_;
+    if (pending_[slot]) {
+        pending_[slot]->wait();
+        pending_[slot].reset();
     }
     if (!ensureTargets(w, h)) return false;
+    auto& uniforms = uniforms_[slot];
 
     const uint32_t iterations = std::clamp<uint32_t>(settings_.iterations, 1u, 7u);
     // Uniforms: [0] the temporal and variance passes, [1..] each a-trous step.
     for (uint32_t i = 0; i <= iterations; ++i) {
-        if (!uniforms_[i]) uniforms_[i] = device_->createBuffer(sizeof(DenoiseUniforms), GPU::BufferUsage::uniform);
-        if (!uniforms_[i]) return false;
+        if (!uniforms[i]) uniforms[i] = device_->createBuffer(sizeof(DenoiseUniforms), GPU::BufferUsage::uniform);
+        if (!uniforms[i]) return false;
         DenoiseUniforms u{};
         u.params[0] = settings_.colorBlend;
         u.params[1] = settings_.momentsBlend;
@@ -221,7 +227,7 @@ bool RealtimeDenoiser::denoise(const std::shared_ptr<GPU::Texture>& noisy, const
         u.filter[1] = settings_.phiColor;
         u.filter[2] = settings_.phiNormal;
         u.filter[3] = settings_.phiDepth;
-        uniforms_[i]->upload(0, sizeof(u), &u);
+        uniforms[i]->upload(0, sizeof(u), &u);
     }
 
     const uint32_t read = historyIndex_, write = 1u - historyIndex_;
@@ -259,7 +265,7 @@ bool RealtimeDenoiser::denoise(const std::shared_ptr<GPU::Texture>& noisy, const
         return true;
     };
     const auto uniform = [&](uint32_t binding, uint32_t index) {
-        return GPU::BindGroupEntryDescriptor{binding, GPU::BufferBinding{uniforms_[index], 0, sizeof(DenoiseUniforms)}};
+        return GPU::BindGroupEntryDescriptor{binding, GPU::BufferBinding{uniforms[index], 0, sizeof(DenoiseUniforms)}};
     };
 
     bool ok = pass(temporalPipeline_, temporalLayout_,
@@ -297,7 +303,8 @@ bool RealtimeDenoiser::denoise(const std::shared_ptr<GPU::Texture>& noisy, const
     device_->submit(commands, fence);
     timing_.begin();
     timing_.submitted(commands, fence);
-    pending_ = fence;
+    pending_[slot] = fence;
+    frameSlot_ = (slot + 1) % kFramesInFlight;
     historyIndex_ = write;
     historyValid_ = true;
     return true;

@@ -156,8 +156,11 @@ DdgiVolume::DdgiVolume(std::shared_ptr<GPU::Device> device)
 }
 
 DdgiVolume::~DdgiVolume() {
-    if (pendingUpdate_) pendingUpdate_->wait();
-    if (pendingResolve_) pendingResolve_->wait();
+    for (const auto* fences : {&pendingUpdate_, &pendingResolve_}) {
+        for (const auto& fence : *fences) {
+            if (fence) fence->wait();
+        }
+    }
 }
 
 void DdgiVolume::setGrid(const Grid& grid) {
@@ -229,9 +232,11 @@ void DdgiVolume::uniforms(float* out, const CameraData* camera) const {
 
 bool DdgiVolume::update(PathTracer& tracer, const RenderScene& scene, const Renderer& renderer) {
     if (!supported() || !ensureAtlases()) return false;
-    if (pendingUpdate_) {
-        pendingUpdate_->wait();  // its uniforms are rewritten below
-        pendingUpdate_.reset();
+    // This frame's uniform buffer: wait only for the frame that last used it.
+    const uint32_t slot = frame_ % kFramesInFlight;
+    if (pendingUpdate_[slot]) {
+        pendingUpdate_[slot]->wait();
+        pendingUpdate_[slot].reset();
     }
     // This frame's rays: turned by a new random rotation, so the probes see
     // every direction over frames.
@@ -246,9 +251,10 @@ bool DdgiVolume::update(PathTracer& tracer, const RenderScene& scene, const Rend
 
     float data[sizeof(ddgi_detail::DdgiUniforms) / sizeof(float)];
     uniforms(data, nullptr);
-    if (!updateUniforms_) updateUniforms_ = device_->createBuffer(sizeof(data), GPU::BufferUsage::uniform);
-    if (!updateUniforms_) return false;
-    updateUniforms_->upload(0, sizeof(data), data);
+    auto& updateUniforms = updateUniforms_[slot];
+    if (!updateUniforms) updateUniforms = device_->createBuffer(sizeof(data), GPU::BufferUsage::uniform);
+    if (!updateUniforms) return false;
+    updateUniforms->upload(0, sizeof(data), data);
 
     const uint32_t read = historyIndex_, write = 1u - historyIndex_;
     auto encoder = device_->createCommandEncoder();
@@ -259,7 +265,7 @@ bool DdgiVolume::update(PathTracer& tracer, const RenderScene& scene, const Rend
         desc.layout = updateLayout_;
         desc.entries = {{0, tracer.probeRays()},
                         {1, previous.texture},
-                        {2, GPU::BufferBinding{updateUniforms_, 0, sizeof(ddgi_detail::DdgiUniforms)}}};
+                        {2, GPU::BufferBinding{updateUniforms, 0, sizeof(ddgi_detail::DdgiUniforms)}}};
         auto group = device_->createBindGroup(desc);
         if (!group) return false;
         groups.push_back(group);
@@ -290,7 +296,7 @@ bool DdgiVolume::update(PathTracer& tracer, const RenderScene& scene, const Rend
     device_->submit(commands, fence);
     updateTiming_.begin();
     updateTiming_.submitted(commands, fence);
-    pendingUpdate_ = fence;
+    pendingUpdate_[slot] = fence;
     historyIndex_ = write;
     historyValid_ = true;
     ++frame_;
@@ -301,9 +307,10 @@ bool DdgiVolume::resolve(const GBufferTargets& gbuffer, const CameraData& camera
     if (!supported() || !irradianceAtlas_[0].texture || !gbuffer.normalRoughness || !gbuffer.depth || gbuffer.width == 0) {
         return false;
     }
-    if (pendingResolve_) {
-        pendingResolve_->wait();
-        pendingResolve_.reset();
+    const uint32_t slot = resolveFrame_ % kFramesInFlight;
+    if (pendingResolve_[slot]) {
+        pendingResolve_[slot]->wait();
+        pendingResolve_[slot].reset();
     }
     const uint32_t w = gbuffer.width, h = gbuffer.height;
     if (!resolveTarget_.texture || resolveTarget_.texture->getWidth() != w || resolveTarget_.texture->getHeight() != h) {
@@ -319,16 +326,17 @@ bool DdgiVolume::resolve(const GBufferTargets& gbuffer, const CameraData& camera
     }
     float data[sizeof(ddgi_detail::DdgiUniforms) / sizeof(float)];
     uniforms(data, &camera);
-    if (!resolveUniforms_) resolveUniforms_ = device_->createBuffer(sizeof(data), GPU::BufferUsage::uniform);
-    if (!resolveUniforms_) return false;
-    resolveUniforms_->upload(0, sizeof(data), data);
+    auto& resolveUniforms = resolveUniforms_[slot];
+    if (!resolveUniforms) resolveUniforms = device_->createBuffer(sizeof(data), GPU::BufferUsage::uniform);
+    if (!resolveUniforms) return false;
+    resolveUniforms->upload(0, sizeof(data), data);
     GPU::BindGroupDescriptor desc{};
     desc.layout = resolveLayout_;
     desc.entries = {{0, irradianceAtlas_[historyIndex_].texture},
                     {1, distanceAtlas_[historyIndex_].texture},
                     {2, gbuffer.normalRoughness},
                     {3, gbuffer.depth},
-                    {4, GPU::BufferBinding{resolveUniforms_, 0, sizeof(ddgi_detail::DdgiUniforms)}}};
+                    {4, GPU::BufferBinding{resolveUniforms, 0, sizeof(ddgi_detail::DdgiUniforms)}}};
     auto group = device_->createBindGroup(desc);
     auto encoder = device_->createCommandEncoder();
     if (!group || !encoder) return false;
@@ -352,7 +360,8 @@ bool DdgiVolume::resolve(const GBufferTargets& gbuffer, const CameraData& camera
     device_->submit(commands, fence);
     resolveTiming_.begin();
     resolveTiming_.submitted(commands, fence);
-    pendingResolve_ = fence;
+    pendingResolve_[slot] = fence;
+    ++resolveFrame_;
     irradiance_ = resolveTarget_.texture;
     return true;
 }

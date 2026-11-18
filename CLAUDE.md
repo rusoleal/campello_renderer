@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 `campello_renderer` (v0.22.2) is a C++20 shared library that provides a 3D rendering layer on top of custom dependencies:
-- **campello_gpu** (v0.31.1) — low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
+- **campello_gpu** (v0.31.2) — low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
 - **gltf** (v0.5.2) — GLTF/GLB asset loader
 - **campello_image** (v0.5.2) — image decoding (PNG, JPEG, WebP, HDR, OpenEXR)
 
@@ -28,6 +28,11 @@ ctest --test-dir build/macos/debug
 # Then run with or without Metal API Validation:
 ./run_macos_example_debug.sh      # MTL_DEBUG_LAYER=1
 ./run_macos_example_release.sh    # no validation
+
+# Frame benchmark (Release; scenarios: draws, gltf, gbuffer, denoise)
+cmake -S . -B build/macos/release -DCAMPELLO_RENDERER_BUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build/macos/release --target campello_renderer_bench
+./build/macos/release/campello_renderer_bench [scenario] [frames]
 
 # Android (primary runtime target)
 cd examples/android

@@ -36,6 +36,7 @@
 
 #include <cstdint>
 #include <map>
+#include <array>
 #include <memory>
 
 namespace systems::leal::campello_gpu {
@@ -87,8 +88,12 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> layout_;
     std::shared_ptr<systems::leal::campello_gpu::ComputePipeline> pipeline_;
     std::map<std::pair<const GpuMesh*, const void*>, Posed> posed_;
-    std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;
-    std::vector<std::shared_ptr<systems::leal::campello_gpu::Buffer>> keepAlive_;
+    // Per frame in flight (kFramesInFlight): a frame waits only for the frame
+    // that last used its slot, not for the previous frame.
+    static constexpr uint32_t kFramesInFlight = 3;
+    std::array<std::shared_ptr<systems::leal::campello_gpu::Fence>, kFramesInFlight> pending_;
+    std::array<std::vector<std::shared_ptr<systems::leal::campello_gpu::Buffer>>, kFramesInFlight> keepAlive_;  // parameter buffers
+    uint32_t slot_ = 0;
     uint32_t posedDraws_ = 0;
 };
 
@@ -203,9 +208,13 @@ protected:
     std::shared_ptr<RayTracingScene> scene_;
     std::shared_ptr<systems::leal::campello_gpu::RayTracingPipeline> pipeline_;
     std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> layout_;
-    std::shared_ptr<systems::leal::campello_gpu::Buffer> uniforms_;
+    // Per frame in flight (kFramesInFlight): a frame waits only for the frame
+    // that last used its slot, not for the previous frame.
+    static constexpr uint32_t kFramesInFlight = 3;
+    std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, kFramesInFlight> uniforms_;
     std::shared_ptr<systems::leal::campello_gpu::Texture> output_;
-    std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;
+    std::array<std::shared_ptr<systems::leal::campello_gpu::Fence>, kFramesInFlight> pending_;
+    uint32_t slot_ = 0;
     GpuTiming timing_;
     uint32_t frame_ = 0;
 };
@@ -349,13 +358,17 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::RayTracingPipeline> initial_;
     std::shared_ptr<systems::leal::campello_gpu::RayTracingPipeline> spatial_;
     std::shared_ptr<systems::leal::campello_gpu::RayTracingPipeline> reference_;
-    std::shared_ptr<systems::leal::campello_gpu::Buffer> uniforms_;
-    std::shared_ptr<systems::leal::campello_gpu::Buffer> lights_;
+    // Per frame in flight (kFramesInFlight): a frame waits only for the frame
+    // that last used its slot, not for the previous frame.
+    static constexpr uint32_t kFramesInFlight = 3;
+    std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, kFramesInFlight> uniforms_;
+    std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, kFramesInFlight> lights_;
+    uint32_t slot_ = 0;
     std::shared_ptr<systems::leal::campello_gpu::Texture> reservoirs_[2];  // restirInitial's, this frame's and the last (the history)
     std::shared_ptr<systems::leal::campello_gpu::Texture> final_;          // restirSpatial's (not read back)
     std::shared_ptr<systems::leal::campello_gpu::Texture> surfaces_[2];  // normal + view depth, this frame's and the last
     std::shared_ptr<systems::leal::campello_gpu::Texture> radiance_;
-    std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;
+    std::array<std::shared_ptr<systems::leal::campello_gpu::Fence>, kFramesInFlight> pending_;
     GpuTiming timing_;
     Settings settings_;
     uint32_t frame_ = 0;
@@ -441,14 +454,18 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> layout_;
     std::shared_ptr<systems::leal::campello_gpu::RayTracingPipeline> initial_;
     std::shared_ptr<systems::leal::campello_gpu::RayTracingPipeline> spatial_;
-    std::shared_ptr<systems::leal::campello_gpu::Buffer> uniforms_;
+    // Per frame in flight (kFramesInFlight): a frame waits only for the frame
+    // that last used its slot, not for the previous frame.
+    static constexpr uint32_t kFramesInFlight = 3;
+    std::array<std::shared_ptr<systems::leal::campello_gpu::Buffer>, kFramesInFlight> uniforms_;
+    uint32_t slot_ = 0;
     // Reservoirs (point, radiance, normal): this frame's and the last (the
     // history), and the spatial pass's (not read back); surfaces.
     std::shared_ptr<systems::leal::campello_gpu::Texture> reservoirs_[2][3];
     std::shared_ptr<systems::leal::campello_gpu::Texture> scratch_[3];
     std::shared_ptr<systems::leal::campello_gpu::Texture> surfaces_[2];
     std::shared_ptr<systems::leal::campello_gpu::Texture> irradiance_;
-    std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;
+    std::array<std::shared_ptr<systems::leal::campello_gpu::Fence>, kFramesInFlight> pending_;
     GpuTiming timing_;
     Settings settings_;
     uint32_t frame_ = 0;

@@ -3501,6 +3501,22 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     systems::leal::campello_gpu::PixelFormat colorFormat, systems::leal::campello_gpu::PrimitiveTopology topology,
     bool wideLines, bool skinned) {
     namespace GPU = systems::leal::campello_gpu;
+    // Consecutive draws mostly ask for the same pipeline (draws are sorted
+    // by state): the last request's answer, without the stage search.
+    const uint64_t layoutHash = layout.hash();
+    const auto& last = lastMeshPipeline;
+    if (last.entry && last.program == programHandle && last.variant == variant && last.layoutHash == layoutHash &&
+        last.doubleSided == doubleSided && last.blend == blend && last.colorFormat == colorFormat &&
+        last.topology == topology && last.wideLines == wideLines && last.skinned == skinned) {
+        return last.entry;
+    }
+    const auto remember = [&](const MeshPipelineEntry* entry) {
+        if (entry) {
+            lastMeshPipeline = {entry,       programHandle, variant,   layoutHash, doubleSided,
+                                blend,       colorFormat,   topology,  wideLines,  skinned};
+        }
+        return entry;
+    };
     const ProgramState* programPtr = programState(programHandle);
     if (!meshRecipe.ready || !device || !programPtr) return nullptr;
     const ProgramState& program = *programPtr;
@@ -3531,12 +3547,9 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
         vertexStageFor(programHandle, layout, lines, wideLines, skinned ? 0u : skinSemantics);
     if (!stage) return nullptr;
 
-    // Only the attributes the stage reads shape the pipeline.
-    VertexLayout read;
-    for (const auto& a : layout.attributes) {
-        if (stage->readMask & semanticBit(a.semantic)) read.attributes.push_back(a);
-    }
-    uint64_t key = read.hash();
+    // Only the attributes the stage reads shape the pipeline (hashed in
+    // place: this runs per draw, the filtered layout is built on a miss).
+    uint64_t key = layout.hash(stage->readMask);
     const auto mix = [&key](uint64_t v) {
         key ^= v + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
     };
@@ -3549,9 +3562,13 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     mix(blend ? 1u : 0u);
     mix(wideLines ? 1u : 0u);
     if (auto it = meshPipelineCache.find(key); it != meshPipelineCache.end()) {
-        return it->second.pipeline ? &it->second : nullptr;
+        return remember(it->second.pipeline ? &it->second : nullptr);
     }
 
+    VertexLayout read;
+    for (const auto& a : layout.attributes) {
+        if (stage->readMask & semanticBit(a.semantic)) read.attributes.push_back(a);
+    }
     GPU::RenderPipelineDescriptor d = meshRecipe.base;
     d.vertex.module     = stage->module;
     d.vertex.entryPoint = stage->entryPoint;
@@ -3627,7 +3644,7 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     entry.pipeline = device->createRenderPipeline(d);
     // A failed creation (null pipeline) is cached too, so it isn't retried every draw.
     auto& stored = meshPipelineCache[key] = entry;
-    return stored.pipeline ? &stored : nullptr;
+    return remember(stored.pipeline ? &stored : nullptr);
 }
 
 void Renderer::setShadowMapResolution(uint32_t texels) {
@@ -3826,7 +3843,7 @@ void Renderer::encodeAmbientOcclusion(const std::shared_ptr<systems::leal::campe
 
 uint64_t Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
                                     const std::shared_ptr<systems::leal::campello_gpu::TextureView>& target,
-                                    const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+                                    const std::vector<const systems::leal::campello_renderer::DrawCall*>& casters,
                                     const systems::leal::vector_math::Matrix4<double>& lightViewProj,
                                     uint64_t transformsOffset) {
     namespace GPU = systems::leal::campello_gpu;
@@ -3852,11 +3869,16 @@ uint64_t Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campell
     rpe->setBindGroup(0, shadowEmptyBindGroup);
     rpe->setBindGroup(1, shadowEmptyBindGroup);
     webgpuBoundDrawGroup = nullptr;
+    boundMeshGroups.fill(nullptr);
 #endif
     // Per caster: the light's clip from local for the lean vertex stage (and
     // the model matrix), after the draws' own transforms.
+    // The casters' transforms are staged and uploaded once, after the loop
+    // (the GPU reads them only once the commands are submitted).
     uint64_t offset = transformsOffset;
-    for (const auto& draw : casters) {
+    shadowTransformStaging.clear();
+    for (const auto* caster : casters) {
+        const auto& draw = *caster;
         if (!draw.mesh || !draw.material || draw.material->alphaBlend ||
             draw.mesh->topology != GPU::PrimitiveTopology::triangleList) {
             continue;
@@ -3867,7 +3889,9 @@ uint64_t Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campell
                                                            format->accessorType == GPU::AccessorType::acVec3);
         if (!positions || !floatPositions) continue;
         if (offset + 128 > transformBuffer->getLength()) break;
-        float matrices[32];
+        const size_t base = shadowTransformStaging.size();
+        shadowTransformStaging.resize(base + 32);
+        float* matrices = shadowTransformStaging.data() + base;
         const auto lightMvp = lightViewProj * draw.worldTransform;
         for (int row = 0; row < 4; ++row) {
             for (int col = 0; col < 4; ++col) {
@@ -3875,7 +3899,6 @@ uint64_t Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campell
                 matrices[16 + col * 4 + row] = (float)draw.worldTransform.data[row * 4 + col];
             }
         }
-        transformBuffer->upload(offset, 128, matrices);
         rpe->setVertexBuffer(0, positions, 0);
         uint32_t firstInstance = 0;
 #if defined(__EMSCRIPTEN__)
@@ -3894,9 +3917,13 @@ uint64_t Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campell
             rpe->draw(draw.mesh->vertexCount, 1, 0, firstInstance);
         }
     }
+    if (!shadowTransformStaging.empty()) {
+        transformBuffer->upload(transformsOffset, shadowTransformStaging.size() * sizeof(float), shadowTransformStaging.data());
+    }
     rpe->end();
 #if defined(__EMSCRIPTEN__)
     webgpuBoundDrawGroup = nullptr;  // per pass
+    boundMeshGroups.fill(nullptr);
 #endif
     return offset;
 }
@@ -3936,7 +3963,7 @@ std::shared_ptr<systems::leal::campello_gpu::Sampler> Renderer::shadowSamplerBin
     return shadowSampler;
 }
 
-bool Renderer::fitShadowLight(const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+bool Renderer::fitShadowLight(const std::vector<const systems::leal::campello_renderer::DrawCall*>& casters,
                               const systems::leal::vector_math::Vector3<double>& toLight, ShadowFit& fit) const {
     namespace VM = systems::leal::vector_math;
     using M4 = VM::Matrix4<double>;
@@ -3944,7 +3971,8 @@ bool Renderer::fitShadowLight(const std::vector<systems::leal::campello_renderer
     double lo[3] = {1e300, 1e300, 1e300};
     double hi[3] = {-1e300, -1e300, -1e300};
     bool any = false;
-    for (const auto& draw : casters) {
+    for (const auto* caster : casters) {
+        const auto& draw = *caster;
         if (!draw.mesh || !draw.mesh->hasBounds ||
             draw.mesh->topology != systems::leal::campello_gpu::PrimitiveTopology::triangleList) continue;
         const auto& m = draw.worldTransform.data;
@@ -4151,6 +4179,7 @@ void Renderer::bindWebGpuTransforms(const std::shared_ptr<systems::leal::campell
         if (webgpuDrawBindGroups.size() > 8) {
             webgpuDrawBindGroups.clear();
             webgpuBoundDrawGroup = nullptr;
+            boundMeshGroups.fill(nullptr);
         }
         GPU::BindGroupDescriptor desc{};
         desc.layout = webgpuDrawBindGroupLayout;
@@ -4372,6 +4401,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     // when setScene() detects other joint/weight formats).
     meshRecipe = MeshPipelineRecipe{};
     meshPipelineCache.clear();
+    lastMeshPipeline = {};
     // Program 0 (built-in PBR) is rebuilt below; app programs keep their
     // shaders (their pipelines are rebuilt from the new recipe on use).
     if (programs.empty()) programs.resize(1);
@@ -4382,6 +4412,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     currentPipelineObject = nullptr;
     activeMeshSlots = nullptr;
     webgpuBoundDrawGroup = nullptr;
+    boundMeshGroups.fill(nullptr);
     standardLayout = VertexLayout::standard(jointsComponentType, weightsComponentType, weightsNormalized);
 
 #if defined(__APPLE__)
@@ -7291,6 +7322,7 @@ void Renderer::renderToTarget(
         currentPipelineObject = nullptr;
         activeMeshSlots = nullptr;
         webgpuBoundDrawGroup = nullptr;
+        boundMeshGroups.fill(nullptr);
         lastBoundVertexBuffers.fill({});
         for (auto &draw : opaqueQueue) {
             renderPrimitive(rpe, *draw.primitive, draw.nodeIndex);
@@ -7339,6 +7371,7 @@ void Renderer::renderToTarget(
             currentPipelineObject = nullptr;
             activeMeshSlots = nullptr;
             webgpuBoundDrawGroup = nullptr;
+            boundMeshGroups.fill(nullptr);
             if (freshEncoder) {
                 lastBoundVertexBuffers.fill({});
             }
@@ -7869,6 +7902,15 @@ void Renderer::gatherVisibleDraws(uint64_t nodeIndex)
     }
 }
 
+void Renderer::setMeshBindGroup(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe, uint32_t index,
+                                const std::shared_ptr<systems::leal::campello_gpu::BindGroup> &group) {
+    if (index < boundMeshGroups.size()) {
+        if (boundMeshGroups[index] == group) return;
+        boundMeshGroups[index] = group;
+    }
+    rpe->setBindGroup(index, group);
+}
+
 void Renderer::setVertexBufferIfChanged(
     const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
     uint32_t slot,
@@ -8003,6 +8045,7 @@ void Renderer::renderPrimitive(
     if (entry->pipeline.get() != currentPipelineObject) {
         rpe->setPipeline(entry->pipeline);
         currentPipelineObject = entry->pipeline.get();
+        boundMeshGroups.fill(nullptr);  // (a new pipeline layout may unbind them)
     }
     currentPipelineVariant = wantedVariant;
 
@@ -8041,16 +8084,16 @@ void Renderer::renderPrimitive(
         directxMaterialBindGroups[matIdx][currentFrameIndex]) {
         bg = directxMaterialBindGroups[matIdx][currentFrameIndex];
     }
-    if (bg) rpe->setBindGroup(0, bg);
+    if (bg) setMeshBindGroup(rpe, 0, bg);
 #else
     if (needsTextures) {
         std::shared_ptr<systems::leal::campello_gpu::BindGroup> bg = defaultBindGroup;
         if (matIdx >= 0 && (size_t)matIdx < materialBindGroups.size() && materialBindGroups[matIdx]) {
             bg = materialBindGroups[matIdx];
         }
-        if (bg) rpe->setBindGroup(0, bg);
+        if (bg) setMeshBindGroup(rpe, 0, bg);
         if (frameBindGroup[currentFrameIndex]) {
-            rpe->setBindGroup(1, frameBindGroup[currentFrameIndex]);
+            setMeshBindGroup(rpe, 1, frameBindGroup[currentFrameIndex]);
         }
     } else {
         // Flat/debug variants: bind only the material buffer (no textures/samplers)
@@ -8060,7 +8103,7 @@ void Renderer::renderPrimitive(
         if (matIdx >= 0 && (size_t)matIdx < flatMaterialBindGroups.size() && flatMaterialBindGroups[matIdx]) {
             bg = flatMaterialBindGroups[matIdx];
         }
-        if (bg) rpe->setBindGroup(0, bg);
+        if (bg) setMeshBindGroup(rpe, 0, bg);
     }
 #endif
 
@@ -9396,9 +9439,17 @@ void Renderer::writeMaterialUniform(uint64_t offset, const float* slotIn) {
         slot[81] = it->second;
         slot[82] = environmentUpAxis == UpAxis::z ? 1.0f : 0.0f;
     }
+    // Unchanged slots aren't rewritten: render() rebuilds every material's
+    // slot each frame (animated materials), but most don't change, and the
+    // buffer is shared by the frames in flight (a rewrite can race the GPU).
+    if (materialUniformShadow.size() >= offset + size && std::memcmp(materialUniformShadow.data() + offset, slot, size) == 0 &&
+        materialUniformShadowBuffer == materialUniformBuffer.get()) {
+        return;
+    }
     materialUniformBuffer->upload(offset, size, slot);
     if (materialUniformShadow.size() < offset + size) materialUniformShadow.resize(offset + size, 0);
     std::memcpy(materialUniformShadow.data() + offset, slot, size);
+    materialUniformShadowBuffer = materialUniformBuffer.get();
 }
 
 void Renderer::uploadWithMips(const std::shared_ptr<systems::leal::campello_gpu::Texture>& texture, const uint8_t* rgba,
@@ -10306,11 +10357,18 @@ void Renderer::render(const RenderScene& scene,
         transformBuffer = device->createBuffer(newSize, kTransformBufferUsage);
         frame.transformBuffer = transformBuffer;
     }
-    std::vector<uint64_t> transformOffsets;
+    // Every draw's transforms (and the G-buffer's previous ones) are staged
+    // here and uploaded in one call each (one copy per frame instead of one
+    // per draw); the buffers stay in member storage across frames.
+    std::vector<uint64_t>& transformOffsets = drawTransformOffsets;
+    transformOffsets.clear();
     transformOffsets.reserve(totalDraws);
+    drawTransformStaging.resize(totalDraws * 32);
+    const bool stagePrevious = gbufferPassActive && gbufferPreviousTransforms[currentFrameIndex % gbufferPreviousTransforms.size()];
+    if (stagePrevious) drawPreviousStaging.assign(totalDraws * 32, 0.0f);
     uint64_t txOffset = 0;
     auto uploadOneTransform = [&](const systems::leal::campello_renderer::DrawCall& draw) {
-        float matrices[32] = {0};
+        float* matrices = drawTransformStaging.data() + txOffset / sizeof(float);
         auto mvp = vpMatrix * draw.worldTransform;
         // Transpose from row-major (vector_math) to column-major (Metal) format.
         for (int row = 0; row < 4; ++row) {
@@ -10319,22 +10377,18 @@ void Renderer::render(const RenderScene& scene,
                 matrices[16 + col * 4 + row] = (float)draw.worldTransform.data[row * 4 + col];
             }
         }
-        transformBuffer->upload(txOffset, 128, matrices);
-        if (gbufferPassActive) {
-            if (const auto& previousBuffer = gbufferPreviousTransforms[currentFrameIndex % gbufferPreviousTransforms.size()]) {
-                // Where the draw was: the previous camera (this one on the
-                // first frame) and its previous transform (this one if unset).
-                const auto& previousModel = draw.previousWorldTransform ? *draw.previousWorldTransform : draw.worldTransform;
-                const auto previousMvp = (gbufferHistoryValid ? gbufferPreviousViewProj : unjitteredViewProj) * previousModel;
-                float previous[32] = {0};
-                for (int row = 0; row < 4; ++row) {
-                    for (int col = 0; col < 4; ++col) previous[col * 4 + row] = (float)previousMvp.data[row * 4 + col];
-                }
-                if (taaJitterActive) {  // removed from the motion (gbufferVertex)
-                    previous[16] = (float)taaJitter[0];
-                    previous[17] = (float)taaJitter[1];
-                }
-                previousBuffer->upload(txOffset, 128, previous);
+        if (stagePrevious) {
+            // Where the draw was: the previous camera (this one on the
+            // first frame) and its previous transform (this one if unset).
+            const auto& previousModel = draw.previousWorldTransform ? *draw.previousWorldTransform : draw.worldTransform;
+            const auto previousMvp = (gbufferHistoryValid ? gbufferPreviousViewProj : unjitteredViewProj) * previousModel;
+            float* previous = drawPreviousStaging.data() + txOffset / sizeof(float);
+            for (int row = 0; row < 4; ++row) {
+                for (int col = 0; col < 4; ++col) previous[col * 4 + row] = (float)previousMvp.data[row * 4 + col];
+            }
+            if (taaJitterActive) {  // removed from the motion (gbufferVertex)
+                previous[16] = (float)taaJitter[0];
+                previous[17] = (float)taaJitter[1];
             }
         }
         transformOffsets.push_back(txOffset);
@@ -10345,7 +10399,11 @@ void Renderer::render(const RenderScene& scene,
     // transformOffsets by position in sortedOpaque, so the upload order must
     // match it. (Uploading in scene.opaque order gave each draw another draw's
     // transform whenever sorting reordered them.)
-    std::vector<systems::leal::campello_renderer::DrawCall> sortedOpaque = scene.opaque;
+    // Pointers into scene.opaque (sorting copies no DrawCalls).
+    std::vector<const systems::leal::campello_renderer::DrawCall*>& sortedOpaque = sortedOpaqueScratch;
+    sortedOpaque.clear();
+    sortedOpaque.reserve(scene.opaque.size());
+    for (const auto& draw : scene.opaque) sortedOpaque.push_back(&draw);
     if (opaqueOrder == OpaqueOrder::frontToBack) {
         // Pipeline class first (blend, double-sided), then nearest first, so
         // early depth testing rejects hidden fragments on GPUs that shade in
@@ -10354,7 +10412,7 @@ void Renderer::render(const RenderScene& scene,
         const auto &eye = scene.camera.position;
         std::vector<std::pair<double, uint32_t>> order(sortedOpaque.size());
         for (uint32_t i = 0; i < sortedOpaque.size(); ++i) {
-            const auto &draw = sortedOpaque[i];
+            const auto &draw = *sortedOpaque[i];
             double c[3] = {0.0, 0.0, 0.0};
             if (draw.mesh && draw.mesh->hasBounds) {
                 for (int k = 0; k < 3; ++k) {
@@ -10376,20 +10434,22 @@ void Renderer::render(const RenderScene& scene,
             return !d.material ? 0 : (d.material->alphaBlend ? 2 : 0) + (d.material->doubleSided ? 1 : 0);
         };
         std::sort(order.begin(), order.end(), [&](const auto &a, const auto &b) {
-            const int ra = rank(sortedOpaque[a.second]);
-            const int rb = rank(sortedOpaque[b.second]);
+            const int ra = rank(*sortedOpaque[a.second]);
+            const int rb = rank(*sortedOpaque[b.second]);
             if (ra != rb) return ra < rb;
             if (a.first != b.first) return a.first < b.first;
             return a.second < b.second;
         });
-        std::vector<systems::leal::campello_renderer::DrawCall> byDepth;
+        std::vector<const systems::leal::campello_renderer::DrawCall*> byDepth;
         byDepth.reserve(sortedOpaque.size());
         for (const auto &entry : order) byDepth.push_back(sortedOpaque[entry.second]);
         sortedOpaque = std::move(byDepth);
     } else {
     std::sort(sortedOpaque.begin(), sortedOpaque.end(),
-        [](const systems::leal::campello_renderer::DrawCall &a,
-           const systems::leal::campello_renderer::DrawCall &b) {
+        [](const systems::leal::campello_renderer::DrawCall *pa,
+           const systems::leal::campello_renderer::DrawCall *pb) {
+            const auto &a = *pa;
+            const auto &b = *pb;
             const bool wideA = a.mesh && a.mesh->wideLines;
             const bool wideB = b.mesh && b.mesh->wideLines;
             if (wideA != wideB) return !wideA;  // wide lines after everything opaque
@@ -10402,8 +10462,15 @@ void Renderer::render(const RenderScene& scene,
             return a.mesh < b.mesh;
         });
     }
-    for (auto &draw : sortedOpaque)      uploadOneTransform(draw);
+    for (const auto *draw : sortedOpaque) uploadOneTransform(*draw);
     for (auto &draw : scene.transparent) uploadOneTransform(draw);
+    if (txOffset > 0) {
+        transformBuffer->upload(0, txOffset, drawTransformStaging.data());
+        if (stagePrevious) {
+            gbufferPreviousTransforms[currentFrameIndex % gbufferPreviousTransforms.size()]->upload(0, txOffset,
+                                                                                                drawPreviousStaging.data());
+        }
+    }
 
     // ------------------------------------------------------------------
     // Sun shadows: the first shadow-casting directional light renders the
@@ -10435,7 +10502,13 @@ void Renderer::render(const RenderScene& scene,
         }
         // Casters: every opaque mesh of the scene whatever the camera sees
         // (render_system() lists them before culling), else the opaque draws.
-        const auto& casters = scene.shadowCasters.empty() ? sortedOpaque : scene.shadowCasters;
+        std::vector<const systems::leal::campello_renderer::DrawCall*>& casters = shadowCasterScratch;
+        if (scene.shadowCasters.empty()) {
+            casters = sortedOpaque;
+        } else {
+            casters.clear();
+            for (const auto& draw : scene.shadowCasters) casters.push_back(&draw);
+        }
         if (useShadowMask) {
             // The mask's red channel into a depth texture of its size.
             const uint32_t mw = shadowMask->getWidth(), mh = shadowMask->getHeight();
@@ -10483,18 +10556,24 @@ void Renderer::render(const RenderScene& scene,
         if (!shadowMaskBound && sun && shadowsEnabled && shadowPipeline && !activeProgramPass && cameraPositionBuffer) {
             // The map depends on the light, its resolution and the casters,
             // not on the camera: redrawn only when one of them changes.
+            // (Hashed 8 bytes per step: this runs over every caster each frame.)
             uint64_t key = 1469598103934665603ull;
             const auto mix = [&key](const void* data, size_t size) {
                 const auto* bytes = static_cast<const uint8_t*>(data);
-                for (size_t i = 0; i < size; ++i) {
-                    key ^= bytes[i];
-                    key *= 1099511628211ull;
+                size_t i = 0;
+                for (; i + 8 <= size; i += 8) {
+                    uint64_t word;
+                    std::memcpy(&word, bytes + i, 8);
+                    key = (key ^ word) * 1099511628211ull;
+                    key ^= key >> 29;
                 }
+                for (; i < size; ++i) key = (key ^ bytes[i]) * 1099511628211ull;
             };
             const double direction[3] = {sun->direction.x(), sun->direction.y(), sun->direction.z()};
             mix(direction, sizeof(direction));
             mix(&shadowMapResolution, sizeof(shadowMapResolution));
-            for (const auto& draw : casters) {
+            for (const auto* caster : casters) {
+                const auto& draw = *caster;
                 mix(&draw.mesh, sizeof(draw.mesh));
                 if (draw.mesh) {
                     const void* positions = draw.mesh->vertexBuffers[VERTEX_SLOT_POSITION].get();
@@ -10539,12 +10618,13 @@ void Renderer::render(const RenderScene& scene,
                     shadowNearRect[3] = std::min(needed[3] + my, fit.full[3]);
                     shadowNearViewProj = shadowProjection(fit, shadowNearRect);
                     // Only the casters whose light-view bounds meet the rectangle.
-                    std::vector<systems::leal::campello_renderer::DrawCall> nearCasters;
+                    std::vector<const systems::leal::campello_renderer::DrawCall*> nearCasters;
                     const double* lv = fit.lightView.data;
-                    for (const auto& draw : casters) {
+                    for (const auto* caster : casters) {
+                        const auto& draw = *caster;
                         if (!draw.mesh) continue;
                         if (!draw.mesh->hasBounds) {
-                            nearCasters.push_back(draw);
+                            nearCasters.push_back(caster);
                             continue;
                         }
                         double clo[2] = {1e300, 1e300}, chi[2] = {-1e300, -1e300};
@@ -10563,7 +10643,7 @@ void Renderer::render(const RenderScene& scene,
                         }
                         if (chi[0] >= shadowNearRect[0] && clo[0] <= shadowNearRect[1] && chi[1] >= shadowNearRect[2] &&
                             clo[1] <= shadowNearRect[3]) {
-                            nearCasters.push_back(draw);
+                            nearCasters.push_back(caster);
                         }
                     }
                     encodeShadowPass(encoder, shadowMapNearView, nearCasters, shadowNearViewProj, casterOffset);
@@ -10687,29 +10767,36 @@ void Renderer::render(const RenderScene& scene,
     // material slots referenced by this scene. Standalone-uploaded materials bake
     // these values at upload time; this ensures they stay current.
     if (materialUniformBuffer) {
-        std::unordered_set<GpuMaterial*> seenMaterials;
-        auto patchGlobals = [&](const systems::leal::campello_renderer::DrawCall& draw) {
-            if (!draw.material || !seenMaterials.insert(draw.material).second) return;
-            uint64_t slotOffset = (uint64_t)draw.material->uniformSlot * kMaterialUniformStride;
-            if (slotOffset + 288 > materialUniformBuffer->getLength()) return;
-            float globals[4] = {
-                (float)viewMode,
-                environmentIntensity,
-                iblEnabled ? 1.0f : 0.0f,
-                0.0f // padding
-            };
-            materialUniformBuffer->upload(slotOffset + 272, 16, globals);
-        };
-        for (auto& draw : scene.opaque) patchGlobals(draw);
-        for (auto& draw : scene.transparent) patchGlobals(draw);
-        // Also patch default slot 0 (used by fallback / unlit draws).
-        float globals[4] = {
+        const float globals[4] = {
             (float)viewMode,
             environmentIntensity,
             iblEnabled ? 1.0f : 0.0f,
-            0.0f
+            0.0f // padding
         };
-        materialUniformBuffer->upload(272, 16, globals);
+        // Written only where they differ from what the slot holds (the CPU
+        // shadow of the buffer): no upload while they stay the same.
+        const auto patchSlot = [&](uint64_t slotOffset) {
+            const uint64_t at = slotOffset + 272;
+            if (at + sizeof(globals) > materialUniformBuffer->getLength()) return;
+            if (materialUniformShadowBuffer == materialUniformBuffer.get() && materialUniformShadow.size() >= at + sizeof(globals) &&
+                std::memcmp(materialUniformShadow.data() + at, globals, sizeof(globals)) == 0) {
+                return;
+            }
+            materialUniformBuffer->upload(at, sizeof(globals), const_cast<float*>(globals));
+            if (materialUniformShadow.size() >= at + sizeof(globals)) {
+                std::memcpy(materialUniformShadow.data() + at, globals, sizeof(globals));
+            }
+        };
+        const GpuMaterial* last = nullptr;
+        for (const auto* list : {&scene.opaque, &scene.transparent}) {
+            for (const auto& draw : *list) {
+                if (!draw.material || draw.material == last) continue;
+                last = draw.material;
+                patchSlot((uint64_t)draw.material->uniformSlot * kMaterialUniformStride);
+            }
+        }
+        // Also the default slot 0 (used by fallback / unlit draws).
+        patchSlot(0);
     }
 
     // Detect whether any transparent draw needs screen-space refraction.
@@ -10845,11 +10932,12 @@ void Renderer::render(const RenderScene& scene,
                 currentPipelineObject = nullptr;
                 activeMeshSlots = nullptr;
                 webgpuBoundDrawGroup = nullptr;
+                boundMeshGroups.fill(nullptr);
                 lastBoundVertexBuffers.fill({});
                 drawIdx = 0;
                 if (reflectionFrameBindGroup) std::swap(frameBindGroup[currentFrameIndex], reflectionFrameBindGroup);
-                for (auto &draw : sortedOpaque) {
-                    renderPrimitive(opaqueRpe, draw, transformOffsets[drawIdx++]);
+                for (const auto *draw : sortedOpaque) {
+                    renderPrimitive(opaqueRpe, *draw, transformOffsets[drawIdx++]);
                 }
                 if (reflectionFrameBindGroup) std::swap(frameBindGroup[currentFrameIndex], reflectionFrameBindGroup);
                 opaqueRpe->end();
@@ -10988,6 +11076,7 @@ void Renderer::render(const RenderScene& scene,
                 currentPipelineObject = nullptr;
                 activeMeshSlots = nullptr;
                 webgpuBoundDrawGroup = nullptr;
+                boundMeshGroups.fill(nullptr);
                 lastBoundVertexBuffers.fill({});
                 drawIdx = (size_t)sortedOpaque.size();
                 for (auto &draw : scene.transparent) {
@@ -11053,12 +11142,13 @@ void Renderer::render(const RenderScene& scene,
         currentPipelineObject = nullptr;
         activeMeshSlots = nullptr;
         webgpuBoundDrawGroup = nullptr;
+        boundMeshGroups.fill(nullptr);
         lastBoundVertexBuffers.fill({});
         drawIdx = 0;
         // (Reflections: the opaque draws with the radiance in slot 22.)
         if (reflectionFrameBindGroup) std::swap(frameBindGroup[currentFrameIndex], reflectionFrameBindGroup);
-        for (auto &draw : sortedOpaque) {
-            renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
+        for (const auto *draw : sortedOpaque) {
+            renderPrimitive(rpe, *draw, transformOffsets[drawIdx++]);
         }
         if (reflectionFrameBindGroup) std::swap(frameBindGroup[currentFrameIndex], reflectionFrameBindGroup);
 
@@ -11070,6 +11160,7 @@ void Renderer::render(const RenderScene& scene,
         currentPipelineObject = nullptr;
         activeMeshSlots = nullptr;
         webgpuBoundDrawGroup = nullptr;
+        boundMeshGroups.fill(nullptr);
         if (!activeProgramPass || activeProgramPass->includeTransparent) {
             for (auto &draw : scene.transparent) {
                 renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
@@ -11377,7 +11468,7 @@ void Renderer::bindVulkanSkin(const std::shared_ptr<systems::leal::campello_gpu:
         if (!group) return;
         it = vulkanSkinBindGroups.insert_or_assign(key, VulkanSkinBindGroup{current, previous, group}).first;
     }
-    rpe->setBindGroup(2, it->second.group);
+    setMeshBindGroup(rpe, 2, it->second.group);
 }
 
 void Renderer::bindVulkanMorph(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
@@ -11404,7 +11495,7 @@ void Renderer::bindVulkanMorph(const std::shared_ptr<systems::leal::campello_gpu
         if (!group) return;
         it = vulkanMorphBindGroups.insert_or_assign(key, VulkanMorphBindGroup{info, positions, normals, group}).first;
     }
-    rpe->setBindGroup(3, it->second.group);
+    setMeshBindGroup(rpe, 3, it->second.group);
 }
 #else
 void Renderer::bindVulkanSkin(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &,
@@ -11475,6 +11566,7 @@ void Renderer::renderPrimitive(
     if (entry->pipeline.get() != currentPipelineObject) {
         rpe->setPipeline(entry->pipeline);
         currentPipelineObject = entry->pipeline.get();
+        boundMeshGroups.fill(nullptr);  // (a new pipeline layout may unbind them)
         currentPipelineVariant = -1;
     }
 
@@ -11487,17 +11579,17 @@ void Renderer::renderPrimitive(
     auto bg = draw.material->directxBindGroup[currentFrameIndex]
         ? draw.material->directxBindGroup[currentFrameIndex]
         : directxDefaultBindGroup[currentFrameIndex];
-    if (bg) rpe->setBindGroup(0, bg);
+    if (bg) setMeshBindGroup(rpe, 0, bg);
 #else
     if (needsTextures) {
         auto bg = draw.material->bindGroup ? draw.material->bindGroup : defaultBindGroup;
-        if (bg) rpe->setBindGroup(0, bg);
+        if (bg) setMeshBindGroup(rpe, 0, bg);
         if (frameBindGroup[currentFrameIndex]) {
-            rpe->setBindGroup(1, frameBindGroup[currentFrameIndex]);
+            setMeshBindGroup(rpe, 1, frameBindGroup[currentFrameIndex]);
         }
     } else {
         auto bg = draw.material->flatBindGroup ? draw.material->flatBindGroup : defaultFlatBindGroup;
-        if (bg) rpe->setBindGroup(0, bg);
+        if (bg) setMeshBindGroup(rpe, 0, bg);
     }
 #endif
 

@@ -180,6 +180,12 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CampelloRendererShaders.cmake)
 option(CAMPELLO_RENDERER_ECS_SUPPORT "Install ecs.hpp (requires campello_core at compile time)" ON)
 
 option(CAMPELLO_RENDERER_BUILD_TEST "Build unit tests" OFF)
+option(CAMPELLO_RENDERER_BUILD_BENCH "Build the frame benchmark (bench/frame_bench.cpp)" OFF)
+
+if(CAMPELLO_RENDERER_BUILD_BENCH)
+    add_executable(${PROJECT_NAME}_bench bench/frame_bench.cpp)
+    target_link_libraries(${PROJECT_NAME}_bench ${PROJECT_NAME})
+endif()
 
 if(CAMPELLO_RENDERER_BUILD_TEST)
     include(CTest)

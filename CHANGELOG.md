@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+- **Frame benchmark** (`bench/frame_bench.cpp`, `-DCAMPELLO_RENDERER_BUILD_BENCH=ON`): CPU time per call and frame time for `render(RenderScene)` with 4,900 draws over 64 materials, the same grid as a glTF scene, `renderGBuffer()`, and the G-buffer plus `RealtimeDenoiser`, at 1280x720 offscreen.
+
+### Changed
+- **Less CPU per frame.** Measured with the benchmark on an Intel Mac (UHD 630), Release, CPU time per call: `render(RenderScene)` 8.64 to 7.17 ms (now GPU-bound), glTF `render()` 7.82 to 5.11 ms, `renderGBuffer()` 9.01 to 4.27 ms.
+  - Bind groups already bound on the pass aren't bound again (`setMeshBindGroup()`). Every draw bound its material and frame groups; on Metal that is a call per texture, sampler and buffer in the group.
+  - Draw transforms, the G-buffer's previous transforms and the shadow casters' transforms are staged and uploaded once per frame, not once per draw.
+  - `render(RenderScene)` sorts pointers to the draws instead of copying every `DrawCall` (twice for front-to-back order), and keeps its scratch lists across frames.
+  - `meshPipeline()` hashes the attributes a stage reads in place (`VertexLayout::hash(mask)`) instead of building a filtered layout per draw, and returns the last answer straight away when a draw asks for the same pipeline as the one before.
+  - Material uniforms (and the per-frame globals patched into them) are uploaded only where they changed. Every material was rewritten every frame, in a buffer the frames in flight share, so a write could race the GPU reading an earlier frame.
+  - The sun shadow map's cache key hashes 8 bytes per step instead of one.
+- **Effects don't wait for the previous frame.** `RealtimeDenoiser`, `DdgiVolume`, `SkinnedMeshes`, `RayTracedShadows`/`RayTracedAmbientOcclusion`, `RestirDirectLighting` and `RestirGlobalIllumination` waited for their previous submission before rewriting their uniforms, so the CPU and GPU took turns whenever one was on. Their uniforms (and parameter buffers) are kept per frame in flight now, and a frame waits only for the one three frames back.
+- **campello_gpu v0.31.2.** On Metal, render targets and storage textures are in GPU-only (Private) memory, which Apple GPUs compress losslessly, so every pass that writes or samples one (scene color, G-buffer, history, effect targets) moves less data. Uploads to them go through a blit.
+- **Test results:** macOS 138 passed (also with Metal API validation); Android (Adreno 618) 104 passed, 34 skipped (ray tracing), 0 failed.
+
 ## [0.22.2] - 2026-11-18
 
 ### Fixed

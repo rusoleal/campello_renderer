@@ -216,7 +216,9 @@ SkinnedMeshes::SkinnedMeshes(std::shared_ptr<GPU::Device> device) : device_(std:
 }
 
 SkinnedMeshes::~SkinnedMeshes() {
-    if (pending_) pending_->wait();
+    for (const auto& fence : pending_) {
+        if (fence) fence->wait();
+    }
 }
 
 bool SkinnedMeshes::isPosed(const GpuMesh* mesh) const {
@@ -241,11 +243,14 @@ RenderScene SkinnedMeshes::pose(const RenderScene& scene) {
         posed_.clear();
         return scene;
     }
-    if (pending_) {
-        pending_->wait();  // its parameter buffers are released below
-        pending_.reset();
+    // This frame's slot: wait only for the frame that last used it
+    // (kFramesInFlight ago) before releasing its parameter buffers.
+    const uint32_t slot = slot_;
+    if (pending_[slot]) {
+        pending_[slot]->wait();
+        pending_[slot].reset();
     }
-    keepAlive_.clear();
+    keepAlive_[slot].clear();
     for (auto& [key, p] : posed_) p.used = false;
     RenderScene out = scene;
     auto encoder = device_->createCommandEncoder();
@@ -293,7 +298,7 @@ RenderScene SkinnedMeshes::pose(const RenderScene& scene) {
             if (!outPositions) continue;
             D::SkinParams params{source.vertexCount, jointsFormat, weightsFormat, hasNormals ? 1u : 0u, d.jointCount, {0, 0, 0}};
             auto paramsBuffer = device_->createBuffer(sizeof(params), GPU::BufferUsage::uniform, &params);
-            keepAlive_.push_back(paramsBuffer);
+            keepAlive_[slot].push_back(paramsBuffer);
             const auto& positions = source.vertexBuffers[Renderer::VERTEX_SLOT_POSITION];
             const auto& normals = hasNormals ? source.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] : positions;
             const auto& joints = source.vertexBuffers[Renderer::VERTEX_SLOT_JOINTS];
@@ -323,7 +328,8 @@ RenderScene SkinnedMeshes::pose(const RenderScene& scene) {
     pass->end();
     auto fence = device_->createFence();
     device_->submit(encoder->finish(), fence);
-    pending_ = fence;
+    pending_[slot] = fence;
+    slot_ = (slot + 1) % kFramesInFlight;
     for (auto it = posed_.begin(); it != posed_.end();) {
         it = it->second.used ? std::next(it) : posed_.erase(it);
     }
@@ -609,18 +615,23 @@ RayTracedEffect::RayTracedEffect(std::shared_ptr<GPU::Device> device, std::share
 }
 
 RayTracedEffect::~RayTracedEffect() {
-    if (pending_) pending_->wait();
+    for (const auto& fence : pending_) {
+        if (fence) fence->wait();
+    }
 }
 
 bool RayTracedEffect::dispatch(const RenderScene& scene, const GBufferTargets& gbuffer, const float (&parameters)[4]) {
     if (!supported() || !scene_ || !gbuffer.normalRoughness || !gbuffer.depth || gbuffer.width == 0 || gbuffer.height == 0) {
         return false;
     }
-    if (pending_) {
-        pending_->wait();  // its uniforms are rewritten below
-        pending_.reset();
+    // This frame's uniform buffer: wait only for the frame that last used it.
+    const uint32_t slot = slot_;
+    if (pending_[slot]) {
+        pending_[slot]->wait();
+        pending_[slot].reset();
     }
     if (!scene_->update(scene) || !scene_->tlas()) return false;
+    auto& uniforms = uniforms_[slot];
     const uint32_t w = gbuffer.width, h = gbuffer.height;
     if (!output_ || output_->getWidth() != w || output_->getHeight() != h) {
         output_ = device_->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba16float, w, h, 1, 1, 1,
@@ -642,14 +653,14 @@ bool RayTracedEffect::dispatch(const RenderScene& scene, const GBufferTargets& g
     u.size[0] = w;
     u.size[1] = h;
     u.size[2] = frame_++;
-    if (!uniforms_) uniforms_ = device_->createBuffer(sizeof(u), GPU::BufferUsage::uniform);
-    if (!uniforms_) return false;
-    uniforms_->upload(0, sizeof(u), &u);
+    if (!uniforms) uniforms = device_->createBuffer(sizeof(u), GPU::BufferUsage::uniform);
+    if (!uniforms) return false;
+    uniforms->upload(0, sizeof(u), &u);
 
     GPU::BindGroupDescriptor desc{};
     desc.layout = layout_;
     desc.entries = {{0, scene_->tlas()},
-                    {1, GPU::BufferBinding{uniforms_, 0, sizeof(u)}},
+                    {1, GPU::BufferBinding{uniforms, 0, sizeof(u)}},
                     {0, gbuffer.normalRoughness},
                     {1, gbuffer.depth},
                     {2, output_}};
@@ -668,7 +679,8 @@ bool RayTracedEffect::dispatch(const RenderScene& scene, const GBufferTargets& g
     device_->submit(commands, fence);
     timing_.begin();
     timing_.submitted(commands, fence);
-    pending_ = fence;
+    pending_[slot] = fence;
+    slot_ = (slot + 1) % kFramesInFlight;
     return true;
 }
 
@@ -789,7 +801,9 @@ RestirDirectLighting::RestirDirectLighting(std::shared_ptr<GPU::Device> device, 
 }
 
 RestirDirectLighting::~RestirDirectLighting() {
-    if (pending_) pending_->wait();
+    for (const auto& fence : pending_) {
+        if (fence) fence->wait();
+    }
 }
 
 bool RestirDirectLighting::ensureTargets(uint32_t width, uint32_t height) {
@@ -824,10 +838,15 @@ bool RestirDirectLighting::frame(const RenderScene& scene, const GBufferTargets&
         gbuffer.width == 0 || gbuffer.height == 0 || scene.lights.empty()) {
         return false;
     }
-    if (pending_) {
-        pending_->wait();  // its uniforms and lights are rewritten below
-        pending_.reset();
+    // This frame's uniforms and lights: wait only for the frame that last
+    // used them (kFramesInFlight ago).
+    const uint32_t slot = slot_;
+    if (pending_[slot]) {
+        pending_[slot]->wait();
+        pending_[slot].reset();
     }
+    auto& uniforms = uniforms_[slot];
+    auto& lightBuffer = lights_[slot];
     if (!scene_->update(scene) || !scene_->tlas()) return false;
     const uint32_t w = gbuffer.width, h = gbuffer.height;
     if (!ensureTargets(w, h)) return false;
@@ -879,11 +898,11 @@ bool RestirDirectLighting::frame(const RenderScene& scene, const GBufferTargets&
         lights[i].extra[2] = static_cast<float>(power[i] / total);
     }
     const uint64_t lightBytes = lights.size() * sizeof(D::RestirLight);
-    if (!lights_ || lights_->getLength() < lightBytes) {
-        lights_ = device_->createBuffer(lightBytes, GPU::BufferUsage::storage);
-        if (!lights_) return false;
+    if (!lightBuffer || lightBuffer->getLength() < lightBytes) {
+        lightBuffer = device_->createBuffer(lightBytes, GPU::BufferUsage::storage);
+        if (!lightBuffer) return false;
     }
-    lights_->upload(0, lightBytes, lights.data());
+    lightBuffer->upload(0, lightBytes, lights.data());
 
     D::RestirUniforms u{};
     const auto invViewProj = (scene.camera.projection * scene.camera.view).inverted();
@@ -907,9 +926,9 @@ bool RestirDirectLighting::frame(const RenderScene& scene, const GBufferTargets&
     u.params[1] = settings_.temporal ? 1.0f : 0.0f;
     u.params[2] = settings_.spatial && settings_.spatialSamples > 0 ? 1.0f : 0.0f;
     u.params[3] = std::clamp(settings_.spatialHistory, 0.0f, 1.0f);
-    if (!uniforms_) uniforms_ = device_->createBuffer(sizeof(u), GPU::BufferUsage::uniform);
-    if (!uniforms_) return false;
-    uniforms_->upload(0, sizeof(u), &u);
+    if (!uniforms) uniforms = device_->createBuffer(sizeof(u), GPU::BufferUsage::uniform);
+    if (!uniforms) return false;
+    uniforms->upload(0, sizeof(u), &u);
 
     const auto& current = surfaces_[surfaceIndex_];
     const auto& previous = surfaces_[1 - surfaceIndex_];
@@ -920,8 +939,8 @@ bool RestirDirectLighting::frame(const RenderScene& scene, const GBufferTargets&
         GPU::BindGroupDescriptor desc{};
         desc.layout = layout_;
         desc.entries = {{0, scene_->tlas()},
-                        {1, GPU::BufferBinding{uniforms_, 0, sizeof(u)}},
-                        {2, GPU::BufferBinding{lights_, 0, lightBytes}},
+                        {1, GPU::BufferBinding{uniforms, 0, sizeof(u)}},
+                        {2, GPU::BufferBinding{lightBuffer, 0, lightBytes}},
                         {0, gbuffer.normalRoughness},
                         {1, gbuffer.depth},
                         {2, gbuffer.albedoMetallic},
@@ -963,7 +982,8 @@ bool RestirDirectLighting::frame(const RenderScene& scene, const GBufferTargets&
     device_->submit(commands, fence);
     timing_.begin();
     timing_.submitted(commands, fence);
-    pending_ = fence;
+    pending_[slot] = fence;
+    slot_ = (slot + 1) % kFramesInFlight;
     if (!reference) {
         surfaceIndex_ = 1 - surfaceIndex_;
         historyValid_ = true;
@@ -1040,7 +1060,9 @@ RestirGlobalIllumination::RestirGlobalIllumination(std::shared_ptr<GPU::Device> 
 }
 
 RestirGlobalIllumination::~RestirGlobalIllumination() {
-    if (pending_) pending_->wait();
+    for (const auto& fence : pending_) {
+        if (fence) fence->wait();
+    }
 }
 
 bool RestirGlobalIllumination::supported() const noexcept {
@@ -1072,10 +1094,13 @@ bool RestirGlobalIllumination::render(const RenderScene& scene, const Renderer& 
         gbuffer.height == 0) {
         return false;
     }
-    if (pending_) {
-        pending_->wait();
-        pending_.reset();
+    // This frame's uniforms: wait only for the frame that last used them.
+    const uint32_t slot = slot_;
+    if (pending_[slot]) {
+        pending_[slot]->wait();
+        pending_[slot].reset();
     }
+    auto& uniforms = uniforms_[slot];
     // This frame's samples (submitted first: the same queue runs them first).
     tracer_->setGlobalIlluminationBounces(settings_.bounces);
     if (!tracer_->traceGlobalIllumination(scene, renderer, gbuffer) || !tracer_->globalIlluminationSamples()) return false;
@@ -1103,9 +1128,9 @@ bool RestirGlobalIllumination::render(const RenderScene& scene, const Renderer& 
     u.params[1] = settings_.temporal ? 1.0f : 0.0f;
     u.params[2] = settings_.spatial && settings_.spatialSamples > 0 ? 1.0f : 0.0f;
     u.params[3] = std::clamp(settings_.spatialHistory, 0.0f, 1.0f) * static_cast<float>(u.counts[0]);
-    if (!uniforms_) uniforms_ = device_->createBuffer(sizeof(u), GPU::BufferUsage::uniform);
-    if (!uniforms_) return false;
-    uniforms_->upload(0, sizeof(u), &u);
+    if (!uniforms) uniforms = device_->createBuffer(sizeof(u), GPU::BufferUsage::uniform);
+    if (!uniforms) return false;
+    uniforms->upload(0, sizeof(u), &u);
 
     const auto& now = reservoirs_[index_];
     const auto& before = reservoirs_[1 - index_];
@@ -1117,7 +1142,7 @@ bool RestirGlobalIllumination::render(const RenderScene& scene, const Renderer& 
         GPU::BindGroupDescriptor desc{};
         desc.layout = layout_;
         desc.entries = {{0, scene_->tlas()},
-                        {1, GPU::BufferBinding{uniforms_, 0, sizeof(u)}},
+                        {1, GPU::BufferBinding{uniforms, 0, sizeof(u)}},
                         {0, gbuffer.normalRoughness},
                         {1, gbuffer.depth},
                         {2, gbuffer.motion},
@@ -1154,7 +1179,8 @@ bool RestirGlobalIllumination::render(const RenderScene& scene, const Renderer& 
     device_->submit(commands, fence);
     timing_.begin();
     timing_.submitted(commands, fence);
-    pending_ = fence;
+    pending_[slot] = fence;
+    slot_ = (slot + 1) % kFramesInFlight;
     index_ = 1 - index_;
     historyValid_ = true;
     return true;

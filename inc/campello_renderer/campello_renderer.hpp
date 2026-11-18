@@ -554,6 +554,17 @@ namespace systems::leal::campello_renderer {
         };
         MeshPipelineRecipe meshRecipe;
         std::unordered_map<uint64_t, MeshPipelineEntry> meshPipelineCache;
+        // meshPipeline()'s last request and answer (cleared with the cache).
+        struct LastMeshPipeline {
+            const MeshPipelineEntry* entry = nullptr;
+            ProgramHandle program = 0;
+            MeshProgram variant{};
+            uint64_t layoutHash = 0;
+            bool doubleSided = false, blend = false;
+            systems::leal::campello_gpu::PixelFormat colorFormat{};
+            systems::leal::campello_gpu::PrimitiveTopology topology{};
+            bool wideLines = false, skinned = false;
+        } lastMeshPipeline;
         // Slot map of the pipeline renderPrimitive() bound; nullptr = identity.
         const std::array<int8_t, kLogicalSlotCount>* activeMeshSlots = nullptr;
         // Binds a mesh vertex/raw buffer by logical slot through activeMeshSlots.
@@ -897,9 +908,16 @@ namespace systems::leal::campello_renderer {
         /// Returns the offset after them.
         uint64_t encodeShadowPass(const std::shared_ptr<systems::leal::campello_gpu::CommandEncoder>& encoder,
                                   const std::shared_ptr<systems::leal::campello_gpu::TextureView>& target,
-                                  const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+                                  const std::vector<const systems::leal::campello_renderer::DrawCall*>& casters,
                                   const systems::leal::vector_math::Matrix4<double>& lightViewProj,
                                   uint64_t transformsOffset);
+        // render(RenderScene) scratch, kept across frames (no per-frame
+        // allocation): the sorted opaque draws, the shadow casters, the
+        // staged transforms (uploaded once per frame) and their offsets.
+        std::vector<const systems::leal::campello_renderer::DrawCall*> sortedOpaqueScratch;
+        std::vector<const systems::leal::campello_renderer::DrawCall*> shadowCasterScratch;
+        std::vector<float> drawTransformStaging, drawPreviousStaging, shadowTransformStaging;
+        std::vector<uint64_t> drawTransformOffsets;
         // Vulkan/WebGPU: the comparison sampler of the shadow lookup (frame
         // binding 10). Metal declares its sampler in the shader.
         std::shared_ptr<systems::leal::campello_gpu::Sampler> shadowSampler;
@@ -959,7 +977,7 @@ namespace systems::leal::campello_renderer {
             double n = 0.0, f = 1.0, sign = 1.0;  ///< depth range along the light, lookAt's z sign
             double lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};  ///< casters' world bounds
         };
-        bool fitShadowLight(const std::vector<systems::leal::campello_renderer::DrawCall>& casters,
+        bool fitShadowLight(const std::vector<const systems::leal::campello_renderer::DrawCall*>& casters,
                             const systems::leal::vector_math::Vector3<double>& toLight, ShadowFit& fit) const;
         static systems::leal::vector_math::Matrix4<double> shadowProjection(const ShadowFit& fit, const double rect[4]);
         /// The light-view rectangle of the view's nearest part (from the
@@ -1063,6 +1081,14 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> webgpuDrawBindGroupLayout;
         std::unordered_map<const void*, std::shared_ptr<systems::leal::campello_gpu::BindGroup>> webgpuDrawBindGroups;
         const void* webgpuBoundDrawGroup = nullptr;
+        // The mesh bind groups (sets 0-3) bound on the current render pass
+        // encoder, so the draw loops skip rebinding the same ones; reset
+        // wherever the encoder's bindings are unknown (with
+        // webgpuBoundDrawGroup). Held, so a freed group's address isn't
+        // mistaken for a new group's.
+        std::array<std::shared_ptr<systems::leal::campello_gpu::BindGroup>, 4> boundMeshGroups;
+        void setMeshBindGroup(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe, uint32_t index,
+                              const std::shared_ptr<systems::leal::campello_gpu::BindGroup> &group);
         uint32_t webgpuFirstInstance = 0;
         void bindWebGpuTransforms(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
                                   const std::shared_ptr<systems::leal::campello_gpu::Buffer> &buffer,
@@ -1134,6 +1160,8 @@ namespace systems::leal::campello_renderer {
         // CPU copy of materialUniformBuffer's written slots, re-uploaded when
         // uploadMaterial() grows the buffer (see writeMaterialUniform()).
         std::vector<uint8_t> materialUniformShadow;
+        // The buffer materialUniformShadow mirrors (writeMaterialUniform() skips unchanged slots of it).
+        const void* materialUniformShadowBuffer = nullptr;
         void writeMaterialUniform(uint64_t offset, const float* slot);
         double gpuFrameTimeMs = 0.0;  // latest completed render() command buffer
         double gbufferGpuTimeMs = 0.0;  // latest completed renderGBuffer() command buffer
