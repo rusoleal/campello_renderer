@@ -1623,6 +1623,10 @@ void Renderer::bakeIblResources() {
     // ~370M environment samples, and as one command buffer it outlasted
     // Apple GPUs' command buffer watchdog in the browser ("Caused GPU Hang
     // Error", device lost). Each job alone is a fraction of that.
+    // Natively each job is also waited for before the next is submitted:
+    // the 67 queued at once lost the device on an Adreno 642L (every later
+    // submission failed, so nothing drew) and wedged an Adreno 618's driver.
+    // The bake runs at load time; the waits cost it nothing that matters.
     std::vector<std::shared_ptr<GPU::BindGroup>> groups;  // alive until the bake has run
     std::shared_ptr<GPU::Fence> lastFence;
     for (size_t i = 0; i < jobs.size(); ++i) {
@@ -1675,6 +1679,9 @@ void Renderer::bakeIblResources() {
         }
         lastFence = device->createFence();
         device->submit(encoder->finish(), lastFence);
+#if !defined(__EMSCRIPTEN__)
+        lastFence->wait();
+#endif
     }
     if (lastFence) lastFence->wait();  // in order: the last done means all done
 #endif

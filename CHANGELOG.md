@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Benchmark: scenario `fill` (one opaque quad filling a 3840x2160 view: fragment cost), `--no-ibl` (pipelines after `setAsset()`, no environment bake), and a check that `fill` drew. Its render targets are kept for the run (on Vulkan a texture view doesn't keep its texture alive).
 - **Material specialization** (`setMaterialSpecialization()`, on by default; Metal and Vulkan). The PBR fragment shader is compiled per set of optional features a material uses (KHR_materials_specular, sheen, clearcoat, transmission with volume and dispersion, iridescence, anisotropy, world mapping, unlit, the debug views), through campello_gpu v0.32.0's shader constants (Metal: function constant 0, `kMaterialFeatures`; Vulkan: specialization constant 0 in `default.frag`, whose `loadMaterial()` copies the uniform block with the off features' values as constants). Unused features' code is left out. On Vulkan the flat variant (the same fragment shader) is specialized too.
   - A material's features come from its own uniforms, so a feature is only left out when its values already switch it off, and specialized pipelines render exactly as the general one (`SpecializedMaterialsRenderAsTheGeneralShader` compares them per pixel).
   - Plain materials' pipelines are created up front; other combinations the first time they're drawn.
@@ -15,6 +16,7 @@
 - New tests `DrawCallInstancesDrawAtTheirTransforms`, `SunShadowsFollowInstancesAndSkins`, `SunShadowsDrawOnlyCastersTheViewNeeds`.
 
 ### Fixed
+- **Nothing drew after the environment bake on some Adreno GPUs** (Vulkan). With pipelines created before `setAsset()` (the usual order), `setAsset()` bakes the environment's image-based lighting, and its 67 jobs were queued at once: an Adreno 642L (Galaxy Tab S7 FE) lost the device, so every later submission failed and frames came out empty, and an Adreno 618 wedged its driver. Natively each job is now waited for before the next. New test `FramesDrawAfterTheEnvironmentBake` (fails on the Adreno 642L without the fix).
 - **Scene-asset materials in `render(RenderScene)`.** `uploadMaterial()` for a material of the scene's own asset reused the bind groups `setScene()` made but never wrote its uniforms (only the glTF `render()` path did, every frame), so a RenderScene draw before or without a glTF render read an empty slot: black base colour, zero roughness. The slot is written on upload now. New test `SceneAssetMaterialsDrawInRenderScene`. Earlier `draws`/`shadows`/`gbuffer` benchmark numbers were measured with those empty materials.
 - **Out-of-bounds reads with `DrawCall::instanceCount` above 1.** Every instance read its matrix from a buffer holding one (the identity), so instances past the first read past its end. A draw now draws no more instances than its `instanceTransformBuffer` holds, one without a buffer; `RenderStats::instanceCount` counts those.
 - **Instances of position-only meshes drew on top of each other.** The lean vertex stages (`vertexLean`, `gbufferVertexLean`, `default_lean.vert`, `gbuffer_lean.vert`) ignored the instance matrices; they apply them now, as the full stages do (glTF EXT_mesh_gpu_instancing and `DrawCall`).

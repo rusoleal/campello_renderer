@@ -4013,6 +4013,33 @@ TEST_F(OffscreenRenderTest, SceneAssetMaterialsDrawInRenderScene) {
     for (int c = 0; c < 3; ++c) EXPECT_GT(pixels[centre + c], 200) << "channel " << c << ": the material's emissive white";
 }
 
+// Pipelines before the asset, as apps do: setAsset() then bakes the
+// environment's image-based lighting on the GPU, and the GPU must still draw
+// afterwards. (Queued all at once, the bake's jobs lost the device on an
+// Adreno 642L: every later frame was silently dropped.)
+TEST_F(OffscreenRenderTest, FramesDrawAfterTheEnvironmentBake) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+#if defined(_WIN32)
+    GTEST_SKIP() << "No EXT_mesh_gpu_instancing on DirectX yet";
+#endif
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+    auto asset = GLTF::loadGLTF(kGltfInstancedQuad, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);  // bakes the built-in environment
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    renderer->setCameraMatrices(identity, identity);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+    renderer->render(view);
+    const auto pixels = readBackPixels(tex);
+    EXPECT_TRUE(litAt(pixels, 13, 32)) << "nothing drawn after the bake (device lost?)";
+    EXPECT_TRUE(litAt(pixels, 51, 32));
+    renderer->clearCameraOverride();
+}
+
 // A RenderScene draw with a joint palette (DrawCall::jointMatrixBuffer) is
 // posed by it; the same mesh without one renders at rest.
 TEST_F(OffscreenRenderTest, DrawCallJointsPoseTheMesh) {
