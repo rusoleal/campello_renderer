@@ -94,7 +94,141 @@ layout(std140, set = 0, binding = 24) uniform MaterialUniforms {
     vec4  normalUvTransformRow0;     // 336  independent KHR_texture_transform for normalTexture
     vec4  normalUvTransformRow1;     // 352
     float texCoord1Mask;             // 368
-} mat;
+} matIn;
+
+// Material specialization (as default.metal's specializedMaterial()): the
+// optional features as specialization constant 0, a bit mask set per
+// pipeline from the material's own uniforms (Renderer::materialFeaturesOf()).
+// A bit is clear only when the material's values already switch its feature
+// off, so loadMaterial() gives the same values, but as constants the driver
+// folds, dropping the feature's code. The default (no constant): every
+// feature, decided at run time.
+layout(constant_id = 0) const uint kMaterialFeatures = 0xFFFFFFFFu;
+const uint kFeatureSpecular     = 1u << 0;
+const uint kFeatureSheen        = 1u << 1;
+const uint kFeatureClearcoat    = 1u << 2;
+const uint kFeatureTransmission = 1u << 3;
+const uint kFeatureIridescence  = 1u << 4;
+const uint kFeatureAnisotropy   = 1u << 5;
+const uint kFeatureWorldMapping = 1u << 6;
+const uint kFeatureUnlit        = 1u << 7;
+const uint kFeatureViewMode     = 1u << 8;
+
+struct MaterialData {
+    vec4 baseColorFactor;
+    vec4 uvTransformRow0;
+    vec4 uvTransformRow1;
+    float metallicFactor;
+    float roughnessFactor;
+    float normalScale;
+    float alphaMode;
+    float alphaCutoff;
+    float unlit;
+    float hasNormalTexture;
+    float hasEmissiveTexture;
+    float hasOcclusionTexture;
+    float occlusionStrength;
+    float doubleSided;
+    vec4 emissiveFactor;
+    float ior;
+    float specularFactor;
+    float hasSpecularTexture;
+    float hasSpecularColorTexture;
+    vec4 specularColorFactor;
+    vec4 sheenColorFactor;
+    float sheenRoughnessFactor;
+    float hasSheenColorTexture;
+    float hasSheenRoughnessTexture;
+    float clearcoatFactor;
+    float clearcoatRoughnessFactor;
+    float hasClearcoatTexture;
+    float hasClearcoatRoughnessTexture;
+    float hasClearcoatNormalTexture;
+    float clearcoatNormalScale;
+    float transmissionFactor;
+    float hasTransmissionTexture;
+    float thicknessFactor;
+    float attenuationDistance;
+    float hasThicknessTexture;
+    vec4 attenuationColor;
+    float viewMode;
+    float environmentIntensity;
+    float iblEnabled;
+    float iridescenceFactor;
+    float iridescenceIor;
+    float iridescenceThicknessMin;
+    float iridescenceThicknessMax;
+    float hasIridescenceTexture;
+    float hasIridescenceThicknessTexture;
+    float anisotropyStrength;
+    float anisotropyRotation;
+    float hasAnisotropicTexture;
+    float dispersion;
+    float worldMapping;
+    float worldMappingUp;
+    vec4 normalUvTransformRow0;
+    vec4 normalUvTransformRow1;
+    float texCoord1Mask;
+};
+MaterialData mat;  // loadMaterial(), first thing in main()
+
+void loadMaterial() {
+    mat.baseColorFactor = matIn.baseColorFactor;
+    mat.uvTransformRow0 = matIn.uvTransformRow0;
+    mat.uvTransformRow1 = matIn.uvTransformRow1;
+    mat.metallicFactor = matIn.metallicFactor;
+    mat.roughnessFactor = matIn.roughnessFactor;
+    mat.normalScale = matIn.normalScale;
+    mat.alphaMode = matIn.alphaMode;
+    mat.alphaCutoff = matIn.alphaCutoff;
+    mat.unlit = (kMaterialFeatures & kFeatureUnlit) != 0u ? matIn.unlit : 0.0;
+    mat.hasNormalTexture = matIn.hasNormalTexture;
+    mat.hasEmissiveTexture = matIn.hasEmissiveTexture;
+    mat.hasOcclusionTexture = matIn.hasOcclusionTexture;
+    mat.occlusionStrength = matIn.occlusionStrength;
+    mat.doubleSided = matIn.doubleSided;
+    mat.emissiveFactor = matIn.emissiveFactor;
+    mat.ior = matIn.ior;
+    mat.specularFactor = (kMaterialFeatures & kFeatureSpecular) != 0u ? matIn.specularFactor : 1.0;
+    mat.hasSpecularTexture = (kMaterialFeatures & kFeatureSpecular) != 0u ? matIn.hasSpecularTexture : 0.0;
+    mat.hasSpecularColorTexture = (kMaterialFeatures & kFeatureSpecular) != 0u ? matIn.hasSpecularColorTexture : 0.0;
+    mat.specularColorFactor = (kMaterialFeatures & kFeatureSpecular) != 0u ? matIn.specularColorFactor : vec4(1.0, 1.0, 1.0, matIn.specularColorFactor.w);
+    mat.sheenColorFactor = (kMaterialFeatures & kFeatureSheen) != 0u ? matIn.sheenColorFactor : vec4(0.0, 0.0, 0.0, matIn.sheenColorFactor.w);
+    mat.sheenRoughnessFactor = matIn.sheenRoughnessFactor;
+    mat.hasSheenColorTexture = (kMaterialFeatures & kFeatureSheen) != 0u ? matIn.hasSheenColorTexture : 0.0;
+    mat.hasSheenRoughnessTexture = (kMaterialFeatures & kFeatureSheen) != 0u ? matIn.hasSheenRoughnessTexture : 0.0;
+    mat.clearcoatFactor = (kMaterialFeatures & kFeatureClearcoat) != 0u ? matIn.clearcoatFactor : 0.0;
+    mat.clearcoatRoughnessFactor = matIn.clearcoatRoughnessFactor;
+    mat.hasClearcoatTexture = (kMaterialFeatures & kFeatureClearcoat) != 0u ? matIn.hasClearcoatTexture : 0.0;
+    mat.hasClearcoatRoughnessTexture = (kMaterialFeatures & kFeatureClearcoat) != 0u ? matIn.hasClearcoatRoughnessTexture : 0.0;
+    mat.hasClearcoatNormalTexture = (kMaterialFeatures & kFeatureClearcoat) != 0u ? matIn.hasClearcoatNormalTexture : 0.0;
+    mat.clearcoatNormalScale = matIn.clearcoatNormalScale;
+    mat.transmissionFactor = (kMaterialFeatures & kFeatureTransmission) != 0u ? matIn.transmissionFactor : 0.0;
+    mat.hasTransmissionTexture = (kMaterialFeatures & kFeatureTransmission) != 0u ? matIn.hasTransmissionTexture : 0.0;
+    mat.thicknessFactor = (kMaterialFeatures & kFeatureTransmission) != 0u ? matIn.thicknessFactor : 0.0;
+    mat.attenuationDistance = matIn.attenuationDistance;
+    mat.hasThicknessTexture = (kMaterialFeatures & kFeatureTransmission) != 0u ? matIn.hasThicknessTexture : 0.0;
+    mat.attenuationColor = matIn.attenuationColor;
+    mat.viewMode = (kMaterialFeatures & kFeatureViewMode) != 0u ? matIn.viewMode : 0.0;
+    mat.environmentIntensity = matIn.environmentIntensity;
+    mat.iblEnabled = matIn.iblEnabled;
+    mat.iridescenceFactor = (kMaterialFeatures & kFeatureIridescence) != 0u ? matIn.iridescenceFactor : 0.0;
+    mat.iridescenceIor = matIn.iridescenceIor;
+    mat.iridescenceThicknessMin = matIn.iridescenceThicknessMin;
+    mat.iridescenceThicknessMax = matIn.iridescenceThicknessMax;
+    mat.hasIridescenceTexture = (kMaterialFeatures & kFeatureIridescence) != 0u ? matIn.hasIridescenceTexture : 0.0;
+    mat.hasIridescenceThicknessTexture = (kMaterialFeatures & kFeatureIridescence) != 0u ? matIn.hasIridescenceThicknessTexture : 0.0;
+    mat.anisotropyStrength = (kMaterialFeatures & kFeatureAnisotropy) != 0u ? matIn.anisotropyStrength : 0.0;
+    mat.anisotropyRotation = matIn.anisotropyRotation;
+    mat.hasAnisotropicTexture = (kMaterialFeatures & kFeatureAnisotropy) != 0u ? matIn.hasAnisotropicTexture : 0.0;
+    mat.dispersion = (kMaterialFeatures & kFeatureTransmission) != 0u ? matIn.dispersion : 0.0;
+    mat.worldMapping = (kMaterialFeatures & kFeatureWorldMapping) != 0u ? matIn.worldMapping : 0.0;
+    mat.worldMappingUp = matIn.worldMappingUp;
+    mat.normalUvTransformRow0 = matIn.normalUvTransformRow0;
+    mat.normalUvTransformRow1 = matIn.normalUvTransformRow1;
+    mat.texCoord1Mask = matIn.texCoord1Mask;
+}
+
 
 // --- Per-frame (set 1) ----------------------------------------------------------
 struct Light {
@@ -451,6 +585,7 @@ void worldMappingFrame(vec3 P, vec3 N, float size, bool zUp, out vec2 uv, out ve
 }
 
 void main() {
+    loadMaterial();
     vec2 texcoord0In = fragTexcoord0;  // world mapping replaces it
     // Derivatives are taken unconditionally (uniform control flow).
     vec3 faceNormal = cross(dFdx(worldPos), dFdy(worldPos));

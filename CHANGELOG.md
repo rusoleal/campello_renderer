@@ -3,10 +3,11 @@
 ## [Unreleased]
 
 ### Added
-- **Material specialization** (`setMaterialSpecialization()`, on by default; Metal). The PBR fragment shader is compiled per set of optional features a material uses (KHR_materials_specular, sheen, clearcoat, transmission with volume and dispersion, iridescence, anisotropy, world mapping, unlit, the debug views), through campello_gpu v0.32.0's shader constants (function constant 0, `kMaterialFeatures`). Unused features' code is left out.
+- **Material specialization** (`setMaterialSpecialization()`, on by default; Metal and Vulkan). The PBR fragment shader is compiled per set of optional features a material uses (KHR_materials_specular, sheen, clearcoat, transmission with volume and dispersion, iridescence, anisotropy, world mapping, unlit, the debug views), through campello_gpu v0.32.0's shader constants (Metal: function constant 0, `kMaterialFeatures`; Vulkan: specialization constant 0 in `default.frag`, whose `loadMaterial()` copies the uniform block with the off features' values as constants). Unused features' code is left out. On Vulkan the flat variant (the same fragment shader) is specialized too.
   - A material's features come from its own uniforms, so a feature is only left out when its values already switch it off, and specialized pipelines render exactly as the general one (`SpecializedMaterialsRenderAsTheGeneralShader` compares them per pixel).
   - Plain materials' pipelines are created up front; other combinations the first time they're drawn.
   - Benchmark (Intel UHD 630, frame time): `draws` 6.67 to 4.47 ms, `shadows` about 9.0 to 6.2 ms.
+  - The benchmark takes `--general` to compare with the general shader, and builds for Android (see `bench/frame_bench.cpp`).
 - **`DrawCall::instanceTransformBuffer`.** A `RenderScene` draw can be instanced: one column-major float4x4 per instance, applied in model space before `worldTransform` (create it with `BufferUsage::vertex`), as glTF's EXT_mesh_gpu_instancing. Before, `DrawCall` had no way to pass instance transforms.
 - **`DrawCall::localBounds`**: model-space bounds covering a draw's instances or the poses of its skin, for fitting sun shadows; unset, the mesh's bounds.
 - **`RenderStats::shadowCastersDrawn` / `shadowCasterCount`**: the casters drawn into the far shadow map the last time it was redrawn, and how many there were.

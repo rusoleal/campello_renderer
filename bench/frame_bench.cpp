@@ -1,7 +1,11 @@
 // Frame benchmark: the CPU cost of the renderer's frame paths and the frame
 // time they sustain, to compare changes against a baseline.
 //
-//   campello_renderer_bench [scenario] [frames]
+//   campello_renderer_bench [scenario] [frames] [--general]
+//
+// On Android: build it for arm64 (CAMPELLO_RENDERER_BUILD_BENCH, the NDK
+// toolchain as run_android_tests.sh), adb push it with the libraries, run
+// it from /data/local/tmp with LD_LIBRARY_PATH=.
 //
 // Scenarios (all by default):
 //   draws    render(RenderScene): a grid of cubes, one DrawCall each, over
@@ -212,19 +216,29 @@ bool buildDrawScene(Renderer& renderer, DrawScene& out) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const std::string only = argc > 1 ? argv[1] : "";
-    const int frames = argc > 2 ? std::max(1, std::atoi(argv[2])) : 200;
+    // [scenario] [frames], and --general: the general PBR shader
+    // (setMaterialSpecialization(false)), to compare with specialization.
+    std::vector<std::string> args;
+    bool specialize = true;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--general") specialize = false;
+        else args.push_back(argv[i]);
+    }
+    const std::string only = args.size() > 0 ? args[0] : "";
+    const int frames = args.size() > 1 ? std::max(1, std::atoi(args[1].c_str())) : 200;
     auto device = GPU::Device::createDefaultDevice(nullptr);
     if (!device) {
         std::fprintf(stderr, "no GPU device\n");
         return 1;
     }
-    std::printf("campello_renderer %s, %s, %dx%d, %d draws, %d materials, %d frames\n", getVersion().c_str(),
-                device->getName().c_str(), kWidth, kHeight, kGrid * kGrid, kMaterials, frames);
+    std::printf("campello_renderer %s, %s, %dx%d, %d draws, %d materials, %d frames, %s shader\n", getVersion().c_str(),
+                device->getName().c_str(), kWidth, kHeight, kGrid * kGrid, kMaterials, frames,
+                specialize ? "specialized" : "general");
 
     if (only.empty() || only == "draws") {
         Renderer renderer(device);
         renderer.resize(kWidth, kHeight);
+        renderer.setMaterialSpecialization(specialize);
         renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
         renderer.setSkyboxEnabled(false);
         DrawScene draws;
@@ -238,6 +252,7 @@ int main(int argc, char** argv) {
         // moving, so the sun's shadow map is redrawn every frame.
         Renderer renderer(device);
         renderer.resize(kWidth, kHeight);
+        renderer.setMaterialSpecialization(specialize);
         renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
         renderer.setSkyboxEnabled(false);
         DrawScene draws;
@@ -265,7 +280,8 @@ int main(int argc, char** argv) {
         if (asset && view) {
             renderer.setAsset(asset);
             renderer.resize(kWidth, kHeight);
-            renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+            renderer.setMaterialSpecialization(specialize);
+        renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
             renderer.setSkyboxEnabled(false);
             RenderScene camera;
             cameraLooking(camera);
@@ -283,6 +299,7 @@ int main(int argc, char** argv) {
     if (only.empty() || only == "gbuffer") {
         Renderer renderer(device);
         renderer.resize(kWidth, kHeight);
+        renderer.setMaterialSpecialization(specialize);
         renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
         DrawScene draws;
         if (!renderer.supportsGBuffer()) {
@@ -294,6 +311,7 @@ int main(int argc, char** argv) {
     if (only.empty() || only == "denoise") {
         Renderer renderer(device);
         renderer.resize(kWidth, kHeight);
+        renderer.setMaterialSpecialization(specialize);
         renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
         RealtimeDenoiser denoiser(device);
         DrawScene draws;

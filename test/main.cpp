@@ -8466,7 +8466,7 @@ TEST_F(OffscreenRenderTest, SpecializedMaterialsRenderAsTheGeneralShader) {
     renderer->setMaterialSpecialization(true);
     const auto specialized = render();
     renderer->setMaterialSpecialization(true);
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__ANDROID__)  // Metal, Vulkan
     EXPECT_GE(renderer->meshPipelineCount(), generalPipelines + 7) << "one pipeline per feature set drawn";
 #endif
     ASSERT_EQ(general.size(), specialized.size());

@@ -3529,11 +3529,6 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     systems::leal::campello_gpu::PixelFormat colorFormat, systems::leal::campello_gpu::PrimitiveTopology topology,
     bool wideLines, bool skinned, uint32_t features) {
     namespace GPU = systems::leal::campello_gpu;
-    // Only the built-in PBR textured fragment is specialized.
-    if (programHandle != kPbrProgram || variant != MeshProgram::textured || wideLines || !meshRecipe.materialFeatureConstant ||
-        !materialSpecialization) {
-        features = kAllMaterialFeatures;
-    }
     // Consecutive draws mostly ask for the same pipeline (draws are sorted
     // by state): the last request's answer, without the stage search.
     const uint64_t layoutHash = layout.hash();
@@ -3543,10 +3538,14 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
         last.topology == topology && last.wideLines == wideLines && last.skinned == skinned && last.features == features) {
         return last.entry;
     }
+    // Remembered as requested (below they're normalized), so the next
+    // identical request matches.
+    const LastMeshPipeline request = {nullptr, programHandle, variant,  layoutHash, doubleSided, blend,
+                                      colorFormat, topology,  wideLines, skinned,   features};
     const auto remember = [&](const MeshPipelineEntry* entry) {
         if (entry) {
-            lastMeshPipeline = {entry,       programHandle, variant,   layoutHash, doubleSided,
-                                blend,       colorFormat,   topology,  wideLines,  skinned, features};
+            lastMeshPipeline = request;
+            lastMeshPipeline.entry = entry;
         }
         return entry;
     };
@@ -3568,6 +3567,12 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     // no blending; app programs: one fragment shader).
     if (program.fragmentEntries[(size_t)variant].empty()) variant = MeshProgram::textured;
     if (program.fragmentEntries[(size_t)variant].empty()) return nullptr;
+    // Only the built-in PBR textured fragment is specialized (on Vulkan the
+    // flat variant is that fragment too).
+    if (programHandle != kPbrProgram || variant != MeshProgram::textured || wideLines || !meshRecipe.materialFeatureConstant ||
+        !materialSpecialization) {
+        features = kAllMaterialFeatures;
+    }
     if (!meshRecipe.supportsBlend || !program.supportsBlend) blend = false;
     if (colorFormat == GPU::PixelFormat::invalid) colorFormat = meshRecipe.colorTarget.format;
     const bool lines = topology != GPU::PrimitiveTopology::triangleList &&
@@ -5374,6 +5379,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         }
         programs[kPbrProgram].fragmentModule = fragModule;
         programs[kPbrProgram].fragmentEntries = {"", "main", ""};
+        meshRecipe.materialFeatureConstant = true;  // default.frag's kMaterialFeatures (constant_id 0)
         meshRecipe.supportsBlend = false;
         // The G-buffer (renderGBuffer()): gbuffer.vert / gbuffer_lean.vert
         // (default.vert's reads plus the previous transform, a per-instance
