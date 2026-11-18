@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **No sky on mobile GPUs in the browser.** Environment cube maps from 32-bit float images (the built-in sky among them) were rgba32float, which WebGPU only filters with the optional `float32-filterable` feature; an Adreno 619 (Galaxy Tab S7 FE, Chrome) lacks it, so the skybox and IBL bake bind groups failed validation and no sky drew. `loadEnvironmentMap()` and `convertEquirectangularImageToCubemap()` store such maps as rgba16float now, clamped to the largest finite half (65504) so the sun doesn't turn into infinity.
+
 ## [0.22.1] - 2026-11-17
 
 ### Fixed
