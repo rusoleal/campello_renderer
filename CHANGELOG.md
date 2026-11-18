@@ -4,10 +4,13 @@
 
 ### Added
 - Benchmark: scenario `fill` (one opaque quad filling a 3840x2160 view: fragment cost), `--no-ibl` (pipelines after `setAsset()`, no environment bake), and a check that `fill` drew. Its render targets are kept for the run (on Vulkan a texture view doesn't keep its texture alive).
-- **Material specialization** (`setMaterialSpecialization()`, on by default; Metal and Vulkan). The PBR fragment shader is compiled per set of optional features a material uses (KHR_materials_specular, sheen, clearcoat, transmission with volume and dispersion, iridescence, anisotropy, world mapping, unlit, the debug views), through campello_gpu v0.32.0's shader constants (Metal: function constant 0, `kMaterialFeatures`; Vulkan: specialization constant 0 in `default.frag`, whose `loadMaterial()` copies the uniform block with the off features' values as constants). Unused features' code is left out. On Vulkan the flat variant (the same fragment shader) is specialized too.
+- **Material specialization** (`setMaterialSpecialization()`, on by default; Metal and Vulkan). The PBR fragment shader is compiled per set of optional features a material uses (KHR_materials_specular, sheen, clearcoat, transmission with volume and dispersion, iridescence, anisotropy, world mapping, unlit, the debug views), through campello_gpu v0.32.0's shader constants (Metal: function constant 0, `kMaterialFeatures`; Vulkan: specialization constant 0 in `default.frag`, which reads the optional features' fields through `MAT_<field>` macros that give the off value as a constant; a first version copied the uniform block into a local struct, which an Adreno 642L kept in scratch memory and ran 7x slower). Unused features' code is left out. On Vulkan the flat variant (the same fragment shader) is specialized too.
   - A material's features come from its own uniforms, so a feature is only left out when its values already switch it off, and specialized pipelines render exactly as the general one (`SpecializedMaterialsRenderAsTheGeneralShader` compares them per pixel).
   - Plain materials' pipelines are created up front; other combinations the first time they're drawn.
-  - Benchmark (Intel UHD 630, frame time): `draws` 6.67 to 4.47 ms, `shadows` about 9.0 to 6.2 ms.
+  - Benchmark, frame time, general shader to specialized:
+    - Intel UHD 630 (Metal): `fill` 47.0 to 23.3 ms, `draws` 6.67 to 4.47 ms, `shadows` about 9.0 to 6.2 ms.
+    - Adreno 642L (Vulkan, Galaxy Tab S7 FE): `fill` 101.6 to 40.1 ms, `draws` 38.1 to 29.7 ms, `shadows` 28.4 to 15.3 ms.
+  - The gain is in the image-based lighting, where most optional features' code runs; with IBL off there's little to remove.
   - The benchmark takes `--general` to compare with the general shader, and builds for Android (see `bench/frame_bench.cpp`).
 - **`DrawCall::instanceTransformBuffer`.** A `RenderScene` draw can be instanced: one column-major float4x4 per instance, applied in model space before `worldTransform` (create it with `BufferUsage::vertex`), as glTF's EXT_mesh_gpu_instancing. Before, `DrawCall` had no way to pass instance transforms.
 - **`DrawCall::localBounds`**: model-space bounds covering a draw's instances or the poses of its skin, for fitting sun shadows; unset, the mesh's bounds.
@@ -24,7 +27,7 @@
 
 ### Changed
 - **The far shadow map draws only the casters that can shadow what's in view** (when `RenderScene::shadowCasters` is empty, so every opaque draw casts and receives). The view, cut to the draws' bounds, gives a light-view rectangle; casters whose light-view bounds miss it (plus a 25% margin) aren't drawn. The map keeps the same projection and is redrawn when the casters or the light change or the view leaves the rectangle drawn. The near cascade uses the same caster test. Benchmark `shadows` (Intel UHD 630): 644 of 4,900 casters drawn, CPU time per frame 10.6 to 9.7 ms.
-- **Test results:** macOS 141 passed (also with Metal API validation); Android (Adreno 618) 107 passed, 34 skipped (ray tracing), 0 failed.
+- **Test results:** macOS 144 passed (also with Metal API validation); Android: Adreno 642L (Galaxy Tab S7 FE, Android 14) 110 passed, 0 failed; Adreno 618 109 passed before the last two fixes.
 
 ## [0.23.0] - 2026-11-18
 
