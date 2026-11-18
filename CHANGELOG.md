@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- **Material specialization** (`setMaterialSpecialization()`, on by default; Metal). The PBR fragment shader is compiled per set of optional features a material uses (KHR_materials_specular, sheen, clearcoat, transmission with volume and dispersion, iridescence, anisotropy, world mapping, unlit, the debug views), through campello_gpu v0.32.0's shader constants (function constant 0, `kMaterialFeatures`). Unused features' code is left out.
+  - A material's features come from its own uniforms, so a feature is only left out when its values already switch it off, and specialized pipelines render exactly as the general one (`SpecializedMaterialsRenderAsTheGeneralShader` compares them per pixel).
+  - Plain materials' pipelines are created up front; other combinations the first time they're drawn.
+  - Benchmark (Intel UHD 630, frame time): `draws` 6.67 to 4.47 ms, `shadows` about 9.0 to 6.2 ms.
 - **`DrawCall::instanceTransformBuffer`.** A `RenderScene` draw can be instanced: one column-major float4x4 per instance, applied in model space before `worldTransform` (create it with `BufferUsage::vertex`), as glTF's EXT_mesh_gpu_instancing. Before, `DrawCall` had no way to pass instance transforms.
 - **`DrawCall::localBounds`**: model-space bounds covering a draw's instances or the poses of its skin, for fitting sun shadows; unset, the mesh's bounds.
 - **`RenderStats::shadowCastersDrawn` / `shadowCasterCount`**: the casters drawn into the far shadow map the last time it was redrawn, and how many there were.
@@ -10,6 +14,7 @@
 - New tests `DrawCallInstancesDrawAtTheirTransforms`, `SunShadowsFollowInstancesAndSkins`, `SunShadowsDrawOnlyCastersTheViewNeeds`.
 
 ### Fixed
+- **Scene-asset materials in `render(RenderScene)`.** `uploadMaterial()` for a material of the scene's own asset reused the bind groups `setScene()` made but never wrote its uniforms (only the glTF `render()` path did, every frame), so a RenderScene draw before or without a glTF render read an empty slot: black base colour, zero roughness. The slot is written on upload now. New test `SceneAssetMaterialsDrawInRenderScene`. Earlier `draws`/`shadows`/`gbuffer` benchmark numbers were measured with those empty materials.
 - **Out-of-bounds reads with `DrawCall::instanceCount` above 1.** Every instance read its matrix from a buffer holding one (the identity), so instances past the first read past its end. A draw now draws no more instances than its `instanceTransformBuffer` holds, one without a buffer; `RenderStats::instanceCount` counts those.
 - **Instances of position-only meshes drew on top of each other.** The lean vertex stages (`vertexLean`, `gbufferVertexLean`, `default_lean.vert`, `gbuffer_lean.vert`) ignored the instance matrices; they apply them now, as the full stages do (glTF EXT_mesh_gpu_instancing and `DrawCall`).
 - **Sun shadows of skinned and instanced casters** (Metal and Vulkan). The shadow pass drew every caster's first instance in its rest pose, so an animated character's shadow stayed in the bind pose and an instanced mesh cast one shadow. Casters with instances or a skin are drawn with their own depth-only vertex stages (`shadowVertexInstanced` / `shadowVertexSkinned`; `shadow.vert` / `shadow_skinned.vert`), one pipeline per joint/weight format. Skinned casters redraw the shadow map every frame, since their pose changes in their buffers. WebGPU and DirectX still draw them at rest.

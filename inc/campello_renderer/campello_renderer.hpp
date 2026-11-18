@@ -556,6 +556,9 @@ namespace systems::leal::campello_renderer {
             // vertex buffer (Vulkan: gbuffer.vert's previous clip transform
             // and jitter), after the per-draw buffers; G-buffer pipelines only.
             std::optional<systems::leal::campello_gpu::VertexLayout> gbufferPreviousTransforms;
+            // The PBR textured fragment takes the material feature mask as
+            // its constant 0 (Metal's kMaterialFeatures, Vulkan's constant_id 0).
+            bool materialFeatureConstant = false;
         };
         // A cached pipeline and where its vertex buffers go: physical slot per
         // logical slot (VERTEX_SLOT_*), -1 = not read by this pipeline.
@@ -584,6 +587,7 @@ namespace systems::leal::campello_renderer {
             systems::leal::campello_gpu::PixelFormat colorFormat{};
             systems::leal::campello_gpu::PrimitiveTopology topology{};
             bool wideLines = false, skinned = false;
+            uint32_t features = 0;
         } lastMeshPipeline;
         // Slot map of the pipeline renderPrimitive() bound; nullptr = identity.
         const std::array<int8_t, kLogicalSlotCount>* activeMeshSlots = nullptr;
@@ -604,18 +608,31 @@ namespace systems::leal::campello_renderer {
         const MeshVertexStage* vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines = false,
                                               bool wide = false, uint32_t excludeMask = 0) const;
         // colorFormat: invalid = the recipe's (createDefaultPipelines()) format.
+        // features: the built-in PBR textured fragment's specialization
+        // (kAllMaterialFeatures: the general pipeline; other programs and
+        // variants ignore it).
         const MeshPipelineEntry* meshPipeline(
             ProgramHandle program, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
             systems::leal::campello_gpu::PixelFormat colorFormat = systems::leal::campello_gpu::PixelFormat::invalid,
             systems::leal::campello_gpu::PrimitiveTopology topology =
                 systems::leal::campello_gpu::PrimitiveTopology::triangleList,
-            bool wideLines = false, bool skinned = true);
+            bool wideLines = false, bool skinned = true, uint32_t features = 0xFFFFFFFFu);
         const MeshPipelineEntry* meshPipeline(
-            MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend, bool skinned = true) {
+            MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend, bool skinned = true,
+            uint32_t features = 0xFFFFFFFFu) {
             return meshPipeline(kPbrProgram, variant, layout, doubleSided, blend,
                                 systems::leal::campello_gpu::PixelFormat::invalid,
-                                systems::leal::campello_gpu::PrimitiveTopology::triangleList, false, skinned);
+                                systems::leal::campello_gpu::PrimitiveTopology::triangleList, false, skinned, features);
         }
+        // Material specialization (setMaterialSpecialization()): the
+        // optional PBR features each material slot uses (kMaterialFeature*
+        // bits, from its uniforms; written by writeMaterialUniform()), and
+        // the mask for a slot's draw (plus the debug views when on).
+        static constexpr uint32_t kAllMaterialFeatures = 0xFFFFFFFFu;
+        static uint32_t materialFeaturesOf(const float* slot);
+        std::vector<uint32_t> materialSlotFeatures;
+        uint32_t drawMaterialFeatures(uint32_t uniformSlot) const;
+        bool materialSpecialization = true;
         // Vulkan: binds a skinned draw's joint palettes (this frame's and the
         // previous frame's, for G-buffer motion) as set 2. A size of 0 binds
         // the rest of the buffer from the offset. Bind groups are cached per
@@ -1670,6 +1687,16 @@ namespace systems::leal::campello_renderer {
             shadowMapValid = false;
             shadowNearValid = false;
         }
+        /// Material specialization (on by default): the built-in PBR shader
+        /// is compiled per set of optional features a material uses
+        /// (specular, sheen, clearcoat, transmission/volume, iridescence,
+        /// anisotropy, world mapping, unlit, the debug views), with the
+        /// unused ones left out, which makes plain materials much cheaper to
+        /// shade. A combination's pipeline is created the first time it's
+        /// drawn. Off: one pipeline that decides every feature at run time.
+        /// Metal (and Vulkan); a no-op elsewhere.
+        void setMaterialSpecialization(bool enabled) { materialSpecialization = enabled; }
+        bool getMaterialSpecialization() const { return materialSpecialization; }
         /// A finer shadow map for the part of the view nearest the camera
         /// (two cascades; on by default). Off: one map over the whole scene.
         void setShadowCascades(bool enabled) { shadowCascades = enabled; }

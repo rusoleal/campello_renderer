@@ -916,9 +916,73 @@ inline void worldMappingFrame(float3 P, float3 N, float size, bool zUp, thread f
     uv = float2(dot(P, T), dot(P, B)) / size;
 }
 
+// ---------------------------------------------------------------------------
+// Material specialization: fragmentMain_textured's optional features as
+// function constant 0, a bit mask (kFeature*). The renderer sets it per
+// pipeline from the material's own uniforms (Renderer::materialFeatures()):
+// a bit is clear only when the material's values already switch the feature
+// off, so specialized pipelines render exactly as the general one, but the
+// compiler drops the code of every feature that's off. Unset (app programs,
+// the general pipeline): every feature, decided at run time.
+// ---------------------------------------------------------------------------
+constant uint kMaterialFeaturesIn [[function_constant(0)]];
+constant uint kMaterialFeatures = is_function_constant_defined(kMaterialFeaturesIn) ? kMaterialFeaturesIn : 0xFFFFFFFFu;
+constant uint kFeatureSpecular     = 1u << 0;  // KHR_materials_specular
+constant uint kFeatureSheen        = 1u << 1;
+constant uint kFeatureClearcoat    = 1u << 2;
+constant uint kFeatureTransmission = 1u << 3;  // with volume and dispersion
+constant uint kFeatureIridescence  = 1u << 4;
+constant uint kFeatureAnisotropy   = 1u << 5;
+constant uint kFeatureWorldMapping = 1u << 6;
+constant uint kFeatureUnlit        = 1u << 7;
+constant uint kFeatureViewMode     = 1u << 8;  // the debug views (setViewMode())
+
+// The material as the specialized pipeline sees it: the off features' values
+// are the constants they already hold, so the compiler folds their branches.
+static inline MaterialUniforms specializedMaterial(constant MaterialUniforms &in) {
+    MaterialUniforms m = in;
+    if (!(kMaterialFeatures & kFeatureSpecular)) {
+        m.specularFactor = 1.0;
+        m.hasSpecularTexture = 0.0;
+        m.hasSpecularColorTexture = 0.0;
+        m.specularColorFactor = float4(1.0, 1.0, 1.0, m.specularColorFactor.w);
+    }
+    if (!(kMaterialFeatures & kFeatureSheen)) {
+        m.sheenColorFactor = float4(0.0, 0.0, 0.0, m.sheenColorFactor.w);
+        m.hasSheenColorTexture = 0.0;
+        m.hasSheenRoughnessTexture = 0.0;
+    }
+    if (!(kMaterialFeatures & kFeatureClearcoat)) {
+        m.clearcoatFactor = 0.0;
+        m.hasClearcoatTexture = 0.0;
+        m.hasClearcoatRoughnessTexture = 0.0;
+        m.hasClearcoatNormalTexture = 0.0;
+    }
+    if (!(kMaterialFeatures & kFeatureTransmission)) {
+        m.transmissionFactor = 0.0;
+        m.hasTransmissionTexture = 0.0;
+        m.thicknessFactor = 0.0;
+        m.hasThicknessTexture = 0.0;
+        m.dispersion = 0.0;
+    }
+    if (!(kMaterialFeatures & kFeatureIridescence)) {
+        m.iridescenceFactor = 0.0;
+        m.hasIridescenceTexture = 0.0;
+        m.hasIridescenceThicknessTexture = 0.0;
+    }
+    if (!(kMaterialFeatures & kFeatureAnisotropy)) {
+        m.anisotropyStrength = 0.0;
+        m.hasAnisotropicTexture = 0.0;
+    }
+    if (!(kMaterialFeatures & kFeatureWorldMapping)) m.worldMapping = 0.0;
+    if (!(kMaterialFeatures & kFeatureUnlit)) m.unlit = 0.0;
+    if (!(kMaterialFeatures & kFeatureViewMode)) m.viewMode = 0.0;
+    return m;
+}
+
 fragment float4 fragmentMain_textured(
     VertexOut        inRaw                     [[stage_in]],
-    constant MaterialUniforms &mat             [[buffer(17)]],
+    constant MaterialUniforms &materialIn      [[buffer(17)]],
     constant CameraUniforms  &camera           [[buffer(18)]],
     texture2d<float> baseColorTexture          [[texture(0)]],
     sampler          baseColorSampler          [[sampler(1)]],
@@ -953,6 +1017,7 @@ fragment float4 fragmentMain_textured(
     depth2d<float>   shadowMapNear               [[texture(30)]],
     bool             frontFacing                 [[front_facing]])
 {
+    const MaterialUniforms mat = specializedMaterial(materialIn);
     // Position-only meshes (vertexLean) carry no normal: use the flat face
     // normal from screen-space derivatives of the world position, turned
     // towards the camera, with a tangent frame built as vertexMain does.

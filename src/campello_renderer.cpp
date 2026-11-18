@@ -3527,21 +3527,26 @@ const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program,
 const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     ProgramHandle programHandle, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
     systems::leal::campello_gpu::PixelFormat colorFormat, systems::leal::campello_gpu::PrimitiveTopology topology,
-    bool wideLines, bool skinned) {
+    bool wideLines, bool skinned, uint32_t features) {
     namespace GPU = systems::leal::campello_gpu;
+    // Only the built-in PBR textured fragment is specialized.
+    if (programHandle != kPbrProgram || variant != MeshProgram::textured || wideLines || !meshRecipe.materialFeatureConstant ||
+        !materialSpecialization) {
+        features = kAllMaterialFeatures;
+    }
     // Consecutive draws mostly ask for the same pipeline (draws are sorted
     // by state): the last request's answer, without the stage search.
     const uint64_t layoutHash = layout.hash();
     const auto& last = lastMeshPipeline;
     if (last.entry && last.program == programHandle && last.variant == variant && last.layoutHash == layoutHash &&
         last.doubleSided == doubleSided && last.blend == blend && last.colorFormat == colorFormat &&
-        last.topology == topology && last.wideLines == wideLines && last.skinned == skinned) {
+        last.topology == topology && last.wideLines == wideLines && last.skinned == skinned && last.features == features) {
         return last.entry;
     }
     const auto remember = [&](const MeshPipelineEntry* entry) {
         if (entry) {
             lastMeshPipeline = {entry,       programHandle, variant,   layoutHash, doubleSided,
-                                blend,       colorFormat,   topology,  wideLines,  skinned};
+                                blend,       colorFormat,   topology,  wideLines,  skinned, features};
         }
         return entry;
     };
@@ -3589,6 +3594,7 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     mix(doubleSided ? 1u : 0u);
     mix(blend ? 1u : 0u);
     mix(wideLines ? 1u : 0u);
+    mix(features);
     if (auto it = meshPipelineCache.find(key); it != meshPipelineCache.end()) {
         return remember(it->second.pipeline ? &it->second : nullptr);
     }
@@ -3657,6 +3663,9 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     GPU::FragmentDescriptor frag{};
     frag.module     = program.fragmentModule;
     frag.entryPoint = wideLines ? program.wideLineFragment : program.fragmentEntries[(size_t)variant];
+    if (features != kAllMaterialFeatures) {
+        frag.constants = {{0, GPU::ShaderConstantType::uint32, (double)features}};
+    }
     if (gbuffer) {
         // GBufferTargets: normal + roughness, base colour + metallic, motion.
         for (GPU::PixelFormat format : {GPU::PixelFormat::rgba16float, GPU::PixelFormat::rgba8unorm, GPU::PixelFormat::rg16float}) {
@@ -4409,6 +4418,10 @@ void Renderer::prewarmMeshPipelines() {
         for (const bool doubleSided : {false, true}) {
             for (const bool blend : {false, true}) {
                 meshPipeline(program, standardLayout, doubleSided, blend, skinned);
+                // Materials without optional features (the commonest).
+                if (program == MeshProgram::textured && meshRecipe.materialFeatureConstant && materialSpecialization) {
+                    meshPipeline(program, standardLayout, doubleSided, blend, skinned, 0u);
+                }
             }
         }
     }
@@ -4417,6 +4430,9 @@ void Renderer::prewarmMeshPipelines() {
         for (const bool doubleSided : {false, true}) {
             for (const bool blend : {false, true}) {
                 meshPipeline(MeshProgram::textured, VertexLayout::positionOnly(), doubleSided, blend);
+                if (meshRecipe.materialFeatureConstant && materialSpecialization) {
+                    meshPipeline(MeshProgram::textured, VertexLayout::positionOnly(), doubleSided, blend, true, 0u);
+                }
             }
         }
     }
@@ -4682,6 +4698,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         programs[kPbrProgram].wideLineFragment = "fragmentWideLine";
         programs[kPbrProgram].fragmentModule = shaderModule;
         programs[kPbrProgram].fragmentEntries = {"fragmentMain_flat", "fragmentMain_textured", "fragmentMain_debug"};
+        meshRecipe.materialFeatureConstant = true;  // kMaterialFeatures (function constant 0)
         // The G-buffer (renderGBuffer()): the PBR vertex stages plus the
         // previous frame's position, one fragment shader, three targets.
         gbufferProgram.name = "gbuffer";
@@ -8277,7 +8294,8 @@ void Renderer::renderPrimitive(
     const MeshPipelineEntry* entry = debugView
         ? meshPipeline(MeshProgram::debug, *layout, false, false, skinnedStage)
         : meshPipeline((hasTexture || clipping) ? MeshProgram::textured : MeshProgram::flat, *layout,
-                       doubleSided || clipping, useBlend, skinnedStage);
+                       doubleSided || clipping, useBlend, skinnedStage,
+                       drawMaterialFeatures(matIdx >= 0 ? (uint32_t)(matIdx + 1) : 0u));
     if (!entry) return;
     activeMeshSlots = &entry->slots;
     if (entry->pipeline.get() != currentPipelineObject) {
@@ -9665,6 +9683,31 @@ void Renderer::rebindMaterialBuffer() {
     }
 }
 
+uint32_t Renderer::materialFeaturesOf(const float* slot) {
+    // Float offsets as buildMaterialSlotFromGltf() writes them; a bit is set
+    // when the material's values don't already switch its feature off (the
+    // shader's specializedMaterial() relies on that).
+    uint32_t features = 0;
+    if (slot[29] != 1.0f || slot[30] > 0.5f || slot[31] > 0.5f || slot[36] != 1.0f || slot[37] != 1.0f || slot[38] != 1.0f) {
+        features |= 1u << 0;  // specular
+    }
+    if (slot[44] != 0.0f || slot[45] != 0.0f || slot[46] != 0.0f || slot[49] > 0.5f || slot[50] > 0.5f) features |= 1u << 1;  // sheen
+    if (slot[51] != 0.0f) features |= 1u << 2;  // clearcoat (its textures scale the factor)
+    if (slot[57] != 0.0f || slot[58] > 0.5f || slot[80] != 0.0f) features |= 1u << 3;  // transmission, volume, dispersion
+    if (slot[71] != 0.0f) features |= 1u << 4;  // iridescence (its textures scale the factor)
+    if (slot[77] != 0.0f) features |= 1u << 5;  // anisotropy (its texture scales the strength)
+    if (slot[81] != 0.0f) features |= 1u << 6;  // world mapping
+    if (slot[17] > 0.5f) features |= 1u << 7;   // unlit
+    return features;
+}
+
+uint32_t Renderer::drawMaterialFeatures(uint32_t uniformSlot) const {
+    if (!materialSpecialization || uniformSlot >= materialSlotFeatures.size()) return kAllMaterialFeatures;
+    uint32_t features = materialSlotFeatures[uniformSlot];
+    if (viewMode != ViewMode::normal) features |= 1u << 8;  // the debug views
+    return features;
+}
+
 void Renderer::writeMaterialUniform(uint64_t offset, const float* slotIn) {
     constexpr uint64_t size = 93 * sizeof(float);
     if (!materialUniformBuffer) return;
@@ -9677,6 +9720,9 @@ void Renderer::writeMaterialUniform(uint64_t offset, const float* slotIn) {
         slot[81] = it->second;
         slot[82] = environmentUpAxis == UpAxis::z ? 1.0f : 0.0f;
     }
+    const size_t slotIndex = (size_t)(offset / kMaterialUniformStride);
+    if (materialSlotFeatures.size() <= slotIndex) materialSlotFeatures.resize(slotIndex + 1, kAllMaterialFeatures);
+    materialSlotFeatures[slotIndex] = materialFeaturesOf(slot);
     // Unchanged slots aren't rewritten: render() rebuilds every material's
     // slot each frame (animated materials), but most don't change, and the
     // buffer is shared by the frames in flight (a rewrite can race the GPU).
@@ -9839,6 +9885,14 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
         mat->alphaCutoff   = (float)material.alphaCutoff;
         mat->baseColorAlpha = material.pbrMetallicRoughness ? (float)material.pbrMetallicRoughness->baseColorFactor.w() : 1.0f;
         mat->transmission  = (material.khrMaterialsTransmission && material.khrMaterialsTransmission->transmissionFactor > 0.0f);
+        // Its uniforms: setScene() only sized the buffer, and the glTF path
+        // (renderToTarget()) writes the slots per frame, so a RenderScene
+        // draw before (or without) a glTF render() read an empty slot.
+        {
+            float slot[93];
+            buildMaterialSlotFromGltf(material, (float)viewMode, environmentIntensity, iblEnabled ? 1.f : 0.f, slot);
+            writeMaterialUniform((uint64_t)mat->uniformSlot * kMaterialUniformStride, slot);
+        }
         GpuMaterial* result = mat.get();
         materialCache[materialIndex] = result;
         materialPool.push_back(std::move(mat));
@@ -11851,7 +11905,8 @@ void Renderer::renderPrimitive(
         ? meshPipeline(program, MeshProgram::debug, layout, false, false, colorFormat,
                        GPU::PrimitiveTopology::triangleList, false, skinnedStage)
         : meshPipeline(program, MeshProgram::textured, layout, doubleSided || (program == kPbrProgram && clippingActive()),
-                       useBlend, colorFormat, draw.mesh->topology, false, skinnedStage);
+                       useBlend, colorFormat, draw.mesh->topology, false, skinnedStage,
+                       draw.material ? drawMaterialFeatures(draw.material->uniformSlot) : kAllMaterialFeatures);
     if (!entry) return;
     activeMeshSlots = &entry->slots;
     // Wide lines expand in screen space: their vertex stage reads the camera
