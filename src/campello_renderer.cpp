@@ -8448,6 +8448,11 @@ void Renderer::setEnvironmentMap(std::shared_ptr<systems::leal::campello_gpu::Te
     bakeIblResources();
 }
 
+namespace {
+    // 32-bit float pixels to clamped half floats (defined below).
+    std::vector<uint16_t> halfPixelsFromFloat(const float *src, size_t count);
+}
+
 std::shared_ptr<systems::leal::campello_gpu::Texture>
 Renderer::loadEnvironmentMap(
     const std::string &px, const std::string &nx,
@@ -8479,8 +8484,12 @@ Renderer::loadEnvironmentMap(
     switch (faces[0]->getFormat()) {
         case Img::ImageFormat::rgba8:   fmt = GPU::PixelFormat::rgba8unorm; break;
         case Img::ImageFormat::rgba16f: fmt = GPU::PixelFormat::rgba16float; break;
-        case Img::ImageFormat::rgba32f: fmt = GPU::PixelFormat::rgba32float; break;
+        // Stored as half floats: WebGPU only filters rgba32float with the
+        // optional float32-filterable feature, which many mobile GPUs lack
+        // (Adreno), and the sky and IBL bake sample this cube filtered.
+        case Img::ImageFormat::rgba32f: fmt = GPU::PixelFormat::rgba16float; break;
     }
+    const bool toHalf = faces[0]->getFormat() == Img::ImageFormat::rgba32f;
 
     // Full mip chain so roughness-based IBL sampling can select a blurred
     // level instead of always reading the sharpest (mip 0) reflection.
@@ -8494,13 +8503,19 @@ Renderer::loadEnvironmentMap(
                             uint32_t(GPU::TextureUsage::copySrc)));
     if (!tex) return nullptr;
 
-    size_t bytesPerFace = faces[0]->getDataSize();
+    size_t bytesPerFace = toHalf ? faces[0]->getDataSize() / 2 : faces[0]->getDataSize();
     size_t totalBytes = bytesPerFace * 6;
     auto staging = device->createBuffer(totalBytes, GPU::BufferUsage::copySrc);
     if (!staging) return nullptr;
 
     for (int i = 0; i < 6; ++i) {
-        staging->upload(i * bytesPerFace, bytesPerFace, const_cast<void*>(faces[i]->getData()));
+        if (toHalf) {
+            auto half = halfPixelsFromFloat(static_cast<const float *>(faces[i]->getData()),
+                                            faces[i]->getDataSize() / sizeof(float));
+            staging->upload(i * bytesPerFace, bytesPerFace, half.data());
+        } else {
+            staging->upload(i * bytesPerFace, bytesPerFace, const_cast<void*>(faces[i]->getData()));
+        }
     }
 
     uint64_t bytesPerRow = (h > 0) ? (bytesPerFace / h) : bytesPerFace;
@@ -8567,6 +8582,16 @@ namespace {
     }
 
     struct Float4 { float r, g, b, a; };
+
+    // Largest finite half float: brighter radiance (the sun) is clamped to
+    // it rather than turning into infinity, which mip filtering would smear.
+    constexpr float HALF_MAX = 65504.0f;
+
+    std::vector<uint16_t> halfPixelsFromFloat(const float *src, size_t count) {
+        std::vector<uint16_t> out(count);
+        for (size_t i = 0; i < count; ++i) out[i] = floatToHalf(std::min(src[i], HALF_MAX));
+        return out;
+    }
 
     // Bilinearly sample an equirectangular image at (u,v) and return float4.
     // u and v are expected in [0,1]; horizontal wrapping is applied.
@@ -8641,10 +8666,10 @@ namespace {
         } else if (fmt == systems::leal::campello_image::ImageFormat::rgba16f) {
             uint16_t *d = static_cast<uint16_t*>(dst);
             int i = idx * 4;
-            d[i]   = floatToHalf(c.r);
-            d[i+1] = floatToHalf(c.g);
-            d[i+2] = floatToHalf(c.b);
-            d[i+3] = floatToHalf(c.a);
+            d[i]   = floatToHalf(std::min(c.r, HALF_MAX));
+            d[i+1] = floatToHalf(std::min(c.g, HALF_MAX));
+            d[i+2] = floatToHalf(std::min(c.b, HALF_MAX));
+            d[i+3] = floatToHalf(std::min(c.a, HALF_MAX));
         } else {
             float *d = static_cast<float*>(dst);
             int i = idx * 4;
@@ -8692,8 +8717,12 @@ Renderer::convertEquirectangularImageToCubemap(
     switch (img->getFormat()) {
         case Img::ImageFormat::rgba8:   fmt = GPU::PixelFormat::rgba8unorm; break;
         case Img::ImageFormat::rgba16f: fmt = GPU::PixelFormat::rgba16float; break;
-        case Img::ImageFormat::rgba32f: fmt = GPU::PixelFormat::rgba32float; break;
+        // Half floats, as in loadEnvironmentMap(): rgba32float is not
+        // filterable without float32-filterable (missing on Adreno).
+        case Img::ImageFormat::rgba32f: fmt = GPU::PixelFormat::rgba16float; break;
     }
+    const Img::ImageFormat storeFormat = img->getFormat() == Img::ImageFormat::rgba32f
+        ? Img::ImageFormat::rgba16f : img->getFormat();
 
     // Full mip chain so roughness-based IBL sampling can select a blurred
     // level instead of always reading the sharpest (mip 0) reflection.
@@ -8708,8 +8737,7 @@ Renderer::convertEquirectangularImageToCubemap(
     if (!tex) return nullptr;
 
     // Allocate one face buffer.
-    size_t bytesPerPixel = (img->getFormat() == Img::ImageFormat::rgba8) ? 4 :
-                           (img->getFormat() == Img::ImageFormat::rgba16f) ? 8 : 16;
+    size_t bytesPerPixel = (storeFormat == Img::ImageFormat::rgba8) ? 4 : 8;
     size_t bytesPerFace = fsize * fsize * bytesPerPixel;
     std::vector<uint8_t> faceData(bytesPerFace);
 
@@ -8759,7 +8787,7 @@ Renderer::convertEquirectangularImageToCubemap(
                 color.r *= intensityScale;
                 color.g *= intensityScale;
                 color.b *= intensityScale;
-                storePixel(faceData.data(), static_cast<int>(y * fsize + x), color, img->getFormat());
+                storePixel(faceData.data(), static_cast<int>(y * fsize + x), color, storeFormat);
             }
         }
 
