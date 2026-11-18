@@ -3308,6 +3308,219 @@ TEST_F(OffscreenRenderTest, SunCastsShadowsOnOpaqueGeometry) {
     EXPECT_NEAR(shadowed(32, 24), lit(32, 24), 4.0) << "the plate shadows itself";
 }
 
+// Sun shadows of deformed casters land where the casters are drawn: a plate
+// moved by its instance matrix (DrawCall::instanceTransformBuffer) to
+// x = 0.8 and one moved by its joint (jointMatrixBuffer) to x = -0.8, both
+// at rest over x = 0. The ground under each darkens; the ground under the
+// rest position doesn't.
+TEST_F(OffscreenRenderTest, SunShadowsFollowInstancesAndSkins) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
+    GTEST_SKIP() << "No instanced or skinned shadow casters on this backend yet";
+#endif
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsShadows()) GTEST_SKIP() << "No shadow maps on this backend";
+    renderer->setEnvironmentIntensity(0.1f);
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+
+    std::vector<float> groundPositions = {-1.5f, 0, -1.5f, 1.5f, 0, -1.5f, 1.5f, 0, 1.5f, -1.5f, 0, 1.5f};
+    std::vector<uint32_t> indices = {0, 2, 1, 0, 3, 2};
+    GpuMesh ground;
+    ground.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(groundPositions.size() * 4, GPU::BufferUsage::vertex, groundPositions.data());
+    ground.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    ground.indexCount = 6;
+    ground.indexFormat = GPU::IndexFormat::uint32;
+    ground.vertexCount = 4;
+    ground.layout = &VertexLayout::positionOnly();
+    ground.setBoundsFromPositions(groundPositions.data(), 4);
+
+    // The plate: 0.6 x 0.6 at y = 0.6 over the origin, standard layout
+    // (normals up; one joint, full weight).
+    std::vector<float> platePositions = {-0.3f, 0.6f, -0.3f, 0.3f, 0.6f, -0.3f, 0.3f, 0.6f, 0.3f, -0.3f, 0.6f, 0.3f};
+    std::vector<float> normals = {0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0};
+    std::vector<uint8_t> joints(16, 0);
+    std::vector<float> weights = {1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0};
+    GpuMesh plate;
+    plate.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(platePositions.size() * 4, GPU::BufferUsage::vertex, platePositions.data());
+    plate.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] = device->createBuffer(normals.size() * 4, GPU::BufferUsage::vertex, normals.data());
+    plate.vertexBuffers[Renderer::VERTEX_SLOT_JOINTS] = device->createBuffer(joints.size(), GPU::BufferUsage::vertex, joints.data());
+    plate.vertexBuffers[Renderer::VERTEX_SLOT_WEIGHTS] = device->createBuffer(weights.size() * 4, GPU::BufferUsage::vertex, weights.data());
+    plate.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    plate.indexCount = 6;
+    plate.indexFormat = GPU::IndexFormat::uint32;
+    plate.vertexCount = 4;
+    plate.layout = nullptr;
+    plate.setBoundsFromPositions(platePositions.data(), 4);
+    float right[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.8f, 0, 0, 1};
+    float left[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -0.8f, 0, 0, 1};
+
+    RenderScene scene;
+    const VM::Vector3<double> eye(0.0, 2.5, 2.5);
+    scene.camera.view = VM::Matrix4<double>::lookAt(eye, VM::Vector3<double>(0.0, 0.0, 0.0), VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = eye;
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.0, -1.0, 0.0);
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    sun.castShadows = true;
+    scene.lights.push_back(sun);
+    DrawCall groundDraw;
+    groundDraw.mesh = &ground;
+    groundDraw.material = red;
+    groundDraw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(groundDraw);
+    DrawCall instanced = groundDraw;
+    instanced.mesh = &plate;
+    instanced.instanceTransformBuffer = device->createBuffer(sizeof(right), GPU::BufferUsage::vertex, right);
+    instanced.localBounds = std::array<double, 6>{0.5, 0.6, -0.3, 1.1, 0.6, 0.3};
+    scene.opaque.push_back(instanced);
+    DrawCall skinned = groundDraw;
+    skinned.mesh = &plate;
+    skinned.jointMatrixBuffer = device->createBuffer(sizeof(left), GPU::BufferUsage::storage, left);
+    skinned.jointCount = 1;
+    scene.opaque.push_back(skinned);
+
+    // A ground point's pixel.
+    const auto viewProj = scene.camera.projection * scene.camera.view;
+    const auto pixelOf = [&](double x, double z) {
+        const double* m = viewProj.data;
+        double c[4];
+        for (int r = 0; r < 4; ++r) c[r] = m[r * 4] * x + m[r * 4 + 2] * z + m[r * 4 + 3];
+        return std::pair<int, int>{(int)((c[0] / c[3] * 0.5 + 0.5) * 64.0), (int)((0.5 - c[1] / c[3] * 0.5) * 64.0)};
+    };
+    const auto renderRed = [&](bool shadows) {
+        renderer->setShadowsEnabled(shadows);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        renderer->render(scene, view);  // the first frame may bind the placeholder map
+        const auto pixels = readBackPixels(tex);
+        return [pixels](std::pair<int, int> p) {
+            return double(pixels[(size_t(p.second) * 64 + size_t(p.first)) * 4]);
+        };
+    };
+    const auto lit = renderRed(false);
+    const auto shadowed = renderRed(true);
+    renderer->setShadowsEnabled(true);
+    renderer->setEnvironmentIntensity(1.0f);
+    const auto underInstance = pixelOf(0.8, 0.0), underSkin = pixelOf(-0.8, 0.0), underRest = pixelOf(0.0, 0.0);
+    EXPECT_GT(lit(underRest), 40.0) << "the sun lights the ground";
+    EXPECT_LT(shadowed(underInstance), lit(underInstance) * 0.7) << "no shadow under the instance";
+    EXPECT_LT(shadowed(underSkin), lit(underSkin) * 0.7) << "no shadow under the posed skin";
+    EXPECT_NEAR(shadowed(underRest), lit(underRest), 4.0) << "shadow at the casters' rest position";
+}
+
+// The far shadow map draws only the casters that can shadow what the view
+// sees: a plate behind the camera isn't drawn (RenderStats), and once the
+// camera turns to it, it's drawn and shadows the ground under it.
+TEST_F(OffscreenRenderTest, SunShadowsDrawOnlyCastersTheViewNeeds) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    if (!renderer->supportsShadows()) GTEST_SKIP() << "No shadow maps on this backend";
+    renderer->setEnvironmentIntensity(0.1f);
+    renderer->setShadowCascades(false);  // the far map alone
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+
+    std::vector<std::vector<float>> positions;
+    std::vector<uint32_t> indices = {0, 2, 1, 0, 3, 2};
+    positions.reserve(2);
+    const auto makeQuad = [&](float y, float half) {
+        positions.push_back({-half, y, -half, half, y, -half, half, y, half, -half, y, half});
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(48, GPU::BufferUsage::vertex, positions.back().data());
+        mesh.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh.indexCount = 6;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = 4;
+        mesh.layout = &VertexLayout::positionOnly();
+        mesh.setBoundsFromPositions(positions.back().data(), 4);
+        return mesh;
+    };
+    GpuMesh ground = makeQuad(0.0f, 20.0f);
+    GpuMesh plate = makeQuad(0.6f, 0.3f);
+
+    RenderScene scene;
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.0, -1.0, 0.0);
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    sun.castShadows = true;
+    scene.lights.push_back(sun);
+    const auto add = [&](GpuMesh* mesh, double x, double z) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = red;
+        draw.worldTransform = VM::Matrix4<double>::translate(VM::Vector3<double>(x, 0.0, z));
+        scene.opaque.push_back(draw);
+    };
+    add(&ground, 0.0, 0.0);
+    add(&plate, 0.0, 0.0);
+    add(&plate, -12.0, 15.0);  // behind the first camera, ahead of the second
+    // Looking at the ground under the plate at (x, z) from 2.5 up and 2.5
+    // back (back: +z, or -z when looking the other way).
+    const auto lookAt = [&](double x, double z, double back) {
+        const VM::Vector3<double> eye(x, 2.5, z + back);
+        scene.camera.view = VM::Matrix4<double>::lookAt(eye, VM::Vector3<double>(x, 0.0, z), VM::Vector3<double>(0.0, 1.0, 0.0));
+        scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+        scene.camera.position = eye;
+    };
+    const auto renderRed = [&](bool shadows) {
+        renderer->setShadowsEnabled(shadows);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        renderer->render(scene, view);
+        const auto pixels = readBackPixels(tex);
+        return double(pixels[(size_t(32) * 64 + size_t(32)) * 4]);  // the image centre
+    };
+
+    lookAt(0.0, 0.0, 2.5);  // towards -z
+    const double litNear = renderRed(false);
+    const double shadowedNear = renderRed(true);
+    const auto nearStats = renderer->getLastFrameStats();
+    EXPECT_LT(shadowedNear, litNear * 0.7) << "no shadow under the plate in view";
+    EXPECT_EQ(nearStats.shadowCasterCount, 3u);
+    EXPECT_EQ(nearStats.shadowCastersDrawn, 2u) << "the plate behind the camera was drawn";
+
+    lookAt(-12.0, 15.0, -2.5);  // towards +z: the first plate is behind
+    const double litFar = renderRed(false);
+    const double shadowedFar = renderRed(true);
+    const auto farStats = renderer->getLastFrameStats();
+    EXPECT_LT(shadowedFar, litFar * 0.7) << "no shadow under the plate turned to";
+    EXPECT_EQ(farStats.shadowCastersDrawn, 2u) << "the plate now behind the camera was drawn";
+    renderer->setShadowCascades(true);
+    renderer->setShadowsEnabled(true);
+    renderer->setEnvironmentIntensity(1.0f);
+}
+
 // Materials of glTFs other than the scene's are their own: two assets with
 // a different material at index 0 (unlit green, unlit blue) give two
 // materials that draw in their own colours, not the first one twice.
@@ -3663,6 +3876,94 @@ TEST_F(OffscreenRenderTest, GltfInstancesDrawAtTheirTransforms) {
     EXPECT_TRUE(litAt(pixels, 51, 32)) << "instance 1 (x = 0.6)";
     EXPECT_FALSE(litAt(pixels, 32, 32)) << "the mesh's own position (x = 0)";
     renderer->clearCameraOverride();
+}
+
+// A RenderScene draw with instanceTransformBuffer draws each instance at its
+// matrix; instanceCount above what the buffer holds draws only those it
+// holds, and without a buffer one instance at worldTransform.
+TEST_F(OffscreenRenderTest, DrawCallInstancesDrawAtTheirTransforms) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+#if defined(_WIN32)
+    GTEST_SKIP() << "No instancing on DirectX yet";
+#endif
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfInstancedQuad, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    GpuMaterial* material = renderer->uploadMaterial((*asset->materials)[0], *asset);
+    ASSERT_NE(material, nullptr);
+
+    std::vector<float> positions = {-0.25f, -0.25f, 0.0f, 0.25f, -0.25f, 0.0f, 0.25f, 0.25f, 0.0f, -0.25f, 0.25f, 0.0f};
+    std::vector<float> normals = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] = device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] = device->createBuffer(normals.size() * 4, GPU::BufferUsage::vertex, normals.data());
+    quad.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = nullptr;
+    quad.setBoundsFromPositions(positions.data(), 4);
+    // Instances at x = -0.6 and x = 0.6 (column-major).
+    float instances[32] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -0.6f, 0, 0, 1,
+                           1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.6f, 0, 0, 1};
+
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::identity();
+    scene.camera.projection = VM::Matrix4<double>::identity();
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 1.0);
+    DrawCall draw;
+    draw.mesh = &quad;
+    draw.material = material;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    draw.instanceCount = 2;
+    draw.instanceTransformBuffer = device->createBuffer(sizeof(instances), GPU::BufferUsage::vertex, instances);
+    scene.opaque.push_back(draw);
+    const auto render = [&]() {
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        return readBackPixels(tex);
+    };
+
+    const auto both = render();
+    EXPECT_TRUE(litAt(both, 13, 32)) << "instance 0 (x = -0.6)";
+    EXPECT_TRUE(litAt(both, 51, 32)) << "instance 1 (x = 0.6)";
+    EXPECT_FALSE(litAt(both, 32, 32)) << "worldTransform alone (x = 0)";
+    EXPECT_EQ(renderer->getLastFrameStats().instanceCount, 2u);
+
+    scene.opaque[0].instanceCount = 5;  // the buffer holds two
+    const auto clamped = render();
+    EXPECT_TRUE(litAt(clamped, 13, 32));
+    EXPECT_TRUE(litAt(clamped, 51, 32));
+    EXPECT_EQ(renderer->getLastFrameStats().instanceCount, 2u);
+
+    scene.opaque[0].instanceTransformBuffer = nullptr;  // no buffer: one, at worldTransform
+    const auto single = render();
+    EXPECT_TRUE(litAt(single, 32, 32));
+    EXPECT_FALSE(litAt(single, 13, 32));
+    EXPECT_FALSE(litAt(single, 51, 32));
+    EXPECT_EQ(renderer->getLastFrameStats().instanceCount, 1u);
+
+    // Position-only meshes (the lean vertex stages) too.
+    if (!renderer->supportsVertexLayout(VertexLayout::positionOnly())) return;
+    GpuMesh lean = quad;
+    lean.vertexBuffers = {};
+    lean.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] = quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION];
+    lean.layout = &VertexLayout::positionOnly();
+    scene.opaque[0].mesh = &lean;
+    scene.opaque[0].instanceCount = 2;
+    scene.opaque[0].instanceTransformBuffer = draw.instanceTransformBuffer;
+    const auto leanInstances = render();
+    EXPECT_TRUE(litAt(leanInstances, 13, 32)) << "position-only: instance 0";
+    EXPECT_TRUE(litAt(leanInstances, 51, 32)) << "position-only: instance 1";
+    EXPECT_FALSE(litAt(leanInstances, 32, 32)) << "position-only: worldTransform alone";
 }
 
 // A RenderScene draw with a joint palette (DrawCall::jointMatrixBuffer) is

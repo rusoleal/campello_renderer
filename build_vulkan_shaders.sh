@@ -41,6 +41,8 @@ SHADERS=(
     "default_skinned.vert       default_skinned_vert.spv       kDefaultVulkanSkinnedVertShader        vulkan_default.h"
     "default.frag               default_frag.spv               kDefaultVulkanFragShader               vulkan_default.h"
     "default_lean.vert          default_lean_vert.spv          kDefaultVulkanLeanVertShader           vulkan_default.h"
+    "shadow.vert                shadow_vert.spv                kDefaultVulkanShadowVertShader         vulkan_default.h"
+    "shadow_skinned.vert        shadow_skinned_vert.spv        kDefaultVulkanShadowSkinnedVertShader  vulkan_default.h"
     "default_line.vert          default_line_vert.spv          kDefaultVulkanLineVertShader           vulkan_default.h"
     "fxaa.vert                  fxaa_vert.spv                  kDefaultVulkanFxaaVertShader           vulkan_default.h"
     "fxaa.frag                  fxaa_frag.spv                  kDefaultVulkanFxaaFragShader           vulkan_default.h"

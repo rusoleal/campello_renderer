@@ -642,6 +642,34 @@ static void buildMaterialSlotFromGltf(const systems::leal::gltf::Material& mat,
 
 namespace {
 
+// The instances a DrawCall can draw: instanceCount, but no more than its
+// instanceTransformBuffer holds (one without a buffer), so the vertex stage
+// never reads past the end of the instance matrices.
+// A DrawCall's model-space bounds: DrawCall::localBounds, else its mesh's.
+// False when it has neither.
+bool drawLocalBounds(const DrawCall& draw, double lo[3], double hi[3]) {
+    if (draw.localBounds) {
+        for (int k = 0; k < 3; ++k) {
+            lo[k] = (*draw.localBounds)[k];
+            hi[k] = (*draw.localBounds)[3 + k];
+        }
+        return true;
+    }
+    if (!draw.mesh || !draw.mesh->hasBounds) return false;
+    for (int k = 0; k < 3; ++k) {
+        lo[k] = draw.mesh->boundsMin[k];
+        hi[k] = draw.mesh->boundsMax[k];
+    }
+    return true;
+}
+
+uint32_t drawInstanceCount(const DrawCall& draw) {
+    if (draw.instanceCount <= 1) return draw.instanceCount;
+    if (!draw.instanceTransformBuffer) return 1;
+    const uint64_t held = draw.instanceTransformBuffer->getLength() / 64;
+    return (uint32_t)std::min<uint64_t>(draw.instanceCount, held);
+}
+
 static systems::leal::campello_image::TextureFormat chooseBasisTargetFormat(
     const std::shared_ptr<systems::leal::campello_gpu::Device>& device)
 {
@@ -3865,6 +3893,8 @@ uint64_t Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campell
     rpe->setViewport(0.0f, 0.0f, size, size, 0.0f, 1.0f);
     rpe->setScissorRect(0.0f, 0.0f, size, size);
     rpe->setPipeline(shadowPipeline);
+    std::shared_ptr<GPU::RenderPipeline> boundShadowPipeline = shadowPipeline;
+    boundMeshGroups.fill(nullptr);
 #if defined(__EMSCRIPTEN__)
     rpe->setBindGroup(0, shadowEmptyBindGroup);
     rpe->setBindGroup(1, shadowEmptyBindGroup);
@@ -3899,22 +3929,61 @@ uint64_t Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campell
                 matrices[16 + col * 4 + row] = (float)draw.worldTransform.data[row * 4 + col];
             }
         }
+        // Instances and skins deform the caster: its own pipeline
+        // (shadowDeformPipeline()), else the lean one. Without one for this
+        // backend, the caster's first instance at rest, as before.
+        const uint32_t instances = drawInstanceCount(draw);
+        if (instances == 0) continue;
+        bool skinned = draw.jointMatrixBuffer != nullptr;
+        std::shared_ptr<GPU::RenderPipeline> deform;
+        if (draw.instanceTransformBuffer || skinned) deform = shadowDeformPipeline(draw, skinned);
+        const auto& pipeline = deform ? deform : shadowPipeline;
+        if (pipeline != boundShadowPipeline) {
+            rpe->setPipeline(pipeline);
+            boundShadowPipeline = pipeline;
+            boundMeshGroups.fill(nullptr);
+        }
         rpe->setVertexBuffer(0, positions, 0);
         uint32_t firstInstance = 0;
 #if defined(__EMSCRIPTEN__)
         bindWebGpuTransforms(rpe, transformBuffer, offset);
         firstInstance = webgpuFirstInstance;
 #elif CAMPELLO_RENDERER_VK_BINDINGS
-        rpe->setVertexBuffer(1, transformBuffer, offset);
+        if (deform) {
+            // The attributes, then the transforms and the instance matrices.
+            uint32_t slot = 1;
+            if (skinned) {
+                rpe->setVertexBuffer(slot++, draw.mesh->vertexBuffers[VERTEX_SLOT_JOINTS], 0);
+                rpe->setVertexBuffer(slot++, draw.mesh->vertexBuffers[VERTEX_SLOT_WEIGHTS], 0);
+                const uint64_t bytes = draw.jointCount > 0 ? (uint64_t)draw.jointCount * 64 : 0;
+                bindVulkanSkin(rpe, draw.jointMatrixBuffer, 0, bytes, draw.jointMatrixBuffer, 0, bytes);
+            }
+            rpe->setVertexBuffer(slot++, transformBuffer, offset);
+            rpe->setVertexBuffer(slot, draw.instanceTransformBuffer ? draw.instanceTransformBuffer
+                                                                     : defaultInstanceMatrixBuffer, 0);
+        } else {
+            rpe->setVertexBuffer(1, transformBuffer, offset);
+            rpe->setVertexBuffer(2, defaultInstanceMatrixBuffer, 0);
+        }
 #else
         rpe->setVertexBuffer(16, transformBuffer, offset);
+        rpe->setVertexBuffer(19, deform && draw.instanceTransformBuffer ? draw.instanceTransformBuffer
+                                                                        : defaultInstanceMatrixBuffer, 0);
+        if (deform) {
+            if (skinned) {
+                rpe->setVertexBuffer(1, draw.mesh->vertexBuffers[VERTEX_SLOT_JOINTS], 0);
+                rpe->setVertexBuffer(2, draw.mesh->vertexBuffers[VERTEX_SLOT_WEIGHTS], 0);
+                rpe->setVertexBuffer(20, draw.jointMatrixBuffer, 0);
+            }
+        }
 #endif
         offset += 128;
+        const uint32_t drawn = deform ? instances : 1;
         if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
             rpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
-            rpe->drawIndexed(draw.mesh->indexCount, 1, 0, 0, firstInstance);
+            rpe->drawIndexed(draw.mesh->indexCount, drawn, 0, 0, firstInstance);
         } else {
-            rpe->draw(draw.mesh->vertexCount, 1, 0, firstInstance);
+            rpe->draw(draw.mesh->vertexCount, drawn, 0, firstInstance);
         }
     }
     if (!shadowTransformStaging.empty()) {
@@ -3963,6 +4032,53 @@ std::shared_ptr<systems::leal::campello_gpu::Sampler> Renderer::shadowSamplerBin
     return shadowSampler;
 }
 
+std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> Renderer::shadowDeformPipeline(
+    const systems::leal::campello_renderer::DrawCall& draw, bool& skinned) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!device || !shadowInstancedModule) return nullptr;
+    const VertexLayout& layout = draw.mesh->layout ? *draw.mesh->layout : standardLayout;
+    const VertexAttributeFormat* joints = layout.find(VertexSemantic::joints);
+    const VertexAttributeFormat* weights = layout.find(VertexSemantic::weights);
+    skinned = skinned && shadowSkinnedModule && joints && weights &&
+              draw.mesh->vertexBuffers[VERTEX_SLOT_JOINTS] && draw.mesh->vertexBuffers[VERTEX_SLOT_WEIGHTS];
+    // Instanced only: one pipeline (key 0). Skinned: one per JOINTS_0 /
+    // WEIGHTS_0 format.
+    const uint64_t skinMask = semanticBit(VertexSemantic::joints) | semanticBit(VertexSemantic::weights);
+    const uint64_t key = skinned ? (layout.hash((uint32_t)skinMask) | 1ull) : 0ull;
+    if (auto it = shadowDeformPipelines.find(key); it != shadowDeformPipelines.end()) return it->second;
+
+    GPU::RenderPipelineDescriptor d = shadowDeformBase;
+    std::vector<GPU::VertexLayout> attributes;
+    const auto add = [&](VertexSemantic semantic, GPU::ComponentType component, GPU::AccessorType accessor,
+                         bool normalized, uint32_t stride) {
+        GPU::VertexLayout buffer{};
+        buffer.arrayStride = (double)stride;
+        buffer.stepMode = GPU::StepMode::vertex;
+        GPU::VertexAttribute attr{};
+        attr.componentType = component;
+        attr.accessorType = accessor;
+        attr.offset = 0;
+        attr.shaderLocation = (uint32_t)semantic;
+        attr.normalized = normalized;
+        buffer.attributes.push_back(attr);
+        attributes.push_back(buffer);
+    };
+    add(VertexSemantic::position, GPU::ComponentType::ctFloat, GPU::AccessorType::acVec3, false, 12);
+    if (skinned) {
+        add(VertexSemantic::joints, joints->componentType, joints->accessorType, joints->normalized, joints->stride());
+        add(VertexSemantic::weights, weights->componentType, weights->accessorType, weights->normalized, weights->stride());
+    }
+    // Attributes first (buffers 0..n-1), then the base's per-draw buffers
+    // (Vulkan: transforms, instances; Metal reads those as raw buffers).
+    attributes.insert(attributes.end(), d.vertex.buffers.begin(), d.vertex.buffers.end());
+    d.vertex.buffers = std::move(attributes);
+    d.vertex.module = skinned ? shadowSkinnedModule : shadowInstancedModule;
+    d.vertex.entryPoint = skinned ? shadowSkinnedEntry : shadowInstancedEntry;
+    auto pipeline = device->createRenderPipeline(d);
+    shadowDeformPipelines[key] = pipeline;  // a failure too, not retried per caster
+    return pipeline;
+}
+
 bool Renderer::fitShadowLight(const std::vector<const systems::leal::campello_renderer::DrawCall*>& casters,
                               const systems::leal::vector_math::Vector3<double>& toLight, ShadowFit& fit) const {
     namespace VM = systems::leal::vector_math;
@@ -3973,13 +4089,13 @@ bool Renderer::fitShadowLight(const std::vector<const systems::leal::campello_re
     bool any = false;
     for (const auto* caster : casters) {
         const auto& draw = *caster;
-        if (!draw.mesh || !draw.mesh->hasBounds ||
-            draw.mesh->topology != systems::leal::campello_gpu::PrimitiveTopology::triangleList) continue;
+        double blo[3], bhi[3];
+        if (!draw.mesh || draw.mesh->topology != systems::leal::campello_gpu::PrimitiveTopology::triangleList ||
+            !drawLocalBounds(draw, blo, bhi)) continue;
         const auto& m = draw.worldTransform.data;
         for (int corner = 0; corner < 8; ++corner) {
-            const double p[3] = {(corner & 1) ? draw.mesh->boundsMax[0] : draw.mesh->boundsMin[0],
-                                 (corner & 2) ? draw.mesh->boundsMax[1] : draw.mesh->boundsMin[1],
-                                 (corner & 4) ? draw.mesh->boundsMax[2] : draw.mesh->boundsMin[2]};
+            const double p[3] = {(corner & 1) ? bhi[0] : blo[0], (corner & 2) ? bhi[1] : blo[1],
+                                 (corner & 4) ? bhi[2] : blo[2]};
             for (int r = 0; r < 3; ++r) {
                 const double w = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3];
                 lo[r] = std::min(lo[r], w);
@@ -4044,7 +4160,7 @@ systems::leal::vector_math::Matrix4<double> Renderer::shadowProjection(const Sha
     return ortho * fit.lightView;
 }
 
-bool Renderer::nearShadowRect(const ShadowFit& fit, const CameraData& camera, double rect[4]) {
+bool Renderer::nearShadowRect(const ShadowFit& fit, const CameraData& camera, double rect[4], bool wholeView) {
     using M4 = systems::leal::vector_math::Matrix4<double>;
     const M4& view = camera.view;
     const M4 invView = view.inverted();
@@ -4073,13 +4189,15 @@ bool Renderer::nearShadowRect(const ShadowFit& fit, const CameraData& camera, do
         dMax = std::max(dMax, d);
     }
     if (dMax <= cameraNear) return false;
-    const double sliceNear = std::max(cameraNear, std::max(dMin, dMax * 0.01));
+    const double sliceNear = wholeView ? std::max(cameraNear, dMin) : std::max(cameraNear, std::max(dMin, dMax * 0.01));
     // Halfway between the logarithmic and the uniform split (the usual
     // "practical" split of cascaded shadow maps).
-    const double sliceFar = 0.5 * (std::sqrt(sliceNear * dMax) + 0.5 * (sliceNear + dMax));
-    if (sliceFar >= 0.6 * dMax) return false;
+    const double sliceFar = wholeView ? dMax : 0.5 * (std::sqrt(sliceNear * dMax) + 0.5 * (sliceNear + dMax));
+    if (!wholeView && sliceFar >= 0.6 * dMax) return false;
     // The slice's corners, world, then light view.
     double lo[2] = {1e300, 1e300}, hi[2] = {-1e300, -1e300};
+    using Point = std::array<double, 3>;
+    std::array<Point, 8> sliceCorners;
     for (int corner = 0; corner < 8; ++corner) {
         const double x = (corner & 1) ? 1.0 : -1.0, y = (corner & 2) ? 1.0 : -1.0;
         const double depth = (corner & 4) ? sliceFar : sliceNear;
@@ -4099,20 +4217,108 @@ bool Renderer::nearShadowRect(const ShadowFit& fit, const CameraData& camera, do
             pv[2] = q[2] * k;
         }
         const double* iv = invView.data;
-        double pw[3];
+        double* pw = sliceCorners[corner].data();
         for (int r = 0; r < 3; ++r) pw[r] = iv[r * 4] * pv[0] + iv[r * 4 + 1] * pv[1] + iv[r * 4 + 2] * pv[2] + iv[r * 4 + 3];
-        const double* lv = fit.lightView.data;
+    }
+    const double* lv = fit.lightView.data;
+    const auto extend = [&](const Point& pw) {
         for (int r = 0; r < 2; ++r) {
             const double w = lv[r * 4] * pw[0] + lv[r * 4 + 1] * pw[1] + lv[r * 4 + 2] * pw[2] + lv[r * 4 + 3];
             lo[r] = std::min(lo[r], w);
             hi[r] = std::max(hi[r], w);
         }
+    };
+    if (!wholeView) {
+        for (const auto& pw : sliceCorners) extend(pw);
+    } else {
+        // The whole view reaches far past what's in it (under a ground
+        // plane, past the scene's sides): only the slice's intersection with
+        // fit.lo..hi can hold receivers. Its corners are the slice's faces
+        // clipped by the box and the box's faces clipped by the slice.
+        using Polygon = std::vector<Point>;
+        const auto clip = [](const Polygon& in, const auto& distance) {
+            Polygon out;
+            for (size_t i = 0; i < in.size(); ++i) {
+                const Point& a = in[i];
+                const Point& b = in[(i + 1) % in.size()];
+                const double da = distance(a), db = distance(b);
+                if (da >= 0.0) out.push_back(a);
+                if ((da >= 0.0) != (db >= 0.0)) {
+                    const double t = da / (da - db);
+                    out.push_back({a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), a[2] + t * (b[2] - a[2])});
+                }
+            }
+            return out;
+        };
+        static constexpr int kFaces[6][4] = {{0, 1, 3, 2}, {4, 5, 7, 6}, {0, 2, 6, 4},
+                                             {1, 3, 7, 5}, {0, 1, 5, 4}, {2, 3, 7, 6}};
+        // The slice's planes, facing in.
+        Point centre{0, 0, 0};
+        for (const auto& c : sliceCorners) {
+            for (int r = 0; r < 3; ++r) centre[r] += c[r] / 8.0;
+        }
+        std::array<std::array<double, 4>, 6> planes;
+        for (int f = 0; f < 6; ++f) {
+            const Point& a = sliceCorners[kFaces[f][0]];
+            const Point& b = sliceCorners[kFaces[f][1]];
+            const Point& c = sliceCorners[kFaces[f][2]];
+            const double u[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+            const double v[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+            double n[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
+            double d = -(n[0] * a[0] + n[1] * a[1] + n[2] * a[2]);
+            if (n[0] * centre[0] + n[1] * centre[1] + n[2] * centre[2] + d < 0.0) {
+                for (double& x : n) x = -x;
+                d = -d;
+            }
+            planes[f] = {n[0], n[1], n[2], d};
+        }
+        // A hair outside counts as inside (faces lying on the box's sides).
+        const double eps = 1e-9 * std::max({1.0, std::abs(fit.hi[0] - fit.lo[0]), std::abs(fit.hi[1] - fit.lo[1]),
+                                            std::abs(fit.hi[2] - fit.lo[2])});
+        bool any = false;
+        const auto add = [&](const Polygon& polygon) {
+            for (const auto& p : polygon) {
+                extend(p);
+                any = true;
+            }
+        };
+        for (const auto& face : kFaces) {
+            Polygon polygon;
+            for (int i : face) polygon.push_back(sliceCorners[i]);
+            for (int k = 0; k < 3 && !polygon.empty(); ++k) {
+                polygon = clip(polygon, [&](const Point& p) { return p[k] - fit.lo[k] + eps; });
+                if (!polygon.empty()) polygon = clip(polygon, [&](const Point& p) { return fit.hi[k] - p[k] + eps; });
+            }
+            add(polygon);
+        }
+        for (int k = 0; k < 3; ++k) {
+            const int a = (k + 1) % 3, b = (k + 2) % 3;
+            for (int side = 0; side < 2; ++side) {
+                Polygon polygon;
+                for (int i = 0; i < 4; ++i) {
+                    Point p;
+                    p[k] = side ? fit.hi[k] : fit.lo[k];
+                    p[a] = (i == 1 || i == 2) ? fit.hi[a] : fit.lo[a];
+                    p[b] = (i >= 2) ? fit.hi[b] : fit.lo[b];
+                    polygon.push_back(p);
+                }
+                for (const auto& plane : planes) {
+                    if (polygon.empty()) break;
+                    polygon = clip(polygon, [&](const Point& p) {
+                        return plane[0] * p[0] + plane[1] * p[1] + plane[2] * p[2] + plane[3] + eps;
+                    });
+                }
+                add(polygon);
+            }
+        }
+        if (!any) return false;  // the view sees none of it: keep everything (conservative)
     }
     rect[0] = std::max(lo[0], fit.full[0]);
     rect[1] = std::min(hi[0], fit.full[1]);
     rect[2] = std::max(lo[1], fit.full[2]);
     rect[3] = std::min(hi[1], fit.full[3]);
     if (rect[1] <= rect[0] || rect[3] <= rect[2]) return false;
+    if (wholeView) return true;
     const double area = (rect[1] - rect[0]) * (rect[3] - rect[2]);
     const double fullArea = (fit.full[1] - fit.full[0]) * (fit.full[3] - fit.full[2]);
     return area < 0.5 * fullArea;
@@ -4512,6 +4718,15 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             sd.cullMode = GPU::CullMode::none;
             sd.frontFace = GPU::FrontFace::ccw;
             shadowPipeline = device->createRenderPipeline(sd);
+            // Casters with instances or a skin: the same state, their own
+            // vertex stages (shadowDeformPipeline() adds the attributes).
+            shadowDeformBase = sd;
+            shadowDeformBase.vertex.buffers.clear();
+            shadowInstancedModule = shaderModule;
+            shadowSkinnedModule = shaderModule;
+            shadowInstancedEntry = "shadowVertexInstanced";
+            shadowSkinnedEntry = "shadowVertexSkinned";
+            shadowDeformPipelines.clear();
         }
         // The per-draw transforms are also per-instance vertex attributes
         // (locations 16-19 mvp, 24-27 model, the slot after the attributes),
@@ -5219,11 +5434,17 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         shadowLayout.bindGroupLayouts = {shadowEmptyBindGroupLayout, shadowEmptyBindGroupLayout, webgpuDrawBindGroupLayout};
         sd.layout = device->createPipelineLayout(shadowLayout);
 #else
-        // default_lean.vert: transforms per instance in the slot after the
-        // position (locations 16-19 mvp, 24-27 model); no descriptors.
-        sd.vertex.module = device->createShaderModule(kDefaultVulkanLeanVertShader, kDefaultVulkanLeanVertShaderSize);
+        // shadow.vert: the transforms in the slot after the position
+        // (locations 16-19 mvp), then the instance matrices (12-15; the
+        // identity for plain casters); no descriptors.
+        sd.vertex.module = device->createShaderModule(kDefaultVulkanShadowVertShader, kDefaultVulkanShadowVertShaderSize);
         sd.vertex.entryPoint = "main";
-        sd.vertex.buffers.push_back(desc.vertex.buffers[VERTEX_SLOT_MVP]);
+        for (uint32_t logical : {(uint32_t)VERTEX_SLOT_MVP, (uint32_t)VERTEX_SLOT_INSTANCE_MATRIX}) {
+            for (const auto& [slot, buffer] : meshRecipe.perDrawBuffers) {
+                if (slot == logical) sd.vertex.buffers.push_back(buffer);
+            }
+        }
+        if (sd.vertex.buffers.size() != 3) sd.vertex.module = nullptr;
         sd.layout = vulkanDefaultPipelineLayout;
 #endif
         GPU::DepthStencilDescriptor shadowDs = ds;
@@ -5237,6 +5458,23 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         if (sd.vertex.module && sd.layout) {
             shadowPipeline = device->createRenderPipeline(sd);
         }
+#if CAMPELLO_RENDERER_VULKAN
+        // Casters with instances or a skin: shadow.vert / shadow_skinned.vert
+        // with the same state. Their vertex buffers: the attributes
+        // (shadowDeformPipeline()), then the transforms and the instance
+        // matrices, as the mesh pipelines have them.
+        if (shadowPipeline) {
+            shadowDeformBase = sd;
+            shadowDeformBase.vertex.buffers.erase(shadowDeformBase.vertex.buffers.begin());  // the position
+            shadowInstancedModule = sd.vertex.module;
+            shadowSkinnedModule = shadowInstancedModule && vulkanSkinBindGroupLayout
+                ? device->createShaderModule(kDefaultVulkanShadowSkinnedVertShader, kDefaultVulkanShadowSkinnedVertShaderSize)
+                : nullptr;
+            shadowInstancedEntry = "main";
+            shadowSkinnedEntry = "main";
+            shadowDeformPipelines.clear();
+        }
+#endif
     }
 
     // --- Ambient occlusion (setAmbientOcclusion()) ---
@@ -10572,6 +10810,7 @@ void Renderer::render(const RenderScene& scene,
             const double direction[3] = {sun->direction.x(), sun->direction.y(), sun->direction.z()};
             mix(direction, sizeof(direction));
             mix(&shadowMapResolution, sizeof(shadowMapResolution));
+            bool skinnedCaster = false;
             for (const auto* caster : casters) {
                 const auto& draw = *caster;
                 mix(&draw.mesh, sizeof(draw.mesh));
@@ -10584,19 +10823,108 @@ void Renderer::render(const RenderScene& scene,
                 const uint8_t blended = draw.material && draw.material->alphaBlend ? 1 : 0;
                 mix(&blended, 1);
                 mix(draw.worldTransform.data, sizeof(double) * 16);
+                const void* instances = draw.instanceTransformBuffer.get();
+                mix(&instances, sizeof(instances));
+                mix(&draw.instanceCount, sizeof(draw.instanceCount));
+                if (draw.localBounds) mix(draw.localBounds->data(), sizeof(double) * 6);
+                // A skin's pose changes in its buffer, out of sight of this
+                // key: skinned casters redraw the map every frame.
+                if (draw.jointMatrixBuffer) skinnedCaster = true;
+            }
+            if (skinnedCaster) {
+                ++shadowSkinnedRedraws;
+                mix(&shadowSkinnedRedraws, sizeof(shadowSkinnedRedraws));
             }
             ShadowFit fit;
             const bool fitted =
                 fitShadowLight(casters, VM::Vector3<double>(-sun->direction.x(), -sun->direction.y(), -sun->direction.z()), fit) &&
                 ensureShadowMap();
             uint64_t casterOffset = txOffset;
-            // Far cascade: all casters; redrawn when they or the light change.
-            if (fitted && (!shadowMapValid || key != shadowMapKey)) {
+            // The casters whose light-view bounds meet a rectangle; those
+            // with unknown extent (no bounds; instances or a pose without
+            // DrawCall::localBounds) always.
+            const double* lv = fit.lightView.data;
+            const auto castersMeeting = [&](const double rect[4],
+                                            std::vector<const systems::leal::campello_renderer::DrawCall*>& out) {
+                out.clear();
+                for (const auto* caster : casters) {
+                    const auto& draw = *caster;
+                    if (!draw.mesh) continue;
+                    double blo[3], bhi[3];
+                    const bool deforms = draw.instanceTransformBuffer || draw.jointMatrixBuffer;
+                    if ((deforms && !draw.localBounds) || !drawLocalBounds(draw, blo, bhi)) {
+                        out.push_back(caster);
+                        continue;
+                    }
+                    double clo[2] = {1e300, 1e300}, chi[2] = {-1e300, -1e300};
+                    const double* m = draw.worldTransform.data;
+                    for (int corner = 0; corner < 8; ++corner) {
+                        const double p[3] = {(corner & 1) ? bhi[0] : blo[0], (corner & 2) ? bhi[1] : blo[1],
+                                             (corner & 4) ? bhi[2] : blo[2]};
+                        double w[3];
+                        for (int r = 0; r < 3; ++r) w[r] = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3];
+                        for (int r = 0; r < 2; ++r) {
+                            const double l = lv[r * 4] * w[0] + lv[r * 4 + 1] * w[1] + lv[r * 4 + 2] * w[2] + lv[r * 4 + 3];
+                            clo[r] = std::min(clo[r], l);
+                            chi[r] = std::max(chi[r], l);
+                        }
+                    }
+                    if (chi[0] >= rect[0] && clo[0] <= rect[1] && chi[1] >= rect[2] && clo[1] <= rect[3]) {
+                        out.push_back(caster);
+                    }
+                }
+            };
+            // Far cascade: the casters that can shadow what the view sees.
+            // With no RenderScene::shadowCasters every opaque draw casts and
+            // receives, so a caster whose light-view bounds miss the view's
+            // light-view rectangle (up to the farthest draw) shadows nothing
+            // visible. The map keeps the full fit's projection; it's redrawn
+            // when the casters or the light change, or the view leaves the
+            // rectangle drawn (which has a margin, so small moves don't).
+            double farNeeded[4];
+            bool farPartial = false;
+            if (fitted && scene.shadowCasters.empty()) {
+                ShadowFit receivers = fit;  // depth range: the transparent draws receive too
+                for (const auto& draw : scene.transparent) {
+                    double blo[3], bhi[3];
+                    if (!drawLocalBounds(draw, blo, bhi)) continue;
+                    const double* m = draw.worldTransform.data;
+                    for (int corner = 0; corner < 8; ++corner) {
+                        const double p[3] = {(corner & 1) ? bhi[0] : blo[0], (corner & 2) ? bhi[1] : blo[1],
+                                             (corner & 4) ? bhi[2] : blo[2]};
+                        for (int r = 0; r < 3; ++r) {
+                            const double w = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3];
+                            receivers.lo[r] = std::min(receivers.lo[r], w);
+                            receivers.hi[r] = std::max(receivers.hi[r], w);
+                        }
+                    }
+                }
+                farPartial = nearShadowRect(receivers, scene.camera, farNeeded, /*wholeView=*/true);
+            }
+            const bool castersChanged = !shadowMapValid || key != shadowMapKey;
+            const bool farCovers = !shadowFarPartial ||
+                                   (farPartial && farNeeded[0] >= shadowFarRect[0] && farNeeded[1] <= shadowFarRect[1] &&
+                                    farNeeded[2] >= shadowFarRect[2] && farNeeded[3] <= shadowFarRect[3]);
+            if (fitted && (castersChanged || !farCovers)) {
                 shadowLightViewProj = shadowProjection(fit, fit.full);
-                casterOffset = encodeShadowPass(encoder, shadowMapView, casters, shadowLightViewProj, casterOffset);
+                const std::vector<const systems::leal::campello_renderer::DrawCall*>* drawn = &casters;
+                std::vector<const systems::leal::campello_renderer::DrawCall*>& farCasters = shadowFarCasterScratch;
+                if (farPartial) {
+                    const double mx = 0.25 * (farNeeded[1] - farNeeded[0]), my = 0.25 * (farNeeded[3] - farNeeded[2]);
+                    shadowFarRect[0] = std::max(farNeeded[0] - mx, fit.full[0]);
+                    shadowFarRect[1] = std::min(farNeeded[1] + mx, fit.full[1]);
+                    shadowFarRect[2] = std::max(farNeeded[2] - my, fit.full[2]);
+                    shadowFarRect[3] = std::min(farNeeded[3] + my, fit.full[3]);
+                    castersMeeting(shadowFarRect, farCasters);
+                    drawn = &farCasters;
+                }
+                shadowFarPartial = farPartial;
+                casterOffset = encodeShadowPass(encoder, shadowMapView, *drawn, shadowLightViewProj, casterOffset);
+                shadowCastersDrawn = (uint32_t)drawn->size();
+                shadowCasterCount = (uint32_t)casters.size();
+                if (castersChanged) shadowNearValid = false;
                 shadowMapKey = key;
                 shadowMapValid = true;
-                shadowNearValid = false;
             }
             if (!fitted) shadowMapValid = false;
             // Near cascade: the view's nearest part, finer. Its rectangle has
@@ -10618,34 +10946,8 @@ void Renderer::render(const RenderScene& scene,
                     shadowNearRect[3] = std::min(needed[3] + my, fit.full[3]);
                     shadowNearViewProj = shadowProjection(fit, shadowNearRect);
                     // Only the casters whose light-view bounds meet the rectangle.
-                    std::vector<const systems::leal::campello_renderer::DrawCall*> nearCasters;
-                    const double* lv = fit.lightView.data;
-                    for (const auto* caster : casters) {
-                        const auto& draw = *caster;
-                        if (!draw.mesh) continue;
-                        if (!draw.mesh->hasBounds) {
-                            nearCasters.push_back(caster);
-                            continue;
-                        }
-                        double clo[2] = {1e300, 1e300}, chi[2] = {-1e300, -1e300};
-                        const double* m = draw.worldTransform.data;
-                        for (int corner = 0; corner < 8; ++corner) {
-                            const double p[3] = {(corner & 1) ? draw.mesh->boundsMax[0] : draw.mesh->boundsMin[0],
-                                                 (corner & 2) ? draw.mesh->boundsMax[1] : draw.mesh->boundsMin[1],
-                                                 (corner & 4) ? draw.mesh->boundsMax[2] : draw.mesh->boundsMin[2]};
-                            double w[3];
-                            for (int r = 0; r < 3; ++r) w[r] = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3];
-                            for (int r = 0; r < 2; ++r) {
-                                const double l = lv[r * 4] * w[0] + lv[r * 4 + 1] * w[1] + lv[r * 4 + 2] * w[2] + lv[r * 4 + 3];
-                                clo[r] = std::min(clo[r], l);
-                                chi[r] = std::max(chi[r], l);
-                            }
-                        }
-                        if (chi[0] >= shadowNearRect[0] && clo[0] <= shadowNearRect[1] && chi[1] >= shadowNearRect[2] &&
-                            clo[1] <= shadowNearRect[3]) {
-                            nearCasters.push_back(caster);
-                        }
-                    }
+                    std::vector<const systems::leal::campello_renderer::DrawCall*>& nearCasters = shadowNearCasterScratch;
+                    castersMeeting(shadowNearRect, nearCasters);
                     encodeShadowPass(encoder, shadowMapNearView, nearCasters, shadowNearViewProj, casterOffset);
                     shadowNearKey = key;
                     shadowNearValid = true;
@@ -11420,12 +11722,14 @@ void Renderer::render(const RenderScene& scene,
     // Stats
     lastFrameStats.gpuFrameTimeMs = gpuFrameTimeMs;
     lastFrameStats.gbufferGpuTimeMs = gbufferGpuTimeMs;
+    lastFrameStats.shadowCastersDrawn = shadowCastersDrawn;
+    lastFrameStats.shadowCasterCount = shadowCasterCount;
     lastFrameStats.opaqueDrawCount = (uint32_t)scene.opaque.size();
     lastFrameStats.transparentDrawCount = (uint32_t)scene.transparent.size();
     lastFrameStats.totalDrawCount = lastFrameStats.opaqueDrawCount + lastFrameStats.transparentDrawCount;
     uint32_t instanceCount = 0;
-    for (auto& draw : scene.opaque) instanceCount += draw.instanceCount;
-    for (auto& draw : scene.transparent) instanceCount += draw.instanceCount;
+    for (auto& draw : scene.opaque) instanceCount += drawInstanceCount(draw);
+    for (auto& draw : scene.transparent) instanceCount += drawInstanceCount(draw);
     lastFrameStats.instanceCount = instanceCount;
     lastFrameStats.visibleNodeCount = lastFrameStats.totalDrawCount;
     lastFrameStats.culledNodeCount = 0;
@@ -11612,18 +11916,13 @@ void Renderer::renderPrimitive(
         }
     }
 
-    // --- 4. Bind instance matrix ---
-    // GpuMesh::vertexBuffers only has the per-vertex attribute slots
-    // (one per VertexSemantic); VERTEX_SLOT_INSTANCE_MATRIX (19) is past its end, so
-    // reading it was out of bounds. Only look there if the array ever grows.
-    constexpr bool meshHasInstanceSlot =
-        VERTEX_SLOT_INSTANCE_MATRIX < std::tuple_size_v<decltype(GpuMesh::vertexBuffers)>;
-    std::shared_ptr<systems::leal::campello_gpu::Buffer> meshInstanceBuffer;
-    if constexpr (meshHasInstanceSlot) {
-        meshInstanceBuffer = draw.mesh->vertexBuffers[VERTEX_SLOT_INSTANCE_MATRIX];
-    }
-    if (draw.instanceCount > 1 && meshInstanceBuffer) {
-        bindMeshBuffer(rpe, VERTEX_SLOT_INSTANCE_MATRIX, meshInstanceBuffer, 0);
+    // --- 4. Bind instance matrices ---
+    // Instances read instanceTransformBuffer[instance]; with no buffer (or a
+    // short one) only the instances it holds are drawn, never past its end.
+    const uint32_t instanceCount = drawInstanceCount(draw);
+    if (instanceCount == 0) return;
+    if (draw.instanceTransformBuffer) {
+        bindMeshBuffer(rpe, VERTEX_SLOT_INSTANCE_MATRIX, draw.instanceTransformBuffer, 0);
     } else if (defaultInstanceMatrixBuffer) {
         bindMeshBuffer(rpe, VERTEX_SLOT_INSTANCE_MATRIX, defaultInstanceMatrixBuffer, 0);
     }
@@ -11673,9 +11972,9 @@ void Renderer::renderPrimitive(
         }
         if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
             rpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
-            rpe->drawIndexed(draw.mesh->indexCount, draw.instanceCount, 0, 0, drawFirstInstance());
+            rpe->drawIndexed(draw.mesh->indexCount, instanceCount, 0, 0, drawFirstInstance());
         } else {
-            rpe->draw(draw.mesh->vertexCount, draw.instanceCount, 0, drawFirstInstance());
+            rpe->draw(draw.mesh->vertexCount, instanceCount, 0, drawFirstInstance());
         }
         return;
     }
@@ -11731,9 +12030,9 @@ void Renderer::renderPrimitive(
     // --- 7. Draw ---
     if (draw.mesh->indexBuffer && draw.mesh->indexCount > 0) {
         rpe->setIndexBuffer(draw.mesh->indexBuffer, draw.mesh->indexFormat, 0);
-        rpe->drawIndexed(draw.mesh->indexCount, draw.instanceCount, 0, 0, drawFirstInstance());
+        rpe->drawIndexed(draw.mesh->indexCount, instanceCount, 0, 0, drawFirstInstance());
     } else {
-        rpe->draw(draw.mesh->vertexCount, draw.instanceCount, 0, drawFirstInstance());
+        rpe->draw(draw.mesh->vertexCount, instanceCount, 0, drawFirstInstance());
     }
 }
 

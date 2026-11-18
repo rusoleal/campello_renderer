@@ -8,6 +8,9 @@
 //            64 materials (sorting, transforms, per-draw binding).
 //   gltf     render(view): the same grid as glTF nodes (node transforms,
 //            material uniforms, renderPrimitive()).
+//   shadows  render(RenderScene) with a third-person view of one corner of
+//            the grid and one cube moving, so the sun's shadow map is
+//            redrawn every frame (shadow caster culling).
 //   gbuffer  renderGBuffer() alone, the grid.
 //   denoise  renderGBuffer() + RealtimeDenoiser::denoise() every frame.
 //
@@ -228,6 +231,31 @@ int main(int argc, char** argv) {
         auto view = target(device);
         if (view && buildDrawScene(renderer, draws)) {
             report("draws", run(device, frames, [&] { renderer.render(draws.scene, view); }));
+        }
+    }
+    if (only.empty() || only == "shadows") {
+        // A third-person view: looking down at one corner of the grid, one cube
+        // moving, so the sun's shadow map is redrawn every frame.
+        Renderer renderer(device);
+        renderer.resize(kWidth, kHeight);
+        renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+        renderer.setSkyboxEnabled(false);
+        DrawScene draws;
+        auto view = target(device);
+        if (view && buildDrawScene(renderer, draws)) {
+            const VM::Vector3<double> eye(-30.0, -30.0, 6.0);
+            draws.scene.camera.view = VM::Matrix4<double>::lookAt(eye, VM::Vector3<double>(-27.0, -27.0, 0.0),
+                                                                 VM::Vector3<double>(0.0, 0.0, 1.0));
+            draws.scene.camera.position = eye;
+            const auto rest = draws.scene.opaque[0].worldTransform;
+            int frame = 0;
+            report("shadows", run(device, frames, [&] {
+                       draws.scene.opaque[0].worldTransform =
+                           VM::Matrix4<double>::translate(VM::Vector3<double>(0.0, 0.0, 0.01 * (frame++ % 2))) * rest;
+                       renderer.render(draws.scene, view);
+                   }));
+            const auto stats = renderer.getLastFrameStats();
+            std::printf("         shadow casters drawn %u of %u\n", stats.shadowCastersDrawn, stats.shadowCasterCount);
         }
     }
     if (only.empty() || only == "gltf") {

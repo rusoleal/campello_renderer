@@ -128,7 +128,21 @@ namespace systems::leal::campello_renderer {
         systems::leal::vector_math::Matrix4<double> worldTransform;
         std::shared_ptr<systems::leal::campello_gpu::Buffer> jointMatrixBuffer; // nullptr if unskinned
         uint32_t jointCount = 0;
+        /// Instances to draw. Above 1 the draw needs instanceTransformBuffer;
+        /// without one (or one too small) it draws only the instances the
+        /// buffer holds, one when there's none.
         uint32_t instanceCount = 1;
+        /// Per-instance transforms (EXT_mesh_gpu_instancing style): one
+        /// column-major float4x4 (64 bytes) per instance, applied in model
+        /// space before worldTransform. Create it with BufferUsage::vertex
+        /// (Vulkan reads it as a per-instance vertex attribute). Null:
+        /// a single instance at worldTransform.
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> instanceTransformBuffer;
+        /// Model-space bounds of what the draw covers, when that isn't the
+        /// mesh's bounds: all its instances, or the poses of its skin. Sun
+        /// shadows are fitted to them. Unset: the mesh's bounds, so instances
+        /// or a pose that leave them may fall outside the shadow map.
+        std::optional<std::array<double, 6>> localBounds;  // min xyz, max xyz
         /// The previous frame's world transform, for motion vectors
         /// (Renderer::renderGBuffer()). Unset: it didn't move.
         std::optional<systems::leal::vector_math::Matrix4<double>> previousWorldTransform;
@@ -238,6 +252,12 @@ namespace systems::leal::campello_renderer {
         double gpuFrameTimeMs = 0.0;
         // GPU execution time of the most recent completed renderGBuffer().
         double gbufferGpuTimeMs = 0.0;
+        // Sun shadows (render(RenderScene)): the casters drawn into the far
+        // shadow map the last time it was redrawn (it's kept while nothing
+        // changes), and how many casters there were then. Fewer drawn than
+        // listed: the rest can't shadow anything in view.
+        uint32_t shadowCastersDrawn = 0;
+        uint32_t shadowCasterCount = 0;
     };
 
     using OverlayCallback = std::function<void(
@@ -898,9 +918,22 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::TextureView> shadowMapView;
         std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapPlaceholder;  // 1x1, bound when off
         std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> shadowPipeline;
+        // Casters with instances or a skin (Metal and Vulkan): depth-only
+        // pipelines with shadowVertexInstanced / shadowVertexSkinned
+        // (shadow.vert, shadow_skinned.vert), built from shadowDeformBase on
+        // first use, per JOINTS_0/WEIGHTS_0 format (shadowDeformPipeline()).
+        systems::leal::campello_gpu::RenderPipelineDescriptor shadowDeformBase;
+        std::shared_ptr<systems::leal::campello_gpu::ShaderModule> shadowInstancedModule, shadowSkinnedModule;
+        std::string shadowInstancedEntry, shadowSkinnedEntry;
+        std::unordered_map<uint64_t, std::shared_ptr<systems::leal::campello_gpu::RenderPipeline>> shadowDeformPipelines;
+        // The pipeline for a deforming caster; `skinned` comes back false when
+        // it can't be skinned (no skin stage, or no JOINTS_0/WEIGHTS_0).
+        std::shared_ptr<systems::leal::campello_gpu::RenderPipeline> shadowDeformPipeline(
+            const systems::leal::campello_renderer::DrawCall& draw, bool& skinned);
         // The map is redrawn only when its inputs change (light, resolution,
         // casters and their transforms): their hash, and the matrix it used.
         uint64_t shadowMapKey = 0;
+        uint64_t shadowSkinnedRedraws = 0;  // mixed into the key: skinned casters redraw every frame
         bool shadowMapValid = false;
         systems::leal::vector_math::Matrix4<double> shadowLightViewProj;
         /// Draws `casters` into `target` with `lightViewProj`; their
@@ -916,6 +949,9 @@ namespace systems::leal::campello_renderer {
         // staged transforms (uploaded once per frame) and their offsets.
         std::vector<const systems::leal::campello_renderer::DrawCall*> sortedOpaqueScratch;
         std::vector<const systems::leal::campello_renderer::DrawCall*> shadowCasterScratch;
+        std::vector<const systems::leal::campello_renderer::DrawCall*> shadowFarCasterScratch;
+        std::vector<const systems::leal::campello_renderer::DrawCall*> shadowNearCasterScratch;
+        uint32_t shadowCastersDrawn = 0, shadowCasterCount = 0;  // RenderStats
         std::vector<float> drawTransformStaging, drawPreviousStaging, shadowTransformStaging;
         std::vector<uint64_t> drawTransformOffsets;
         // Vulkan/WebGPU: the comparison sampler of the shadow lookup (frame
@@ -984,7 +1020,10 @@ namespace systems::leal::campello_renderer {
         /// camera to halfway between the logarithmic and uniform split of the
         /// casters' depth range),
         /// or false when a near cascade wouldn't be much finer than the far one.
-        static bool nearShadowRect(const ShadowFit& fit, const CameraData& camera, double rect[4]);
+        /// wholeView: the rectangle of the whole view up to the far end of
+        /// fit.lo..hi instead (the far map's caster culling), false only when
+        /// it can't be found (the view misses fit.lo..hi, or no projection).
+        static bool nearShadowRect(const ShadowFit& fit, const CameraData& camera, double rect[4], bool wholeView = false);
         std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapNear;
         std::shared_ptr<systems::leal::campello_gpu::TextureView> shadowMapNearView;
         std::shared_ptr<systems::leal::campello_gpu::Texture> shadowMapNearBinding();
@@ -1013,6 +1052,11 @@ namespace systems::leal::campello_renderer {
         bool shadowNearValid = false;
         uint64_t shadowNearKey = 0;
         double shadowNearRect[4] = {0, 0, 0, 0};
+        // The far map holds only the casters meeting this light-view
+        // rectangle (the view and a margin; render(RenderScene) without
+        // RenderScene::shadowCasters). false: it holds all of them.
+        bool shadowFarPartial = false;
+        double shadowFarRect[4] = {0, 0, 0, 0};
         systems::leal::vector_math::Matrix4<double> shadowNearViewProj;
 
         // Per-node matrices uploaded to the GPU at the start of each render().
@@ -1620,7 +1664,8 @@ namespace systems::leal::campello_renderer {
         bool supportsShadows() const { return shadowPipeline != nullptr; }
         /// The shadow map is redrawn only when the light, its resolution or
         /// the casters (meshes, their buffers and transforms) change; call
-        /// this after rewriting a mesh's buffers in place.
+        /// this after rewriting a mesh's (or a draw's instanceTransformBuffer)
+        /// buffers in place. Skinned casters redraw it every frame.
         void invalidateShadowMap() {
             shadowMapValid = false;
             shadowNearValid = false;
