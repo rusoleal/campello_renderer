@@ -14,6 +14,8 @@
   - Material uniforms (and the per-frame globals patched into them) are uploaded only where they changed. Every material was rewritten every frame, in a buffer the frames in flight share, so a write could race the GPU reading an earlier frame.
   - The sun shadow map's cache key hashes 8 bytes per step instead of one.
 - **Effects don't wait for the previous frame.** `RealtimeDenoiser`, `DdgiVolume`, `SkinnedMeshes`, `RayTracedShadows`/`RayTracedAmbientOcclusion`, `RestirDirectLighting` and `RestirGlobalIllumination` waited for their previous submission before rewriting their uniforms, so the CPU and GPU took turns whenever one was on. Their uniforms (and parameter buffers) are kept per frame in flight now, and a frame waits only for the one three frames back.
+- **campello_gpu v0.31.2.** On Metal, render targets and storage textures are in GPU-only (Private) memory, which Apple GPUs compress losslessly, so every pass that writes or samples one (scene color, G-buffer, history, effect targets) moves less data. Uploads to them go through a blit.
+- **Test results:** macOS 138 passed (also with Metal API validation); Android (Adreno 618) 104 passed, 34 skipped (ray tracing), 0 failed.
 
 ## [0.22.2] - 2026-11-18
 
