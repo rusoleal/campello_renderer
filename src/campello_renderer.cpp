@@ -5900,12 +5900,13 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         prewarmMeshPipelines();
     }
 
-    // --- Sun shadows: depth only, with leanVertex (as Vulkan) ---
+    // --- Sun shadows: depth only, with shadowVertex (as Vulkan's shadow.vert) ---
     // The shadow pass binds a second set of per-draw transforms whose "mvp"
-    // is the light's view-projection times the model matrix. No pixel shader
-    // or colour targets, no bind groups; no culling (mixed winding),
-    // slope-scaled bias; the receiver bias is in shadowLookup().
-    if (kDefaultDirectXLeanVertShaderSize > 0) {
+    // is the light's view-projection times the model matrix, then the
+    // instance matrices (the identity for plain casters). No pixel shader or
+    // colour targets; no culling (mixed winding), slope-scaled bias; the
+    // receiver bias is in shadowLookup().
+    if (kDefaultDirectXShadowVertShaderSize > 0) {
         GPU::RenderPipelineDescriptor sd{};
         GPU::VertexLayout positions{};
         positions.arrayStride = 12;
@@ -5917,9 +5918,14 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         position.shaderLocation = 0;
         positions.attributes.push_back(position);
         sd.vertex.buffers.push_back(positions);
-        sd.vertex.module = device->createShaderModule(kDefaultDirectXLeanVertShader, kDefaultDirectXLeanVertShaderSize);
-        sd.vertex.entryPoint = "leanVertex";
-        sd.vertex.buffers.push_back(desc.vertex.buffers[VERTEX_SLOT_MVP]);
+        sd.vertex.module = device->createShaderModule(kDefaultDirectXShadowVertShader, kDefaultDirectXShadowVertShaderSize);
+        sd.vertex.entryPoint = "shadowVertex";
+        for (uint32_t logical : {(uint32_t)VERTEX_SLOT_MVP, (uint32_t)VERTEX_SLOT_INSTANCE_MATRIX}) {
+            for (const auto& [slot, buffer] : meshRecipe.perDrawBuffers) {
+                if (slot == logical) sd.vertex.buffers.push_back(buffer);
+            }
+        }
+        if (sd.vertex.buffers.size() != 3) sd.vertex.module = nullptr;
         sd.layout = directxPbrPipelineLayout;
         GPU::DepthStencilDescriptor shadowDs = ds;
         shadowDs.depthBias = 2.0;
@@ -5931,6 +5937,21 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         sd.frontFace = GPU::FrontFace::ccw;
         if (sd.vertex.module && sd.layout) {
             shadowPipeline = device->createRenderPipeline(sd);
+        }
+        // Casters with instances or a skin (shadowDeformPipeline()):
+        // shadowVertex / shadowSkinnedVertex with the same state; their vertex
+        // buffers are the attributes, then the transforms and the instance
+        // matrices. The skin's palette is bind group 2 of the PBR layout.
+        if (shadowPipeline) {
+            shadowDeformBase = sd;
+            shadowDeformBase.vertex.buffers.erase(shadowDeformBase.vertex.buffers.begin());  // the position
+            shadowInstancedModule = sd.vertex.module;
+            shadowSkinnedModule = skinBindGroupLayout && kDefaultDirectXShadowSkinnedVertShaderSize > 0
+                ? device->createShaderModule(kDefaultDirectXShadowSkinnedVertShader, kDefaultDirectXShadowSkinnedVertShaderSize)
+                : nullptr;
+            shadowInstancedEntry = "shadowVertex";
+            shadowSkinnedEntry = "shadowSkinnedVertex";
+            shadowDeformPipelines.clear();
         }
     }
 

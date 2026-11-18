@@ -1983,13 +1983,20 @@ struct LeanVertexIn {
     float4 modelCol1 : TEXCOORD25;
     float4 modelCol2 : TEXCOORD26;
     float4 modelCol3 : TEXCOORD27;
+    // The instance's transform (DrawCall::instanceTransformBuffer,
+    // EXT_mesh_gpu_instancing; the identity without instances).
+    float4 instanceCol0 : TEXCOORD12;
+    float4 instanceCol1 : TEXCOORD13;
+    float4 instanceCol2 : TEXCOORD14;
+    float4 instanceCol3 : TEXCOORD15;
 };
 
 PixelIn leanVertex(LeanVertexIn input) {
     PixelIn output;
-    float3 p = input.position;
-    output.clipPosition   = input.mvpCol0 * p.x + input.mvpCol1 * p.y + input.mvpCol2 * p.z + input.mvpCol3;
-    output.worldPos       = (input.modelCol0 * p.x + input.modelCol1 * p.y + input.modelCol2 * p.z + input.modelCol3).xyz;
+    Columns instance = columns(input.instanceCol0, input.instanceCol1, input.instanceCol2, input.instanceCol3);
+    float4 localPos = transform(instance, float4(input.position, 1.0));
+    output.clipPosition   = transform(columns(input.mvpCol0, input.mvpCol1, input.mvpCol2, input.mvpCol3), localPos);
+    output.worldPos       = transform(columns(input.modelCol0, input.modelCol1, input.modelCol2, input.modelCol3), localPos).xyz;
     output.worldNormal    = float3(0.0, 0.0, 0.0);
     output.worldTangent   = float3(0.0, 0.0, 0.0);
     output.worldBitangent = float3(0.0, 0.0, 0.0);
@@ -2009,6 +2016,37 @@ PixelIn lineVertex(LeanVertexIn input) {
     return output;
 }
 
+// Sun shadow casters (encodeShadowPass()), depth only, as shadow.glsl: the
+// shadow pass binds the light's clip from local as the per-draw mvp
+// (locations 16-19) and each instance's matrix at 12-15 (the identity for
+// plain casters). shadowSkinnedVertex adds JOINTS_0 / WEIGHTS_0 and the joint
+// palette (bind group 2), for skinned casters (shadowDeformPipeline()).
+struct ShadowVertexIn {
+    float3 position     : TEXCOORD0;
+    float4 mvpCol0      : TEXCOORD16;
+    float4 mvpCol1      : TEXCOORD17;
+    float4 mvpCol2      : TEXCOORD18;
+    float4 mvpCol3      : TEXCOORD19;
+    float4 instanceCol0 : TEXCOORD12;
+    float4 instanceCol1 : TEXCOORD13;
+    float4 instanceCol2 : TEXCOORD14;
+    float4 instanceCol3 : TEXCOORD15;
+};
+
+float4 shadowClip(ShadowVertexIn input, Columns skin) {
+    Columns instance = columns(input.instanceCol0, input.instanceCol1, input.instanceCol2, input.instanceCol3);
+    float4 local = transform(instance, transform(skin, float4(input.position, 1.0)));
+    return transform(columns(input.mvpCol0, input.mvpCol1, input.mvpCol2, input.mvpCol3), local);
+}
+
+float4 shadowVertex(ShadowVertexIn input) : SV_Position {
+    return shadowClip(input, identityColumns());
+}
+
+float4 shadowSkinnedVertex(ShadowVertexIn input, uint4 joints : TEXCOORD4, float4 weights : TEXCOORD5) : SV_Position {
+    return shadowClip(input, blendJoints(jointMatrices, joints, weights));
+}
+
 struct GBufferLeanVertexIn {
     float3 position  : TEXCOORD0;
     float4 mvpCol0   : TEXCOORD16;
@@ -2024,17 +2062,22 @@ struct GBufferLeanVertexIn {
     float4 modelCol2 : TEXCOORD26;
     float4 modelCol3 : TEXCOORD27;
     float4 jitter    : TEXCOORD28;
+    float4 instanceCol0 : TEXCOORD12;  // the instance's transform, as LeanVertexIn
+    float4 instanceCol1 : TEXCOORD13;
+    float4 instanceCol2 : TEXCOORD14;
+    float4 instanceCol3 : TEXCOORD15;
 };
 
 GBufferPixelIn gbufferLeanVertex(GBufferLeanVertexIn input) {
     GBufferPixelIn output;
-    float3 p = input.position;
-    float4 clip = input.mvpCol0 * p.x + input.mvpCol1 * p.y + input.mvpCol2 * p.z + input.mvpCol3;
+    Columns instance = columns(input.instanceCol0, input.instanceCol1, input.instanceCol2, input.instanceCol3);
+    float4 localPos = transform(instance, float4(input.position, 1.0));
+    float4 clip = transform(columns(input.mvpCol0, input.mvpCol1, input.mvpCol2, input.mvpCol3), localPos);
     output.currentClip  = clip - float4(input.jitter.xy * clip.w, 0.0, 0.0);
-    output.previousClip = input.previousMvpCol0 * p.x + input.previousMvpCol1 * p.y +
-                          input.previousMvpCol2 * p.z + input.previousMvpCol3;
+    output.previousClip = transform(columns(input.previousMvpCol0, input.previousMvpCol1, input.previousMvpCol2,
+                                            input.previousMvpCol3), localPos);
     output.clipPosition   = clip;
-    output.worldPos       = (input.modelCol0 * p.x + input.modelCol1 * p.y + input.modelCol2 * p.z + input.modelCol3).xyz;
+    output.worldPos       = transform(columns(input.modelCol0, input.modelCol1, input.modelCol2, input.modelCol3), localPos).xyz;
     output.worldNormal    = float3(0.0, 0.0, 0.0);
     output.worldTangent   = float3(0.0, 0.0, 0.0);
     output.worldBitangent = float3(0.0, 0.0, 0.0);

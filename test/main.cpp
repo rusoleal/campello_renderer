@@ -3312,7 +3312,7 @@ TEST_F(OffscreenRenderTest, SunCastsShadowsOnOpaqueGeometry) {
 // rest position doesn't.
 TEST_F(OffscreenRenderTest, SunShadowsFollowInstancesAndSkins) {
     if (!device) GTEST_SKIP() << "No GPU device available";
-#if defined(_WIN32) || defined(__EMSCRIPTEN__)
+#if defined(__EMSCRIPTEN__)
     GTEST_SKIP() << "No instanced or skinned shadow casters on this backend yet";
 #endif
     namespace GPU = systems::leal::campello_gpu;
@@ -3874,9 +3874,6 @@ TEST_F(OffscreenRenderTest, GltfInstancesDrawAtTheirTransforms) {
 // holds, and without a buffer one instance at worldTransform.
 TEST_F(OffscreenRenderTest, DrawCallInstancesDrawAtTheirTransforms) {
     if (!device) GTEST_SKIP() << "No GPU device available";
-#if defined(_WIN32)
-    GTEST_SKIP() << "No instancing on DirectX yet";
-#endif
     namespace GPU = systems::leal::campello_gpu;
     namespace VM = systems::leal::vector_math;
     auto asset = GLTF::loadGLTF(kGltfInstancedQuad, kNoOpLoader);
