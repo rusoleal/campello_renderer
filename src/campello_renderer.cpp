@@ -49,10 +49,29 @@
 #else
 #define CAMPELLO_RENDERER_VULKAN 0
 #endif
+// The DirectX 12 backend.
+#if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__) && !defined(__EMSCRIPTEN__)
+#define CAMPELLO_RENDERER_DIRECTX 1
+#else
+#define CAMPELLO_RENDERER_DIRECTX 0
+#endif
+// Skinning and morph targets in their own vertex stages, which meshPipeline()
+// picks only for draws that deform, with the joint palettes and morph
+// targets as bind groups 2 and 3 (bindSkin(), bindMorph()): Vulkan and
+// DirectX. Metal's one stage reads them as raw buffers instead.
+#define CAMPELLO_RENDERER_SPLIT_DEFORM (CAMPELLO_RENDERER_VULKAN || CAMPELLO_RENDERER_DIRECTX)
+// The built-in PBR program's bind groups as material (group 0, built once
+// per material) + frame (group 1: lights, camera, environment, scene colour,
+// shadows; rebuilt per frame/pass), with Vulkan's layouts
+// (ensureVulkanPbrBindGroupLayouts()): Vulkan, WebGPU and DirectX. Metal has
+// its own layout (bindGroupLayout).
+#define CAMPELLO_RENDERER_PBR_BIND_GROUPS (CAMPELLO_RENDERER_VK_BINDINGS || CAMPELLO_RENDERER_DIRECTX)
 
 // Joint palettes and morph target data: vertex (raw) buffers on Metal,
-// storage buffers on Vulkan (sets 2 and 3 of the mesh pipelines,
-// bindVulkanSkin() and bindVulkanMorph()).
+// storage buffers on Vulkan (bind groups 2 and 3 of the mesh pipelines,
+// bindSkin() and bindMorph()). DirectX reads them through the same bind
+// groups but keeps them CPU-written upload buffers (storage usage would put
+// them in the GPU-only heap): campello_gpu views them as raw buffers there.
 #if CAMPELLO_RENDERER_VULKAN
 static constexpr auto kDeformBufferUsage = static_cast<systems::leal::campello_gpu::BufferUsage>(
     static_cast<int>(systems::leal::campello_gpu::BufferUsage::vertex) |
@@ -1334,174 +1353,6 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
 #endif
 }
 
-// DirectX-only: a single combined bind group layout carrying every per-material AND
-// per-frame PBR resource together — see the doc comment on
-// Renderer::directxPbrBindGroupLayout (campello_renderer.hpp) for why this differs
-// from Vulkan's material+frame split. Binding numbers 0-24 reuse the exact numbers
-// shaders/vulkan/default.frag's material set uses; frame resources are offset to
-// start at 30 purely so they can never collide with the material range even though
-// campello_gpu's D3D12 backend would tolerate it (independent t#/s#/b# namespaces,
-// like Metal) — see ensureDirectXPbrBindGroupLayout()'s call site for confirmation
-// this was verified against the vendored campello_gpu D3D12 backend source.
-void Renderer::ensureDirectXPbrBindGroupLayout() {
-    namespace GPU = systems::leal::campello_gpu;
-    if (directxPbrBindGroupLayout) return;
-
-    auto addTex = [](GPU::BindGroupLayoutDescriptor &desc, uint32_t binding,
-                      GPU::TextureType dim = GPU::TextureType::tt2d) {
-        GPU::EntryObject e{};
-        e.binding    = binding;
-        e.visibility = GPU::ShaderStage::fragment;
-        e.type       = GPU::EntryObjectType::texture;
-        e.data.texture.multisampled  = false;
-        e.data.texture.sampleType    = GPU::EntryObjectTextureType::ttFloat;
-        e.data.texture.viewDimension = dim;
-        desc.entries.push_back(e);
-    };
-    auto addSamp = [](GPU::BindGroupLayoutDescriptor &desc, uint32_t binding) {
-        GPU::EntryObject e{};
-        e.binding    = binding;
-        e.visibility = GPU::ShaderStage::fragment;
-        e.type       = GPU::EntryObjectType::sampler;
-        e.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
-        desc.entries.push_back(e);
-    };
-    auto addBuf = [](GPU::BindGroupLayoutDescriptor &desc, uint32_t binding, uint32_t size) {
-        GPU::EntryObject e{};
-        e.binding    = binding;
-        e.visibility = GPU::ShaderStage::fragment;
-        e.type       = GPU::EntryObjectType::buffer;
-        e.data.buffer.hasDinamicOffaset = false;
-        e.data.buffer.minBindingSize    = size;
-        e.data.buffer.type              = GPU::EntryObjectBufferType::uniform;
-        desc.entries.push_back(e);
-    };
-
-    GPU::BindGroupLayoutDescriptor desc{};
-    // --- Per-material textures/samplers + MaterialUniforms ---
-    addTex(desc, 0);  addSamp(desc, 1);   // baseColor
-    addTex(desc, 2);  addSamp(desc, 3);   // metallicRoughness
-    addTex(desc, 4);  addSamp(desc, 5);   // normal
-    addTex(desc, 6);  addSamp(desc, 7);   // emissive
-    addTex(desc, 8);  addSamp(desc, 9);   // occlusion
-    addTex(desc, 10); addSamp(desc, 11);  // specular
-    addTex(desc, 12); addSamp(desc, 13);  // specularColor
-    addTex(desc, 14);                     // sheenColor (reuses sampler 1)
-    addTex(desc, 15);                     // sheenRoughness (reuses sampler 1)
-    addTex(desc, 16);                     // clearcoat (reuses sampler 1)
-    addTex(desc, 17);                     // clearcoatRoughness (reuses sampler 1)
-    addTex(desc, 18);                     // clearcoatNormal (reuses sampler 1)
-    addTex(desc, 19);                     // transmission (reuses sampler 1)
-    addTex(desc, 20);                     // thickness (reuses sampler 1)
-    addTex(desc, 21);                     // iridescence (reuses sampler 1)
-    addTex(desc, 22);                     // iridescenceThickness (reuses sampler 1)
-    addTex(desc, 23);                     // anisotropic (reuses sampler 1)
-    addBuf(desc, 24, kMaterialUniformStride);
-
-    // --- Per-frame lights/camera/environment/scene-color (offset to avoid any
-    // chance of overlap with the material range above within the same
-    // RegisterSpace(0) root signature) ---
-    addBuf(desc, 30, 272);                          // LightsUniform
-    addBuf(desc, 31, 160);                          // CameraUniforms
-    addTex(desc, 32, GPU::TextureType::ttCube);     // environmentMap (prefiltered specular)
-    addSamp(desc, 33);                              // environmentSampler
-    addTex(desc, 34);                               // sceneColorTexture / opaqueSceneTexture
-    addSamp(desc, 35);                              // sceneColorSampler
-    addTex(desc, 36, GPU::TextureType::ttCube);     // irradianceEnvironmentMap
-    addTex(desc, 37);                               // brdfLutTexture
-    addSamp(desc, 38);                              // brdfLutSampler
-
-    directxPbrBindGroupLayout = device->createBindGroupLayout(desc);
-}
-
-// DirectX-only: builds one combined bind group (see ensureDirectXPbrBindGroupLayout())
-// for a specific material's cached texture assignments, bound against frameIndex's
-// lights/camera buffers and the caller-supplied scene-color/opaque-scene texture.
-std::shared_ptr<systems::leal::campello_gpu::BindGroup> Renderer::buildDirectXCombinedBindGroup(
-    const DirectXMaterialResources& res, uint32_t frameIndex,
-    const std::shared_ptr<systems::leal::campello_gpu::Texture>& sceneColorOrOpaque) {
-    namespace GPU = systems::leal::campello_gpu;
-    if (!directxPbrBindGroupLayout || !materialUniformBuffer) return nullptr;
-    auto& fr = frameResources[frameIndex];
-    if (!fr.lightsUniformBuffer || !fr.cameraPositionBuffer) return nullptr;
-
-    std::shared_ptr<GPU::Texture> envSpecular = prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap;
-    std::shared_ptr<GPU::Texture> envIrradiance = irradianceEnvironmentMap ? irradianceEnvironmentMap : environmentMap;
-    std::shared_ptr<GPU::Texture> lut = brdfLutTexture ? brdfLutTexture : defaultTexture;
-    std::shared_ptr<GPU::Texture> scTex = sceneColorOrOpaque ? sceneColorOrOpaque : defaultTexture;
-    if (!envSpecular || !envIrradiance || !environmentSampler) return nullptr;
-
-    GPU::BindGroupDescriptor bgDesc{};
-    bgDesc.layout = directxPbrBindGroupLayout;
-    bgDesc.entries = {
-        {0,  res.baseColorTex},        {1,  res.baseColorSamp},
-        {2,  res.mrTex},               {3,  res.mrSamp},
-        {4,  res.normalTex},           {5,  res.normalSamp},
-        {6,  res.emissiveTex},         {7,  res.emissiveSamp},
-        {8,  res.occlusionTex},        {9,  res.occlusionSamp},
-        {10, res.specularTex},         {11, res.specularSamp},
-        {12, res.specularColorTex},    {13, res.specularColorSamp},
-        {14, res.sheenColorTex},
-        {15, res.sheenRoughnessTex},
-        {16, res.clearcoatTex},
-        {17, res.clearcoatRoughnessTex},
-        {18, res.clearcoatNormalTex},
-        {19, res.transmissionTex},
-        {20, res.thicknessTex},
-        {21, res.iridescenceTex},
-        {22, res.iridescenceThicknessTex},
-        {23, res.anisotropicTex},
-        {24, GPU::BufferBinding{materialUniformBuffer, res.materialBufferOffset, kMaterialUniformStride}},
-        {30, GPU::BufferBinding{fr.lightsUniformBuffer, 0, 272}},
-        {31, GPU::BufferBinding{fr.cameraPositionBuffer, 0, 160}},
-        {32, envSpecular},
-        {33, environmentSampler},
-        {34, scTex},
-        {35, environmentSampler},
-        {36, envIrradiance},
-        {37, lut},
-        {38, environmentSampler},
-    };
-    return device->createBindGroup(bgDesc);
-}
-
-// DirectX-only: rebuilds every combined bind group (default + all glTF materials +
-// all ECS GpuMaterials) for one frame-in-flight slot. Called once per material at
-// scene/material load (with a defaultTexture placeholder for the scene-color entry,
-// mirroring frameBindGroup[]'s "safe placeholder" comment on Vulkan/Metal) and again
-// every render() call once the real scene-color/opaque-scene texture for this frame
-// is known — see the two call sites in render()/renderToTarget(). This means DirectX
-// pays for materials-many createBindGroup() calls per relevant render pass where
-// Vulkan/Metal pay for exactly one (rebuilding only frameBindGroup[currentFrameIndex])
-// — an accepted cost of the single-combined-bind-group workaround described on
-// Renderer::directxPbrBindGroupLayout; scenes are not expected to have enough
-// materials for this to be a practical bottleneck.
-void Renderer::rebuildDirectXCombinedBindGroups(uint32_t frameIndex,
-    const std::shared_ptr<systems::leal::campello_gpu::Texture>& sceneColorOrOpaque) {
-    if (!directxPbrBindGroupLayout || frameIndex >= kMaxFramesInFlight) return;
-
-    directxDefaultBindGroup[frameIndex] = buildDirectXCombinedBindGroup(
-        directxDefaultResources, frameIndex, sceneColorOrOpaque);
-
-    for (size_t m = 0; m < directxMaterialResources.size(); ++m) {
-        if (m >= directxMaterialBindGroups.size()) break;
-        directxMaterialBindGroups[m][frameIndex] = buildDirectXCombinedBindGroup(
-            directxMaterialResources[m], frameIndex, sceneColorOrOpaque);
-    }
-
-    for (auto& matPtr : materialPool) {
-        if (!matPtr) continue;
-        // ECS GpuMaterials store their DirectXMaterialResources via uniformSlot's
-        // offset and the same texture pointers already cached on directxBindGroup's
-        // sibling fields — see uploadMesh()'s material-creation call site, which
-        // populates directxEcsMaterialResources keyed by GpuMaterial pointer.
-        auto it = directxEcsMaterialResources.find(matPtr.get());
-        if (it == directxEcsMaterialResources.end()) continue;
-        matPtr->directxBindGroup[frameIndex] = buildDirectXCombinedBindGroup(
-            it->second, frameIndex, sceneColorOrOpaque);
-    }
-}
-
 // Bakes the three IBL precompute resources the glTF-Sample-Renderer reference
 // uses for image-based lighting — see shaders/vulkan/ibl_bake.frag's header
 // comment for what each mode computes. Called wherever environmentMap is
@@ -2455,7 +2306,7 @@ void Renderer::setScene(uint32_t index) {
         materialUniformShadow.clear();
     }
 
-#if CAMPELLO_RENDERER_VK_BINDINGS
+#if CAMPELLO_RENDERER_PBR_BIND_GROUPS
     ensureVulkanPbrBindGroupLayouts();
     if (!defaultBindGroup && vulkanMaterialBindGroupLayout && defaultTexture && defaultSampler &&
         defaultMetallicRoughnessTexture && defaultNormalTexture &&
@@ -2495,53 +2346,6 @@ void Renderer::setScene(uint32_t index) {
         // reuse the same fully-populated bind group for both.
         defaultFlatBindGroup = defaultBindGroup;
         rememberMaterialBufferBindGroup("default", bgDesc, defaultBindGroup);
-    }
-#elif defined(_WIN32)
-    ensureDirectXPbrBindGroupLayout();
-    if (directxPbrBindGroupLayout && defaultTexture && defaultSampler &&
-        defaultMetallicRoughnessTexture && defaultNormalTexture &&
-        defaultEmissiveTexture && defaultOcclusionTexture &&
-        defaultSpecularTexture && defaultSpecularColorTexture &&
-        defaultSheenColorTexture && defaultSheenRoughnessTexture &&
-        defaultClearcoatTexture && defaultClearcoatRoughnessTexture &&
-        defaultClearcoatNormalTexture &&
-        materialUniformBuffer) {
-        directxDefaultResources = DirectXMaterialResources{};
-        directxDefaultResources.baseColorTex          = defaultTexture;
-        directxDefaultResources.baseColorSamp         = defaultSampler;
-        directxDefaultResources.mrTex                 = defaultMetallicRoughnessTexture;
-        directxDefaultResources.mrSamp                = defaultSampler;
-        directxDefaultResources.normalTex             = defaultNormalTexture;
-        directxDefaultResources.normalSamp            = defaultSampler;
-        directxDefaultResources.emissiveTex           = defaultEmissiveTexture;
-        directxDefaultResources.emissiveSamp          = defaultSampler;
-        directxDefaultResources.occlusionTex          = defaultOcclusionTexture;
-        directxDefaultResources.occlusionSamp         = defaultSampler;
-        directxDefaultResources.specularTex           = defaultSpecularTexture;
-        directxDefaultResources.specularSamp          = defaultSampler;
-        directxDefaultResources.specularColorTex      = defaultSpecularColorTexture;
-        directxDefaultResources.specularColorSamp     = defaultSampler;
-        directxDefaultResources.sheenColorTex         = defaultSheenColorTexture;
-        directxDefaultResources.sheenRoughnessTex     = defaultSheenRoughnessTexture;
-        directxDefaultResources.clearcoatTex          = defaultClearcoatTexture;
-        directxDefaultResources.clearcoatRoughnessTex = defaultClearcoatRoughnessTexture;
-        directxDefaultResources.clearcoatNormalTex    = defaultClearcoatNormalTexture;
-        directxDefaultResources.transmissionTex       = defaultTexture; // no dedicated default, white is a no-op
-        directxDefaultResources.thicknessTex          = defaultTexture;
-        directxDefaultResources.iridescenceTex        = defaultTexture;
-        directxDefaultResources.iridescenceThicknessTex = defaultTexture;
-        directxDefaultResources.anisotropicTex        = defaultTexture;
-        directxDefaultResources.materialBufferOffset  = 0;
-        // Real scene-color/opaque-scene texture is not known yet at scene load —
-        // rebuildDirectXCombinedBindGroups() replaces this placeholder every
-        // render() call (see its own doc comment).
-        for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
-            directxDefaultBindGroup[f] = buildDirectXCombinedBindGroup(directxDefaultResources, f, defaultTexture);
-        }
-        // No separate flat shader on DirectX (pipelineFlat aliases pipelineTextured,
-        // matching Vulkan) — reuse the same fully-populated bind groups for both.
-        defaultBindGroup = directxDefaultBindGroup[0];
-        defaultFlatBindGroup = defaultBindGroup;
     }
 #else
     if (!defaultBindGroup && bindGroupLayout && defaultTexture && defaultSampler &&
@@ -2603,7 +2407,7 @@ void Renderer::setScene(uint32_t index) {
     // Per-frame bind groups for lights, camera matrices, environment map,
     // and screen-space refraction source.
     for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
-#if CAMPELLO_RENDERER_VK_BINDINGS
+#if CAMPELLO_RENDERER_PBR_BIND_GROUPS
         ensureVulkanPbrBindGroupLayouts();
         if (!frameBindGroup[f] && vulkanFrameBindGroupLayout &&
             frameResources[f].lightsUniformBuffer &&
@@ -2627,12 +2431,6 @@ void Renderer::setScene(uint32_t index) {
             };
             frameBindGroup[f] = device->createBindGroup(bgDesc);
         }
-#elif defined(_WIN32)
-        // No separate frameBindGroup[] on DirectX — lights/camera/environment are
-        // folded into each material's combined bind group instead (see
-        // ensureDirectXPbrBindGroupLayout()'s doc comment). directxDefaultBindGroup[f]
-        // was already built above; per-material combined bind groups are built in
-        // their own loop below once their textures are known.
 #else
         if (!frameBindGroup[f] && bindGroupLayout &&
             frameResources[f].lightsUniformBuffer &&
@@ -2740,12 +2538,8 @@ void Renderer::setScene(uint32_t index) {
     // ------------------------------------------------------------------
     materialBindGroups.clear();
     flatMaterialBindGroups.clear();
-    directxMaterialResources.clear();
-    directxMaterialBindGroups.clear();
     if (asset->materials && bindGroupLayout) {
         materialBindGroups.resize(asset->materials->size());
-        directxMaterialResources.resize(asset->materials->size());
-        directxMaterialBindGroups.resize(asset->materials->size());
         flatMaterialBindGroups.resize(asset->materials->size());
         for (size_t m = 0; m < asset->materials->size(); ++m) {
             auto &mat = (*asset->materials)[m];
@@ -2915,7 +2709,7 @@ void Renderer::setScene(uint32_t index) {
 
             // Create bind group with all textures and static material buffer.
             // Lights (10) and camera (18) are bound separately via frameBindGroup.
-#if CAMPELLO_RENDERER_VK_BINDINGS
+#if CAMPELLO_RENDERER_PBR_BIND_GROUPS
             ensureVulkanPbrBindGroupLayouts();
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout  = vulkanMaterialBindGroupLayout;
@@ -2948,36 +2742,6 @@ void Renderer::setScene(uint32_t index) {
             // No separate flat shader on Vulkan — reuse the same bind group.
             flatMaterialBindGroups[m] = materialBindGroups[m];
             rememberMaterialBufferBindGroup("scene:" + std::to_string(m), bgDesc, materialBindGroups[m]);
-#elif defined(_WIN32)
-            ensureDirectXPbrBindGroupLayout();
-            DirectXMaterialResources& res = directxMaterialResources[m];
-            res = DirectXMaterialResources{};
-            res.baseColorTex          = baseColorTex;          res.baseColorSamp     = baseColorSamp;
-            res.mrTex                 = mrTex;                 res.mrSamp            = mrSamp;
-            res.normalTex             = normalTex;              res.normalSamp        = normalSamp;
-            res.emissiveTex           = emissiveTex;            res.emissiveSamp      = emissiveSamp;
-            res.occlusionTex          = occlusionTex;           res.occlusionSamp     = occlusionSamp;
-            res.specularTex           = specularTex;            res.specularSamp      = specularSamp;
-            res.specularColorTex      = specularColorTex;       res.specularColorSamp = specularColorSamp;
-            res.sheenColorTex         = sheenColorTex;
-            res.sheenRoughnessTex     = sheenRoughnessTex;
-            res.clearcoatTex          = clearcoatTex;
-            res.clearcoatRoughnessTex = clearcoatRoughnessTex;
-            res.clearcoatNormalTex    = clearcoatNormalTex;
-            res.transmissionTex       = transmissionTex;
-            res.thicknessTex          = thicknessTex;
-            res.iridescenceTex        = iridescenceTex;
-            res.iridescenceThicknessTex = iridescenceThicknessTex;
-            res.anisotropicTex        = anisotropicTex;
-            res.materialBufferOffset  = (uint64_t)(m + 1) * kMaterialUniformStride;
-            // Real scene-color/opaque-scene texture is filled in by
-            // rebuildDirectXCombinedBindGroups() every render() call.
-            for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
-                directxMaterialBindGroups[m][f] = buildDirectXCombinedBindGroup(res, f, defaultTexture);
-            }
-            // No separate flat shader on DirectX — reuse the same bind groups.
-            materialBindGroups[m] = directxMaterialBindGroups[m][0];
-            flatMaterialBindGroups[m] = materialBindGroups[m];
 #else
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout  = bindGroupLayout;
@@ -3969,7 +3733,7 @@ uint64_t Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campell
 #if defined(__EMSCRIPTEN__)
         bindWebGpuTransforms(rpe, transformBuffer, offset);
         firstInstance = webgpuFirstInstance;
-#elif CAMPELLO_RENDERER_VK_BINDINGS
+#elif CAMPELLO_RENDERER_VK_BINDINGS || CAMPELLO_RENDERER_DIRECTX
         if (deform) {
             // The attributes, then the transforms and the instance matrices.
             uint32_t slot = 1;
@@ -3977,7 +3741,7 @@ uint64_t Renderer::encodeShadowPass(const std::shared_ptr<systems::leal::campell
                 rpe->setVertexBuffer(slot++, draw.mesh->vertexBuffers[VERTEX_SLOT_JOINTS], 0);
                 rpe->setVertexBuffer(slot++, draw.mesh->vertexBuffers[VERTEX_SLOT_WEIGHTS], 0);
                 const uint64_t bytes = draw.jointCount > 0 ? (uint64_t)draw.jointCount * 64 : 0;
-                bindVulkanSkin(rpe, draw.jointMatrixBuffer, 0, bytes, draw.jointMatrixBuffer, 0, bytes);
+                bindSkin(rpe, draw.jointMatrixBuffer, 0, bytes, draw.jointMatrixBuffer, 0, bytes);
             }
             rpe->setVertexBuffer(slot++, transformBuffer, offset);
             rpe->setVertexBuffer(slot, draw.instanceTransformBuffer ? draw.instanceTransformBuffer
@@ -4425,7 +4189,7 @@ void Renderer::prewarmMeshPipelines() {
     // The combinations the built-in draw paths use, created now rather than
     // on the first frame that needs them. On Vulkan, the unskinned ones: a
     // skinned draw's pipeline (the skinning stage) is made on first use.
-    constexpr bool skinned = !CAMPELLO_RENDERER_VULKAN;
+    constexpr bool skinned = !CAMPELLO_RENDERER_SPLIT_DEFORM;
     for (const MeshProgram program : {MeshProgram::flat, MeshProgram::textured}) {
         for (const bool doubleSided : {false, true}) {
             for (const bool blend : {false, true}) {
@@ -4466,11 +4230,7 @@ void Renderer::setSectionCaps(bool enabled, float r, float g, float b) {
 }
 
 bool Renderer::supportsClipPlanes() const {
-#if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
-    return false;  // default.hlsl doesn't read the clip block yet
-#else
     return meshRecipe.ready;
-#endif
 }
 
 void Renderer::uploadClipUniforms(const std::shared_ptr<systems::leal::campello_gpu::Buffer>& buffer) const {
@@ -4625,6 +4385,36 @@ void Renderer::renderGBuffer(const RenderScene& scene) {
     // This frame's camera is the next one's previous.
     gbufferPreviousViewProj = scene.camera.projection * scene.camera.view;
     gbufferHistoryValid = true;
+}
+
+// The deforming vertex stages' bind groups (CAMPELLO_RENDERER_SPLIT_DEFORM),
+// read-only storage buffers in the vertex stage:
+// - group 2, skinned draws' joint palettes: this frame's at binding 0, the
+//   previous frame's at 1 (G-buffer motion);
+// - group 3, morph targets: the node's MorphInfo at binding 0, the
+//   primitive's POSITION and NORMAL deltas at 1 and 2.
+// Unskinned pipelines leave them unbound.
+static void ensureDeformBindGroupLayouts(systems::leal::campello_gpu::Device& device,
+                                         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout>& skin,
+                                         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout>& morph) {
+    namespace GPU = systems::leal::campello_gpu;
+    const auto make = [&](std::initializer_list<uint64_t> minSizes) {
+        GPU::BindGroupLayoutDescriptor desc{};
+        uint32_t binding = 0;
+        for (uint64_t minSize : minSizes) {
+            GPU::EntryObject e{};
+            e.binding = binding++;
+            e.visibility = GPU::ShaderStage::vertex;
+            e.type = GPU::EntryObjectType::buffer;
+            e.data.buffer.hasDinamicOffaset = false;
+            e.data.buffer.minBindingSize = minSize;
+            e.data.buffer.type = GPU::EntryObjectBufferType::readOnlyStorage;
+            desc.entries.push_back(e);
+        }
+        return device.createBindGroupLayout(desc);
+    };
+    if (!skin) skin = make({64, 64});       // one joint
+    if (!morph) morph = make({44, 12, 12});  // MorphInfo; one delta
 }
 
 void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat colorFormat) {
@@ -5124,42 +4914,11 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 #if defined(__EMSCRIPTEN__)
     plDesc.bindGroupLayouts.push_back(webgpuDrawBindGroupLayout);
 #else
-    // Set 2: skinned draws' joint palettes (default_skinned.vert,
-    // gbuffer_skinned.vert): this frame's at binding 0, the previous frame's
-    // at 1 (G-buffer motion). Unskinned pipelines leave it unbound.
-    if (!vulkanSkinBindGroupLayout) {
-        GPU::BindGroupLayoutDescriptor skinDesc{};
-        for (uint32_t binding : {0u, 1u}) {
-            GPU::EntryObject e{};
-            e.binding = binding;
-            e.visibility = GPU::ShaderStage::vertex;
-            e.type = GPU::EntryObjectType::buffer;
-            e.data.buffer.hasDinamicOffaset = false;
-            e.data.buffer.minBindingSize = 64;  // one joint
-            e.data.buffer.type = GPU::EntryObjectBufferType::readOnlyStorage;
-            skinDesc.entries.push_back(e);
-        }
-        vulkanSkinBindGroupLayout = device->createBindGroupLayout(skinDesc);
-    }
-    // Set 3: morph targets (the same stages): the node's MorphInfo at
-    // binding 0, the primitive's POSITION and NORMAL deltas at 1 and 2.
-    if (!vulkanMorphBindGroupLayout) {
-        GPU::BindGroupLayoutDescriptor morphDesc{};
-        for (uint32_t binding : {0u, 1u, 2u}) {
-            GPU::EntryObject e{};
-            e.binding = binding;
-            e.visibility = GPU::ShaderStage::vertex;
-            e.type = GPU::EntryObjectType::buffer;
-            e.data.buffer.hasDinamicOffaset = false;
-            e.data.buffer.minBindingSize = binding == 0 ? 44 : 12;  // MorphInfo; one delta
-            e.data.buffer.type = GPU::EntryObjectBufferType::readOnlyStorage;
-            morphDesc.entries.push_back(e);
-        }
-        vulkanMorphBindGroupLayout = device->createBindGroupLayout(morphDesc);
-    }
-    if (vulkanSkinBindGroupLayout && vulkanMorphBindGroupLayout) {
-        plDesc.bindGroupLayouts.push_back(vulkanSkinBindGroupLayout);
-        plDesc.bindGroupLayouts.push_back(vulkanMorphBindGroupLayout);
+    // Sets 2 and 3: skinned and morphed draws' deformation (ensureDeformBindGroupLayouts()).
+    ensureDeformBindGroupLayouts(*device, skinBindGroupLayout, morphBindGroupLayout);
+    if (skinBindGroupLayout && morphBindGroupLayout) {
+        plDesc.bindGroupLayouts.push_back(skinBindGroupLayout);
+        plDesc.bindGroupLayouts.push_back(morphBindGroupLayout);
     }
 #endif
     vulkanDefaultPipelineLayout = device->createPipelineLayout(plDesc);
@@ -5370,7 +5129,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
         // meshPipeline() picks it only for draws with a skin or morph targets.
         const uint32_t skinnedReads =
             standardReads | semanticBit(VertexSemantic::joints) | semanticBit(VertexSemantic::weights);
-        if (vulkanSkinBindGroupLayout && vulkanMorphBindGroupLayout) {
+        if (skinBindGroupLayout && morphBindGroupLayout) {
             if (auto skinnedModule = device->createShaderModule(kDefaultVulkanSkinnedVertShader,
                                                                 kDefaultVulkanSkinnedVertShaderSize)) {
                 programs[kPbrProgram].vertexStages.push_back({skinnedReads, skinnedModule, "main"});
@@ -5415,7 +5174,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
                     {standardReads, gbufferVert, "main"},
                     {semanticBit(VertexSemantic::position), gbufferLean, "main"},
                 };
-                if (vulkanSkinBindGroupLayout && vulkanMorphBindGroupLayout) {
+                if (skinBindGroupLayout && morphBindGroupLayout) {
                     if (auto gbufferSkinned = device->createShaderModule(kDefaultVulkanGBufferSkinnedVertShader,
                                                                          kDefaultVulkanGBufferSkinnedVertShaderSize)) {
                         gbufferProgram.vertexStages.push_back({skinnedReads, gbufferSkinned, "main"});
@@ -5497,7 +5256,7 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             shadowDeformBase = sd;
             shadowDeformBase.vertex.buffers.erase(shadowDeformBase.vertex.buffers.begin());  // the position
             shadowInstancedModule = sd.vertex.module;
-            shadowSkinnedModule = shadowInstancedModule && vulkanSkinBindGroupLayout
+            shadowSkinnedModule = shadowInstancedModule && skinBindGroupLayout
                 ? device->createShaderModule(kDefaultVulkanShadowSkinnedVertShader, kDefaultVulkanShadowSkinnedVertShaderSize)
                 : nullptr;
             shadowInstancedEntry = "main";
@@ -5925,16 +5684,22 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     auto pixelModule = device->createShaderModule(kDefaultDirectXPixelShader, kDefaultDirectXPixelShaderSize);
     if (!vertModule || !pixelModule) return;
 
-    // set 0 = combined per-material + per-frame PBR resources — see
-    // ensureDirectXPbrBindGroupLayout()'s doc comment for why DirectX uses one
-    // combined bind group instead of Vulkan/Metal's material+frame split. An
-    // explicit PipelineLayout is required here for the same reason Vulkan's
-    // branch documents on its own vulkanDefaultPipelineLayout: an empty
-    // fallback root signature fails resource binding rather than erroring at
-    // creation time.
-    ensureDirectXPbrBindGroupLayout();
+    // The PBR pipeline layout, as Vulkan's: group 0 = material, 1 = frame
+    // (ensureVulkanPbrBindGroupLayouts()), 2 = joint palettes, 3 = morph
+    // targets (ensureDeformBindGroupLayouts()). campello_gpu puts group N in
+    // register space N (default.hlsl's spaceN) and maps setBindGroup(N) to
+    // that group's root parameters. An explicit PipelineLayout is required:
+    // an empty fallback root signature fails resource binding rather than
+    // erroring at creation time.
+    ensureVulkanPbrBindGroupLayouts();
+    if (!vulkanMaterialBindGroupLayout || !vulkanFrameBindGroupLayout) return;
     GPU::PipelineLayoutDescriptor plDesc{};
-    plDesc.bindGroupLayouts = { directxPbrBindGroupLayout };
+    plDesc.bindGroupLayouts = { vulkanMaterialBindGroupLayout, vulkanFrameBindGroupLayout };
+    ensureDeformBindGroupLayouts(*device, skinBindGroupLayout, morphBindGroupLayout);
+    if (skinBindGroupLayout && morphBindGroupLayout) {
+        plDesc.bindGroupLayouts.push_back(skinBindGroupLayout);
+        plDesc.bindGroupLayouts.push_back(morphBindGroupLayout);
+    }
     directxPbrPipelineLayout = device->createPipelineLayout(plDesc);
 
     GPU::RenderPipelineDescriptor desc{};
@@ -6004,9 +5769,12 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     // Slot 16 — per-node NodeTransforms{mvp, model}, per-instance, 128 bytes
     // (MVP columns at locations 16-19, MODEL columns at locations 24-27) — the
     // same buffer/layout every backend shares; see default.vert's comment.
+    // Stride 0, as on Vulkan: every instance of a draw reads the draw's
+    // transforms (the binding offset selects them), so instanced draws
+    // (EXT_mesh_gpu_instancing) differ only by their instance matrix.
     {
         GPU::VertexLayout mvpLayout{};
-        mvpLayout.arrayStride = 128; // sizeof(NodeTransforms) = 2 * sizeof(float4x4)
+        mvpLayout.arrayStride = 0;  // one NodeTransforms (128 bytes) per draw
         mvpLayout.stepMode    = GPU::StepMode::instance;
         for (uint32_t col = 0; col < 4; col++) {
             GPU::VertexAttribute attr{};
@@ -6067,23 +5835,163 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
 
     // --- Mesh pipelines: the recipe meshPipeline() builds from ---
     // As on Vulkan: one pixel shader for every program, no blend state yet,
-    // transforms as per-instance attributes after the attribute slots. No lean vertex
-    // shader yet, so VertexLayout::positionOnly() is unsupported here.
+    // transforms as per-instance attributes after the attribute slots. Position-only
+    // meshes (VertexLayout::positionOnly()) take leanVertex, which pixelMain gives
+    // the flat face normal.
     {
         meshRecipe.base = desc;
         meshRecipe.base.vertex.buffers.clear();
         meshRecipe.colorTarget = cs;
         meshRecipe.perDrawBuffers = {{VERTEX_SLOT_MVP, desc.vertex.buffers[VERTEX_SLOT_MVP]}};
+        // EXT_mesh_gpu_instancing: the instance's transform, per instance at
+        // locations 12-15 (vertexMain, gbufferVertex; the identity for draws
+        // without instances), after the transforms, as on Vulkan.
+        {
+            GPU::VertexLayout instances{};
+            instances.arrayStride = 64;
+            instances.stepMode = GPU::StepMode::instance;
+            for (uint32_t col = 0; col < 4; ++col) {
+                GPU::VertexAttribute attr{};
+                attr.componentType = GPU::ComponentType::ctFloat;
+                attr.accessorType = GPU::AccessorType::acVec4;
+                attr.offset = col * 16;
+                attr.shaderLocation = 12 + col;
+                instances.attributes.push_back(attr);
+            }
+            meshRecipe.perDrawBuffers.push_back({VERTEX_SLOT_INSTANCE_MATRIX, instances});
+        }
         const uint32_t standardReads =
             semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::normal) |
             semanticBit(VertexSemantic::texcoord0) | semanticBit(VertexSemantic::tangent) |
             semanticBit(VertexSemantic::color0) | semanticBit(VertexSemantic::texcoord1);
+        // Skinned and morphed draws: vertexSkinned also reads JOINTS_0/WEIGHTS_0,
+        // the joint palette and the morph targets (bind groups 2 and 3);
+        // meshPipeline() picks it only for draws with a skin or morph targets.
+        const uint32_t skinnedReads =
+            standardReads | semanticBit(VertexSemantic::joints) | semanticBit(VertexSemantic::weights);
+        const bool deformLayouts = skinBindGroupLayout && morphBindGroupLayout;
         programs[kPbrProgram].vertexStages.push_back({standardReads, vertModule, "vertexMain"});
+        if (deformLayouts && kDefaultDirectXSkinnedVertShaderSize > 0) {
+            if (auto skinnedModule = device->createShaderModule(kDefaultDirectXSkinnedVertShader, kDefaultDirectXSkinnedVertShaderSize)) {
+                programs[kPbrProgram].vertexStages.push_back({skinnedReads, skinnedModule, "vertexSkinned"});
+            }
+        }
+        if (kDefaultDirectXLeanVertShaderSize > 0) {
+            if (auto leanModule = device->createShaderModule(kDefaultDirectXLeanVertShader, kDefaultDirectXLeanVertShaderSize)) {
+                programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), leanModule, "leanVertex"});
+            }
+        }
+        // Line meshes (lineList/lineStrip): lineVertex, position only.
+        if (kDefaultDirectXLineVertShaderSize > 0) {
+            if (auto lineModule = device->createShaderModule(kDefaultDirectXLineVertShader, kDefaultDirectXLineVertShaderSize)) {
+                programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), lineModule, "lineVertex", true});
+            }
+        }
         programs[kPbrProgram].fragmentModule = pixelModule;
         programs[kPbrProgram].fragmentEntries = {"", "pixelMain", ""};
         meshRecipe.supportsBlend = false;
+        // The G-buffer (renderGBuffer()): gbufferVertex (vertexMain's reads
+        // plus the previous transform, a per-instance buffer: previous clip
+        // from local at locations 20-23, the jitter at 28) and gbufferPixel
+        // (three targets), with the PBR pipeline layout, as on Vulkan.
+        if (kDefaultDirectXGBufferVertShaderSize > 0 && kDefaultDirectXGBufferPixelShaderSize > 0) {
+            auto gbufferVert = device->createShaderModule(kDefaultDirectXGBufferVertShader, kDefaultDirectXGBufferVertShaderSize);
+            auto gbufferPixel = device->createShaderModule(kDefaultDirectXGBufferPixelShader, kDefaultDirectXGBufferPixelShaderSize);
+            if (gbufferVert && gbufferPixel) {
+                GPU::VertexLayout previous{};
+                previous.arrayStride = 0;  // one GBufferTransforms per draw, as the transforms
+                previous.stepMode = GPU::StepMode::instance;
+                for (uint32_t col = 0; col < 5; ++col) {
+                    GPU::VertexAttribute attr{};
+                    attr.componentType = GPU::ComponentType::ctFloat;
+                    attr.accessorType = GPU::AccessorType::acVec4;
+                    attr.offset = col * 16;  // previousMvp columns, then the jitter
+                    attr.shaderLocation = col < 4 ? 20 + col : 28;
+                    previous.attributes.push_back(attr);
+                }
+                meshRecipe.gbufferPreviousTransforms = previous;
+                gbufferProgram.name = "gbuffer";
+                gbufferProgram.vertexStages = {{standardReads, gbufferVert, "gbufferVertex"}};
+                if (deformLayouts && kDefaultDirectXGBufferSkinnedVertShaderSize > 0) {
+                    if (auto gbufferSkinned = device->createShaderModule(kDefaultDirectXGBufferSkinnedVertShader,
+                                                                         kDefaultDirectXGBufferSkinnedVertShaderSize)) {
+                        gbufferProgram.vertexStages.push_back({skinnedReads, gbufferSkinned, "gbufferSkinnedVertex"});
+                    }
+                }
+                if (auto gbufferLean = device->createShaderModule(kDefaultDirectXGBufferLeanVertShader,
+                                                                  kDefaultDirectXGBufferLeanVertShaderSize)) {
+                    gbufferProgram.vertexStages.push_back({semanticBit(VertexSemantic::position), gbufferLean, "gbufferLeanVertex"});
+                }
+                gbufferProgram.fragmentModule = gbufferPixel;
+                gbufferProgram.fragmentEntries = {"", "gbufferPixel", ""};
+            }
+        }
         meshRecipe.ready = true;
         prewarmMeshPipelines();
+    }
+
+    // --- Sun shadows: depth only, with shadowVertex (as Vulkan's shadow.vert) ---
+    // The shadow pass binds a second set of per-draw transforms whose "mvp"
+    // is the light's view-projection times the model matrix, then the
+    // instance matrices (the identity for plain casters). No pixel shader or
+    // colour targets; no culling (mixed winding), slope-scaled bias; the
+    // receiver bias is in shadowLookup().
+    if (kDefaultDirectXShadowVertShaderSize > 0) {
+        GPU::RenderPipelineDescriptor sd{};
+        GPU::VertexLayout positions{};
+        positions.arrayStride = 12;
+        positions.stepMode = GPU::StepMode::vertex;
+        GPU::VertexAttribute position{};
+        position.componentType = GPU::ComponentType::ctFloat;
+        position.accessorType = GPU::AccessorType::acVec3;
+        position.offset = 0;
+        position.shaderLocation = 0;
+        positions.attributes.push_back(position);
+        sd.vertex.buffers.push_back(positions);
+        sd.vertex.module = device->createShaderModule(kDefaultDirectXShadowVertShader, kDefaultDirectXShadowVertShaderSize);
+        sd.vertex.entryPoint = "shadowVertex";
+        for (uint32_t logical : {(uint32_t)VERTEX_SLOT_MVP, (uint32_t)VERTEX_SLOT_INSTANCE_MATRIX}) {
+            for (const auto& [slot, buffer] : meshRecipe.perDrawBuffers) {
+                if (slot == logical) sd.vertex.buffers.push_back(buffer);
+            }
+        }
+        if (sd.vertex.buffers.size() != 3) sd.vertex.module = nullptr;
+        sd.layout = directxPbrPipelineLayout;
+        GPU::DepthStencilDescriptor shadowDs = ds;
+        shadowDs.depthBias = 2.0;
+        shadowDs.depthBiasSlopeScale = 2.0;
+        shadowDs.depthBiasClamp = 0.01;
+        sd.depthStencil = shadowDs;
+        sd.topology = GPU::PrimitiveTopology::triangleList;
+        sd.cullMode = GPU::CullMode::none;
+        sd.frontFace = GPU::FrontFace::ccw;
+        if (sd.vertex.module && sd.layout) {
+            shadowPipeline = device->createRenderPipeline(sd);
+        }
+        // Casters with instances or a skin (shadowDeformPipeline()):
+        // shadowVertex / shadowSkinnedVertex with the same state; their vertex
+        // buffers are the attributes, then the transforms and the instance
+        // matrices. The skin's palette is bind group 2 of the PBR layout.
+        if (shadowPipeline) {
+            shadowDeformBase = sd;
+            shadowDeformBase.vertex.buffers.erase(shadowDeformBase.vertex.buffers.begin());  // the position
+            shadowInstancedModule = sd.vertex.module;
+            shadowSkinnedModule = skinBindGroupLayout && kDefaultDirectXShadowSkinnedVertShaderSize > 0
+                ? device->createShaderModule(kDefaultDirectXShadowSkinnedVertShader, kDefaultDirectXShadowSkinnedVertShaderSize)
+                : nullptr;
+            shadowInstancedEntry = "shadowVertex";
+            shadowSkinnedEntry = "shadowSkinnedVertex";
+            shadowDeformPipelines.clear();
+        }
+    }
+
+    // --- Ambient occlusion (setAmbientOcclusion()): ssaoPixel / ssaoApplyPixel ---
+    if (kDefaultDirectXSsaoPixelShaderSize > 0 && kDefaultDirectXSsaoApplyPixelShaderSize > 0) {
+        createAmbientOcclusionPipelines(
+            device->createShaderModule(kDefaultDirectXFxaaVertShader, kDefaultDirectXFxaaVertShaderSize), "fxaaVertex",
+            device->createShaderModule(kDefaultDirectXSsaoPixelShader, kDefaultDirectXSsaoPixelShaderSize), "ssaoPixel",
+            device->createShaderModule(kDefaultDirectXSsaoApplyPixelShader, kDefaultDirectXSsaoApplyPixelShaderSize),
+            "ssaoApplyPixel", colorFormat);
     }
 
     // --- FXAA post-process pipeline (DirectX) ---
@@ -6156,6 +6064,69 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
                 fxaaDesc.layout = directxFxaaPipelineLayout;
 
                 pipelineFxaa = device->createRenderPipeline(fxaaDesc);
+            }
+        }
+    }
+
+    // --- TAA resolve pipeline (DirectX; taaPixel): current (t0), history
+    //     (t1), motion (t2), sampler (s3), uniforms (b4) — the same binding
+    //     numbers as Vulkan's layout, each in its own register space — and two
+    //     targets, the output and the next history. ---
+    {
+        if (!taaBindGroupLayout) {
+            GPU::BindGroupLayoutDescriptor tgl{};
+            for (uint32_t binding = 0; binding < 3; ++binding) {
+                GPU::EntryObject t{};
+                t.binding = binding;
+                t.visibility = GPU::ShaderStage::fragment;
+                t.type = GPU::EntryObjectType::texture;
+                t.data.texture.multisampled = false;
+                t.data.texture.sampleType = GPU::EntryObjectTextureType::ttFloat;
+                t.data.texture.viewDimension = GPU::TextureType::tt2d;
+                tgl.entries.push_back(t);
+            }
+            GPU::EntryObject sampler{};
+            sampler.binding = 3;
+            sampler.visibility = GPU::ShaderStage::fragment;
+            sampler.type = GPU::EntryObjectType::sampler;
+            sampler.data.sampler.type = GPU::EntryObjectSamplerType::filtering;
+            tgl.entries.push_back(sampler);
+            GPU::EntryObject buffer{};
+            buffer.binding = 4;
+            buffer.visibility = GPU::ShaderStage::fragment;
+            buffer.type = GPU::EntryObjectType::buffer;
+            buffer.data.buffer.hasDinamicOffaset = false;
+            buffer.data.buffer.minBindingSize = 32;
+            buffer.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+            tgl.entries.push_back(buffer);
+            taaBindGroupLayout = device->createBindGroupLayout(tgl);
+        }
+        if (taaBindGroupLayout && kDefaultDirectXFxaaVertShaderSize > 0 && kDefaultDirectXTaaPixelShaderSize > 0) {
+            auto taaVertModule = device->createShaderModule(kDefaultDirectXFxaaVertShader, kDefaultDirectXFxaaVertShaderSize);
+            auto taaPixelModule = device->createShaderModule(kDefaultDirectXTaaPixelShader, kDefaultDirectXTaaPixelShaderSize);
+            if (taaVertModule && taaPixelModule) {
+                GPU::RenderPipelineDescriptor taaDesc{};
+                taaDesc.vertex.module = taaVertModule;
+                taaDesc.vertex.entryPoint = "fxaaVertex";
+                taaDesc.topology = GPU::PrimitiveTopology::triangleList;
+                taaDesc.cullMode = GPU::CullMode::none;
+                taaDesc.frontFace = GPU::FrontFace::ccw;
+                GPU::FragmentDescriptor taaFrag{};
+                taaFrag.module = taaPixelModule;
+                taaFrag.entryPoint = "taaPixel";
+                for (int k = 0; k < 2; ++k) {
+                    GPU::ColorState target{};
+                    target.format = colorFormat;
+                    target.writeMask = GPU::ColorWrite::all;
+                    taaFrag.targets.push_back(target);
+                }
+                taaDesc.fragment = taaFrag;
+                GPU::PipelineLayoutDescriptor taaPlDesc{};
+                taaPlDesc.bindGroupLayouts = {taaBindGroupLayout};
+                directxTaaPipelineLayout = device->createPipelineLayout(taaPlDesc);
+                taaDesc.layout = directxTaaPipelineLayout;
+                pipelineTaa = device->createRenderPipeline(taaDesc);
+                taaHistoryValid = false;
             }
         }
     }
@@ -7487,10 +7458,15 @@ void Renderer::renderToTarget(
     // Keep binding 22 as the safe placeholder here; we will switch it to
     // opaqueSceneTexture right before the transparent pass so the opaque
     // pass does not trigger a Metal read-write conflict.
-#if CAMPELLO_RENDERER_VK_BINDINGS
+#if CAMPELLO_RENDERER_PBR_BIND_GROUPS
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
-        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
+        // The scene colour placeholder for the opaque passes. On DirectX the default
+        // texture: sceneColorTexture can be this pass's colour attachment (TAA, FXAA,
+        // SSAA) and D3D12 rejects a render target bound as a shader resource.
+        // Transmissive draws get the opaque scene copy before the transparent pass.
+        std::shared_ptr<GPU::Texture> scTex = (CAMPELLO_RENDERER_DIRECTX || !sceneColorTexture[currentFrameIndex])
+                                                  ? defaultTexture : sceneColorTexture[currentFrameIndex];
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
@@ -7508,11 +7484,6 @@ void Renderer::renderToTarget(
             {11, shadowMapNearBinding()},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
-    }
-#elif defined(_WIN32)
-    {
-        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
-        rebuildDirectXCombinedBindGroups(currentFrameIndex, scTex);
     }
 #else
     if (bindGroupLayout && frameBindGroup[currentFrameIndex]) {
@@ -7779,7 +7750,7 @@ void Renderer::renderToTarget(
         // Switch binding 22 to the mipmapped opaque scene texture so
         // transmissive materials can sample it without conflicting with
         // the color attachment (which is sceneColorView or colorView).
-#if CAMPELLO_RENDERER_VK_BINDINGS
+#if CAMPELLO_RENDERER_PBR_BIND_GROUPS
         if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture[currentFrameIndex] &&
             environmentMap && environmentSampler && fxaaSampler) {
             GPU::BindGroupDescriptor bgDesc{};
@@ -7799,10 +7770,6 @@ void Renderer::renderToTarget(
                 {11, shadowMapNearBinding()},
             };
             frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
-        }
-#elif defined(_WIN32)
-        if (opaqueSceneTexture[currentFrameIndex]) {
-            rebuildDirectXCombinedBindGroups(currentFrameIndex, opaqueSceneTexture[currentFrameIndex]);
         }
 #else
         if (bindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture[currentFrameIndex]) {
@@ -8303,7 +8270,7 @@ void Renderer::renderPrimitive(
                          frameResources[currentFrameIndex].jointMatrixBuffer;
     const auto morphData = morphBuffers.find(&primitive);
     const bool hasMorph = morphData != morphBuffers.end() && morphData->second.positionDeltas;
-    const bool skinnedStage = !CAMPELLO_RENDERER_VULKAN || hasSkin || hasMorph;
+    const bool skinnedStage = !CAMPELLO_RENDERER_SPLIT_DEFORM || hasSkin || hasMorph;
     const MeshPipelineEntry* entry = debugView
         ? meshPipeline(MeshProgram::debug, *layout, false, false, skinnedStage)
         : meshPipeline((hasTexture || clipping) ? MeshProgram::textured : MeshProgram::flat, *layout,
@@ -8341,20 +8308,6 @@ void Renderer::renderPrimitive(
     bool needsTextures = (wantedVariant == 2 || wantedVariant == 5 ||
                           wantedVariant == 7 || wantedVariant == 9) ||
                           sharesFlatAndTexturedPipeline;
-#if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
-    // DirectX: a single combined bind group already carries lights/camera/
-    // environment alongside the material — no separate setBindGroup(1, ...)
-    // call (and no textured-vs-flat split, matching pipelineFlat aliasing
-    // pipelineTextured above) — see ensureDirectXPbrBindGroupLayout()'s doc
-    // comment.
-    (void)needsTextures;
-    std::shared_ptr<systems::leal::campello_gpu::BindGroup> bg = directxDefaultBindGroup[currentFrameIndex];
-    if (matIdx >= 0 && (size_t)matIdx < directxMaterialBindGroups.size() &&
-        directxMaterialBindGroups[matIdx][currentFrameIndex]) {
-        bg = directxMaterialBindGroups[matIdx][currentFrameIndex];
-    }
-    if (bg) setMeshBindGroup(rpe, 0, bg);
-#else
     if (needsTextures) {
         std::shared_ptr<systems::leal::campello_gpu::BindGroup> bg = defaultBindGroup;
         if (matIdx >= 0 && (size_t)matIdx < materialBindGroups.size() && materialBindGroups[matIdx]) {
@@ -8374,7 +8327,6 @@ void Renderer::renderPrimitive(
         }
         if (bg) setMeshBindGroup(rpe, 0, bg);
     }
-#endif
 
     // --- 5. Bind transform matrices for this node ---
     // Buffer contains: MVP (64 bytes) + Model (64 bytes) = 128 bytes per node.
@@ -8419,23 +8371,23 @@ void Renderer::renderPrimitive(
         bindMeshBuffer(
             rpe, VERTEX_SLOT_JOINT_MATRICES, defaultJointMatrixBuffer, 0);
     }
-#if CAMPELLO_RENDERER_VULKAN
+#if CAMPELLO_RENDERER_SPLIT_DEFORM
     if (entry->skinned) {
         if (hasSkin) {
             const auto& sd = skinData[(size_t)nodeSkin];
             const auto& joints = frameResources[currentFrameIndex].jointMatrixBuffer;
-            bindVulkanSkin(rpe, joints, sd.gpuOffset, sd.jointCount * 64, joints, sd.gpuOffset, sd.jointCount * 64);
+            bindSkin(rpe, joints, sd.gpuOffset, sd.jointCount * 64, joints, sd.gpuOffset, sd.jointCount * 64);
         } else {
-            bindVulkanSkin(rpe, defaultJointMatrixBuffer, 0, 64, defaultJointMatrixBuffer, 0, 64);
+            bindSkin(rpe, defaultJointMatrixBuffer, 0, 64, defaultJointMatrixBuffer, 0, 64);
         }
         // Set 3: the morph targets with the node's weights, or none.
         const auto weights = morphNodeUniformBuffers.find(nodeIndex);
         if (hasMorph && weights != morphNodeUniformBuffers.end() && weights->second) {
             const auto& deltas = morphData->second;
-            bindVulkanMorph(rpe, weights->second, deltas.positionDeltas,
+            bindMorph(rpe, weights->second, deltas.positionDeltas,
                             deltas.normalDeltas ? deltas.normalDeltas : deltas.positionDeltas);
         } else {
-            bindVulkanMorph(rpe, defaultMorphInfoBuffer, fallbackTangentBuffer, fallbackTangentBuffer);
+            bindMorph(rpe, defaultMorphInfoBuffer, fallbackTangentBuffer, fallbackTangentBuffer);
         }
     }
 #endif
@@ -10261,7 +10213,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     }
 
     // --- Create bind groups ---
-#if CAMPELLO_RENDERER_VK_BINDINGS
+#if CAMPELLO_RENDERER_PBR_BIND_GROUPS
     ensureVulkanPbrBindGroupLayouts();
     GPU::BindGroupDescriptor bgDesc{};
     bgDesc.layout  = vulkanMaterialBindGroupLayout;
@@ -10294,31 +10246,6 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     // No separate flat shader on Vulkan — reuse the same bind group.
     auto flatBindGroup = bindGroup;
     rememberMaterialBufferBindGroup("slot:" + std::to_string(uniformSlot), bgDesc, bindGroup);
-#elif defined(_WIN32)
-    ensureDirectXPbrBindGroupLayout();
-    DirectXMaterialResources dxRes{};
-    dxRes.baseColorTex          = baseColorTex;          dxRes.baseColorSamp     = baseColorSamp;
-    dxRes.mrTex                 = mrTex;                 dxRes.mrSamp            = mrSamp;
-    dxRes.normalTex             = normalTex;              dxRes.normalSamp        = normalSamp;
-    dxRes.emissiveTex           = emissiveTex;            dxRes.emissiveSamp      = emissiveSamp;
-    dxRes.occlusionTex          = occlusionTex;           dxRes.occlusionSamp     = occlusionSamp;
-    dxRes.specularTex           = specularTex;            dxRes.specularSamp      = specularSamp;
-    dxRes.specularColorTex      = specularColorTex;       dxRes.specularColorSamp = specularColorSamp;
-    dxRes.sheenColorTex         = sheenColorTex;
-    dxRes.sheenRoughnessTex     = sheenRoughnessTex;
-    dxRes.clearcoatTex          = clearcoatTex;
-    dxRes.clearcoatRoughnessTex = clearcoatRoughnessTex;
-    dxRes.clearcoatNormalTex    = clearcoatNormalTex;
-    dxRes.transmissionTex       = transmissionTex;
-    dxRes.thicknessTex          = thicknessTex;
-    dxRes.iridescenceTex        = iridescenceTex;
-    dxRes.iridescenceThicknessTex = iridescenceThicknessTex;
-    dxRes.anisotropicTex        = anisotropicTex;
-    dxRes.materialBufferOffset  = (uint64_t)uniformSlot * kMaterialUniformStride;
-    // mat->bindGroup/flatBindGroup are unused on DirectX (drawDrawCall() reads
-    // mat->directxBindGroup[frameIndex] instead — see the assignment below).
-    std::shared_ptr<GPU::BindGroup> bindGroup;
-    std::shared_ptr<GPU::BindGroup> flatBindGroup;
 #else
     GPU::BindGroupDescriptor bgDesc{};
     bgDesc.layout  = bindGroupLayout;
@@ -10386,14 +10313,6 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     if (material.normalTexture && normalTex != defaultTexture) mat->normalTexture = normalTex;
     if (mrTex != defaultTexture) mat->metallicRoughnessTexture = mrTex;
 
-#if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
-    // Real scene-color/opaque-scene texture is filled in by
-    // rebuildDirectXCombinedBindGroups() every render(RenderScene, ...) call.
-    for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
-        mat->directxBindGroup[f] = buildDirectXCombinedBindGroup(dxRes, f, defaultTexture);
-    }
-    directxEcsMaterialResources[mat.get()] = dxRes;
-#endif
 
     GpuMaterial* result = mat.get();
     if (sceneAsset && materialIndex >= 0) {
@@ -10544,10 +10463,15 @@ void Renderer::render(const RenderScene& scene,
     }
 
     // Update per-frame bind group (lights + camera + placeholder texture).
-#if CAMPELLO_RENDERER_VK_BINDINGS
+#if CAMPELLO_RENDERER_PBR_BIND_GROUPS
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
-        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
+        // The scene colour placeholder for the opaque passes. On DirectX the default
+        // texture: sceneColorTexture can be this pass's colour attachment (TAA, FXAA,
+        // SSAA) and D3D12 rejects a render target bound as a shader resource.
+        // Transmissive draws get the opaque scene copy before the transparent pass.
+        std::shared_ptr<GPU::Texture> scTex = (CAMPELLO_RENDERER_DIRECTX || !sceneColorTexture[currentFrameIndex])
+                                                  ? defaultTexture : sceneColorTexture[currentFrameIndex];
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
@@ -10565,11 +10489,6 @@ void Renderer::render(const RenderScene& scene,
             {11, shadowMapNearBinding()},
         };
         frameBindGroup[currentFrameIndex] = device->createBindGroup(bgDesc);
-    }
-#elif defined(_WIN32)
-    {
-        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
-        rebuildDirectXCombinedBindGroups(currentFrameIndex, scTex);
     }
 #else
     if (bindGroupLayout && frameBindGroup[currentFrameIndex]) {
@@ -11055,10 +10974,15 @@ void Renderer::render(const RenderScene& scene,
     bool useIntermediate = useSsaa || useFxaa || useTaa;
 
     // Update per-frame bind group (lights + camera + placeholder texture).
-#if CAMPELLO_RENDERER_VK_BINDINGS
+#if CAMPELLO_RENDERER_PBR_BIND_GROUPS
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
-        std::shared_ptr<GPU::Texture> scTex = sceneColorTexture[currentFrameIndex] ? sceneColorTexture[currentFrameIndex] : defaultTexture;
+        // The scene colour placeholder for the opaque passes. On DirectX the default
+        // texture: sceneColorTexture can be this pass's colour attachment (TAA, FXAA,
+        // SSAA) and D3D12 rejects a render target bound as a shader resource.
+        // Transmissive draws get the opaque scene copy before the transparent pass.
+        std::shared_ptr<GPU::Texture> scTex = (CAMPELLO_RENDERER_DIRECTX || !sceneColorTexture[currentFrameIndex])
+                                                  ? defaultTexture : sceneColorTexture[currentFrameIndex];
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
@@ -11368,7 +11292,7 @@ void Renderer::render(const RenderScene& scene,
         }
 
         // Switch binding 22 to the mipmapped opaque scene texture for transmission.
-#if CAMPELLO_RENDERER_VK_BINDINGS
+#if CAMPELLO_RENDERER_PBR_BIND_GROUPS
         if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] && opaqueSceneTexture[currentFrameIndex] &&
             environmentMap && environmentSampler && fxaaSampler) {
             GPU::BindGroupDescriptor bgDesc{};
@@ -11805,13 +11729,13 @@ void Renderer::render(const RenderScene& scene,
 }
 
 
-#if CAMPELLO_RENDERER_VULKAN
-void Renderer::bindVulkanSkin(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+#if CAMPELLO_RENDERER_SPLIT_DEFORM
+void Renderer::bindSkin(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
                               const std::shared_ptr<systems::leal::campello_gpu::Buffer> &current, uint64_t currentOffset,
                               uint64_t currentSize, const std::shared_ptr<systems::leal::campello_gpu::Buffer> &previous,
                               uint64_t previousOffset, uint64_t previousSize) {
     namespace GPU = systems::leal::campello_gpu;
-    if (!vulkanSkinBindGroupLayout || !current || !previous) return;
+    if (!skinBindGroupLayout || !current || !previous) return;
     const auto range = [](const std::shared_ptr<GPU::Buffer>& buffer, uint64_t offset, uint64_t size) {
         const uint64_t length = buffer->getLength();
         if (offset >= length) return (uint64_t)0;
@@ -11827,52 +11751,52 @@ void Renderer::bindVulkanSkin(const std::shared_ptr<systems::leal::campello_gpu:
     }
     // A cached group is only reused while its buffers are the same live ones
     // (an address can be reused by a new buffer once the old one is gone).
-    auto it = vulkanSkinBindGroups.find(key);
-    if (it == vulkanSkinBindGroups.end() || it->second.current.lock() != current ||
+    auto it = skinBindGroups.find(key);
+    if (it == skinBindGroups.end() || it->second.current.lock() != current ||
         it->second.previous.lock() != previous) {
-        if (vulkanSkinBindGroups.size() > 256) vulkanSkinBindGroups.clear();
+        if (skinBindGroups.size() > 256) skinBindGroups.clear();
         GPU::BindGroupDescriptor desc{};
-        desc.layout = vulkanSkinBindGroupLayout;
+        desc.layout = skinBindGroupLayout;
         desc.entries = {{0, GPU::BufferBinding{current, currentOffset, currentSize}},
                         {1, GPU::BufferBinding{previous, previousOffset, previousSize}}};
         auto group = device->createBindGroup(desc);
         if (!group) return;
-        it = vulkanSkinBindGroups.insert_or_assign(key, VulkanSkinBindGroup{current, previous, group}).first;
+        it = skinBindGroups.insert_or_assign(key, SkinBindGroup{current, previous, group}).first;
     }
     setMeshBindGroup(rpe, 2, it->second.group);
 }
 
-void Renderer::bindVulkanMorph(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+void Renderer::bindMorph(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
                                const std::shared_ptr<systems::leal::campello_gpu::Buffer> &info,
                                const std::shared_ptr<systems::leal::campello_gpu::Buffer> &positions,
                                const std::shared_ptr<systems::leal::campello_gpu::Buffer> &normals) {
     namespace GPU = systems::leal::campello_gpu;
-    if (!vulkanMorphBindGroupLayout || !info || !positions || !normals) return;
+    if (!morphBindGroupLayout || !info || !positions || !normals) return;
     uint64_t key = 0;
     for (const auto* buffer : {info.get(), positions.get(), normals.get()}) {
         key ^= std::hash<uint64_t>{}((uint64_t)(uintptr_t)buffer) + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
     }
-    // Reused only while its buffers are the same live ones (bindVulkanSkin()).
-    auto it = vulkanMorphBindGroups.find(key);
-    if (it == vulkanMorphBindGroups.end() || it->second.info.lock() != info ||
+    // Reused only while its buffers are the same live ones (bindSkin()).
+    auto it = morphBindGroups.find(key);
+    if (it == morphBindGroups.end() || it->second.info.lock() != info ||
         it->second.positions.lock() != positions || it->second.normals.lock() != normals) {
-        if (vulkanMorphBindGroups.size() > 1024) vulkanMorphBindGroups.clear();
+        if (morphBindGroups.size() > 1024) morphBindGroups.clear();
         GPU::BindGroupDescriptor desc{};
-        desc.layout = vulkanMorphBindGroupLayout;
+        desc.layout = morphBindGroupLayout;
         desc.entries = {{0, GPU::BufferBinding{info, 0, info->getLength()}},
                         {1, GPU::BufferBinding{positions, 0, positions->getLength()}},
                         {2, GPU::BufferBinding{normals, 0, normals->getLength()}}};
         auto group = device->createBindGroup(desc);
         if (!group) return;
-        it = vulkanMorphBindGroups.insert_or_assign(key, VulkanMorphBindGroup{info, positions, normals, group}).first;
+        it = morphBindGroups.insert_or_assign(key, MorphBindGroup{info, positions, normals, group}).first;
     }
     setMeshBindGroup(rpe, 3, it->second.group);
 }
 #else
-void Renderer::bindVulkanSkin(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &,
+void Renderer::bindSkin(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &,
                               const std::shared_ptr<systems::leal::campello_gpu::Buffer> &, uint64_t, uint64_t,
                               const std::shared_ptr<systems::leal::campello_gpu::Buffer> &, uint64_t, uint64_t) {}
-void Renderer::bindVulkanMorph(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &,
+void Renderer::bindMorph(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &,
                                const std::shared_ptr<systems::leal::campello_gpu::Buffer> &,
                                const std::shared_ptr<systems::leal::campello_gpu::Buffer> &,
                                const std::shared_ptr<systems::leal::campello_gpu::Buffer> &) {}
@@ -11911,7 +11835,7 @@ void Renderer::renderPrimitive(
     const bool wideLines = draw.mesh->wideLines;
     // Vulkan takes the skinning vertex stage only for draws with joints
     // (step 6 binds them); Metal's one stage does both.
-    const bool skinnedStage = !CAMPELLO_RENDERER_VULKAN || draw.jointMatrixBuffer || draw.previousJointMatrixBuffer;
+    const bool skinnedStage = !CAMPELLO_RENDERER_SPLIT_DEFORM || draw.jointMatrixBuffer || draw.previousJointMatrixBuffer;
     const MeshPipelineEntry* entry = wideLines
         ? meshPipeline(program, MeshProgram::textured, layout, true, true, colorFormat, draw.mesh->topology, true)
         : debugView
@@ -11944,15 +11868,6 @@ void Renderer::renderPrimitive(
 
     // --- 2. Bind bind groups ---
     bool needsTextures = !debugView;
-#if defined(_WIN32) && !defined(ANDROID) && !defined(__linux__)
-    // DirectX: single combined bind group — see renderPrimitive()'s identical
-    // branch / ensureDirectXPbrBindGroupLayout()'s doc comment.
-    (void)needsTextures;
-    auto bg = draw.material->directxBindGroup[currentFrameIndex]
-        ? draw.material->directxBindGroup[currentFrameIndex]
-        : directxDefaultBindGroup[currentFrameIndex];
-    if (bg) setMeshBindGroup(rpe, 0, bg);
-#else
     if (needsTextures) {
         auto bg = draw.material->bindGroup ? draw.material->bindGroup : defaultBindGroup;
         if (bg) setMeshBindGroup(rpe, 0, bg);
@@ -11963,7 +11878,6 @@ void Renderer::renderPrimitive(
         auto bg = draw.material->flatBindGroup ? draw.material->flatBindGroup : defaultFlatBindGroup;
         if (bg) setMeshBindGroup(rpe, 0, bg);
     }
-#endif
 
     // --- 3. Bind transform ---
     if (transformBuffer) {
@@ -12009,7 +11923,7 @@ void Renderer::renderPrimitive(
     } else if (defaultJointMatrixBuffer) {
         bindMeshBuffer(rpe, VERTEX_SLOT_JOINT_MATRICES, defaultJointMatrixBuffer, 0);
     }
-#if CAMPELLO_RENDERER_VULKAN
+#if CAMPELLO_RENDERER_SPLIT_DEFORM
     if (entry->skinned) {
         // Set 2: this frame's palette and (G-buffer motion) the previous
         // one, which is this frame's when the draw has none.
@@ -12018,9 +11932,9 @@ void Renderer::renderPrimitive(
                                                               : defaultJointMatrixBuffer;
         const auto& previousJoints = draw.previousJointMatrixBuffer ? draw.previousJointMatrixBuffer : joints;
         const uint64_t bytes = draw.jointCount > 0 ? (uint64_t)draw.jointCount * 64 : 0;
-        bindVulkanSkin(rpe, joints, 0, joints == defaultJointMatrixBuffer ? 64 : bytes, previousJoints, 0,
+        bindSkin(rpe, joints, 0, joints == defaultJointMatrixBuffer ? 64 : bytes, previousJoints, 0,
                        previousJoints == defaultJointMatrixBuffer ? 64 : bytes);
-        bindVulkanMorph(rpe, defaultMorphInfoBuffer, fallbackTangentBuffer, fallbackTangentBuffer);  // no morphs
+        bindMorph(rpe, defaultMorphInfoBuffer, fallbackTangentBuffer, fallbackTangentBuffer);  // no morphs
     }
 #endif
 

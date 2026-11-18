@@ -51,17 +51,12 @@
 // shaders/vulkan/skybox.frag's header comment.
 //
 // --- Resource binding scheme --------------------------------------------------------------
-// D3D12 (like Metal, unlike Vulkan) gives textures/samplers/buffers independent register
-// namespaces (t#/s#/b#), so a single combined bind group is used for *all* per-material and
-// per-frame PBR resources (see Renderer::ensureDirectXPbrBindGroupLayout() in
-// campello_renderer.cpp) — material bindings reuse the same numbers as
-// shaders/vulkan/default.frag's material set (0-24); frame bindings (lights/camera/
-// environment/IBL) are offset to start at 30 purely to guarantee no accidental overlap,
-// since campello_gpu's D3D12 backend places every bind group's ranges in the same
-// RegisterSpace(0) — see that method's own comment for why campello_renderer.cpp does NOT
-// use Vulkan's separate material+frame bind *groups* here (a real root-signature-index bug
-// in campello_gpu's D3D12 backend when more than one bind group with samplers is used per
-// draw), even though the register numbering below is otherwise modeled on Vulkan's.
+// The PBR pipeline's bind groups are Vulkan's (ensureVulkanPbrBindGroupLayouts() in
+// campello_renderer.cpp): group 0 = material (built once per material), group 1 = frame
+// (lights, camera, environment, scene colour, shadows), group 2 = joint palettes, group 3 =
+// morph targets. campello_gpu's D3D12 backend puts group N in register space N, so each
+// group's registers below are its Vulkan binding numbers in spaceN (t/s/b by resource type:
+// D3D12 gives textures, samplers and buffers separate register namespaces).
 //
 // Compile on Windows with DXC — see build_directx_shaders.ps1 for the full per-entry-point
 // invocation list and src/shaders/directx_default.h regeneration.
@@ -102,7 +97,7 @@ float3 linearToSRGBFast(float3 color) {
 }
 
 // ---------------------------------------------------------------------------
-// Main PBR pipeline — resources (combined bind group; see header comment above)
+// Main PBR pipeline — resources (material and frame bind groups; see header comment above)
 // ---------------------------------------------------------------------------
 
 // --- Material (buffer 24) -------------------------------------------------------------
@@ -128,7 +123,7 @@ cbuffer MaterialUniforms : register(b24) {
     float hasEmissiveTexture;         // 76
     float hasOcclusionTexture;        // 80
     float occlusionStrength;          // 84
-    float _pad0;                      // 88
+    float doubleSided;                // 88: 1 = double-sided material (no section cap)
     float _pad1;                      // 92
     float4 emissiveFactor;            // 96
     float ior;                        // 112
@@ -175,22 +170,22 @@ cbuffer MaterialUniforms : register(b24) {
     float anisotropyRotation;         // 312
     float hasAnisotropicTexture;      // 316
     float dispersion;                 // 320
-    float _pad12;                     // 324
-    float _pad13;                     // 328
+    float worldMapping;               // 324  world-space box mapping: world units per repeat (0: off; G-buffer only here)
+    float worldMappingUp;             // 328  1: z up, 0: y up
     float _pad14;                     // 332
     float4 normalUvTransformRow0;     // 336  independent KHR_texture_transform for normalTexture
     float4 normalUvTransformRow1;     // 352
     float texCoord1Mask;              // 368
 };
 
-// --- Per-frame (buffers 30/31) --------------------------------------------------------
+// --- Per-frame (bind group 1, space1: buffers 0/1) ---------------------------------------
 struct Light {
     float4 position;   // xyz = position/dir, w = type (0=dir, 1=point, 2=spot)
     float4 color;      // xyz = rgb, w = intensity
     float4 direction;  // xyz = spot dir, w = range
-    float4 spotAngles; // x = innerCone, y = outerCone, zw = padding
+    float4 spotAngles; // x = innerCone, y = outerCone, z = casts the shadow map
 };
-cbuffer LightsUniform : register(b30) {
+cbuffer LightsUniform : register(b0, space1) {
     uint  lightCount;
     uint  _lpad0;
     uint  _lpad1;
@@ -198,12 +193,24 @@ cbuffer LightsUniform : register(b30) {
     Light lights[4];
 };
 
-cbuffer CameraUniforms : register(b31) {
+// Byte-exact mirror of default.frag's CameraUniforms (kCameraUniformSize, 464
+// bytes); HLSL cbuffer packing matches std140 for these members.
+cbuffer CameraUniforms : register(b1, space1) {
     float4   cameraPos;    // xyz used, w unused
     float4x4 viewMatrix;
     float4x4 projMatrix;
     float2   screenSize;
     float2   _cpad;
+    // Clip block (Renderer::uploadClipUniforms()).
+    uint4    clipInfo;       // x = plane count, y = section caps on
+    float4   capColor;
+    float4   clipPlanes[6];  // xyz = unit normal, w = d: kept where dot(n, p) + d >= 0
+    // Sun shadows (Renderer::render()): shadow map clip from world.
+    float4x4 shadowViewProj;
+    float4   shadowParams;   // x = on, y = texel size (uv)
+    float4   viewParams;     // x = exposure in EV (colour x 2^EV before tone mapping)
+    float4x4 shadowNearViewProj;  // the near cascade (sun shadows)
+    float4   shadowNearParams;    // x = near cascade on
 };
 
 // --- Per-material textures/samplers -----------------------------------------------------
@@ -232,14 +239,53 @@ Texture2D<float4> iridescenceTexture        : register(t21); // reuses baseColor
 Texture2D<float4> iridescenceThicknessTexture : register(t22); // reuses baseColorSampler
 Texture2D<float4> anisotropicTexture        : register(t23); // reuses baseColorSampler
 
-// --- Per-frame textures/samplers (environment / IBL / screen-space refraction source) ---
-TextureCube<float4> environmentMap  : register(t32); // GGX-prefiltered specular cubemap (bakeIblResources())
-SamplerState         environmentSampler : register(s33);
-Texture2D<float4>    sceneColorTexture  : register(t34); // opaque scene color, for KHR_materials_transmission
-SamplerState          sceneColorSampler : register(s35);
-TextureCube<float4>  irradianceMap  : register(t36); // Lambertian-convolved diffuse cubemap (bakeIblResources())
-Texture2D<float4>    brdfLutTexture : register(t37); // Karis split-sum LUT indexed by (NdotV, roughness)
-SamplerState          brdfLutSampler : register(s38);
+// --- Per-frame textures/samplers (bind group 1, space1: environment, IBL, scene colour, shadows) ---
+TextureCube<float4> environmentMap  : register(t2, space1) ; // GGX-prefiltered specular cubemap (bakeIblResources())
+SamplerState         environmentSampler : register(s3, space1);
+Texture2D<float4>    sceneColorTexture  : register(t4, space1) ; // opaque scene color, for KHR_materials_transmission
+SamplerState          sceneColorSampler : register(s5, space1);
+TextureCube<float4>  irradianceMap  : register(t6, space1); // Lambertian-convolved diffuse cubemap (bakeIblResources())
+Texture2D<float4>    brdfLutTexture : register(t7, space1); // Karis split-sum LUT indexed by (NdotV, roughness)
+SamplerState          brdfLutSampler : register(s8, space1);
+Texture2D<float>       shadowMap      : register(t9, space1) ; // sun shadows (depth)
+SamplerComparisonState shadowSampler  : register(s10, space1); // compare less-or-equal
+Texture2D<float>       shadowMapNear  : register(t11, space1); // sun shadows, near cascade
+
+// One shadow map's verdict on P: 1 lit .. 0 shadowed, 3x3 percentage-closer
+// filtering; `inside` false where the map doesn't cover P. Receiver bias as
+// default.frag / default.metal's shadowLookup(). M arrives column-major
+// (cbuffer default), so M[c][r] in GLSL is M[r][c] here.
+float shadowLookup(Texture2D<float> map, float4x4 M, float texel, float3 P, float3 N, float3 L, out bool inside) {
+    float worldTexel = 2.0 * texel / max(length(float3(M[0][0], M[0][1], M[0][2])), 1e-6);
+    float depthPerWorld = length(float3(M[2][0], M[2][1], M[2][2]));
+    float NdotL = clamp(dot(N, L), 0.0, 1.0);
+    float slope = sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.2);
+    float4 clip = mul(M, float4(P + N * worldTexel * (1.0 + slope), 1.0));
+    float3 ndc = clip.xyz / clip.w;
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    inside = all(uv >= 2.0 * texel) && all(uv <= 1.0 - 2.0 * texel) && ndc.z <= 1.0;
+    if (!inside) return 1.0;
+    float depth = ndc.z - depthPerWorld * worldTexel;
+    float lit = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            lit += map.SampleCmpLevelZero(shadowSampler, uv + float2(x, y) * texel, depth);
+        }
+    }
+    return lit / 9.0;
+}
+
+// How lit P is by the shadow-casting light: the near cascade where it covers
+// P, else the far one (the whole scene); outside both, lit.
+float sunShadow(float3 P, float3 N, float3 L) {
+    if (shadowParams.x < 0.5) return 1.0;
+    bool inside = false;
+    if (shadowNearParams.x > 0.5) {
+        float lit = shadowLookup(shadowMapNear, shadowNearViewProj, shadowParams.y, P, N, L, inside);
+        if (inside) return lit;
+    }
+    return shadowLookup(shadowMap, shadowViewProj, shadowParams.y, P, N, L, inside);
+}
 
 // ---------------------------------------------------------------------------
 // Vertex stage
@@ -262,7 +308,94 @@ struct VertexIn {
     float4 modelCol1 : TEXCOORD25;
     float4 modelCol2 : TEXCOORD26;
     float4 modelCol3 : TEXCOORD27;
+    // EXT_mesh_gpu_instancing: this instance's transform, per instance
+    // (locations 12-15; the identity for draws without instances).
+    float4 instanceCol0 : TEXCOORD12;
+    float4 instanceCol1 : TEXCOORD13;
+    float4 instanceCol2 : TEXCOORD14;
+    float4 instanceCol3 : TEXCOORD15;
 };
+
+// ---------------------------------------------------------------------------
+// Deformation (shaders/vulkan/skinning.glsl), in glTF's order: morph targets,
+// then skeletal skinning, then the instance's transform. Only the skinned
+// entry points (vertexSkinned, gbufferSkinnedVertex) read the palette and the
+// deltas; the renderer picks them for draws with a skin or morph targets.
+//
+// Bind group 2 of the pipeline layout (register space 2, campello_gpu numbers
+// spaces by the layout's position): the draw's joint palette (column-major
+// float4x4 per joint) and the previous frame's (G-buffer motion). Group 3
+// (space 3): the node's MorphInfo (target count, whether targets have
+// normals, vertex count, up to 8 weights) and the primitive's POSITION and
+// NORMAL deltas, target-major, 3 floats per vertex (target t, vertex v at
+// t * vertexCount + v). Raw buffers: campello_gpu views read-only storage
+// buffers as ByteAddressBuffers.
+// ---------------------------------------------------------------------------
+ByteAddressBuffer jointMatrices         : register(t0, space2);
+ByteAddressBuffer previousJointMatrices : register(t1, space2);
+ByteAddressBuffer morphInfo             : register(t0, space3);
+ByteAddressBuffer morphPositions        : register(t1, space3);
+ByteAddressBuffer morphNormals          : register(t2, space3);
+
+// A float4x4 as its four columns (M*v as a column combination; see the
+// header comment on HLSL's row-filling constructor).
+struct Columns {
+    float4 c0, c1, c2, c3;
+};
+
+Columns columns(float4 c0, float4 c1, float4 c2, float4 c3) {
+    Columns m;
+    m.c0 = c0; m.c1 = c1; m.c2 = c2; m.c3 = c3;
+    return m;
+}
+
+float4 transform(Columns m, float4 v) {
+    return m.c0 * v.x + m.c1 * v.y + m.c2 * v.z + m.c3 * v.w;
+}
+
+Columns compose(Columns a, Columns b) {  // a * b
+    return columns(transform(a, b.c0), transform(a, b.c1), transform(a, b.c2), transform(a, b.c3));
+}
+
+Columns identityColumns() {
+    return columns(float4(1, 0, 0, 0), float4(0, 1, 0, 0), float4(0, 0, 1, 0), float4(0, 0, 0, 1));
+}
+
+Columns loadJoint(ByteAddressBuffer palette, uint joint) {
+    uint base = joint * 64;
+    return columns(asfloat(palette.Load4(base)), asfloat(palette.Load4(base + 16)),
+                   asfloat(palette.Load4(base + 32)), asfloat(palette.Load4(base + 48)));
+}
+
+// Up to four joints blended by weight; weights summing to zero leave the
+// vertex unskinned (as Metal).
+Columns blendJoints(ByteAddressBuffer palette, uint4 j, float4 w) {
+    if (w.x + w.y + w.z + w.w <= 0.001) return identityColumns();
+    Columns m = columns(float4(0, 0, 0, 0), float4(0, 0, 0, 0), float4(0, 0, 0, 0), float4(0, 0, 0, 0));
+    [unroll] for (int i = 0; i < 4; ++i) {
+        if (w[i] > 0.0) {
+            Columns joint = loadJoint(palette, j[i]);
+            m.c0 += w[i] * joint.c0;
+            m.c1 += w[i] * joint.c1;
+            m.c2 += w[i] * joint.c2;
+            m.c3 += w[i] * joint.c3;
+        }
+    }
+    return m;
+}
+
+void applyMorph(inout float3 p, inout float3 n, uint vertexId) {
+    uint targets = min(uint(asfloat(morphInfo.Load(0))), 8u);
+    bool hasNormal = asfloat(morphInfo.Load(4)) > 0.5;
+    uint vertexCount = uint(asfloat(morphInfo.Load(8)));
+    for (uint t = 0u; t < targets; ++t) {
+        float w = asfloat(morphInfo.Load(12 + t * 4));
+        if (w == 0.0) continue;
+        uint offset = (t * vertexCount + vertexId) * 12;
+        p += w * asfloat(morphPositions.Load3(offset));
+        if (hasNormal) n += w * asfloat(morphNormals.Load3(offset));
+    }
+}
 
 struct PixelIn {
     float4 clipPosition  : SV_Position;
@@ -275,21 +408,20 @@ struct PixelIn {
     float4 color0           : TEXCOORD6;
 };
 
-PixelIn vertexMain(VertexIn input) {
+// The PBR vertex stage. `skin` is the instance's transform times the joints'
+// blend (the identity for both when unused); position and normal are morphed.
+PixelIn pbrVertex(VertexIn input, Columns skin, float3 position, float3 normal) {
     PixelIn output;
+    Columns mvp = columns(input.mvpCol0, input.mvpCol1, input.mvpCol2, input.mvpCol3);
+    Columns model = columns(input.modelCol0, input.modelCol1, input.modelCol2, input.modelCol3);
 
-    // M*v via explicit column linear-combination — see header comment for why.
-    output.clipPosition = input.mvpCol0 * input.position.x + input.mvpCol1 * input.position.y +
-                           input.mvpCol2 * input.position.z + input.mvpCol3;
+    float4 localPos = transform(skin, float4(position, 1.0));
+    output.clipPosition = transform(mvp, localPos);
+    output.worldPos = transform(model, localPos).xyz;
 
-    float4 worldPos4 = input.modelCol0 * input.position.x + input.modelCol1 * input.position.y +
-                        input.modelCol2 * input.position.z + input.modelCol3;
-    output.worldPos = worldPos4.xyz;
-
-    // Normal/tangent use w=0 (direction, not position) — the column combination simply
-    // omits the *Col3 (translation) term, exactly like GLSL's `(model * vec4(v, 0.0)).xyz`.
-    float3 N = normalize((input.modelCol0 * input.normal.x + input.modelCol1 * input.normal.y +
-                           input.modelCol2 * input.normal.z).xyz);
+    // Normal/tangent use w=0 (direction, not position), exactly like GLSL's
+    // `(model * vec4(v, 0.0)).xyz`.
+    float3 N = normalize(transform(model, transform(skin, float4(normal, 0.0))).xyz);
 
     // Tangent frame: synthesize an arbitrary tangent orthogonal to N when the mesh has no
     // real TANGENT attribute (near-zero length), otherwise transform the vertex tangent by
@@ -303,9 +435,7 @@ PixelIn vertexMain(VertexIn input) {
             T = normalize(cross(float3(1.0, 0.0, 0.0), N));
         }
     } else {
-        float3 tangentWorld = (input.modelCol0 * input.tangent.x + input.modelCol1 * input.tangent.y +
-                                input.modelCol2 * input.tangent.z).xyz;
-        T = normalize(tangentWorld);
+        T = normalize(transform(model, transform(skin, float4(input.tangent.xyz, 0.0))).xyz);
         T = normalize(T - dot(T, N) * N);
     }
     float3 B = cross(N, T);
@@ -318,6 +448,24 @@ PixelIn vertexMain(VertexIn input) {
     output.color0 = input.color0;
 
     return output;
+}
+
+Columns instanceColumns(VertexIn input) {
+    return columns(input.instanceCol0, input.instanceCol1, input.instanceCol2, input.instanceCol3);
+}
+
+PixelIn vertexMain(VertexIn input) {
+    return pbrVertex(input, instanceColumns(input), input.position, input.normal);
+}
+
+// Skinned and morphed draws: JOINTS_0 / WEIGHTS_0 at locations 4 and 5.
+PixelIn vertexSkinned(VertexIn input, uint4 joints : TEXCOORD4, float4 weights : TEXCOORD5,
+                      uint vertexId : SV_VertexID) {
+    float3 position = input.position;
+    float3 normal = input.normal;
+    applyMorph(position, normal, vertexId);
+    Columns skin = compose(instanceColumns(input), blendJoints(jointMatrices, joints, weights));
+    return pbrVertex(input, skin, position, normal);
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +638,42 @@ float2 applyUvTransform(float2 uv, float4 row0, float4 row1) {
 // ---------------------------------------------------------------------------
 // Fragment (pixel) stage — main
 // ---------------------------------------------------------------------------
-float4 pixelMain(PixelIn input) : SV_Target {
+// World-space box mapping (MaterialUniforms::worldMapping, default.frag):
+// texture coordinates from the world position on the plane facing the
+// normal's dominant direction, with that plane's tangent frame.
+void worldMappingFrame(float3 P, float3 N, float size, bool zUp, out float2 uv, out float3 T, out float3 B) {
+    float3 U = zUp ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
+    float nu = dot(N, U);
+    if (abs(nu) > 0.7071) {
+        T = float3(1.0, 0.0, 0.0);
+        B = zUp ? float3(0.0, -1.0, 0.0) : float3(0.0, 0.0, 1.0);
+    } else {
+        float3 h = normalize(N - U * nu);
+        T = cross(U, h);
+        B = -U;
+    }
+    uv = float2(dot(P, T), dot(P, B)) / size;
+}
+
+float4 pixelMain(PixelIn input, bool isFrontFace : SV_IsFrontFace) : SV_Target {
+    // Position-only meshes (leanVertex) have a zero normal: the flat face
+    // normal from screen-space derivatives of the world position, turned
+    // towards the camera (default.frag). Derivatives in uniform control flow.
+    float3 faceNormal = cross(ddx(input.worldPos), ddy(input.worldPos));
+    if (dot(input.worldNormal, input.worldNormal) < 1e-8) {
+        float3 Nf = length(faceNormal) > 1e-20 ? normalize(faceNormal) : float3(0.0, 0.0, 1.0);
+        if (dot(Nf, cameraPos.xyz - input.worldPos) < 0.0) Nf = -Nf;
+        float3 Tf = abs(Nf.y) < 0.999 ? normalize(cross(float3(0.0, 1.0, 0.0), Nf)) : normalize(cross(float3(1.0, 0.0, 0.0), Nf));
+        input.worldNormal    = Nf;
+        input.worldTangent   = Tf;
+        input.worldBitangent = cross(Nf, Tf);
+    }
+    if (worldMapping > 0.0) {
+        float3 Tw, Bw;
+        worldMappingFrame(input.worldPos, normalize(input.worldNormal), worldMapping, worldMappingUp > 0.5, input.uv0, Tw, Bw);
+        input.worldTangent   = Tw;
+        input.worldBitangent = Bw;
+    }
     float2 uv0 = input.uv0;
     if (uvTransformRow0.w > 0.5) {
         uv0 = applyUvTransform(input.uv0, uvTransformRow0, uvTransformRow1);
@@ -639,6 +822,17 @@ float4 pixelMain(PixelIn input) : SV_Target {
     // cbuffer but never read anywhere), so every ViewMode hotkey (0-9,
     // q/w/e/r/t/y/u/i/o/p/z) silently did nothing on Windows — pressing e.g.
     // '4' (roughness) just kept showing normal shading.
+
+    // Clip planes (Renderer::setClipPlanes()): discard the clipped side. With
+    // section caps on, back faces of single-sided surfaces (the inside of a
+    // cut solid, visible through the cut) take the cap colour (default.frag).
+    for (uint ci = 0u; ci < clipInfo.x; ++ci) {
+        if (dot(clipPlanes[ci].xyz, input.worldPos) + clipPlanes[ci].w < 0.0) discard;
+    }
+    if (clipInfo.y != 0u && !isFrontFace && doubleSided < 0.5) {
+        return float4(capColor.rgb, 1.0);
+    }
+
     if (viewMode > 0.5) {
         if (abs(viewMode - 1.0) < 0.5) { // VIEW_MODE_WORLD_NORMAL
             float3 Ndbg = normalize(input.worldNormal);
@@ -781,7 +975,8 @@ float4 pixelMain(PixelIn input) : SV_Target {
 
         for (int ch2 = 0; ch2 < 3; ch2++) {
             if (uvValid[ch2]) {
-                transmitted[ch2] = sceneColorTexture.SampleLevel(sceneColorSampler, sampleUV[ch2], lod)[ch2];
+                // Stored display-encoded (tone mapped, sRGB): back to linear.
+                transmitted[ch2] = pow(max(sceneColorTexture.SampleLevel(sceneColorSampler, sampleUV[ch2], lod)[ch2], 0.0), 2.2);
             } else {
                 // Explicit LOD: this branch varies per pixel, so Sample() can't pick a mip here.
                 transmitted[ch2] = environmentMap.SampleLevel(environmentSampler, Trefr, 0.0)[ch2];
@@ -884,7 +1079,9 @@ float4 pixelMain(PixelIn input) : SV_Target {
         }
 
         float NdotL      = max(dot(N, lightDir), 0.0);
-        float3  lightColor = light.color.xyz * light.color.w * attenuation * spotFactor;
+        // The sun (spotAngles.z): darkened where the shadow map says so.
+        float shadow     = light.spotAngles.z > 0.5 ? sunShadow(input.worldPos, N, lightDir) : 1.0;
+        float3  lightColor = light.color.xyz * light.color.w * attenuation * spotFactor * shadow;
 
         float3  halfDir = normalize(lightDir + viewDir);
         float NdotH   = max(dot(N, halfDir), 0.0);
@@ -964,6 +1161,7 @@ float4 pixelMain(PixelIn input) : SV_Target {
                        + emissive + transmitted * transmittance) * ccAmbientAtten
                       + totalClearcoat + iblClearcoat;
 
+    finalColor *= exp2(viewParams.x);  // exposure (Renderer::setExposure())
     finalColor = toneMapKhronosPbrNeutral(finalColor);
     finalColor = linearToSRGBFast(finalColor);
 
@@ -1091,7 +1289,7 @@ SamplerState         skyboxEnvSampler : register(s1);
 cbuffer SkyboxUniforms : register(b2) {
     float4x4 invVP;
     float2   skyboxScreenSize;
-    float2   _skyboxPad;
+    float2   _skyboxPad;      // x = exposure in EV (as CameraUniforms.viewParams.x)
     float4   skyboxCameraPos; // xyz used, w unused
 };
 
@@ -1107,6 +1305,7 @@ float4 skyboxPixel(FxaaOut input) : SV_Target {
     // Match the tonemapping + sRGB encoding pixelMain() applies before writing to the
     // 8-bit swapchain — the environment is genuine HDR, so returning it raw here hard-clips
     // to solid white/saturated colors instead of compressing smoothly.
+    color *= exp2(_skyboxPad.x);  // exposure, as pixelMain
     color = toneMapKhronosPbrNeutral(color);
     color = linearToSRGBFast(color);
 
@@ -1439,9 +1638,23 @@ static float fbm2D(float x, float y, int octaves, float lacunarity, float gain) 
     return total / maxValue;
 }
 
+// Raw buffers: campello_gpu views storage buffers as (RW)ByteAddressBuffers
+// (a bind group layout carries no structure stride). ProceduralNode is 48
+// bytes: value, then 8 uints.
+ByteAddressBuffer   nodes     : register(t1);
+RWByteAddressBuffer outPixels : register(u2);
+
+ProceduralNode loadNode(uint n) {
+    uint base = n * 48;
+    ProceduralNode node;
+    node.value  = asfloat(nodes.Load4(base));
+    uint4 a = nodes.Load4(base + 16);
+    uint4 b = nodes.Load4(base + 32);
+    node.op = a.x; node.outReg = a.y; node.inA = a.z; node.inB = a.w;
+    node.inC = b.x; node.inD = b.y; node.flags = b.z; node.pad = b.w;
+    return node;
+}
 ConstantBuffer<ProceduralBakeUniforms> uniforms : register(b0);
-StructuredBuffer<ProceduralNode> nodes : register(t1);
-RWStructuredBuffer<float4> outPixels : register(u2);
 
 [numthreads(1, 1, 1)]
 void proceduralBakeKernel(uint3 groupID : SV_GroupID)
@@ -1458,7 +1671,7 @@ void proceduralBakeKernel(uint3 groupID : SV_GroupID)
     float v = ((float)y + 0.5f) / (float)uniforms.height;
 
     for (uint n = 0; n < uniforms.nodeCount; n++) {
-        ProceduralNode node = nodes[n];
+        ProceduralNode node = loadNode(n);
         float4 a = (node.flags & FLAG_HAS_A) ? regs[node.inA] : float4(0.0f, 0.0f, 0.0f, 0.0f);
         float4 b = (node.flags & FLAG_HAS_B) ? regs[node.inB] : float4(0.0f, 0.0f, 0.0f, 0.0f);
         float4 c = (node.flags & FLAG_HAS_C) ? regs[node.inC] : float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -1639,5 +1852,474 @@ void proceduralBakeKernel(uint3 groupID : SV_GroupID)
     }
 
     uint idx = y * uniforms.width + x;
-    outPixels[idx] = saturate(final);
+    outPixels.Store4(idx * 16, asuint(saturate(final)));
+}
+
+// ---------------------------------------------------------------------------
+// G-buffer stages (Renderer::renderGBuffer()), ports of shaders/vulkan/
+// gbuffer_vertex.glsl and gbuffer.frag (themselves ports of default.metal's
+// gbufferVertex/gbufferFragment): world normal + roughness, base colour +
+// metallic and motion. The pipeline layout and bind group are the PBR
+// pipeline's (the combined bind group), so the registers are pixelMain's.
+//
+// The previous frame's transform per draw is a per-instance vertex buffer at
+// the draw's transform offset (Renderer's gbufferPreviousTransforms, the
+// 128-byte NodeTransforms stride): previous clip from local at locations
+// 20-23, this frame's projection jitter (clip x / w) at 28. Skinned draws
+// (gbufferSkinnedVertex) place the previous position with the previous palette.
+// ---------------------------------------------------------------------------
+struct GBufferVertexIn {
+    float3 position : TEXCOORD0;
+    float3 normal   : TEXCOORD1;
+    float2 uv0      : TEXCOORD2;
+    float4 tangent  : TEXCOORD3;
+    float4 color0   : TEXCOORD6;
+    float2 uv1      : TEXCOORD7;
+    float4 mvpCol0   : TEXCOORD16;
+    float4 mvpCol1   : TEXCOORD17;
+    float4 mvpCol2   : TEXCOORD18;
+    float4 mvpCol3   : TEXCOORD19;
+    float4 previousMvpCol0 : TEXCOORD20;
+    float4 previousMvpCol1 : TEXCOORD21;
+    float4 previousMvpCol2 : TEXCOORD22;
+    float4 previousMvpCol3 : TEXCOORD23;
+    float4 modelCol0 : TEXCOORD24;
+    float4 modelCol1 : TEXCOORD25;
+    float4 modelCol2 : TEXCOORD26;
+    float4 modelCol3 : TEXCOORD27;
+    float4 jitter    : TEXCOORD28;
+    float4 instanceCol0 : TEXCOORD12;  // EXT_mesh_gpu_instancing (vertexMain)
+    float4 instanceCol1 : TEXCOORD13;
+    float4 instanceCol2 : TEXCOORD14;
+    float4 instanceCol3 : TEXCOORD15;
+};
+
+struct GBufferPixelIn {
+    float4 clipPosition   : SV_Position;
+    float3 worldPos       : TEXCOORD0;
+    float3 worldNormal    : TEXCOORD1;
+    float3 worldTangent   : TEXCOORD2;
+    float3 worldBitangent : TEXCOORD3;
+    float2 uv0            : TEXCOORD4;
+    float2 uv1            : TEXCOORD5;
+    float4 color0         : TEXCOORD6;
+    float4 currentClip    : TEXCOORD7;  // unjittered
+    float4 previousClip   : TEXCOORD8;
+};
+
+struct GBufferOut {
+    float4 normalRoughness : SV_Target0;  // xyz world normal (towards the viewer), w perceptual roughness
+    float4 albedoMetallic  : SV_Target1;  // rgb base colour (linear), a metallic
+    float2 motion          : SV_Target2;  // previous minus current image uv, y down
+};
+
+// `skin` / `previousSkin`: this frame's and the previous frame's instance x
+// joints transform (the previous palette places the previous position, so a
+// moving skin has motion); position and normal are morphed (this frame's
+// weights for both, as on Metal).
+GBufferPixelIn gbufferVertexCommon(GBufferVertexIn input, Columns skin, Columns previousSkin, float3 position,
+                                   float3 normal) {
+    GBufferPixelIn output;
+    Columns mvp = columns(input.mvpCol0, input.mvpCol1, input.mvpCol2, input.mvpCol3);
+    Columns previousMvp = columns(input.previousMvpCol0, input.previousMvpCol1, input.previousMvpCol2, input.previousMvpCol3);
+    Columns model = columns(input.modelCol0, input.modelCol1, input.modelCol2, input.modelCol3);
+    float4 localPos = transform(skin, float4(position, 1.0));
+    float4 clip = transform(mvp, localPos);
+    // Motion is the surface's, not the jitter's.
+    output.currentClip  = clip - float4(input.jitter.xy * clip.w, 0.0, 0.0);
+    output.previousClip = transform(previousMvp, transform(previousSkin, float4(position, 1.0)));
+    output.clipPosition = clip;  // D3D clip +Y is up, as the CPU matrices (see vertexMain)
+
+    output.worldPos = transform(model, localPos).xyz;
+    float3 N = normalize(transform(model, transform(skin, float4(normal, 0.0))).xyz);
+    float3 T;
+    if (length(input.tangent.xyz) < 0.001) {
+        T = abs(N.y) < 0.999 ? normalize(cross(float3(0.0, 1.0, 0.0), N)) : normalize(cross(float3(1.0, 0.0, 0.0), N));
+    } else {
+        T = normalize(transform(model, transform(skin, float4(input.tangent.xyz, 0.0))).xyz);
+        T = normalize(T - dot(T, N) * N);
+    }
+    output.worldNormal    = N;
+    output.worldTangent   = T;
+    output.worldBitangent = cross(N, T);
+    output.uv0    = input.uv0;
+    output.uv1    = input.uv1;
+    output.color0 = input.color0;
+    return output;
+}
+
+Columns gbufferInstanceColumns(GBufferVertexIn input) {
+    return columns(input.instanceCol0, input.instanceCol1, input.instanceCol2, input.instanceCol3);
+}
+
+GBufferPixelIn gbufferVertex(GBufferVertexIn input) {
+    Columns instance = gbufferInstanceColumns(input);
+    return gbufferVertexCommon(input, instance, instance, input.position, input.normal);
+}
+
+// Skinned and morphed draws (vertexSkinned): the previous palette places
+// where the vertex was; it's this frame's when the draw has none.
+GBufferPixelIn gbufferSkinnedVertex(GBufferVertexIn input, uint4 joints : TEXCOORD4, float4 weights : TEXCOORD5,
+                                    uint vertexId : SV_VertexID) {
+    float3 position = input.position;
+    float3 normal = input.normal;
+    applyMorph(position, normal, vertexId);
+    Columns instance = gbufferInstanceColumns(input);
+    Columns skin = compose(instance, blendJoints(jointMatrices, joints, weights));
+    Columns previousSkin = compose(instance, blendJoints(previousJointMatrices, joints, weights));
+    return gbufferVertexCommon(input, skin, previousSkin, position, normal);
+}
+
+// Position-only meshes (VertexLayout::positionOnly()): one 12-byte stream.
+// A zero normal, which gbufferPixel/pixelMain replace with the flat face
+// normal; same outputs as the full stages (default_lean.vert / gbuffer_lean.vert).
+struct LeanVertexIn {
+    float3 position  : TEXCOORD0;
+    float4 mvpCol0   : TEXCOORD16;
+    float4 mvpCol1   : TEXCOORD17;
+    float4 mvpCol2   : TEXCOORD18;
+    float4 mvpCol3   : TEXCOORD19;
+    float4 modelCol0 : TEXCOORD24;
+    float4 modelCol1 : TEXCOORD25;
+    float4 modelCol2 : TEXCOORD26;
+    float4 modelCol3 : TEXCOORD27;
+    // The instance's transform (DrawCall::instanceTransformBuffer,
+    // EXT_mesh_gpu_instancing; the identity without instances).
+    float4 instanceCol0 : TEXCOORD12;
+    float4 instanceCol1 : TEXCOORD13;
+    float4 instanceCol2 : TEXCOORD14;
+    float4 instanceCol3 : TEXCOORD15;
+};
+
+PixelIn leanVertex(LeanVertexIn input) {
+    PixelIn output;
+    Columns instance = columns(input.instanceCol0, input.instanceCol1, input.instanceCol2, input.instanceCol3);
+    float4 localPos = transform(instance, float4(input.position, 1.0));
+    output.clipPosition   = transform(columns(input.mvpCol0, input.mvpCol1, input.mvpCol2, input.mvpCol3), localPos);
+    output.worldPos       = transform(columns(input.modelCol0, input.modelCol1, input.modelCol2, input.modelCol3), localPos).xyz;
+    output.worldNormal    = float3(0.0, 0.0, 0.0);
+    output.worldTangent   = float3(0.0, 0.0, 0.0);
+    output.worldBitangent = float3(0.0, 0.0, 0.0);
+    output.uv0    = float2(0.0, 0.0);
+    output.uv1    = float2(0.0, 0.0);
+    output.color0 = float4(1.0, 1.0, 1.0, 1.0);
+    return output;
+}
+
+// Line meshes (GpuMesh::topology lineList/lineStrip): leanVertex plus a small
+// clip-space depth offset towards the camera, so edges drawn on their own
+// faces win the depth test (depth bias doesn't apply to lines). As Metal's
+// vertexLine and default_line.vert.
+PixelIn lineVertex(LeanVertexIn input) {
+    PixelIn output = leanVertex(input);
+    output.clipPosition.z -= 4.0e-6 * output.clipPosition.w;  // kLineDepthOffset
+    return output;
+}
+
+// Sun shadow casters (encodeShadowPass()), depth only, as shadow.glsl: the
+// shadow pass binds the light's clip from local as the per-draw mvp
+// (locations 16-19) and each instance's matrix at 12-15 (the identity for
+// plain casters). shadowSkinnedVertex adds JOINTS_0 / WEIGHTS_0 and the joint
+// palette (bind group 2), for skinned casters (shadowDeformPipeline()).
+struct ShadowVertexIn {
+    float3 position     : TEXCOORD0;
+    float4 mvpCol0      : TEXCOORD16;
+    float4 mvpCol1      : TEXCOORD17;
+    float4 mvpCol2      : TEXCOORD18;
+    float4 mvpCol3      : TEXCOORD19;
+    float4 instanceCol0 : TEXCOORD12;
+    float4 instanceCol1 : TEXCOORD13;
+    float4 instanceCol2 : TEXCOORD14;
+    float4 instanceCol3 : TEXCOORD15;
+};
+
+float4 shadowClip(ShadowVertexIn input, Columns skin) {
+    Columns instance = columns(input.instanceCol0, input.instanceCol1, input.instanceCol2, input.instanceCol3);
+    float4 local = transform(instance, transform(skin, float4(input.position, 1.0)));
+    return transform(columns(input.mvpCol0, input.mvpCol1, input.mvpCol2, input.mvpCol3), local);
+}
+
+float4 shadowVertex(ShadowVertexIn input) : SV_Position {
+    return shadowClip(input, identityColumns());
+}
+
+float4 shadowSkinnedVertex(ShadowVertexIn input, uint4 joints : TEXCOORD4, float4 weights : TEXCOORD5) : SV_Position {
+    return shadowClip(input, blendJoints(jointMatrices, joints, weights));
+}
+
+struct GBufferLeanVertexIn {
+    float3 position  : TEXCOORD0;
+    float4 mvpCol0   : TEXCOORD16;
+    float4 mvpCol1   : TEXCOORD17;
+    float4 mvpCol2   : TEXCOORD18;
+    float4 mvpCol3   : TEXCOORD19;
+    float4 previousMvpCol0 : TEXCOORD20;
+    float4 previousMvpCol1 : TEXCOORD21;
+    float4 previousMvpCol2 : TEXCOORD22;
+    float4 previousMvpCol3 : TEXCOORD23;
+    float4 modelCol0 : TEXCOORD24;
+    float4 modelCol1 : TEXCOORD25;
+    float4 modelCol2 : TEXCOORD26;
+    float4 modelCol3 : TEXCOORD27;
+    float4 jitter    : TEXCOORD28;
+    float4 instanceCol0 : TEXCOORD12;  // the instance's transform, as LeanVertexIn
+    float4 instanceCol1 : TEXCOORD13;
+    float4 instanceCol2 : TEXCOORD14;
+    float4 instanceCol3 : TEXCOORD15;
+};
+
+GBufferPixelIn gbufferLeanVertex(GBufferLeanVertexIn input) {
+    GBufferPixelIn output;
+    Columns instance = columns(input.instanceCol0, input.instanceCol1, input.instanceCol2, input.instanceCol3);
+    float4 localPos = transform(instance, float4(input.position, 1.0));
+    float4 clip = transform(columns(input.mvpCol0, input.mvpCol1, input.mvpCol2, input.mvpCol3), localPos);
+    output.currentClip  = clip - float4(input.jitter.xy * clip.w, 0.0, 0.0);
+    output.previousClip = transform(columns(input.previousMvpCol0, input.previousMvpCol1, input.previousMvpCol2,
+                                            input.previousMvpCol3), localPos);
+    output.clipPosition   = clip;
+    output.worldPos       = transform(columns(input.modelCol0, input.modelCol1, input.modelCol2, input.modelCol3), localPos).xyz;
+    output.worldNormal    = float3(0.0, 0.0, 0.0);
+    output.worldTangent   = float3(0.0, 0.0, 0.0);
+    output.worldBitangent = float3(0.0, 0.0, 0.0);
+    output.uv0    = float2(0.0, 0.0);
+    output.uv1    = float2(0.0, 0.0);
+    output.color0 = float4(1.0, 1.0, 1.0, 1.0);
+    return output;
+}
+
+GBufferOut gbufferPixel(GBufferPixelIn input, bool isFrontFace : SV_IsFrontFace) {
+    float2 texcoord0 = input.uv0;
+    float3 faceNormal = cross(ddx(input.worldPos), ddy(input.worldPos));
+    float3 worldNormal = input.worldNormal;
+    float3 worldTangent = input.worldTangent;
+    float3 worldBitangent = input.worldBitangent;
+    if (dot(input.worldNormal, input.worldNormal) < 1e-8) {
+        float3 Nf = length(faceNormal) > 1e-20 ? normalize(faceNormal) : float3(0.0, 0.0, 1.0);
+        if (dot(Nf, cameraPos.xyz - input.worldPos) < 0.0) Nf = -Nf;
+        float3 Tf = abs(Nf.y) < 0.999 ? normalize(cross(float3(0.0, 1.0, 0.0), Nf)) : normalize(cross(float3(1.0, 0.0, 0.0), Nf));
+        worldNormal = Nf;
+        worldTangent = Tf;
+        worldBitangent = cross(Nf, Tf);
+    }
+    if (worldMapping > 0.0) {
+        float3 Tw, Bw;
+        worldMappingFrame(input.worldPos, normalize(worldNormal), worldMapping, worldMappingUp > 0.5, texcoord0, Tw, Bw);
+        worldTangent = Tw;
+        worldBitangent = Bw;
+    }
+
+    // Every material sample before the discard (see pixelMain: implicit-LOD
+    // samples after a discard picked wrong mips at triangle edges on AMD).
+    float2 uv0 = texcoord0;
+    if (uvTransformRow0.w > 0.5) uv0 = applyUvTransform(texcoord0, uvTransformRow0, uvTransformRow1);
+    float2 baseColorUV = (uvTransformRow0.w > 0.5) ? uv0 : selectUV(uv0, input.uv1, texCoord1Mask, kUV1BaseColor);
+    float4 baseColor = baseColorTexture.Sample(baseColorSampler, baseColorUV) * baseColorFactor * input.color0;
+    float2 mrUV = selectUV(uv0, input.uv1, texCoord1Mask, kUV1MetallicRoughness);
+    float4 mr = metallicRoughnessTexture.Sample(metallicRoughnessSampler, mrUV);
+    float2 normalUV = (normalUvTransformRow0.w > 0.5)
+        ? applyUvTransform(texcoord0, normalUvTransformRow0, normalUvTransformRow1)
+        : selectUV(texcoord0, input.uv1, texCoord1Mask, kUV1Normal);
+    float3 ns = normalTexture.Sample(normalSampler, normalUV).rgb * 2.0 - 1.0;
+
+    if (alphaMode > 0.5 && alphaMode < 1.5 && baseColor.a < alphaCutoff) discard;
+    for (uint ci = 0u; ci < clipInfo.x; ++ci) {
+        if (dot(clipPlanes[ci].xyz, input.worldPos) + clipPlanes[ci].w < 0.0) discard;
+    }
+
+    float metallic = 0.0;
+    float roughness = 1.0;
+    float3 N = normalize(worldNormal);
+    if (unlit < 0.5) {
+        metallic = mr.b * metallicFactor;
+        roughness = clamp(mr.g * roughnessFactor, 0.04, 1.0);
+        if (hasNormalTexture > 0.5) {
+            ns.xy *= normalScale;
+            float3 nsN = normalize(ns);
+            // TBN * ns as a column combination (see the header comment).
+            N = normalize(nsN.x * normalize(worldTangent) + nsN.y * normalize(worldBitangent) + nsN.z * N);
+        }
+    }
+    // Towards the viewer (back faces of two-sided surfaces).
+    if (dot(N, cameraPos.xyz - input.worldPos) < 0.0 && !isFrontFace) N = -N;
+
+    GBufferOut output;
+    output.normalRoughness = float4(N, roughness);
+    output.albedoMetallic = float4(clamp(baseColor.rgb, 0.0, 1.0), metallic);
+    // D3D clip +Y is up (as the Metal clips, before Vulkan's flip); image y is down.
+    float2 current = input.currentClip.xy / input.currentClip.w;
+    float2 previous = input.previousClip.xy / input.previousClip.w;
+    output.motion = (previous - current) * float2(0.5, -0.5);
+    return output;
+}
+
+// ---------------------------------------------------------------------------
+// TAA resolve and the built-in temporal upscaler, a port of shaders/vulkan/
+// taa.frag (default.metal's taaFragment; see it for the method), drawn with
+// fxaaVertex's fullscreen triangle. Writes the output and the next history.
+// ---------------------------------------------------------------------------
+Texture2D<float4> taaCurrent : register(t0);
+Texture2D<float4> taaHistory : register(t1);
+Texture2D<float4> taaMotion  : register(t2);
+SamplerState      taaSampler : register(s3);
+cbuffer TaaUniforms : register(b4) {
+    float2 taaInputSize;     // the frame's (internal) size in pixels
+    float2 taaJitter;        // how far this frame's jitter moved the geometry, in input pixels (x right, y down)
+    float  taaBlend;         // the frame's weight where a sample is at the pixel
+    float  taaHistoryValid;  // 0: no history (first frame, cut, resize)
+    float2 taaOutputSize;    // the output's size in pixels
+};
+
+struct TaaOut {
+    float4 color   : SV_Target0;
+    float4 history : SV_Target1;
+};
+
+float3 rgbToYCoCg(float3 c) {
+    return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0.0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25)));
+}
+float3 yCoCgToRgb(float3 c) {
+    return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+TaaOut taaPixel(FxaaOut input) {
+    float2 fragUV = input.uv;  // (0, 0) = top-left
+    float2 p = fragUV * taaInputSize;
+    int2 centre = int2(floor(p));
+    int2 limit = int2(taaInputSize) - 1;
+    float3 sum = float3(0.0, 0.0, 0.0), m1 = float3(0.0, 0.0, 0.0), m2 = float3(0.0, 0.0, 0.0);
+    float weights = 0.0, nearest = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int2 q = clamp(centre + int2(dx, dy), int2(0, 0), limit);
+            float3 c = taaCurrent.Load(int3(q, 0)).rgb;
+            // Where its sample was in the unjittered image, in output pixels.
+            float2 d = (float2(q) + 0.5 - taaJitter - p) * (taaOutputSize / taaInputSize);
+            float w = exp(-2.29 * dot(d, d));
+            sum += w * c;
+            weights += w;
+            nearest = max(nearest, w);
+            float3 t = rgbToYCoCg(c);
+            m1 += t;
+            m2 += t * t;
+        }
+    }
+    float3 c = weights > 1e-6 ? sum / weights : taaCurrent.Load(int3(clamp(centre, int2(0, 0), limit), 0)).rgb;
+    float3 mean = m1 / 9.0;
+    float3 sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
+    uint mw, mh;
+    taaMotion.GetDimensions(mw, mh);
+    int2 motionSize = int2(mw, mh);
+    int2 motionPixel = min(int2(fragUV * float2(motionSize)), motionSize - 1);
+    float2 previousUV = fragUV + taaMotion.Load(int3(motionPixel, 0)).xy;
+    float3 result = c;
+    if (taaHistoryValid > 0.5 && all(previousUV >= 0.0) && all(previousUV <= 1.0)) {
+        float3 h = clamp(rgbToYCoCg(taaHistory.SampleLevel(taaSampler, previousUV, 0.0).rgb),
+                         mean - 1.5 * sigma, mean + 1.5 * sigma);
+        // Less of this frame where its nearest sample is far from the pixel.
+        result = lerp(yCoCgToRgb(h), c, clamp(taaBlend * nearest * 2.0, 0.0, 1.0));
+    }
+    TaaOut output;
+    output.color = float4(result, 1.0);
+    output.history = float4(result, 1.0);
+    return output;
+}
+
+// ---------------------------------------------------------------------------
+// Screen-space ambient occlusion (setAmbientOcclusion()), ports of
+// shaders/vulkan/ssao.frag and ssao_apply.frag (Metal's ssaoFragment and
+// ssaoApplyFragment; see default.metal for the method), drawn with
+// fxaaVertex's fullscreen triangle. Pass 1: scene depth -> AO at the output
+// size. Pass 2: the AO blurred 4x4 (depth-aware), multiplied into the frame
+// by the blend state. Registers follow aoBindGroupLayout's bindings.
+// ---------------------------------------------------------------------------
+Texture2D<float>  aoDepthTexture : register(t0);
+Texture2D<float4> aoTexture      : register(t1);
+cbuffer AoUniforms : register(b2) {
+    float4x4 aoProj;     // view -> clip
+    float4x4 aoInvProj;  // clip -> view
+    float4   aoParams;   // x = radius (view units), y = intensity (power), z = bias, w = samples
+    float4   aoSize;     // depth texture width, height; output width, height
+};
+
+float aoDepthAt(float2 uv) {
+    int2 texel = int2(clamp(uv * aoSize.xy, float2(0.0, 0.0), aoSize.xy - 1.0));
+    return aoDepthTexture.Load(int3(texel, 0));
+}
+
+float3 aoViewPos(float2 uv, float depth) {
+    float4 p = mul(aoInvProj, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0));
+    return p.xyz / p.w;
+}
+
+float4 ssaoPixel(FxaaOut input) : SV_Target {
+    float2 fragUV = input.uv;
+    float depth = aoDepthAt(fragUV);
+    if (depth >= 1.0) return float4(1.0, 1.0, 1.0, 1.0);
+    float3 P = aoViewPos(fragUV, depth);
+    float2 px = 1.0 / aoSize.zw;
+    float3 R = aoViewPos(fragUV + float2(px.x, 0.0), aoDepthAt(fragUV + float2(px.x, 0.0)));
+    float3 L = aoViewPos(fragUV - float2(px.x, 0.0), aoDepthAt(fragUV - float2(px.x, 0.0)));
+    float3 D = aoViewPos(fragUV + float2(0.0, px.y), aoDepthAt(fragUV + float2(0.0, px.y)));
+    float3 U = aoViewPos(fragUV - float2(0.0, px.y), aoDepthAt(fragUV - float2(0.0, px.y)));
+    float3 dx = abs(R.z - P.z) < abs(P.z - L.z) ? R - P : P - L;
+    float3 dy = abs(D.z - P.z) < abs(P.z - U.z) ? D - P : P - U;
+    float3 N = normalize(cross(dx, dy));
+    if (dot(N, -P) < 0.0) N = -N;
+
+    float radius = aoParams.x;
+    float bias = aoParams.z;
+    int samples = int(aoParams.w);
+    float noise = frac(52.9829189 * frac(dot(input.position.xy, float2(0.06711056, 0.00583715))));
+    float angle = noise * 6.28318530718;
+    float3 helper = abs(N.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 T = normalize(cross(helper, N));
+    float3 B = cross(N, T);
+    float3 Tr = T * cos(angle) + B * sin(angle);
+    float3 Br = cross(N, Tr);
+
+    float occlusion = 0.0;
+    for (int i = 0; i < samples; ++i) {
+        float t = (float(i) + 0.5) / float(samples);
+        float phi = float(i) * 2.39996323;
+        float cosTheta = sqrt(1.0 - t * 0.9);
+        float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+        float scale = lerp(0.15, 1.0, t * t);
+        float3 k = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta) * scale;
+        float3 S = P + (Tr * k.x + Br * k.y + N * k.z) * radius;
+        float4 c = mul(aoProj, float4(S, 1.0));
+        float2 suv = float2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+        if (any(suv < 0.0) || any(suv > 1.0)) continue;
+        float sceneDepth = aoDepthAt(suv);
+        if (sceneDepth >= 1.0) continue;
+        float3 Q = aoViewPos(suv, sceneDepth);
+        float range = smoothstep(0.0, 1.0, radius / max(abs(P.z - Q.z), 1e-4));
+        occlusion += (abs(Q.z) <= abs(S.z) - bias ? 1.0 : 0.0) * range;
+    }
+    float ao = pow(clamp(1.0 - occlusion / float(max(samples, 1)), 0.0, 1.0), aoParams.y);
+    return float4(ao, ao, ao, 1.0);
+}
+
+float4 ssaoApplyPixel(FxaaOut input) : SV_Target {
+    float2 fragUV = input.uv;
+    float depth = aoDepthAt(fragUV);
+    if (depth >= 1.0) return float4(1.0, 1.0, 1.0, 1.0);
+    float z = aoViewPos(fragUV, depth).z;
+    int2 centre = int2(fragUV * aoSize.zw);
+    int2 limit = int2(aoSize.zw) - 1;
+    float2 px = 1.0 / aoSize.zw;
+    float sum = 0.0;
+    float weight = 0.0;
+    for (int y = -2; y < 2; ++y) {
+        for (int x = -2; x < 2; ++x) {
+            int2 at = clamp(centre + int2(x, y), int2(0, 0), limit);
+            float2 uv = (float2(at) + 0.5) * px;
+            float d = aoDepthAt(uv);
+            float sz = aoViewPos(uv, d).z;
+            float w = (d < 1.0 && abs(sz - z) < 0.05 * abs(z) + aoParams.z) ? 1.0 : 0.0;
+            sum += aoTexture.Load(int3(at, 0)).r * w;
+            weight += w;
+        }
+    }
+    float ao = weight > 0.0 ? sum / weight : 1.0;
+    return float4(ao, ao, ao, 1.0);
 }

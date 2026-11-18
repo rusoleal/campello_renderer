@@ -52,7 +52,7 @@ namespace systems::leal::campello_renderer {
         // storage that outlives the mesh (e.g. VertexLayout::positionOnly()).
         const VertexLayout* layout = nullptr;
         // Primitive topology. Lines (lineList, lineStrip) are drawn by the
-        // built-in program with its line vertex stage (Metal, Vulkan): one
+        // built-in program with its line vertex stage (Metal, Vulkan, DirectX): one
         // pixel wide, nudged towards the camera so edges stay visible on
         // their faces, no culling; use an unlit material for a flat colour.
         // Clip planes apply to them too.
@@ -92,11 +92,6 @@ namespace systems::leal::campello_renderer {
     struct GpuMaterial {
         std::shared_ptr<systems::leal::campello_gpu::BindGroup> bindGroup;     // textures + samplers
         std::shared_ptr<systems::leal::campello_gpu::BindGroup> flatBindGroup; // fallback for flat pipeline
-        // DirectX-only: one combined (material+frame) bind group per frame-in-flight
-        // slot — see Renderer::ensureDirectXPbrBindGroupLayout()'s doc comment. Array
-        // size is a literal (not Renderer::kMaxFramesInFlight) since GpuMaterial is
-        // declared before class Renderer; keep in sync if that constant ever changes.
-        std::array<std::shared_ptr<systems::leal::campello_gpu::BindGroup>, 3> directxBindGroup;
         uint32_t uniformSlot = 0; // index into the global material uniform buffer
         bool doubleSided = false;
         bool alphaBlend = false;
@@ -447,60 +442,10 @@ namespace systems::leal::campello_renderer {
 
         // Vulkan-only PBR bind group layouts — see ensureVulkanPbrBindGroupLayouts().
         // GpuMaterial::bindGroup/flatBindGroup and frameBindGroup[] are built
-        // against these instead of the shared bindGroupLayout on Vulkan builds.
+        // against these instead of the shared bindGroupLayout on Vulkan, WebGPU
+        // and DirectX builds (CAMPELLO_RENDERER_PBR_BIND_GROUPS).
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout>  vulkanMaterialBindGroupLayout;
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout>  vulkanFrameBindGroupLayout;
-
-        // DirectX-only combined PBR bind group layout — see
-        // ensureDirectXPbrBindGroupLayout()'s doc comment for why DirectX uses
-        // ONE combined bind group (material+frame together) per (material,
-        // frame-in-flight) pair, instead of Vulkan/Metal's material+frame split:
-        // campello_gpu's D3D12 backend places every bind group's descriptor
-        // ranges in the same RegisterSpace(0), and RenderPassEncoder::setBindGroup
-        // there treats its index as a literal root-parameter slot rather than a
-        // logical group number — a second setBindGroup(1, frameBindGroup) call
-        // (the convention every other call site in this file uses) lands on the
-        // material group's own sampler table instead of the frame group's
-        // resource table. Combining both into one bind group sidesteps that.
-        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout>  directxPbrBindGroupLayout;
-        void ensureDirectXPbrBindGroupLayout();
-
-        // Cached per-material texture/sampler assignments (DirectX only), so a
-        // material's combined bind group can be rebuilt for a different
-        // frame-in-flight slot (different lights/camera buffer, different
-        // scene-color/opaque-scene texture) without re-deriving them from the
-        // glTF material each time. Mirrors the local variables already computed
-        // at each material-bind-group-creation call site (baseColorTex, mrTex, ...).
-        struct DirectXMaterialResources {
-            std::shared_ptr<systems::leal::campello_gpu::Texture> baseColorTex, mrTex, normalTex,
-                emissiveTex, occlusionTex, specularTex, specularColorTex, sheenColorTex,
-                sheenRoughnessTex, clearcoatTex, clearcoatRoughnessTex, clearcoatNormalTex,
-                transmissionTex, thicknessTex, iridescenceTex, iridescenceThicknessTex, anisotropicTex;
-            std::shared_ptr<systems::leal::campello_gpu::Sampler> baseColorSamp, mrSamp, normalSamp,
-                emissiveSamp, occlusionSamp, specularSamp, specularColorSamp;
-            uint64_t materialBufferOffset = 0;
-        };
-        std::vector<DirectXMaterialResources> directxMaterialResources; // parallel to materialBindGroups
-        DirectXMaterialResources directxDefaultResources;
-        // directxMaterialBindGroups/directxDefaultBindGroup are declared further down,
-        // right after kMaxFramesInFlight (a std::array size needs that constant visible
-        // at this point in the class, and it's declared later in this same class).
-        // ECS-path (GpuMaterial) equivalent of directxMaterialResources above, keyed
-        // by GpuMaterial* since GpuMaterial instances live in materialPool rather than
-        // a flat index-addressable vector. Populated in uploadMesh()'s material-
-        // creation path; consumed by rebuildDirectXCombinedBindGroups().
-        std::unordered_map<const GpuMaterial*, DirectXMaterialResources> directxEcsMaterialResources;
-
-        std::shared_ptr<systems::leal::campello_gpu::BindGroup> buildDirectXCombinedBindGroup(
-            const DirectXMaterialResources& res, uint32_t frameIndex,
-            const std::shared_ptr<systems::leal::campello_gpu::Texture>& sceneColorOrOpaque);
-        // Rebuilds every DirectX combined bind group (default + all glTF
-        // materials + all ECS GpuMaterials) for one frame-in-flight slot —
-        // called at scene/material load and again whenever the frame-varying
-        // scene-color/opaque-scene texture changes, mirroring frameBindGroup[]'s
-        // rebuild pattern on Vulkan/Metal (see the two render()-time call sites).
-        void rebuildDirectXCombinedBindGroups(uint32_t frameIndex,
-            const std::shared_ptr<systems::leal::campello_gpu::Texture>& sceneColorOrOpaque);
 
         // Mesh pipelines (docs/design/programmable-pipelines.md, phase 1).
         // createDefaultPipelines() fills a per-backend recipe; pipelines are
@@ -572,7 +517,7 @@ namespace systems::leal::campello_renderer {
             int8_t previousTransformSlot = -1;
             // The vertex stage reads JOINTS_0/WEIGHTS_0 (skins). On Vulkan it
             // also morphs: the draw binds its joint palette at set 2
-            // (bindVulkanSkin()) and its morph targets at set 3 (bindVulkanMorph()).
+            // (bindSkin()) and its morph targets at set 3 (bindMorph()).
             bool skinned = false;
         };
         MeshPipelineRecipe meshRecipe;
@@ -637,33 +582,33 @@ namespace systems::leal::campello_renderer {
         // previous frame's, for G-buffer motion) as set 2. A size of 0 binds
         // the rest of the buffer from the offset. Bind groups are cached per
         // (buffers, ranges).
-        void bindVulkanSkin(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+        void bindSkin(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
                             const std::shared_ptr<systems::leal::campello_gpu::Buffer> &current, uint64_t currentOffset,
                             uint64_t currentSize, const std::shared_ptr<systems::leal::campello_gpu::Buffer> &previous,
                             uint64_t previousOffset, uint64_t previousSize);
-        struct VulkanSkinBindGroup {
+        struct SkinBindGroup {
             std::weak_ptr<systems::leal::campello_gpu::Buffer> current;
             std::weak_ptr<systems::leal::campello_gpu::Buffer> previous;
             std::shared_ptr<systems::leal::campello_gpu::BindGroup> group;
         };
-        std::unordered_map<uint64_t, VulkanSkinBindGroup> vulkanSkinBindGroups;
+        std::unordered_map<uint64_t, SkinBindGroup> skinBindGroups;
         // Set 2 of the Vulkan mesh pipelines: the joint palettes (storage buffers).
-        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> vulkanSkinBindGroupLayout;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> skinBindGroupLayout;
         // Vulkan: binds a morphed draw's MorphInfo and POSITION/NORMAL deltas
         // (whole buffers) as set 3 of the deforming stages; cached per buffers.
-        void bindVulkanMorph(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+        void bindMorph(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
                              const std::shared_ptr<systems::leal::campello_gpu::Buffer> &info,
                              const std::shared_ptr<systems::leal::campello_gpu::Buffer> &positions,
                              const std::shared_ptr<systems::leal::campello_gpu::Buffer> &normals);
-        struct VulkanMorphBindGroup {
+        struct MorphBindGroup {
             std::weak_ptr<systems::leal::campello_gpu::Buffer> info;
             std::weak_ptr<systems::leal::campello_gpu::Buffer> positions;
             std::weak_ptr<systems::leal::campello_gpu::Buffer> normals;
             std::shared_ptr<systems::leal::campello_gpu::BindGroup> group;
         };
-        std::unordered_map<uint64_t, VulkanMorphBindGroup> vulkanMorphBindGroups;
+        std::unordered_map<uint64_t, MorphBindGroup> morphBindGroups;
         // Set 3 of the Vulkan mesh pipelines: the morph targets (storage buffers).
-        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> vulkanMorphBindGroupLayout;
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> morphBindGroupLayout;
         void prewarmMeshPipelines();
         // True when the backend has a separate flat fragment shader (Metal);
         // elsewhere "flat" draws use the textured shader and its bind group.
@@ -769,6 +714,7 @@ namespace systems::leal::campello_renderer {
         // (Metal needs neither).
         std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> directxPbrPipelineLayout;
         std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> directxFxaaPipelineLayout;
+        std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> directxTaaPipelineLayout;
         std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> directxDownsamplePipelineLayout;
         std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> directxIblBakePipelineLayout;
         std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> directxSkyboxPipelineLayout;
@@ -837,11 +783,6 @@ namespace systems::leal::campello_renderer {
         // Frame-in-flight ring buffer (3 frames) — prevents CPU overwriting GPU data.
         static constexpr uint32_t kMaxFramesInFlight = 3;
 
-        // DirectX-only combined bind groups (see ensureDirectXPbrBindGroupLayout()'s
-        // doc comment) — declared here rather than alongside directxMaterialResources
-        // above since a std::array size needs kMaxFramesInFlight already visible.
-        std::vector<std::array<std::shared_ptr<systems::leal::campello_gpu::BindGroup>, kMaxFramesInFlight>> directxMaterialBindGroups;
-        std::array<std::shared_ptr<systems::leal::campello_gpu::BindGroup>, kMaxFramesInFlight> directxDefaultBindGroup;
 
         // Per-frame uniform buffer for skybox: invVP (64) + screenSize (8) + cameraPos (12) + pad = 96 bytes.
         std::shared_ptr<systems::leal::campello_gpu::Buffer>           skyboxUniformBuffer[kMaxFramesInFlight];
@@ -1484,7 +1425,7 @@ namespace systems::leal::campello_renderer {
         /// True when meshes with this vertex layout (GpuMesh::layout) can be
         /// drawn: the backend's shaders have a vertex stage that reads only
         /// attributes the layout has (call after createDefaultPipelines()).
-        /// VertexLayout::positionOnly() is supported on Metal and Vulkan.
+        /// VertexLayout::positionOnly() is supported on Metal, Vulkan and DirectX.
         bool supportsVertexLayout(const VertexLayout& layout) const {
             return supportsProgram(kPbrProgram, layout);
         }
@@ -1519,7 +1460,7 @@ namespace systems::leal::campello_renderer {
         static WideLineVertices expandLines(const float* positions, size_t vertexCount, const uint32_t* indices,
                                             size_t indexCount, float widthPixels);
         /// True when line meshes (GpuMesh::topology lineList/lineStrip) with
-        /// this layout can be drawn by the built-in program (Metal, Vulkan).
+        /// this layout can be drawn by the built-in program (Metal, Vulkan, DirectX).
         bool supportsLines(const VertexLayout& layout = VertexLayout::positionOnly()) const {
             return meshRecipe.ready && vertexStageFor(kPbrProgram, layout, true) != nullptr;
         }
@@ -1531,7 +1472,7 @@ namespace systems::leal::campello_renderer {
         void renderProgramPass(const RenderScene& scene,
                                std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView,
                                const ProgramPassOptions& options);
-        /// Whether renderGBuffer() works on this backend (Metal, Vulkan).
+        /// Whether renderGBuffer() works on this backend (Metal, Vulkan, DirectX).
         bool supportsGBuffer() const { return gbufferProgram.fragmentModule != nullptr && meshRecipe.ready; }
         /// Draws the scene's opaque draws into the G-buffer (gBuffer()) at
         /// renderWidth x renderHeight (resize()): normals, roughness, base
@@ -1559,7 +1500,7 @@ namespace systems::leal::campello_renderer {
         /// back-face culling, so the inside of cut solids shows; with section
         /// caps on, back faces of single-sided materials are painted in the
         /// cap colour (a solid-looking cut). Empty = no clipping. Only on
-        /// backends where supportsClipPlanes() (Metal, Vulkan; not DirectX yet).
+        /// backends where supportsClipPlanes() (Metal, Vulkan, DirectX).
         void setClipPlanes(const std::vector<std::array<double, 4>>& planes);
         const std::vector<std::array<double, 4>>& getClipPlanes() const { return clipPlanes; }
         void setSectionCaps(bool enabled, float r = 0.35f, float g = 0.35f, float b = 0.38f);
@@ -1672,7 +1613,7 @@ namespace systems::leal::campello_renderer {
         uint32_t internalWidth() const;
         uint32_t internalHeight() const;
         /// Sun shadows: the first directional light with castShadows casts a
-        /// shadow map over the opaque draws (Metal for now; supportsShadows()).
+        /// shadow map over the opaque draws (Metal, Vulkan, DirectX; supportsShadows()).
         /// On by default.
         void setShadowsEnabled(bool enabled) { shadowsEnabled = enabled; }
         bool getShadowsEnabled() const { return shadowsEnabled; }

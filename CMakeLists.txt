@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project(campello_renderer VERSION 0.23.0)
+project(campello_renderer VERSION 0.24.0)
 
 configure_file(src/campello_renderer_config.h.in campello_renderer_config.h)
 
@@ -208,6 +208,7 @@ if(CAMPELLO_RENDERER_BUILD_TEST)
         WGSL test/shaders/element_id.wgsl
         VULKAN_VERTEX test/shaders/element_id.vert
         VULKAN_FRAGMENT test/shaders/element_id.frag
+        DIRECTX test/shaders/element_id.hlsl
         VERTEX_READS "semanticBit(VertexSemantic::position) | semanticBit(VertexSemantic::custom0)")
     # App program using the lighting inputs and its own G-buffer stages (Metal).
     campello_renderer_add_shader_program(
