@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-18
+
 ### Added
 - **Frame benchmark** (`bench/frame_bench.cpp`, `-DCAMPELLO_RENDERER_BUILD_BENCH=ON`): CPU time per call and frame time for `render(RenderScene)` with 4,900 draws over 64 materials, the same grid as a glTF scene, `renderGBuffer()`, and the G-buffer plus `RealtimeDenoiser`, at 1280x720 offscreen.
 
