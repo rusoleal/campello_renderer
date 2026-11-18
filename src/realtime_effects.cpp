@@ -10,6 +10,20 @@
 #include <algorithm>
 #include <cmath>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
+// The ray traced effects (RayTracedShadows, ..., PathTracer) have shaders on
+// this backend: Metal only so far (rt_effects.cpp, path_tracer.cpp). Elsewhere
+// a device can report Feature::raytracing (DirectX on WARP does) with no
+// effect able to run.
+#if defined(__APPLE__) && !TARGET_OS_SIMULATOR
+#define CAMPELLO_RENDERER_RT_EFFECTS 1
+#else
+#define CAMPELLO_RENDERER_RT_EFFECTS 0
+#endif
+
 namespace systems::leal::campello_renderer {
 
 namespace GPU = systems::leal::campello_gpu;
@@ -57,7 +71,8 @@ RealtimeEffects::~RealtimeEffects() {
 
 bool RealtimeEffects::raytracingSupported() const {
     const auto device = renderer_.getDevice();
-    return device && renderer_.supportsGBuffer() && device->getFeatures().count(GPU::Feature::raytracing) != 0;
+    return CAMPELLO_RENDERER_RT_EFFECTS && device && renderer_.supportsGBuffer() &&
+           device->getFeatures().count(GPU::Feature::raytracing) != 0;
 }
 
 void RealtimeEffects::setQuality(EffectQuality quality) {

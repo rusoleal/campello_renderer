@@ -37,6 +37,7 @@
 - **DirectX: the benchmark's output went wrong after a few frames.** `target()` keeps only the texture's view, and a D3D12 view didn't keep its texture alive, so its render target descriptor was reused by other textures. Fixed in campello_gpu (views keep their texture).
 - **DirectX: thin glass in `render(RenderScene)` showed the wrong background.** Before the transparent pass, the combined bind groups weren't switched to the opaque scene copy, as the glTF `render()` path does. Transmission also skipped the sRGB-to-linear decode of the opaque scene that Metal and Vulkan do, so the background seen through the glass was too bright.
 - **DirectX: the opaque passes bound the scene colour texture as a shader resource while it was their render target** (TAA, FXAA, SSAA), which D3D12 rejects. They bind the 1×1 default texture there now. Transmissive draws still get the opaque scene copy.
+- **`RealtimeEffects::raytracingSupported()` was true where no ray traced effect can run.** It only checked `Feature::raytracing` and the G-buffer, so with the G-buffer on DirectX, a device with DXR (WARP) turned on effects whose shaders exist only on Metal and every effect timing stayed 0. It now also requires a backend with the effects (Metal).
 
 ## [0.23.0] - 2026-11-18
 
