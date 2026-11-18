@@ -3954,6 +3954,80 @@ TEST_F(OffscreenRenderTest, DrawCallInstancesDrawAtTheirTransforms) {
     EXPECT_FALSE(litAt(leanInstances, 32, 32)) << "position-only: worldTransform alone";
 }
 
+// A RenderScene draw with a material of the scene's own asset (setAsset())
+// draws in that material's colour (emissive white) without a glTF render() first: its
+// uniforms are written when it's uploaded (they were left empty: black).
+TEST_F(OffscreenRenderTest, SceneAssetMaterialsDrawInRenderScene) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto asset = GLTF::loadGLTF(kGltfInstancedQuad, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    GpuMaterial* white = renderer->uploadMaterial((*asset->materials)[0], *asset);  // emissive white
+    ASSERT_NE(white, nullptr);
+
+    std::vector<float> positions = {-0.5f, -0.5f, 0.0f, 0.5f, -0.5f, 0.0f, 0.5f, 0.5f, 0.0f, -0.5f, 0.5f, 0.0f};
+    std::vector<float> normals = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] = device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] = device->createBuffer(normals.size() * 4, GPU::BufferUsage::vertex, normals.data());
+    quad.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = nullptr;
+    quad.setBoundsFromPositions(positions.data(), 4);
+
+    RenderScene scene;
+    scene.camera.view = VM::Matrix4<double>::identity();
+    scene.camera.projection = VM::Matrix4<double>::identity();
+    scene.camera.position = VM::Vector3<double>(0.0, 0.0, 1.0);
+    DrawCall draw;
+    draw.mesh = &quad;
+    draw.material = white;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(draw);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    renderer->render(scene, view);
+    const auto pixels = readBackPixels(tex);
+    const size_t centre = (size_t(32) * 64 + 32) * 4;
+    for (int c = 0; c < 3; ++c) EXPECT_GT(pixels[centre + c], 200) << "channel " << c << ": the material's emissive white";
+}
+
+// Pipelines before the asset, as apps do: setAsset() then bakes the
+// environment's image-based lighting on the GPU, and the GPU must still draw
+// afterwards. (Queued all at once, the bake's jobs lost the device on an
+// Adreno 642L: every later frame was silently dropped.)
+TEST_F(OffscreenRenderTest, FramesDrawAfterTheEnvironmentBake) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+#if defined(_WIN32)
+    GTEST_SKIP() << "No EXT_mesh_gpu_instancing on DirectX yet";
+#endif
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+    auto asset = GLTF::loadGLTF(kGltfInstancedQuad, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);  // bakes the built-in environment
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    renderer->setCameraMatrices(identity, identity);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+    renderer->render(view);
+    const auto pixels = readBackPixels(tex);
+    EXPECT_TRUE(litAt(pixels, 13, 32)) << "nothing drawn after the bake (device lost?)";
+    EXPECT_TRUE(litAt(pixels, 51, 32));
+    renderer->clearCameraOverride();
+}
+
 // A RenderScene draw with a joint palette (DrawCall::jointMatrixBuffer) is
 // posed by it; the same mesh without one renders at rest.
 TEST_F(OffscreenRenderTest, DrawCallJointsPoseTheMesh) {
@@ -8306,6 +8380,121 @@ TEST_F(OffscreenRenderTest, MeshPipelinesComeFromLayoutsAndAreCached) {
     // The meshes' buffers die with this scope: let the GPU finish with them
     // first (DirectX and Vulkan don't keep in-flight resources alive).
     device->waitForIdle();
+}
+
+// Material specialization (setMaterialSpecialization()): materials each
+// using one optional PBR feature render the same with pipelines specialized
+// to their features as with the general pipeline, and specializing makes
+// pipelines for the feature sets drawn.
+static const char *kGltfFeatureMaterials = R"({
+    "asset": {"version": "2.0"},
+    "extensionsUsed": ["KHR_materials_clearcoat", "KHR_materials_sheen", "KHR_materials_specular",
+                       "KHR_materials_iridescence", "KHR_materials_anisotropy", "KHR_materials_unlit",
+                       "KHR_materials_transmission"],
+    "materials": [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.3, 0.2, 1], "metallicFactor": 0.1, "roughnessFactor": 0.5}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.3, 0.2, 1], "metallicFactor": 0.1, "roughnessFactor": 0.5},
+         "extensions": {"KHR_materials_clearcoat": {"clearcoatFactor": 1.0, "clearcoatRoughnessFactor": 0.1}}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.3, 0.2, 1], "metallicFactor": 0.1, "roughnessFactor": 0.5},
+         "extensions": {"KHR_materials_sheen": {"sheenColorFactor": [0.2, 0.9, 0.4], "sheenRoughnessFactor": 0.4}}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.3, 0.2, 1], "metallicFactor": 0.1, "roughnessFactor": 0.5},
+         "extensions": {"KHR_materials_specular": {"specularFactor": 0.4, "specularColorFactor": [0.2, 0.4, 1.0]}}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.3, 0.2, 1], "metallicFactor": 0.1, "roughnessFactor": 0.5},
+         "extensions": {"KHR_materials_iridescence": {"iridescenceFactor": 1.0}}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.3, 0.2, 1], "metallicFactor": 0.1, "roughnessFactor": 0.3},
+         "extensions": {"KHR_materials_anisotropy": {"anisotropyStrength": 0.8}}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.3, 0.2, 1]},
+         "extensions": {"KHR_materials_unlit": {}}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.3, 0.2, 1], "metallicFactor": 0.0, "roughnessFactor": 0.2},
+         "extensions": {"KHR_materials_transmission": {"transmissionFactor": 0.7}}}
+    ]
+})";
+
+TEST_F(OffscreenRenderTest, SpecializedMaterialsRenderAsTheGeneralShader) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfFeatureMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    ASSERT_EQ(asset->materials->size(), 8u);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(128, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.05f, 0.05f, 0.05f, 1.0f);
+
+    // Eight quads, 4 x 2, facing the camera, each with its own material.
+    std::vector<float> positions = {-0.2f, -0.2f, 0.0f, 0.2f, -0.2f, 0.0f, 0.2f, 0.2f, 0.0f, -0.2f, 0.2f, 0.0f};
+    std::vector<float> normals = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    std::vector<float> tangents = {1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1};
+    std::vector<float> uvs = {0, 1, 1, 1, 1, 0, 0, 0};
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] = device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] = device->createBuffer(normals.size() * 4, GPU::BufferUsage::vertex, normals.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_TANGENT] = device->createBuffer(tangents.size() * 4, GPU::BufferUsage::vertex, tangents.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_TEXCOORD0] = device->createBuffer(uvs.size() * 4, GPU::BufferUsage::vertex, uvs.data());
+    quad.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = nullptr;
+    quad.setBoundsFromPositions(positions.data(), 4);
+
+    RenderScene scene;
+    const VM::Vector3<double> eye(0.0, 0.3, 2.2);
+    scene.camera.view = VM::Matrix4<double>::lookAt(eye, VM::Vector3<double>(0.0, 0.0, 0.0), VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(45.0 * 3.14159265358979323846 / 180.0, 2.0, 0.1, 100.0);
+    scene.camera.position = eye;
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(0.3, -0.5, -1.0);
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    scene.lights.push_back(sun);
+    for (size_t i = 0; i < 8; ++i) {
+        GpuMaterial* material = renderer->uploadMaterial((*asset->materials)[i], *asset);
+        ASSERT_NE(material, nullptr);
+        DrawCall draw;
+        draw.mesh = &quad;
+        draw.material = material;
+        draw.worldTransform = VM::Matrix4<double>::translate(
+            VM::Vector3<double>(-0.75 + 0.5 * double(i % 4), i < 4 ? 0.25 : -0.25, 0.0));
+        scene.opaque.push_back(draw);
+    }
+    const auto render = [&] {
+        auto tex = makeOffscreenTexture(128, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        renderer->render(scene, view);
+        return readBackPixels(tex);
+    };
+
+    renderer->setMaterialSpecialization(false);
+    const size_t generalPipelines = renderer->meshPipelineCount();
+    const auto general = render();
+    EXPECT_EQ(renderer->meshPipelineCount(), generalPipelines) << "the general shader made pipelines";
+    renderer->setMaterialSpecialization(true);
+    const auto specialized = render();
+    renderer->setMaterialSpecialization(true);
+#if defined(__APPLE__) || defined(__ANDROID__)  // Metal, Vulkan
+    EXPECT_GE(renderer->meshPipelineCount(), generalPipelines + 7) << "one pipeline per feature set drawn";
+#endif
+    ASSERT_EQ(general.size(), specialized.size());
+    int worst = 0;
+    for (size_t i = 0; i < general.size(); ++i) worst = std::max(worst, std::abs(int(general[i]) - int(specialized[i])));
+    EXPECT_LE(worst, 1) << "specialized materials render differently";
+    // The features show (not all quads the same colour): the plain quad
+    // (column 21, row 24) against the clearcoat, sheen and unlit ones.
+    const auto at = [&](const std::vector<uint8_t>& p, int x, int y) {
+        const size_t i = (size_t(y) * 128 + size_t(x)) * 4;
+        return std::abs(int(p[i]) - 0) + int(p[i + 1]) + int(p[i + 2]);
+    };
+    const int plain = at(general, 21, 24);
+    EXPECT_NE(plain, at(general, 53, 24)) << "clearcoat";
+    EXPECT_NE(plain, at(general, 85, 24)) << "sheen";
+    EXPECT_NE(plain, at(general, 53, 42)) << "unlit";
 }
 
 // OpaqueOrder::frontToBack only reorders draws: whatever order the scene

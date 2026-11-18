@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added
+- **Material specialization** (`setMaterialSpecialization()`, on by default; Metal and Vulkan). The PBR fragment shader is compiled per set of optional features a material uses (KHR_materials_specular, sheen, clearcoat, transmission with volume and dispersion, iridescence, anisotropy, world mapping, unlit, the debug views), through campello_gpu v0.32.0's shader constants (Metal: function constant 0, `kMaterialFeatures`; Vulkan: specialization constant 0 in `default.frag`, which reads the optional features' fields through `MAT_<field>` macros that give the off value as a constant; a first version copied the uniform block into a local struct, which an Adreno 642L kept in scratch memory and ran 7x slower). Unused features' code is left out. On Vulkan the flat variant (the same fragment shader) is specialized too.
+  - A material's features come from its own uniforms, so a feature is only left out when its values already switch it off, and specialized pipelines render exactly as the general one (`SpecializedMaterialsRenderAsTheGeneralShader` compares them per pixel).
+  - Plain materials' pipelines are created up front; other combinations the first time they're drawn.
+  - Benchmark, frame time, general shader to specialized:
+    - Intel UHD 630 (Metal): `fill` 47.0 to 23.3 ms, `draws` 6.67 to 4.47 ms, `shadows` about 9.0 to 6.2 ms.
+    - Adreno 642L (Vulkan, Galaxy Tab S7 FE): `fill` 101.6 to 40.1 ms, `draws` 38.1 to 29.7 ms, `shadows` 28.4 to 15.3 ms.
+  - The gain is in the image-based lighting, where most optional features' code runs; with IBL off there's little to remove.
+  - The benchmark takes `--general` to compare with the general shader, and builds for Android (see `bench/frame_bench.cpp`).
+- Benchmark: scenario `fill` (one opaque quad filling a 3840x2160 view: fragment cost), `--no-ibl` (pipelines after `setAsset()`, no environment bake), and a check that `fill` drew. Its render targets are kept for the run (on Vulkan a texture view doesn't keep its texture alive).
+
+### Changed
+- **campello_gpu v0.33.0**: pipeline-time shader constants (material specialization), texture views that keep their texture alive on Vulkan, and failed Vulkan submissions reported.
+- **Test results:** macOS 144 passed (also with Metal API validation); Android: Adreno 642L (Galaxy Tab S7 FE, Android 14) 110 passed, 0 failed.
+
+### Fixed
+- **Nothing drew after the environment bake on some Adreno GPUs** (Vulkan). With pipelines created before `setAsset()` (the usual order), `setAsset()` bakes the environment's image-based lighting, and its 67 jobs were queued at once: an Adreno 642L (Galaxy Tab S7 FE) lost the device, so every later submission failed and frames came out empty, and an Adreno 618 wedged its driver. Natively each job is now waited for before the next. New test `FramesDrawAfterTheEnvironmentBake` (fails on the Adreno 642L without the fix).
+- **Scene-asset materials in `render(RenderScene)`.** `uploadMaterial()` for a material of the scene's own asset reused the bind groups `setScene()` made but never wrote its uniforms (only the glTF `render()` path did, every frame), so a RenderScene draw before or without a glTF render read an empty slot: black base colour, zero roughness. The slot is written on upload now. New test `SceneAssetMaterialsDrawInRenderScene`. Earlier `draws`/`shadows`/`gbuffer` benchmark numbers were measured with those empty materials.
+
 ## [0.24.0] - 2026-11-18
 
 ### Added

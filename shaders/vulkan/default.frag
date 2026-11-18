@@ -96,6 +96,51 @@ layout(std140, set = 0, binding = 24) uniform MaterialUniforms {
     float texCoord1Mask;             // 368
 } mat;
 
+// Material specialization (as default.metal's specializedMaterial()): the
+// optional features as specialization constant 0, a bit mask set per
+// pipeline from the material's own uniforms (Renderer::materialFeaturesOf()).
+// A bit is clear only when the material's values already switch its feature
+// off, so MAT_<field> gives the value the uniform holds anyway, but as a
+// constant the driver folds, dropping the feature's code. The default (no
+// constant): every feature, read from the uniforms at run time. (Fields are
+// read through these macros, not copied: a copy of the block into a local
+// struct went to scratch memory on an Adreno 642L, 7x slower.)
+layout(constant_id = 0) const uint kMaterialFeatures = 0xFFFFFFFFu;
+const uint kFeatureSpecular     = 1u << 0;
+const uint kFeatureSheen        = 1u << 1;
+const uint kFeatureClearcoat    = 1u << 2;
+const uint kFeatureTransmission = 1u << 3;
+const uint kFeatureIridescence  = 1u << 4;
+const uint kFeatureAnisotropy   = 1u << 5;
+const uint kFeatureWorldMapping = 1u << 6;
+const uint kFeatureUnlit        = 1u << 7;
+const uint kFeatureViewMode     = 1u << 8;
+#define MAT_specularFactor ((kMaterialFeatures & kFeatureSpecular) != 0u ? mat.specularFactor : 1.0)
+#define MAT_hasSpecularTexture ((kMaterialFeatures & kFeatureSpecular) != 0u ? mat.hasSpecularTexture : 0.0)
+#define MAT_hasSpecularColorTexture ((kMaterialFeatures & kFeatureSpecular) != 0u ? mat.hasSpecularColorTexture : 0.0)
+#define MAT_specularColorFactor ((kMaterialFeatures & kFeatureSpecular) != 0u ? mat.specularColorFactor : vec4(1.0, 1.0, 1.0, mat.specularColorFactor.w))
+#define MAT_sheenColorFactor ((kMaterialFeatures & kFeatureSheen) != 0u ? mat.sheenColorFactor : vec4(0.0, 0.0, 0.0, mat.sheenColorFactor.w))
+#define MAT_hasSheenColorTexture ((kMaterialFeatures & kFeatureSheen) != 0u ? mat.hasSheenColorTexture : 0.0)
+#define MAT_hasSheenRoughnessTexture ((kMaterialFeatures & kFeatureSheen) != 0u ? mat.hasSheenRoughnessTexture : 0.0)
+#define MAT_clearcoatFactor ((kMaterialFeatures & kFeatureClearcoat) != 0u ? mat.clearcoatFactor : 0.0)
+#define MAT_hasClearcoatTexture ((kMaterialFeatures & kFeatureClearcoat) != 0u ? mat.hasClearcoatTexture : 0.0)
+#define MAT_hasClearcoatRoughnessTexture ((kMaterialFeatures & kFeatureClearcoat) != 0u ? mat.hasClearcoatRoughnessTexture : 0.0)
+#define MAT_hasClearcoatNormalTexture ((kMaterialFeatures & kFeatureClearcoat) != 0u ? mat.hasClearcoatNormalTexture : 0.0)
+#define MAT_transmissionFactor ((kMaterialFeatures & kFeatureTransmission) != 0u ? mat.transmissionFactor : 0.0)
+#define MAT_hasTransmissionTexture ((kMaterialFeatures & kFeatureTransmission) != 0u ? mat.hasTransmissionTexture : 0.0)
+#define MAT_thicknessFactor ((kMaterialFeatures & kFeatureTransmission) != 0u ? mat.thicknessFactor : 0.0)
+#define MAT_hasThicknessTexture ((kMaterialFeatures & kFeatureTransmission) != 0u ? mat.hasThicknessTexture : 0.0)
+#define MAT_dispersion ((kMaterialFeatures & kFeatureTransmission) != 0u ? mat.dispersion : 0.0)
+#define MAT_iridescenceFactor ((kMaterialFeatures & kFeatureIridescence) != 0u ? mat.iridescenceFactor : 0.0)
+#define MAT_hasIridescenceTexture ((kMaterialFeatures & kFeatureIridescence) != 0u ? mat.hasIridescenceTexture : 0.0)
+#define MAT_hasIridescenceThicknessTexture ((kMaterialFeatures & kFeatureIridescence) != 0u ? mat.hasIridescenceThicknessTexture : 0.0)
+#define MAT_anisotropyStrength ((kMaterialFeatures & kFeatureAnisotropy) != 0u ? mat.anisotropyStrength : 0.0)
+#define MAT_hasAnisotropicTexture ((kMaterialFeatures & kFeatureAnisotropy) != 0u ? mat.hasAnisotropicTexture : 0.0)
+#define MAT_worldMapping ((kMaterialFeatures & kFeatureWorldMapping) != 0u ? mat.worldMapping : 0.0)
+#define MAT_unlit ((kMaterialFeatures & kFeatureUnlit) != 0u ? mat.unlit : 0.0)
+#define MAT_viewMode ((kMaterialFeatures & kFeatureViewMode) != 0u ? mat.viewMode : 0.0)
+
+
 // --- Per-frame (set 1) ----------------------------------------------------------
 struct Light {
     vec4 position;   // xyz = position/dir, w = type (0=dir, 1=point, 2=spot)
@@ -467,9 +512,9 @@ void main() {
         worldTangentIn   = T;
         worldBitangentIn = cross(N, T);
     }
-    if (mat.worldMapping > 0.0) {
+    if (MAT_worldMapping > 0.0) {
         vec3 T, B;
-        worldMappingFrame(worldPos, normalize(worldNormalIn), mat.worldMapping, mat.worldMappingUp > 0.5, texcoord0In, T, B);
+        worldMappingFrame(worldPos, normalize(worldNormalIn), MAT_worldMapping, mat.worldMappingUp > 0.5, texcoord0In, T, B);
         worldTangentIn   = T;
         worldBitangentIn = B;
     }
@@ -497,8 +542,8 @@ void main() {
     vec4 baseColor = texture(sampler2D(baseColorTexture, baseColorSampler), baseColorUV)
                     * mat.baseColorFactor * fragColor0;
 
-    float transmission = mat.transmissionFactor;
-    if (mat.hasTransmissionTexture > 0.5) {
+    float transmission = MAT_transmissionFactor;
+    if (MAT_hasTransmissionTexture > 0.5) {
         vec2 transUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1Transmission);
         transmission *= texture(sampler2D(transmissionTexture, baseColorSampler), transUV).r;
     }
@@ -509,7 +554,7 @@ void main() {
     }
 
     // Unlit: return base color without lighting.
-    if (mat.unlit > 0.5) {
+    if (MAT_unlit > 0.5) {
         outColor = baseColor;
         return;
     }
@@ -551,22 +596,22 @@ void main() {
         emissive *= texture(sampler2D(emissiveTexture, emissiveSampler), emisUV).rgb;
     }
 
-    float specularFactor = mat.specularFactor;
-    if (mat.hasSpecularTexture > 0.5) {
+    float specularFactor = MAT_specularFactor;
+    if (MAT_hasSpecularTexture > 0.5) {
         vec2 specUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1Specular);
         specularFactor *= texture(sampler2D(specularTexture, specularSampler), specUV).a;
     }
 
-    vec3 specularColorFactorSampled = mat.specularColorFactor.xyz;
-    if (mat.hasSpecularColorTexture > 0.5) {
+    vec3 specularColorFactorSampled = MAT_specularColorFactor.xyz;
+    if (MAT_hasSpecularColorTexture > 0.5) {
         vec2 specColUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1SpecularColor);
         specularColorFactorSampled *= texture(sampler2D(specularColorTexture, specularColorSampler), specColUV).rgb;
     }
 
     // Anisotropy.
-    float anisoStrength = mat.anisotropyStrength;
+    float anisoStrength = MAT_anisotropyStrength;
     float anisoRotation = mat.anisotropyRotation;
-    if (mat.hasAnisotropicTexture > 0.5) {
+    if (MAT_hasAnisotropicTexture > 0.5) {
         vec2 anisoUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1Anisotropic);
         vec2 anisoTex = texture(sampler2D(anisotropicTexture, baseColorSampler), anisoUV).rg;
         anisoStrength *= anisoTex.r;
@@ -574,46 +619,46 @@ void main() {
     }
 
     // KHR_materials_iridescence.
-    float iridescenceFactor = mat.iridescenceFactor;
-    if (mat.hasIridescenceTexture > 0.5) {
+    float iridescenceFactor = MAT_iridescenceFactor;
+    if (MAT_hasIridescenceTexture > 0.5) {
         vec2 iridUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1Iridescence);
         iridescenceFactor *= texture(sampler2D(iridescenceTexture, baseColorSampler), iridUV).r;
     }
     float iridescenceThickness = mat.iridescenceThicknessMax;
-    if (mat.hasIridescenceThicknessTexture > 0.5) {
+    if (MAT_hasIridescenceThicknessTexture > 0.5) {
         vec2 iridThickUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1IridescenceThickness);
         iridescenceThickness = mix(mat.iridescenceThicknessMin, mat.iridescenceThicknessMax,
             texture(sampler2D(iridescenceThicknessTexture, baseColorSampler), iridThickUV).g);
     }
 
     // KHR_materials_sheen.
-    vec3 sheenColor = mat.sheenColorFactor.xyz;
-    if (mat.hasSheenColorTexture > 0.5) {
+    vec3 sheenColor = MAT_sheenColorFactor.xyz;
+    if (MAT_hasSheenColorTexture > 0.5) {
         vec2 sheenColUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1SheenColor);
         sheenColor *= texture(sampler2D(sheenColorTexture, baseColorSampler), sheenColUV).rgb;
     }
     float sheenRoughness = clamp(mat.sheenRoughnessFactor, 0.07, 1.0);
-    if (mat.hasSheenRoughnessTexture > 0.5) {
+    if (MAT_hasSheenRoughnessTexture > 0.5) {
         vec2 sheenRoughUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1SheenRoughness);
         sheenRoughness = clamp(sheenRoughness * texture(sampler2D(sheenRoughnessTexture, baseColorSampler), sheenRoughUV).r, 0.07, 1.0);
     }
 
     // KHR_materials_clearcoat.
-    float ccFactor = mat.clearcoatFactor;
-    if (mat.hasClearcoatTexture > 0.5) {
+    float ccFactor = MAT_clearcoatFactor;
+    if (MAT_hasClearcoatTexture > 0.5) {
         vec2 ccUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1Clearcoat);
         ccFactor *= texture(sampler2D(clearcoatTexture, baseColorSampler), ccUV).r;
     }
     ccFactor = clamp(ccFactor, 0.0, 1.0);
 
     float ccRoughness = clamp(mat.clearcoatRoughnessFactor, 0.001, 1.0);
-    if (mat.hasClearcoatRoughnessTexture > 0.5) {
+    if (MAT_hasClearcoatRoughnessTexture > 0.5) {
         vec2 ccRoughUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1ClearcoatRoughness);
         ccRoughness = clamp(ccRoughness * texture(sampler2D(clearcoatRoughnessTexture, baseColorSampler), ccRoughUV).g, 0.001, 1.0);
     }
 
     vec3 ccN = normalize(worldNormalIn);
-    if (mat.hasClearcoatNormalTexture > 0.5) {
+    if (MAT_hasClearcoatNormalTexture > 0.5) {
         vec2 ccNormUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1ClearcoatNormal);
         vec3 ccNS = texture(sampler2D(clearcoatNormalTexture, baseColorSampler), ccNormUV).rgb * 2.0 - 1.0;
         ccNS.xy *= mat.clearcoatNormalScale;
@@ -654,7 +699,7 @@ void main() {
         vec3 envSpecular = textureLod(samplerCube(environmentMap, environmentSampler), R, roughness * envMaxLod).rgb;
         float f0_scalar = (mat.ior - 1.0) / (mat.ior + 1.0);
         f0_scalar *= f0_scalar;
-        vec3 F0 = mix(vec3(f0_scalar) * mat.specularColorFactor.xyz, baseColor.rgb, metallic);
+        vec3 F0 = mix(vec3(f0_scalar) * MAT_specularColorFactor.xyz, baseColor.rgb, metallic);
         if (iridescenceFactor > 0.0) {
             vec3 iridF0 = EvalIridescence(1.0, mat.iridescenceIor, NdotV, iridescenceThickness, F0);
             F0 = mix(F0, iridF0, iridescenceFactor);
@@ -678,8 +723,8 @@ void main() {
         vec3 Trefr = refract(-viewDir, N, eta);
         if (all(equal(Trefr, vec3(0.0)))) Trefr = -viewDir;
 
-        float thickness = mat.thicknessFactor;
-        if (mat.hasThicknessTexture > 0.5) {
+        float thickness = MAT_thicknessFactor;
+        if (MAT_hasThicknessTexture > 0.5) {
             vec2 thickUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1Thickness);
             thickness *= texture(sampler2D(thicknessTexture, baseColorSampler), thickUV).r;
         }
@@ -692,8 +737,8 @@ void main() {
             vec3 viewPos = (camera.viewMatrix * vec4(worldPos, 1.0)).xyz;
             vec3 viewNormal = normalize((camera.viewMatrix * vec4(N, 0.0)).xyz);
             vec3 viewIncident = normalize(viewPos);
-            if (mat.dispersion > 0.0) {
-                float dispersionScale = mat.dispersion * 0.02;
+            if (MAT_dispersion > 0.0) {
+                float dispersionScale = MAT_dispersion * 0.02;
                 vec3 iorRGB = vec3(mat.ior + dispersionScale, mat.ior, max(mat.ior - dispersionScale, 1.001));
                 for (int ch = 0; ch < 3; ch++) {
                     float etaCh = 1.0 / iorRGB[ch];

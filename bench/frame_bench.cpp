@@ -1,7 +1,11 @@
 // Frame benchmark: the CPU cost of the renderer's frame paths and the frame
 // time they sustain, to compare changes against a baseline.
 //
-//   campello_renderer_bench [scenario] [frames]
+//   campello_renderer_bench [scenario] [frames] [--general] [--no-ibl]
+//
+// On Android: build it for arm64 (CAMPELLO_RENDERER_BUILD_BENCH, the NDK
+// toolchain as run_android_tests.sh), adb push it with the libraries, run
+// it from /data/local/tmp with LD_LIBRARY_PATH=.
 //
 // Scenarios (all by default):
 //   draws    render(RenderScene): a grid of cubes, one DrawCall each, over
@@ -11,6 +15,8 @@
 //   shadows  render(RenderScene) with a third-person view of one corner of
 //            the grid and one cube moving, so the sun's shadow map is
 //            redrawn every frame (shadow caster culling).
+//   fill     one opaque quad filling a 3840x2160 view: fragment shading
+//            (material specialization) with almost no CPU work.
 //   gbuffer  renderGBuffer() alone, the grid.
 //   denoise  renderGBuffer() + RealtimeDenoiser::denoise() every frame.
 //
@@ -172,10 +178,17 @@ void report(const char* name, const Result& r) {
     std::fflush(stdout);
 }
 
-std::shared_ptr<GPU::TextureView> target(const std::shared_ptr<GPU::Device>& device) {
-    auto texture = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm, kWidth, kHeight, 1, 1, 1,
+// The render targets, kept for the run: on Vulkan a view doesn't keep its
+// texture alive (a view of a released texture is a dangling image).
+std::vector<std::shared_ptr<GPU::Texture>> gTargets;
+
+std::shared_ptr<GPU::TextureView> target(const std::shared_ptr<GPU::Device>& device, uint32_t width = kWidth,
+                                         uint32_t height = kHeight) {
+    auto texture = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm, width, height, 1, 1, 1,
                                          GPU::TextureUsage::renderTarget);
-    return texture ? texture->createView(GPU::PixelFormat::rgba8unorm, 1) : nullptr;
+    if (!texture) return nullptr;
+    gTargets.push_back(texture);
+    return texture->createView(GPU::PixelFormat::rgba8unorm, 1);
 }
 
 // The grid as DrawCalls: one cube mesh, the asset's materials.
@@ -184,10 +197,25 @@ struct DrawScene {
     RenderScene scene;
 };
 
+// --no-ibl: pipelines are created after setAsset(), which then has none to
+// bake the environment's IBL with (as the tests do). The bake hangs some
+// Adreno drivers; shading then has no image-based light.
+bool gBakeIbl = true;
+bool gSpecialize = true;
+
+void createPipelines(Renderer& renderer) {
+    renderer.setMaterialSpecialization(gSpecialize);
+    renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+}
+
 bool buildDrawScene(Renderer& renderer, DrawScene& out) {
     out.asset = load(gridGltf(false));
     if (!out.asset) return false;
-    renderer.setAsset(out.asset);
+    const auto setupStart = Clock::now();
+    renderer.setAsset(out.asset);  // with pipelines: bakes the environment's IBL
+    std::printf("         setAsset %.0f ms\n", std::chrono::duration<double, std::milli>(Clock::now() - setupStart).count());
+    std::fflush(stdout);
+    if (!gBakeIbl) createPipelines(renderer);
     GpuMesh* mesh = renderer.uploadMesh((*out.asset->meshes)[0].primitives[0], *out.asset);
     if (!mesh) return false;
     std::vector<GpuMaterial*> materials;
@@ -209,28 +237,96 @@ bool buildDrawScene(Renderer& renderer, DrawScene& out) {
     return true;
 }
 
+// Fragment-bound: one opaque quad filling a 3840x2160 view (8.3M shaded
+// fragments a frame, one draw), so the frame time is the fragment shader's.
+constexpr uint32_t kFillWidth = 3840, kFillHeight = 2160;
+
+struct FillScene {
+    std::shared_ptr<gltf::GLTF> asset;
+    GpuMesh quad;
+    RenderScene scene;
+};
+
+bool buildFillScene(const std::shared_ptr<GPU::Device>& device, Renderer& renderer, FillScene& out) {
+    out.asset = load(R"({"asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": []}],
+        "materials": [{"pbrMetallicRoughness":
+            {"baseColorFactor": [0.8, 0.5, 0.3, 1], "metallicFactor": 0.1, "roughnessFactor": 0.5}}]})");
+    if (!out.asset) return false;
+    renderer.setAsset(out.asset);
+    if (!gBakeIbl) createPipelines(renderer);
+    GpuMaterial* material = renderer.uploadMaterial((*out.asset->materials)[0], *out.asset);
+    if (!material) return false;
+    // A unit quad facing +z, scaled per layer to fill the view.
+    const float positions[] = {-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0};
+    const float normals[] = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    const float tangents[] = {1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1};
+    const float uvs[] = {0, 1, 1, 1, 1, 0, 0, 0};
+    const uint32_t indices[] = {0, 1, 2, 0, 2, 3};
+    auto& q = out.quad;
+    q.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+        device->createBuffer(sizeof(positions), GPU::BufferUsage::vertex, (void*)positions);
+    q.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] = device->createBuffer(sizeof(normals), GPU::BufferUsage::vertex, (void*)normals);
+    q.vertexBuffers[Renderer::VERTEX_SLOT_TANGENT] = device->createBuffer(sizeof(tangents), GPU::BufferUsage::vertex, (void*)tangents);
+    q.vertexBuffers[Renderer::VERTEX_SLOT_TEXCOORD0] = device->createBuffer(sizeof(uvs), GPU::BufferUsage::vertex, (void*)uvs);
+    q.indexBuffer = device->createBuffer(sizeof(indices), GPU::BufferUsage::index, (void*)indices);
+    q.indexCount = 6;
+    q.indexFormat = GPU::IndexFormat::uint32;
+    q.vertexCount = 4;
+    q.layout = nullptr;
+    q.setBoundsFromPositions(positions, 4);
+
+    const VM::Vector3<double> eye(0.0, 0.0, 0.0);
+    out.scene.camera.view = VM::Matrix4<double>::lookAt(eye, VM::Vector3<double>(0.0, 0.0, -1.0), VM::Vector3<double>(0.0, 1.0, 0.0));
+    out.scene.camera.projection =
+        VM::Matrix4<double>::perspective(55.0 * 3.14159265358979323846 / 180.0, double(kFillWidth) / kFillHeight, 0.1, 100.0);
+    out.scene.camera.position = eye;
+    DrawCall draw;  // 2 away, wider than the view (55 deg, 16:9) there
+    draw.mesh = &q;
+    draw.material = material;
+    draw.worldTransform = VM::Matrix4<double>::translate(VM::Vector3<double>(0.0, 0.0, -2.0)) *
+                          VM::Matrix4<double>::scale(VM::Vector3<double>(2.4, 2.4, 1.0));
+    out.scene.opaque.push_back(draw);
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(-0.3, -0.5, -1.0);
+    out.scene.lights.push_back(sun);
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    const std::string only = argc > 1 ? argv[1] : "";
-    const int frames = argc > 2 ? std::max(1, std::atoi(argv[2])) : 200;
+    // [scenario] [frames], and --general: the general PBR shader
+    // (setMaterialSpecialization(false)), to compare with specialization.
+    std::vector<std::string> args;
+    bool specialize = true;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--general") specialize = false;
+        else if (std::string(argv[i]) == "--no-ibl") gBakeIbl = false;
+        else args.push_back(argv[i]);
+    }
+    gSpecialize = specialize;
+    const std::string only = args.size() > 0 ? args[0] : "";
+    const int frames = args.size() > 1 ? std::max(1, std::atoi(args[1].c_str())) : 200;
     auto device = GPU::Device::createDefaultDevice(nullptr);
     if (!device) {
         std::fprintf(stderr, "no GPU device\n");
         return 1;
     }
-    std::printf("campello_renderer %s, %s, %dx%d, %d draws, %d materials, %d frames\n", getVersion().c_str(),
-                device->getName().c_str(), kWidth, kHeight, kGrid * kGrid, kMaterials, frames);
+    std::printf("campello_renderer %s, %s, %dx%d, %d draws, %d materials, %d frames, %s shader\n", getVersion().c_str(),
+                device->getName().c_str(), kWidth, kHeight, kGrid * kGrid, kMaterials, frames,
+                specialize ? "specialized" : "general");
 
     if (only.empty() || only == "draws") {
         Renderer renderer(device);
         renderer.resize(kWidth, kHeight);
-        renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+        if (gBakeIbl) createPipelines(renderer);
         renderer.setSkyboxEnabled(false);
         DrawScene draws;
         auto view = target(device);
         if (view && buildDrawScene(renderer, draws)) {
             report("draws", run(device, frames, [&] { renderer.render(draws.scene, view); }));
+
         }
     }
     if (only.empty() || only == "shadows") {
@@ -238,7 +334,7 @@ int main(int argc, char** argv) {
         // moving, so the sun's shadow map is redrawn every frame.
         Renderer renderer(device);
         renderer.resize(kWidth, kHeight);
-        renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+        if (gBakeIbl) createPipelines(renderer);
         renderer.setSkyboxEnabled(false);
         DrawScene draws;
         auto view = target(device);
@@ -258,6 +354,31 @@ int main(int argc, char** argv) {
             std::printf("         shadow casters drawn %u of %u\n", stats.shadowCastersDrawn, stats.shadowCasterCount);
         }
     }
+    if (only.empty() || only == "fill") {
+        Renderer renderer(device);
+        renderer.resize(kFillWidth, kFillHeight);
+        if (gBakeIbl) createPipelines(renderer);
+        renderer.setSkyboxEnabled(false);
+        FillScene fill;
+        auto view = target(device, kFillWidth, kFillHeight);
+        if (view && buildFillScene(device, renderer, fill)) {
+            report("fill", run(device, frames, [&] { renderer.render(fill.scene, view); }));
+            // That it drew: the centre pixel of one more frame (not the clear colour).
+            auto readable = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm, kFillWidth,
+                                                  kFillHeight, 1, 1, 1,
+                                                  (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::renderTarget) |
+                                                                      uint32_t(GPU::TextureUsage::copySrc)));
+            if (readable) {
+                renderer.render(fill.scene, readable->createView(GPU::PixelFormat::rgba8unorm, 1));
+                device->waitForIdle();
+                std::vector<uint8_t> pixels(size_t(kFillWidth) * kFillHeight * 4);
+                if (readable->download(0, 0, pixels.data(), pixels.size())) {
+                    const size_t at = (size_t(kFillHeight / 2) * kFillWidth + kFillWidth / 2) * 4;
+                    std::printf("         centre pixel %u %u %u\n", pixels[at], pixels[at + 1], pixels[at + 2]);
+                }
+            }
+        }
+    }
     if (only.empty() || only == "gltf") {
         Renderer renderer(device);
         auto asset = load(gridGltf(true));
@@ -265,7 +386,7 @@ int main(int argc, char** argv) {
         if (asset && view) {
             renderer.setAsset(asset);
             renderer.resize(kWidth, kHeight);
-            renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+            createPipelines(renderer);  // after setAsset(): the glTF scenario never bakes IBL
             renderer.setSkyboxEnabled(false);
             RenderScene camera;
             cameraLooking(camera);
@@ -283,7 +404,7 @@ int main(int argc, char** argv) {
     if (only.empty() || only == "gbuffer") {
         Renderer renderer(device);
         renderer.resize(kWidth, kHeight);
-        renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+        if (gBakeIbl) createPipelines(renderer);
         DrawScene draws;
         if (!renderer.supportsGBuffer()) {
             std::printf("gbuffer  (not supported here)\n");
@@ -294,7 +415,7 @@ int main(int argc, char** argv) {
     if (only.empty() || only == "denoise") {
         Renderer renderer(device);
         renderer.resize(kWidth, kHeight);
-        renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+        if (gBakeIbl) createPipelines(renderer);
         RealtimeDenoiser denoiser(device);
         DrawScene draws;
         auto noisy = device->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba16float, kWidth, kHeight, 1, 1, 1,
@@ -308,5 +429,6 @@ int main(int argc, char** argv) {
                    }));
         }
     }
+    gTargets.clear();  // before the device goes
     return 0;
 }
