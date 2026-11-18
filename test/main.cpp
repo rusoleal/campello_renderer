@@ -2949,9 +2949,6 @@ static const char *kGltfMorphTriangleTemplate = R"({
 // shader reading them at another stride moves only the first vertex).
 TEST_F(OffscreenRenderTest, MorphTargetMovesEveryVertex) {
     if (!device) GTEST_SKIP() << "No GPU device available";
-#if defined(_WIN32)
-    GTEST_SKIP() << "No morph targets on DirectX yet";
-#endif
     const auto render = [&](double weight) -> std::vector<uint8_t> {
         renderer = std::make_unique<systems::leal::campello_renderer::Renderer>(device);
         char json[4096];
@@ -3802,9 +3799,6 @@ static bool litAt(const std::vector<uint8_t>& pixels, int x, int y) {
 // at its rest position.
 TEST_F(OffscreenRenderTest, GltfSkinPosesTheMesh) {
     if (!device) GTEST_SKIP() << "No GPU device available";
-#if defined(_WIN32)
-    GTEST_SKIP() << "No skinning on DirectX yet";
-#endif
     auto asset = GLTF::loadGLTF(kGltfSkinnedQuad, kNoOpLoader);
     ASSERT_NE(asset, nullptr);
     renderer->setAsset(asset);
@@ -3855,9 +3849,6 @@ static const char *kGltfInstancedQuad = R"({
 // column 13, x = 0.6 near column 51), nothing at the mesh's own position.
 TEST_F(OffscreenRenderTest, GltfInstancesDrawAtTheirTransforms) {
     if (!device) GTEST_SKIP() << "No GPU device available";
-#if defined(_WIN32)
-    GTEST_SKIP() << "No EXT_mesh_gpu_instancing on DirectX yet";
-#endif
     auto asset = GLTF::loadGLTF(kGltfInstancedQuad, kNoOpLoader);
     ASSERT_NE(asset, nullptr);
     renderer->setAsset(asset);
@@ -4020,9 +4011,6 @@ TEST_F(OffscreenRenderTest, DrawCallJointsPoseTheMesh) {
     const auto rest = render();
     EXPECT_TRUE(litAt(rest, 32, 32)) << "no joints: at rest";
     EXPECT_FALSE(litAt(rest, 51, 32));
-#if defined(_WIN32)
-    GTEST_SKIP() << "No skinning on DirectX yet";
-#endif
 
     scene.opaque[0].jointMatrixBuffer = device->createBuffer(sizeof(moved), GPU::BufferUsage::storage, moved);
     scene.opaque[0].jointCount = 1;

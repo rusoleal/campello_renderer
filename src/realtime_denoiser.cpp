@@ -26,6 +26,9 @@
 #elif (defined(ANDROID) || defined(__linux__)) && !defined(__EMSCRIPTEN__)
 #include "shaders/vulkan_denoiser.h"
 #define CAMPELLO_RENDERER_VULKAN_DENOISER 1
+#elif defined(_WIN32)
+#include "shaders/directx_denoiser.h"
+#define CAMPELLO_RENDERER_DIRECTX_DENOISER 1
 #endif
 
 namespace systems::leal::campello_renderer {
@@ -106,7 +109,7 @@ std::shared_ptr<GPU::RenderPipeline> makePipeline(GPU::Device& device, const std
 
 RealtimeDenoiser::RealtimeDenoiser(std::shared_ptr<GPU::Device> device)
     : device_(std::move(device)) {
-#if defined(__APPLE__) || defined(CAMPELLO_RENDERER_VULKAN_DENOISER)
+#if defined(__APPLE__) || defined(CAMPELLO_RENDERER_VULKAN_DENOISER) || defined(CAMPELLO_RENDERER_DIRECTX_DENOISER)
     if (!device_) return;
     auto& d = *device_;
 #if defined(__APPLE__)
@@ -116,6 +119,21 @@ RealtimeDenoiser::RealtimeDenoiser(std::shared_ptr<GPU::Device> device)
     const auto vertex = module;
     const char* vertexEntry = "denoiseVertex";
     const auto temporal = module, variance = module, atrous = module, atrousFirst = module, modulate = module;
+    const char* temporalEntry = "denoiseTemporal";
+    const char* varianceEntry = "denoiseVariance";
+    const char* atrousEntry = "denoiseAtrous";
+    const char* atrousFirstEntry = "denoiseAtrousFirst";
+    const char* modulateEntry = "denoiseModulate";
+#elif defined(CAMPELLO_RENDERER_DIRECTX_DENOISER)
+    // DXIL: a module per entry point of shaders/directx/denoiser.hlsl.
+    const auto dxil = [&](const unsigned char* code, unsigned int size) { return device_->createShaderModule(code, size); };
+    const auto vertex = dxil(shaders::kDenoiserDirectXVertShader, shaders::kDenoiserDirectXVertShaderSize);
+    const char* vertexEntry = "denoiseVertex";
+    const auto temporal = dxil(shaders::kDenoiserDirectXTemporalShader, shaders::kDenoiserDirectXTemporalShaderSize);
+    const auto variance = dxil(shaders::kDenoiserDirectXVarianceShader, shaders::kDenoiserDirectXVarianceShaderSize);
+    const auto atrous = dxil(shaders::kDenoiserDirectXAtrousShader, shaders::kDenoiserDirectXAtrousShaderSize);
+    const auto atrousFirst = dxil(shaders::kDenoiserDirectXAtrousFirstShader, shaders::kDenoiserDirectXAtrousFirstShaderSize);
+    const auto modulate = dxil(shaders::kDenoiserDirectXModulateShader, shaders::kDenoiserDirectXModulateShaderSize);
     const char* temporalEntry = "denoiseTemporal";
     const char* varianceEntry = "denoiseVariance";
     const char* atrousEntry = "denoiseAtrous";

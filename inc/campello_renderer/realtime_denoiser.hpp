@@ -17,7 +17,7 @@
 //
 // The input is demodulated by the G-buffer's base colour (filtered as
 // illumination, so texture detail isn't blurred) and multiplied back after;
-// background pixels (nothing in the G-buffer) pass through. Metal and Vulkan.
+// background pixels (nothing in the G-buffer) pass through. Metal, Vulkan and DirectX.
 
 #include <campello_renderer/campello_renderer.hpp>
 #include <campello_renderer/gpu_timing.hpp>
@@ -44,7 +44,7 @@ public:
     explicit RealtimeDenoiser(std::shared_ptr<systems::leal::campello_gpu::Device> device);
     ~RealtimeDenoiser();
 
-    /// Whether this device can run it (Metal, Vulkan).
+    /// Whether this device can run it (Metal, Vulkan, DirectX).
     [[nodiscard]] bool supported() const noexcept {
         return temporalPipeline_ != nullptr;
     }
