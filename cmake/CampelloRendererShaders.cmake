@@ -160,7 +160,17 @@ function(campello_renderer_add_shader_program)
 
     # DirectX: HLSL -> DXIL (dxc, if found)
     if(ARG_DIRECTX)
-        find_program(CAMPELLO_DXC dxc)
+        # dxc ships with the Windows SDK (bin/<version>/x64), not on PATH:
+        # look there too, newest SDK first (as build_directx_shaders.ps1).
+        set(dxc_hints "")
+        if(CMAKE_HOST_WIN32)
+            file(GLOB sdk_bins LIST_DIRECTORIES true "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/10.*")
+            list(SORT sdk_bins COMPARE NATURAL ORDER DESCENDING)
+            foreach(dir IN LISTS sdk_bins)
+                list(APPEND dxc_hints "${dir}/x64")
+            endforeach()
+        endif()
+        find_program(CAMPELLO_DXC dxc HINTS ${dxc_hints})
         if(CAMPELLO_DXC)
             get_filename_component(src "${ARG_DIRECTX}" ABSOLUTE)
             set(vs "${out_dir}/${ARG_NAME}_vs.dxil")

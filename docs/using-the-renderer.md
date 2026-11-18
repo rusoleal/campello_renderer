@@ -51,20 +51,20 @@ use(tracer.output());
 | Feature | Turn on | Default | Backends | Custom programs |
 |---|---|---|---|---|
 | Image-based lighting | `setEnvironmentMap()`, `setIBLEnabled()` | on (built-in sky) | every backend | read the environment textures (see 3) |
-| Sun shadow maps | `setShadowsEnabled()`, `LightData::castShadows` | on | Metal | `campello::sunVisibility()` |
+| Sun shadow maps | `setShadowsEnabled()`, `LightData::castShadows` | on | Metal, Vulkan, DirectX | `campello::sunVisibility()` |
 | SSAO | `setAmbientOcclusion()` | off | varies (see the setter) | automatic (applied to the frame) |
 | FXAA / SSAA | `setFxaaEnabled()` / `setSsaaScale()` | off | varies (see the setter) | automatic |
-| Clip planes | `setClipPlanes()` | off | Metal, Vulkan | clip in your fragment shader (`CameraUniforms::clipPlanes`) |
-| TAA | `setTemporalAntiAliasing(true)` | off | Metal, Vulkan | automatic (with your G-buffer stages if you move geometry) |
-| Render scale + upscaling | `setRenderScale()`, `setUpscaler()` | 1, built-in | Metal, Vulkan (built-in); MetalFX on macOS 13 / iOS 16 | automatic |
-| G-buffer | `renderGBuffer()` | not run | Metal, Vulkan | your own G-buffer stages (see 3) |
+| Clip planes | `setClipPlanes()` | off | Metal, Vulkan, DirectX | clip in your fragment shader (`CameraUniforms::clipPlanes`) |
+| TAA | `setTemporalAntiAliasing(true)` | off | Metal, Vulkan, DirectX | automatic (with your G-buffer stages if you move geometry) |
+| Render scale + upscaling | `setRenderScale()`, `setUpscaler()` | 1, built-in | Metal, Vulkan, DirectX (built-in); MetalFX on macOS 13 / iOS 16 | automatic |
+| G-buffer | `renderGBuffer()` | not run | Metal, Vulkan, DirectX | your own G-buffer stages (see 3) |
 | Ray traced shadows | `RayTracedShadows` → `setShadowMask()` | null (shadow maps) | Metal + `Feature::raytracing` | `campello::sunVisibility()` |
 | Ray traced AO | `RayTracedAmbientOcclusion` → `setAmbientOcclusionMask()` | null (SSAO) | same | automatic |
 | Ray traced reflections | `PathTracer::traceReflections()` → `setReflections()` | null (environment) | same | `campello::reflectedRadiance()` |
 | Probe GI (DDGI) | `DdgiVolume` → `setIndirectDiffuse()` | null (irradiance map) | same | `campello::indirectIrradiance()` |
 | Many lights (ReSTIR DI) | `RestirDirectLighting` → `setDirectLighting()` | null (4-light loop) | same | `campello::directRadiance()` |
 | One-bounce GI (ReSTIR GI) | `RestirGlobalIllumination` → `setIndirectDiffuse()` | null (irradiance map) | same | `campello::indirectIrradiance()` |
-| Real-time denoiser | `RealtimeDenoiser` | not run | Metal, Vulkan | — |
+| Real-time denoiser | `RealtimeDenoiser` | not run | Metal, Vulkan, DirectX | — |
 
 The ray traced effects are classes you create and run. The renderer never runs them itself. Each one reads the G-buffer and writes a texture, and you hand that texture to the renderer. A frame with all of them looks like this:
 
