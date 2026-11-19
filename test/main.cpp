@@ -8454,8 +8454,7 @@ TEST_F(OffscreenRenderTest, CompressedTexturesDrawAsTheirPixels) {
     EXPECT_TRUE(format == GPU::PixelFormat::bc7_rgba_unorm_srgb || format == GPU::PixelFormat::astc_4x4_unorm_srgb ||
                 format == GPU::PixelFormat::etc2_rgb8unorm_srgb)
         << "compressed sRGB, got " << int(format);
-    // 64 down to 4: mips below a 4x4 block aren't uploaded (WebGPU copies only whole blocks).
-    EXPECT_EQ(material->baseColorTexture->getMipLevelCount(), 5u);
+    EXPECT_EQ(material->baseColorTexture->getMipLevelCount(), 7u);
 
     std::vector<float> positions = {-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0};
     std::vector<float> normals = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
@@ -8564,8 +8563,7 @@ TEST_F(OffscreenRenderTest, Ktx2TexturesTranscodeForTheirData) {
         << "compressed sRGB, got " << int(colourFormat);
     const auto normalFormat = material->normalTexture->getFormat();
     EXPECT_NE(normalFormat, GPU::PixelFormat::astc_4x4_unorm_srgb) << "a normal map decoded as sRGB";
-    // 32 down to 4: the whole-block mips (WebGPU copies only whole blocks).
-    EXPECT_EQ(material->baseColorTexture->getMipLevelCount(), 4u);
+    EXPECT_EQ(material->baseColorTexture->getMipLevelCount(), 6u);  // 32 down to 1
     if (renderer->canCompressTextures(false)) {
         EXPECT_TRUE(normalFormat == GPU::PixelFormat::bc7_rgba_unorm || normalFormat == GPU::PixelFormat::etc2_rgb8unorm)
             << "compressed linear, got " << int(normalFormat);
