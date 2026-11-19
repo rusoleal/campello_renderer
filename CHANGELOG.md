@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Skinning and morph targets on WebGPU.** The web build drew skinned meshes in their rest pose and ignored morph weights: `shaders/webgpu/default.wgsl` had no deforming vertex stage. New entry point `vs_skinned` (a port of `skinning.glsl`: morph targets, then up to four joints per vertex; weights summing to zero leave the vertex unskinned), which `meshPipeline()` picks only for draws with a skin or morph targets, as on Vulkan and DirectX (`CAMPELLO_RENDERER_SPLIT_DEFORM` now includes WebGPU).
+  - WebGPU allows four bind groups and group 2 already holds the per-draw transforms, so the joint palette and the morph targets share **group 3** (binding 0: palette, 1: MorphInfo, 2/3: POSITION/NORMAL deltas), instead of Vulkan's sets 2 and 3. Only `vs_skinned`'s pipelines have group 3 in their layout (`webgpuSkinnedPipelineLayout`), since WebGPU requires every group of a pipeline's layout to be bound. `bindSkin()` keeps the palette for the `bindMorph()` call that follows; that one builds and caches the combined group.
+  - The joint palettes, morph buffers and the per-vertex fallback buffers are created with storage usage on WebGPU too (`kDeformBufferUsage`): the fallback tangent buffer is the "no morph deltas" binding, and WebGPU rejected it as vertex-only.
+  - Not yet on WebGPU: skinned and instanced shadow casters (still drawn at rest), and the G-buffer's previous palette (no G-buffer on WebGPU).
+- **Instancing on WebGPU** (`EXT_mesh_gpu_instancing` and `DrawCall::instanceTransformBuffer`). The web build drew an instanced mesh once, at its own transform: WebGPU draws find their transform through `firstInstance`, which instancing needs for the instance index, and the WGSL stages never applied instance matrices. New entry points `vs_instanced` and `vs_lean_instanced` (position-only meshes), which `meshPipeline()` picks for draws with instance matrices (new `instanced` argument; ignored on the other backends, whose stages always apply instances). Their pipeline layout's group 2 holds the draw's own transform as a uniform: `bindWebGpuInstanced()` copies it from the CPU staging to a 256-byte slot of `webgpuInstanceTransformBuffer` (slots reset per `render()`), and the draw starts at instance 0. The instance matrices stay a per-instance vertex buffer (locations 8-11), so `instanceTransformBuffer` still only needs vertex usage.
+  - Limits on WebGPU: a draw both skinned and instanced keeps its skin and loses the instance placement (the skinned stage already uses WebGPU's 8 vertex buffers); line meshes don't take instances.
+- `test/webgpu/run_wgsl_check.sh`: 18 checks, including the skinned and instanced pipelines and renders (a joint, a morph target and a zero weight; two instances at their matrices).
+- Web test suite (`test/webgpu/run_web_tests.sh`, Edge on an Intel UHD 630): **98 passed, 0 failed** (main: 6 failures). Fixed: `GltfSkinPosesTheMesh`, `DrawCallJointsPoseTheMesh`, `MorphTargetMovesEveryVertex`, `GltfInstancesDrawAtTheirTransforms`, `DrawCallInstancesDrawAtTheirTransforms` and `FramesDrawAfterTheEnvironmentBake` (it draws the instanced quad).
+
+
 ## [0.27.0] - 2026-11-19
 
 ### Added
@@ -11,16 +24,6 @@
 - **campello_image v0.6.0** (KTX2 encoding).
 - **campello_gpu v0.33.1**: compressed formats on Intel Macs (ASTC was reported, and its textures failed Metal validation) and compressed uploads on Vulkan (rows were skewed). Compressed textures need both.
 - `run_android_tests.sh`: `CAMPELLO_IMAGE_SOURCE` builds against a local campello_image, as `CAMPELLO_GPU_SOURCE` does for campello_gpu.
-
-### Added
-- **Skinning and morph targets on WebGPU.** The web build drew skinned meshes in their rest pose and ignored morph weights: `shaders/webgpu/default.wgsl` had no deforming vertex stage. New entry point `vs_skinned` (a port of `skinning.glsl`: morph targets, then up to four joints per vertex; weights summing to zero leave the vertex unskinned), which `meshPipeline()` picks only for draws with a skin or morph targets, as on Vulkan and DirectX (`CAMPELLO_RENDERER_SPLIT_DEFORM` now includes WebGPU).
-  - WebGPU allows four bind groups and group 2 already holds the per-draw transforms, so the joint palette and the morph targets share **group 3** (binding 0: palette, 1: MorphInfo, 2/3: POSITION/NORMAL deltas), instead of Vulkan's sets 2 and 3. Only `vs_skinned`'s pipelines have group 3 in their layout (`webgpuSkinnedPipelineLayout`), since WebGPU requires every group of a pipeline's layout to be bound. `bindSkin()` keeps the palette for the `bindMorph()` call that follows; that one builds and caches the combined group.
-  - The joint palettes, morph buffers and the per-vertex fallback buffers are created with storage usage on WebGPU too (`kDeformBufferUsage`): the fallback tangent buffer is the "no morph deltas" binding, and WebGPU rejected it as vertex-only.
-  - Not yet on WebGPU: skinned and instanced shadow casters (still drawn at rest), and the G-buffer's previous palette (no G-buffer on WebGPU).
-- **Instancing on WebGPU** (`EXT_mesh_gpu_instancing` and `DrawCall::instanceTransformBuffer`). The web build drew an instanced mesh once, at its own transform: WebGPU draws find their transform through `firstInstance`, which instancing needs for the instance index, and the WGSL stages never applied instance matrices. New entry points `vs_instanced` and `vs_lean_instanced` (position-only meshes), which `meshPipeline()` picks for draws with instance matrices (new `instanced` argument; ignored on the other backends, whose stages always apply instances). Their pipeline layout's group 2 holds the draw's own transform as a uniform: `bindWebGpuInstanced()` copies it from the CPU staging to a 256-byte slot of `webgpuInstanceTransformBuffer` (slots reset per `render()`), and the draw starts at instance 0. The instance matrices stay a per-instance vertex buffer (locations 8-11), so `instanceTransformBuffer` still only needs vertex usage.
-  - Limits on WebGPU: a draw both skinned and instanced keeps its skin and loses the instance placement (the skinned stage already uses WebGPU's 8 vertex buffers); line meshes don't take instances.
-- `test/webgpu/run_wgsl_check.sh`: 18 checks, including the skinned and instanced pipelines and renders (a joint, a morph target and a zero weight; two instances at their matrices).
-- Web test suite (`test/webgpu/run_web_tests.sh`, Edge on an Intel UHD 630): **98 passed, 0 failed** (main: 6 failures). Fixed: `GltfSkinPosesTheMesh`, `DrawCallJointsPoseTheMesh`, `MorphTargetMovesEveryVertex`, `GltfInstancesDrawAtTheirTransforms`, `DrawCallInstancesDrawAtTheirTransforms` and `FramesDrawAfterTheEnvironmentBake` (it draws the instanced quad).
 
 ### Changed
 - **Procedural textures (KHR_texture_procedurals) are baked by campello_procedural v0.1.0**, a new library: MaterialX 1.39 standard library nodes (about 70, against about 20 before), with noise ported from MaterialX, so graphs bake as MaterialX renders them. Linked privately; the public API is unchanged.
