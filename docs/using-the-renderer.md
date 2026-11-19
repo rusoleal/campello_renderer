@@ -20,7 +20,7 @@ renderer.render(colorView);   // or render() on the device's swapchain
 
 ### Your own scene (games, ECS)
 
-You keep the scene. Each frame you fill a `RenderScene` with the camera, the lights and the opaque and transparent `DrawCall`s, then draw it. The ECS (`ecs.hpp`) fills it for you, including the previous transforms for motion vectors.
+You keep the scene. Each frame you fill a `RenderScene` with the camera, the lights and the opaque and transparent `DrawCall`s, then draw it. The ECS (`ecs.hpp`) fills it for you, including the previous transforms for motion vectors. Draws outside the camera's view are skipped (`setViewCulling()`); give instanced and skinned draws `DrawCall::localBounds`, or they're always drawn.
 
 ```cpp
 renderer.render(scene, colorView);

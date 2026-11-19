@@ -3518,6 +3518,103 @@ TEST_F(OffscreenRenderTest, SunShadowsDrawOnlyCastersTheViewNeeds) {
     renderer->setEnvironmentIntensity(1.0f);
 }
 
+// View culling (render(RenderScene)): a plate out of view isn't drawn
+// (RenderStats) but still shadows the ground in view, a draw with instances
+// and no DrawCall::localBounds is drawn wherever it is, and the image is
+// the one drawn without culling.
+TEST_F(OffscreenRenderTest, ViewCullingSkipsOnlyDrawsOutOfView) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    renderer->setEnvironmentIntensity(0.1f);
+    renderer->setShadowCascades(false);
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+
+    std::vector<std::vector<float>> positions;
+    std::vector<uint32_t> indices = {0, 2, 1, 0, 3, 2};
+    positions.reserve(2);
+    const auto makeQuad = [&](float y, float half) {
+        positions.push_back({-half, y, -half, half, y, -half, half, y, half, -half, y, half});
+        GpuMesh mesh;
+        mesh.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] =
+            device->createBuffer(48, GPU::BufferUsage::vertex, positions.back().data());
+        mesh.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+        mesh.indexCount = 6;
+        mesh.indexFormat = GPU::IndexFormat::uint32;
+        mesh.vertexCount = 4;
+        mesh.layout = &VertexLayout::positionOnly();
+        mesh.setBoundsFromPositions(positions.back().data(), 4);
+        return mesh;
+    };
+    GpuMesh ground = makeQuad(0.0f, 20.0f);
+    GpuMesh plate = makeQuad(2.0f, 0.5f);
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    auto oneInstance = device->createBuffer(64, GPU::BufferUsage::vertex, const_cast<float*>(identity));
+
+    RenderScene scene;
+    LightData sun;
+    sun.type = 0;
+    sun.direction = VM::Vector3<double>(1.0, -1.0, 0.0);  // the plate at x = -2 shadows x = 0
+    sun.color = VM::Vector3<double>(1.0, 1.0, 1.0);
+    sun.intensity = 3.0f;
+    sun.castShadows = true;
+    scene.lights.push_back(sun);
+    const auto add = [&](GpuMesh* mesh, double x, double z) {
+        DrawCall draw;
+        draw.mesh = mesh;
+        draw.material = red;
+        draw.worldTransform = VM::Matrix4<double>::translate(VM::Vector3<double>(x, 0.0, z));
+        scene.opaque.push_back(draw);
+    };
+    add(&ground, 0.0, 0.0);
+    add(&plate, -2.0, 0.0);  // out of view, its shadow in view
+    add(&plate, 0.0, 30.0);  // behind the camera, with an instance
+    scene.opaque.back().instanceTransformBuffer = oneInstance;
+    const VM::Vector3<double> eye(0.0, 2.5, 2.5);
+    scene.camera.view = VM::Matrix4<double>::lookAt(eye, VM::Vector3<double>(0.0, 0.0, 0.0), VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(60.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = eye;
+    const auto render = [&](bool culling, bool shadows) {
+        renderer->setViewCulling(culling);
+        renderer->setShadowsEnabled(shadows);
+        auto tex = makeOffscreenTexture(64, 64);
+        auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+        renderer->render(scene, view);
+        renderer->render(scene, view);
+        return readBackPixels(tex);
+    };
+    const auto red32 = [](const std::vector<uint8_t>& p) { return double(p[(size_t(32) * 64 + size_t(32)) * 4]); };
+
+    const auto unculled = render(false, true);
+    EXPECT_EQ(renderer->getLastFrameStats().culledNodeCount, 0u);
+    const auto culled = render(true, true);
+    const auto stats = renderer->getLastFrameStats();
+    EXPECT_EQ(stats.culledNodeCount, 1u) << "the plate out of view was drawn";
+    EXPECT_EQ(stats.visibleNodeCount, 2u) << "the instanced draw without bounds was culled";
+    ASSERT_EQ(culled.size(), unculled.size());
+    int worst = 0;
+    for (size_t i = 0; i < culled.size(); ++i) worst = std::max(worst, std::abs(int(culled[i]) - int(unculled[i])));
+    EXPECT_LE(worst, 1) << "culling changed the image";
+    if (renderer->supportsShadows()) {
+        const double lit = red32(render(true, false));
+        EXPECT_LT(red32(culled), lit * 0.7) << "the culled plate cast no shadow";
+    }
+    renderer->setViewCulling(true);
+    renderer->setShadowCascades(true);
+    renderer->setShadowsEnabled(true);
+    renderer->setEnvironmentIntensity(1.0f);
+}
+
 // Materials of glTFs other than the scene's are their own: two assets with
 // a different material at index 0 (unlit green, unlit blue) give two
 // materials that draw in their own colours, not the first one twice.

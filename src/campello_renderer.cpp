@@ -1,4 +1,5 @@
 #include <campello_renderer/campello_renderer.hpp>
+#include <campello_renderer/culling.hpp>
 #include "campello_renderer_config.h"
 #include <cstdio>
 #include <cstring>
@@ -680,6 +681,18 @@ bool drawLocalBounds(const DrawCall& draw, double lo[3], double hi[3]) {
         hi[k] = draw.mesh->boundsMax[k];
     }
     return true;
+}
+
+// False when the camera can't see any of the draw (isOutsideFrustum() on its
+// bounds). Draws whose extent isn't known (no bounds; instances or a skin
+// without DrawCall::localBounds) and wide lines (their width is in pixels)
+// are always in view.
+bool drawInView(const DrawCall& draw, const systems::leal::vector_math::Matrix4<double>& viewProj) {
+    if (!draw.mesh || draw.mesh->wideLines) return true;
+    const bool deforms = draw.instanceTransformBuffer || draw.jointMatrixBuffer;
+    double lo[3], hi[3];
+    if ((deforms && !draw.localBounds) || !drawLocalBounds(draw, lo, hi)) return true;
+    return !isOutsideFrustum(viewProj, draw.worldTransform, lo, hi);
 }
 
 uint32_t drawInstanceCount(const DrawCall& draw) {
@@ -10688,6 +10701,21 @@ void Renderer::render(const RenderScene& scene,
     }
     for (const auto *draw : sortedOpaque) uploadOneTransform(*draw);
     for (auto &draw : scene.transparent) uploadOneTransform(draw);
+    // View culling (setViewCulling()): the draws the camera can see, by
+    // position in transformOffsets (sortedOpaque, then the transparent ones).
+    // Shadows still take every caster.
+    std::vector<uint8_t>& drawVisible = drawVisibleScratch;
+    drawVisible.assign(totalDraws, 1);
+    uint32_t drawsCulled = 0;
+    if (viewCulling) {
+        for (size_t i = 0; i < totalDraws; ++i) {
+            const auto& draw = i < sortedOpaque.size() ? *sortedOpaque[i] : scene.transparent[i - sortedOpaque.size()];
+            if (!drawInView(draw, unjitteredViewProj)) {
+                drawVisible[i] = 0;
+                ++drawsCulled;
+            }
+        }
+    }
     if (txOffset > 0) {
         transformBuffer->upload(0, txOffset, drawTransformStaging.data());
         if (stagePrevious) {
@@ -11094,7 +11122,9 @@ void Renderer::render(const RenderScene& scene,
 
     // Detect whether any transparent draw needs screen-space refraction.
     bool needsScreenSpaceRefraction = false;
-    for (auto &draw : scene.transparent) {
+    for (size_t t = 0; t < scene.transparent.size(); ++t) {
+        const auto& draw = scene.transparent[t];
+        if (!drawVisible[sortedOpaque.size() + t]) continue;
         if (!activeProgramPass && draw.material && draw.material->transmission) {
             needsScreenSpaceRefraction = true;
             break;
@@ -11230,7 +11260,8 @@ void Renderer::render(const RenderScene& scene,
                 drawIdx = 0;
                 if (reflectionFrameBindGroup) std::swap(frameBindGroup[currentFrameIndex], reflectionFrameBindGroup);
                 for (const auto *draw : sortedOpaque) {
-                    renderPrimitive(opaqueRpe, *draw, transformOffsets[drawIdx++]);
+                    const size_t at = drawIdx++;
+                    if (drawVisible[at]) renderPrimitive(opaqueRpe, *draw, transformOffsets[at]);
                 }
                 if (reflectionFrameBindGroup) std::swap(frameBindGroup[currentFrameIndex], reflectionFrameBindGroup);
                 opaqueRpe->end();
@@ -11373,7 +11404,8 @@ void Renderer::render(const RenderScene& scene,
                 lastBoundVertexBuffers.fill({});
                 drawIdx = (size_t)sortedOpaque.size();
                 for (auto &draw : scene.transparent) {
-                    renderPrimitive(transRpe, draw, transformOffsets[drawIdx++]);
+                    const size_t at = drawIdx++;
+                    if (drawVisible[at]) renderPrimitive(transRpe, draw, transformOffsets[at]);
                 }
                 transRpe->end();
             }
@@ -11441,7 +11473,8 @@ void Renderer::render(const RenderScene& scene,
         // (Reflections: the opaque draws with the radiance in slot 22.)
         if (reflectionFrameBindGroup) std::swap(frameBindGroup[currentFrameIndex], reflectionFrameBindGroup);
         for (const auto *draw : sortedOpaque) {
-            renderPrimitive(rpe, *draw, transformOffsets[drawIdx++]);
+            const size_t at = drawIdx++;
+            if (drawVisible[at]) renderPrimitive(rpe, *draw, transformOffsets[at]);
         }
         if (reflectionFrameBindGroup) std::swap(frameBindGroup[currentFrameIndex], reflectionFrameBindGroup);
 
@@ -11456,7 +11489,8 @@ void Renderer::render(const RenderScene& scene,
         boundMeshGroups.fill(nullptr);
         if (!activeProgramPass || activeProgramPass->includeTransparent) {
             for (auto &draw : scene.transparent) {
-                renderPrimitive(rpe, draw, transformOffsets[drawIdx++]);
+                const size_t at = drawIdx++;
+                if (drawVisible[at]) renderPrimitive(rpe, draw, transformOffsets[at]);
             }
         }
 
@@ -11722,8 +11756,8 @@ void Renderer::render(const RenderScene& scene,
     for (auto& draw : scene.opaque) instanceCount += drawInstanceCount(draw);
     for (auto& draw : scene.transparent) instanceCount += drawInstanceCount(draw);
     lastFrameStats.instanceCount = instanceCount;
-    lastFrameStats.visibleNodeCount = lastFrameStats.totalDrawCount;
-    lastFrameStats.culledNodeCount = 0;
+    lastFrameStats.visibleNodeCount = lastFrameStats.totalDrawCount - drawsCulled;
+    lastFrameStats.culledNodeCount = drawsCulled;
     auto frameEnd = std::chrono::steady_clock::now();
     lastFrameStats.cpuFrameTimeMs = std::chrono::duration<double, std::milli>(frameEnd - frameStart).count();
 }

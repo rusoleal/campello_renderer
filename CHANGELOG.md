@@ -11,11 +11,13 @@
     - Adreno 642L (Vulkan, Galaxy Tab S7 FE): `fill` 101.6 to 40.1 ms, `draws` 38.1 to 29.7 ms, `shadows` 28.4 to 15.3 ms.
   - The gain is in the image-based lighting, where most optional features' code runs; with IBL off there's little to remove.
   - The benchmark takes `--general` to compare with the general shader, and builds for Android (see `bench/frame_bench.cpp`).
-- Benchmark: scenario `fill` (one opaque quad filling a 3840x2160 view: fragment cost), `--no-ibl` (pipelines after `setAsset()`, no environment bake), and a check that `fill` drew. Its render targets are kept for the run (on Vulkan a texture view doesn't keep its texture alive).
+- **View culling in `render(RenderScene)`** (`setViewCulling()`, on by default). Draws whose world-space bounds (`DrawCall::localBounds`, else the mesh's) lie outside the camera's view are skipped, so a scene listed without culling no longer draws everything; `render_system()` already culled, and a caller that does loses only the CPU test. Draws without bounds, instanced or skinned draws without `localBounds`, and wide lines are always drawn, and sun shadows still take every caster. `RenderStats::culledNodeCount` / `visibleNodeCount` count the draws skipped and drawn (before, always 0 and all). `isOutsideFrustum()` (`culling.hpp`) takes a box too. New test `ViewCullingSkipsOnlyDrawsOutOfView`.
+  - Benchmark `shadows` (229 of 4,900 draws in view), frame time without culling (`--no-cull`) to with: Intel UHD 630 5.6 to 4.9 ms, Adreno 642L 15.0 to 12.6 ms.
+- Benchmark: scenario `fill` (one opaque quad filling a 3840x2160 view: fragment cost), `--no-cull`, `--no-ibl` (pipelines after `setAsset()`, no environment bake), and a check that `fill` drew. Its render targets are kept for the run (on Vulkan a texture view doesn't keep its texture alive).
 
 ### Changed
 - **campello_gpu v0.33.0**: pipeline-time shader constants (material specialization), texture views that keep their texture alive on Vulkan, and failed Vulkan submissions reported.
-- **Test results:** macOS 144 passed (also with Metal API validation); Android: Adreno 642L (Galaxy Tab S7 FE, Android 14) 110 passed, 0 failed.
+- **Test results:** macOS 151 passed (also with Metal API validation); Android: Adreno 642L (Galaxy Tab S7 FE, Android 14) 111 passed, 0 failed.
 
 ### Fixed
 - **Nothing drew after the environment bake on some Adreno GPUs** (Vulkan). With pipelines created before `setAsset()` (the usual order), `setAsset()` bakes the environment's image-based lighting, and its 67 jobs were queued at once: an Adreno 642L (Galaxy Tab S7 FE) lost the device, so every later submission failed and frames came out empty, and an Adreno 618 wedged its driver. Natively each job is now waited for before the next. New test `FramesDrawAfterTheEnvironmentBake` (fails on the Adreno 642L without the fix).

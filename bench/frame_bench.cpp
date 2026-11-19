@@ -1,7 +1,7 @@
 // Frame benchmark: the CPU cost of the renderer's frame paths and the frame
 // time they sustain, to compare changes against a baseline.
 //
-//   campello_renderer_bench [scenario] [frames] [--general] [--no-ibl]
+//   campello_renderer_bench [scenario] [frames] [--general] [--no-ibl] [--no-cull]
 //
 // On Android: build it for arm64 (CAMPELLO_RENDERER_BUILD_BENCH, the NDK
 // toolchain as run_android_tests.sh), adb push it with the libraries, run
@@ -14,7 +14,8 @@
 //            material uniforms, renderPrimitive()).
 //   shadows  render(RenderScene) with a third-person view of one corner of
 //            the grid and one cube moving, so the sun's shadow map is
-//            redrawn every frame (shadow caster culling).
+//            redrawn every frame (shadow caster culling, view culling;
+//            --no-cull draws every cube).
 //   fill     one opaque quad filling a 3840x2160 view: fragment shading
 //            (material specialization) with almost no CPU work.
 //   gbuffer  renderGBuffer() alone, the grid.
@@ -202,9 +203,11 @@ struct DrawScene {
 // Adreno drivers; shading then has no image-based light.
 bool gBakeIbl = true;
 bool gSpecialize = true;
+bool gViewCulling = true;  // --no-cull: setViewCulling(false)
 
 void createPipelines(Renderer& renderer) {
     renderer.setMaterialSpecialization(gSpecialize);
+    renderer.setViewCulling(gViewCulling);
     renderer.createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
 }
 
@@ -303,6 +306,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--general") specialize = false;
         else if (std::string(argv[i]) == "--no-ibl") gBakeIbl = false;
+        else if (std::string(argv[i]) == "--no-cull") gViewCulling = false;
         else args.push_back(argv[i]);
     }
     gSpecialize = specialize;
@@ -351,7 +355,8 @@ int main(int argc, char** argv) {
                        renderer.render(draws.scene, view);
                    }));
             const auto stats = renderer.getLastFrameStats();
-            std::printf("         shadow casters drawn %u of %u\n", stats.shadowCastersDrawn, stats.shadowCasterCount);
+            std::printf("         shadow casters drawn %u of %u, draws in view %u of %u\n", stats.shadowCastersDrawn,
+                        stats.shadowCasterCount, stats.visibleNodeCount, stats.totalDrawCount);
         }
     }
     if (only.empty() || only == "fill") {
