@@ -730,6 +730,22 @@ static systems::leal::campello_image::TextureFormat chooseBasisTargetFormat(
     return TextureFormat::rgba8;
 }
 
+// The format a KTX2/Basis texture transcodes to: chooseBasisTargetFormat(),
+// except for linear data (normal maps, metallic-roughness...) where that is
+// ASTC, which campello_gpu has only as sRGB (decoding linear data as sRGB
+// skews it): BC7 where the GPU has it, else RGBA8.
+static systems::leal::campello_image::TextureFormat basisTargetFormatFor(
+    const std::shared_ptr<systems::leal::campello_gpu::Device>& device, bool srgb)
+{
+    using systems::leal::campello_image::TextureFormat;
+    const TextureFormat format = chooseBasisTargetFormat(device);
+    if (srgb || format != TextureFormat::astc_4x4_unorm) return format;
+    if (device && device->getFeatures().count(systems::leal::campello_gpu::Feature::bcTextureCompression)) {
+        return TextureFormat::bc7_rgba_unorm;
+    }
+    return TextureFormat::rgba8;
+}
+
 static systems::leal::campello_gpu::PixelFormat textureDataFormatToPixelFormat(
     systems::leal::campello_image::TextureFormat tfmt,
     bool wantsSrgb)
@@ -1857,7 +1873,6 @@ void Renderer::setScene(uint32_t index) {
     std::vector<std::shared_ptr<GPU::Texture>> texturesNeedingMips;
 
     // Decode and upload images referenced by this scene.
-    systems::leal::campello_image::TextureFormat basisTargetFormat = chooseBasisTargetFormat(device);
     for (int a = 0; a < (int)info->images.size(); a++) {
         if (info->images[a]) {
             if (gpuTextures[a] == nullptr) {
@@ -1869,6 +1884,7 @@ void Renderer::setScene(uint32_t index) {
                     // ------------------------------------------------------------------
                     // KHR_texture_basisu path — use TextureData for GPU-compressed upload.
                     // ------------------------------------------------------------------
+                    const auto basisTargetFormat = basisTargetFormatFor(device, wantsSrgb);
                     std::shared_ptr<systems::leal::campello_image::TextureData> texData;
                     if (image.data.size() > 0) {
                         texData = systems::leal::campello_image::TextureData::fromMemory(
@@ -9727,6 +9743,10 @@ std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::proceduralTextur
     return texture;
 }
 
+bool Renderer::canCompressTextures(bool srgb) const {
+    return basisTargetFormatFor(device, srgb) != systems::leal::campello_image::TextureFormat::rgba8;
+}
+
 std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::compressedTexture(const uint8_t* rgba, uint32_t width,
                                                                                   uint32_t height, bool srgb) {
     namespace GPU = systems::leal::campello_gpu;
@@ -9972,7 +9992,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
             // can't parse KTX2/.basis bytes at all.
             // ------------------------------------------------------------
             std::shared_ptr<systems::leal::campello_image::TextureData> texData;
-            auto basisTargetFormat = chooseBasisTargetFormat(device);
+            const auto basisTargetFormat = basisTargetFormatFor(device, srgb);
             if (!image.data.empty()) {
                 texData = systems::leal::campello_image::TextureData::fromMemory(
                     image.data.data(), image.data.size(), basisTargetFormat);
@@ -10002,6 +10022,41 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                                     (uint32_t)GPU::TextureUsage::copyDst));
             if (texture && !uploadTextureDataWithMips(device, texture, *texData)) {
                 texture = nullptr;
+            }
+            // A colour texture's average (the path tracer's stand-in, and
+            // what records it as GpuMaterial::baseColorTexture): its smallest
+            // mip, transcoded to RGBA8 (the whole image when it has no mips).
+            const uint8_t* bytes = nullptr;
+            size_t length = 0;
+            if (!image.data.empty()) {
+                bytes = image.data.data();
+                length = image.data.size();
+            } else if (image.bufferView != -1 && asset.bufferViews && asset.buffers) {
+                auto& bufferView = (*asset.bufferViews)[image.bufferView];
+                auto& buffer = (*asset.buffers)[bufferView.buffer];
+                if (!buffer.data.empty()) {
+                    bytes = buffer.data.data() + bufferView.byteOffset;
+                    length = bufferView.byteLength;
+                }
+            }
+            if (texture && srgb && bytes) {
+                if (auto rgba = systems::leal::campello_image::TextureData::fromMemory(
+                        bytes, length, systems::leal::campello_image::TextureFormat::rgba8)) {
+                    const uint32_t level = rgba->getMipLevelCount() - 1;
+                    const auto* px = static_cast<const uint8_t*>(rgba->getData(level));
+                    const size_t count = rgba->getDataSize(level) / 4;
+                    double sum[3] = {0.0, 0.0, 0.0};
+                    for (size_t i = 0; i < count; ++i) {
+                        for (int c = 0; c < 3; ++c) {
+                            const double v = px[i * 4 + (size_t)c] / 255.0;
+                            sum[c] += v <= 0.04045 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4);
+                        }
+                    }
+                    if (count > 0) {
+                        textureAverages[texture.get()] = {(float)(sum[0] / count), (float)(sum[1] / count),
+                                                          (float)(sum[2] / count)};
+                    }
+                }
             }
             *cached = texture;
             return texture;

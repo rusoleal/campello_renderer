@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **`canCompressTextures(srgb)`**: whether this device keeps KTX2 (Basis) textures of a kind compressed on the GPU: colour data, or linear data such as normal maps. An app encoding its own KTX2 textures (campello_bim, a frame at a time) can skip the linear ones where they would become RGBA8.
+
+### Fixed
+- **KTX2 normal maps on Apple and most mobile GPUs** (and other linear KTX2 data): they were transcoded to ASTC, which campello_gpu has only as sRGB, so the GPU decoded them as sRGB and skewed them. Linear KTX2 data now goes to BC7 where the GPU has it, else RGBA8 (`basisTargetFormatFor()`, used by `setScene()` and `uploadMaterial()`).
+- **KTX2 base colour textures had no average colour**, so `uploadMaterial()` didn't record them as `GpuMaterial::baseColorTexture`, and the path tracer shaded them with the factor alone. The average now comes from the texture's smallest mip, transcoded to RGBA8.
+- New test `Ktx2TexturesTranscodeForTheirData`: a KTX2 colour map is uploaded compressed sRGB and recorded; a KTX2 normal map gets a linear format, compressed where `canCompressTextures(false)` says so. Passes on macOS (BC7) and on an Adreno 642L (ASTC colour, RGBA8 normal).
+
 ## [0.27.0] - 2026-11-19
 
 ### Added
