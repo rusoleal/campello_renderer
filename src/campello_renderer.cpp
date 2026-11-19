@@ -106,6 +106,7 @@ static void trimWebGpuMaterialEntries(systems::leal::campello_gpu::BindGroupDesc
 #include <campello_image/image.hpp>
 #include <campello_image/texture_data.hpp>
 #include <campello_image/gpu_format_bridge.hpp>
+#include "procedural_bridge.hpp"
 
 using namespace systems::leal::campello_renderer;
 
@@ -2463,71 +2464,6 @@ void Renderer::setScene(uint32_t index) {
     // ------------------------------------------------------------------
     // Build GPU samplers from GLTF samplers.
     // ------------------------------------------------------------------
-    // ------------------------------------------------------------------
-    // KHR_texture_procedurals — bake procedural graphs into textures.
-    // ------------------------------------------------------------------
-    if (asset->khrTextureProcedurals && !asset->khrTextureProcedurals->procedurals.empty()) {
-        auto& procedurals = asset->khrTextureProcedurals->procedurals;
-        for (auto& mat : *asset->materials) {
-            auto bakeIfNeeded = [&](const std::shared_ptr<systems::leal::gltf::TextureInfo>& texInfo) {
-                if (!texInfo || !texInfo->khrTextureProcedurals) return;
-                int64_t graphIdx = texInfo->khrTextureProcedurals->index;
-                const std::string& outputName = texInfo->khrTextureProcedurals->output;
-                if (graphIdx < 0 || graphIdx >= (int64_t)procedurals.size()) return;
-
-                std::string key = "graph:" + std::to_string(graphIdx) + ":output:" + outputName;
-                if (proceduralBakedTextures.count(key)) return; // already baked
-
-                const auto& graph = procedurals[graphIdx];
-                auto pixels = device
-                    ? bakeProceduralTextureGPU(device, *asset, graph, outputName,
-                                                proceduralBakeSize, proceduralBakeSize)
-                    : bakeProceduralTexture(*asset, graph, outputName,
-                                             proceduralBakeSize, proceduralBakeSize);
-                auto texture = device->createTexture(
-                    GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm,
-                    proceduralBakeSize, proceduralBakeSize, 1, 1, 1,
-                    (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
-                                        (uint32_t)GPU::TextureUsage::copyDst));
-                if (texture) {
-                    texture->upload(0, pixels.size(), pixels.data());
-                    proceduralBakedTextures[key] = texture;
-                }
-            };
-
-            if (mat.pbrMetallicRoughness) {
-                bakeIfNeeded(mat.pbrMetallicRoughness->baseColorTexture);
-                bakeIfNeeded(mat.pbrMetallicRoughness->metallicRoughnessTexture);
-            }
-            bakeIfNeeded(mat.normalTexture);
-            bakeIfNeeded(mat.emissiveTexture);
-            bakeIfNeeded(mat.occlusionTexture);
-            if (mat.khrMaterialsTransmission)
-                bakeIfNeeded(mat.khrMaterialsTransmission->transmissionTexture);
-            if (mat.khrMaterialsClearcoat) {
-                bakeIfNeeded(mat.khrMaterialsClearcoat->clearcoatTexture);
-                bakeIfNeeded(mat.khrMaterialsClearcoat->clearcoatRoughnessTexture);
-                bakeIfNeeded(mat.khrMaterialsClearcoat->clearcoatNormalTexture);
-            }
-            if (mat.khrMaterialsSheen) {
-                bakeIfNeeded(mat.khrMaterialsSheen->sheenColorTexture);
-                bakeIfNeeded(mat.khrMaterialsSheen->sheenRoughnessTexture);
-            }
-            if (mat.khrMaterialsSpecular) {
-                bakeIfNeeded(mat.khrMaterialsSpecular->specularTexture);
-                bakeIfNeeded(mat.khrMaterialsSpecular->specularColorTexture);
-            }
-            if (mat.khrMaterialsVolume)
-                bakeIfNeeded(mat.khrMaterialsVolume->thicknessTexture);
-            if (mat.khrMaterialsIridescence) {
-                bakeIfNeeded(mat.khrMaterialsIridescence->iridescenceTexture);
-                bakeIfNeeded(mat.khrMaterialsIridescence->iridescenceThicknessTexture);
-            }
-            if (mat.khrMaterialsAnisotropy)
-                bakeIfNeeded(mat.khrMaterialsAnisotropy->anisotropyTexture);
-        }
-    }
-
     gpuSamplers.clear();
     if (asset->samplers) {
         gpuSamplers.resize(asset->samplers->size());
@@ -2560,22 +2496,19 @@ void Renderer::setScene(uint32_t index) {
             // Helper to get texture and sampler from a TextureInfo
             auto getTextureAndSampler = [&](const std::shared_ptr<systems::leal::gltf::TextureInfo> &texInfo,
                                             std::shared_ptr<GPU::Texture> &outTex,
-                                            std::shared_ptr<GPU::Sampler> &outSamp) {
-                if (!texInfo || texInfo->index < 0 || !asset->textures) {
-                    return;
-                }
-
-                // KHR_texture_procedurals: use baked texture if available.
-                if (texInfo->khrTextureProcedurals) {
-                    int64_t graphIdx = texInfo->khrTextureProcedurals->index;
-                    const std::string& outputName = texInfo->khrTextureProcedurals->output;
-                    std::string key = "graph:" + std::to_string(graphIdx) + ":output:" + outputName;
-                    auto it = proceduralBakedTextures.find(key);
-                    if (it != proceduralBakedTextures.end() && it->second) {
-                        outTex = it->second;
-                        outSamp = defaultSampler;
+                                            std::shared_ptr<GPU::Sampler> &outSamp,
+                                            bool srgb = false) {
+                // KHR_texture_procedurals: the graph's bake (its sampler; the
+                // texture's own is ignored), else the fallback texture.
+                if (texInfo && texInfo->khrTextureProcedurals) {
+                    if (auto baked = proceduralTexture(*asset, *texInfo, srgb)) {
+                        outTex = baked;
+                        outSamp = proceduralSampler ? proceduralSampler : defaultSampler;
                         return;
                     }
+                }
+                if (!texInfo || texInfo->index < 0 || !asset->textures) {
+                    return;
                 }
 
                 size_t texIdx = (size_t)texInfo->index;
@@ -2599,7 +2532,7 @@ void Renderer::setScene(uint32_t index) {
             std::shared_ptr<GPU::Texture> baseColorTex = defaultTexture;
             std::shared_ptr<GPU::Sampler> baseColorSamp = defaultSampler;
             if (mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture) {
-                getTextureAndSampler(mat.pbrMetallicRoughness->baseColorTexture, baseColorTex, baseColorSamp);
+                getTextureAndSampler(mat.pbrMetallicRoughness->baseColorTexture, baseColorTex, baseColorSamp, true);
             }
 
             // Metallic-roughness texture (binding 2, 3)
@@ -2620,7 +2553,7 @@ void Renderer::setScene(uint32_t index) {
             std::shared_ptr<GPU::Texture> emissiveTex = defaultEmissiveTexture;
             std::shared_ptr<GPU::Sampler> emissiveSamp = defaultSampler;
             if (mat.emissiveTexture) {
-                getTextureAndSampler(mat.emissiveTexture, emissiveTex, emissiveSamp);
+                getTextureAndSampler(mat.emissiveTexture, emissiveTex, emissiveSamp, true);
             }
 
             // Occlusion texture (binding 8, 9)
@@ -2641,7 +2574,7 @@ void Renderer::setScene(uint32_t index) {
             std::shared_ptr<GPU::Texture> specularColorTex = defaultSpecularColorTexture;
             std::shared_ptr<GPU::Sampler> specularColorSamp = defaultSampler;
             if (mat.khrMaterialsSpecular && mat.khrMaterialsSpecular->specularColorTexture) {
-                getTextureAndSampler(mat.khrMaterialsSpecular->specularColorTexture, specularColorTex, specularColorSamp);
+                getTextureAndSampler(mat.khrMaterialsSpecular->specularColorTexture, specularColorTex, specularColorSamp, true);
             }
 
             // Sheen color texture (binding 15) — KHR_materials_sheen: RGB sRGB sheen color
@@ -2650,7 +2583,7 @@ void Renderer::setScene(uint32_t index) {
             {
                 std::shared_ptr<GPU::Sampler> unused = defaultSampler;
                 if (mat.khrMaterialsSheen && mat.khrMaterialsSheen->sheenColorTexture)
-                    getTextureAndSampler(mat.khrMaterialsSheen->sheenColorTexture, sheenColorTex, unused);
+                    getTextureAndSampler(mat.khrMaterialsSheen->sheenColorTexture, sheenColorTex, unused, true);
             }
 
             // Sheen roughness texture (binding 16) — KHR_materials_sheen: R channel = roughness
@@ -2806,6 +2739,7 @@ void Renderer::setScene(uint32_t index) {
 #endif
         }
     }
+    proceduralBakes.clear();  // the textures are made
 
     // ------------------------------------------------------------------
     // Compute approximate scene bounding radius from node positions.
@@ -9714,6 +9648,81 @@ void Renderer::writeMaterialUniform(uint64_t offset, const float* slotIn) {
     materialUniformShadowBuffer = materialUniformBuffer.get();
 }
 
+std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::proceduralTexture(
+    const systems::leal::gltf::GLTF& asset, const systems::leal::gltf::TextureInfo& info, bool srgb) {
+    namespace GPU = systems::leal::campello_gpu;
+    namespace cp = systems::leal::campello_procedural;
+    if (!device || !info.khrTextureProcedurals || !asset.khrTextureProcedurals) return nullptr;
+    const auto& procedurals = asset.khrTextureProcedurals->procedurals;
+    const int64_t index = info.khrTextureProcedurals->index;
+    if (index < 0 || index >= (int64_t)procedurals.size()) return nullptr;
+    const cp::Graph graph = procedural::toGraph(procedurals[(size_t)index]);
+    const uint32_t size = (uint32_t)std::max(1, proceduralBakeSize);
+    // Keyed by the graph's content (its values included): materials with the
+    // same graph and values share the bake and its textures, whatever asset
+    // they come from.
+    const std::string json = cp::writeGraph(graph);
+    const std::string graphKey =
+        std::to_string(std::hash<std::string>{}(json)) + ":" + std::to_string(json.size()) + ":" + std::to_string(size);
+    std::string output = info.khrTextureProcedurals->output;
+    if (output.empty() && !graph.outputs.empty()) output = graph.outputs.front().name;
+    const std::string key = graphKey + "|" + output + (srgb ? "|srgb" : "|linear");
+    if (const auto it = proceduralBakedTextures.find(key); it != proceduralBakedTextures.end()) return it->second;
+
+    // Every output of the graph in one pass, kept while the caller resolves
+    // the material's other slots (setScene(), uploadMaterial()).
+    auto& bake = proceduralBakes[graphKey];
+    if (!bake) {
+        cp::BakeOptions options;
+        options.width = size;
+        options.height = size;
+        options.images = procedural::imageResolver(asset);
+        auto result = std::make_shared<cp::BakeResult>(cp::bake(graph, options));
+        if (!result->ok()) {
+            std::cerr << "[Renderer] KHR_texture_procedurals graph " << index << " (" << graph.name
+                      << "): " << result->error << std::endl;
+        }
+        bake = std::move(result);
+    }
+    const cp::Image* image = bake->find(output);
+    std::shared_ptr<GPU::Texture> texture;
+    if (image) {
+        // Colour slots sRGB-encoded (as image textures), with a mip chain
+        // (patterns shimmer in the distance without one).
+        const auto rgba = cp::toRGBA8(*image, srgb ? cp::Encoding::srgb : cp::Encoding::linear);
+        const uint32_t mipLevels = 1u + (uint32_t)std::floor(std::log2((double)size));
+        texture = device->createTexture(GPU::TextureType::tt2d,
+                                        srgb ? GPU::PixelFormat::rgba8unorm_srgb : GPU::PixelFormat::rgba8unorm, size,
+                                        size, 1, mipLevels, 1,
+                                        (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                                            (uint32_t)GPU::TextureUsage::copyDst));
+        if (texture) {
+            uploadWithMips(texture, rgba.data(), size, size, mipLevels, srgb);
+            // Its average colour (the path tracer's stand-in), linear.
+            double sum[3] = {0.0, 0.0, 0.0};
+            for (size_t i = 0; i < image->rgba.size(); i += 4) {
+                for (size_t c = 0; c < 3; ++c) sum[c] += std::clamp(image->rgba[i + c], 0.0f, 1.0f);
+            }
+            const double count = (double)size * size;
+            textureAverages[texture.get()] = {(float)(sum[0] / count), (float)(sum[1] / count), (float)(sum[2] / count)};
+        }
+    }
+    if (!proceduralSampler) {
+        GPU::SamplerDescriptor sd{};
+        sd.addressModeU = GPU::WrapMode::repeat;
+        sd.addressModeV = GPU::WrapMode::repeat;
+        sd.addressModeW = GPU::WrapMode::repeat;
+        sd.magFilter = GPU::FilterMode::fmLinear;
+        sd.minFilter = GPU::FilterMode::fmLinearMipmapLinear;
+        sd.lodMinClamp = 0.0;
+        sd.lodMaxClamp = 1000.0;
+        sd.maxAnisotropy = 8.0;
+        proceduralSampler = device->createSampler(sd);
+    }
+    proceduralBakedTextures[key] = texture;  // (null too: not retried every material)
+    return texture;
+}
+
 void Renderer::uploadWithMips(const std::shared_ptr<systems::leal::campello_gpu::Texture>& texture, const uint8_t* rgba,
                               uint32_t width, uint32_t height, uint32_t mipLevels, bool srgb) {
     namespace GPU = systems::leal::campello_gpu;
@@ -10038,6 +10047,14 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                                     std::shared_ptr<GPU::Texture>& outTex,
                                     std::shared_ptr<GPU::Sampler>& outSamp,
                                     bool srgb = false) {
+        // KHR_texture_procedurals: the graph's bake, else the fallback texture.
+        if (texInfo && texInfo->khrTextureProcedurals) {
+            if (auto baked = proceduralTexture(asset, *texInfo, srgb)) {
+                outTex = baked;
+                outSamp = proceduralSampler ? proceduralSampler : defaultSampler;
+                return;
+            }
+        }
         if (!texInfo || texInfo->index < 0 || !asset.textures) return;
         size_t texIdx = (size_t)texInfo->index;
         if (texIdx >= asset.textures->size()) return;
@@ -10181,6 +10198,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
     if (material.khrMaterialsAnisotropy && material.khrMaterialsAnisotropy->anisotropyTexture) {
         getTextureAndSampler(material.khrMaterialsAnisotropy->anisotropyTexture, anisotropicTex, anisotropicSamp);
     }
+    proceduralBakes.clear();  // the textures are made
 
     // --- Determine uniform slot ---
     uint32_t uniformSlot = 0;

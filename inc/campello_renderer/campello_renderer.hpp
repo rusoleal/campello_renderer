@@ -28,6 +28,10 @@
 
 namespace systems::leal::campello_image { class Image; }
 
+namespace systems::leal::campello_procedural {
+    struct BakeResult;
+}
+
 namespace systems::leal::campello_renderer {
 
     struct GpuMesh {
@@ -1179,10 +1183,19 @@ namespace systems::leal::campello_renderer {
         bool viewCulling = true;
         bool defaultLightEnabled = true;
 
-        // KHR_texture_procedurals — load-time baked textures.
-        // Key: "graph:<index>:output:<name>"  Value: baked GPU texture.
+        // KHR_texture_procedurals (proceduralTexture()): baked textures by
+        // graph content, output, encoding and size, so materials with the
+        // same graph and values share them; the bakes (every output of a
+        // graph, float) while a setScene() or uploadMaterial() needs them;
+        // their sampler (repeat, trilinear).
         std::unordered_map<std::string, std::shared_ptr<systems::leal::campello_gpu::Texture>> proceduralBakedTextures;
+        std::unordered_map<std::string, std::shared_ptr<const campello_procedural::BakeResult>> proceduralBakes;
+        std::shared_ptr<systems::leal::campello_gpu::Sampler> proceduralSampler;
         int proceduralBakeSize = 1024;
+        // The texture a procedural texture slot bakes to (null when the slot
+        // has no graph or the graph doesn't compile).
+        std::shared_ptr<systems::leal::campello_gpu::Texture> proceduralTexture(
+            const systems::leal::gltf::GLTF& asset, const systems::leal::gltf::TextureInfo& info, bool srgb);
 
         // Standalone animation helper — extracted in Phase 5.
         std::unique_ptr<GltfAnimator> animator;

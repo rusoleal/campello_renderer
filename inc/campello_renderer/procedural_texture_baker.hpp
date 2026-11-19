@@ -8,7 +8,10 @@
 namespace systems::leal::campello_renderer {
 
 /**
- * Bake a KHR_texture_procedurals graph output into an RGBA8 CPU pixel buffer.
+ * Bake a KHR_texture_procedurals graph output into an RGBA8 CPU pixel buffer
+ * (linear, 0..1 clamped), with campello_procedural: MaterialX 1.39 nodes and
+ * texture coordinates (v up: row 0 is v = 1, so the image is a glTF texture
+ * as it is). All zeros when the graph doesn't compile.
  *
  * @param asset   The glTF asset (used for image sampling and graph definitions).
  * @param graph   The procedural graph to evaluate.
@@ -33,13 +36,9 @@ namespace systems::leal::campello_gpu {
 namespace systems::leal::campello_renderer {
 
 /**
- * GPU-accelerated procedural texture baker using a pre-compiled uber-shader.
- *
- * Falls back to CPU baking if the graph contains unsupported nodes (e.g. `image`)
- * or if GPU pipeline creation fails.
- *
- * @param device  campello_gpu device used for compute dispatch.
- * @return Row-major RGBA8 pixel data (size = width * height * 4).
+ * Deprecated: the same as bakeProceduralTexture() (the device is unused).
+ * The GPU baker evaluated a smaller node set with its own noise; graphs are
+ * now baked by campello_procedural on the CPU.
  */
 std::vector<uint8_t> bakeProceduralTextureGPU(
     const std::shared_ptr<systems::leal::campello_gpu::Device>& device,
