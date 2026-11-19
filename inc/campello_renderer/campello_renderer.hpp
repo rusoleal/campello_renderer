@@ -236,6 +236,8 @@ namespace systems::leal::campello_renderer {
         uint32_t opaqueDrawCount = 0;
         uint32_t transparentDrawCount = 0;
         uint32_t totalDrawCount = 0;
+        // render(RenderScene): the draws skipped by view culling
+        // (Renderer::setViewCulling()) and those drawn.
         uint32_t culledNodeCount = 0;
         uint32_t visibleNodeCount = 0;
         uint32_t instanceCount = 0;
@@ -906,6 +908,7 @@ namespace systems::leal::campello_renderer {
         // allocation): the sorted opaque draws, the shadow casters, the
         // staged transforms (uploaded once per frame) and their offsets.
         std::vector<const systems::leal::campello_renderer::DrawCall*> sortedOpaqueScratch;
+        std::vector<uint8_t> drawVisibleScratch;  // per draw: in view (setViewCulling())
         std::vector<const systems::leal::campello_renderer::DrawCall*> shadowCasterScratch;
         std::vector<const systems::leal::campello_renderer::DrawCall*> shadowFarCasterScratch;
         std::vector<const systems::leal::campello_renderer::DrawCall*> shadowNearCasterScratch;
@@ -1173,6 +1176,7 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<std::atomic<double>> gpuFrameTimeAsyncMs =
             std::make_shared<std::atomic<double>>(0.0);
         OpaqueOrder opaqueOrder = OpaqueOrder::byState;
+        bool viewCulling = true;
         bool defaultLightEnabled = true;
 
         // KHR_texture_procedurals — load-time baked textures.
@@ -1421,6 +1425,16 @@ namespace systems::leal::campello_renderer {
         /// Order of opaque draws within a frame (see OpaqueOrder).
         void setOpaqueOrder(OpaqueOrder order) { opaqueOrder = order; }
         OpaqueOrder getOpaqueOrder() const { return opaqueOrder; }
+
+        /// render(RenderScene): skip the draws the camera can't see (their
+        /// world-space bounds outside the view). On by default; a caller that
+        /// already culls (render_system()) loses only the CPU test. Draws
+        /// with no bounds, and instanced or skinned draws without
+        /// DrawCall::localBounds, are always drawn. Sun shadows take every
+        /// caster either way. RenderStats::culledNodeCount counts the draws
+        /// skipped, visibleNodeCount those drawn.
+        void setViewCulling(bool enabled) { viewCulling = enabled; }
+        bool getViewCulling() const { return viewCulling; }
 
         /// True when meshes with this vertex layout (GpuMesh::layout) can be
         /// drawn: the backend's shaders have a vertex stage that reads only
