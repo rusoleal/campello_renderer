@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Compressed textures on WebGPU** (`setTextureCompression()`, KTX2/Basis textures): their mips were copied with tightly packed rows, and WebGPU's `copyBufferToTexture()` needs `bytesPerRow` to be a multiple of 256 (a 32x32 BC7 mip has 128-byte rows), so the copy was rejected and the texture stayed black. `uploadTextureDataWithMips()` pads each mip's rows to 256 bytes in the staging buffer on WebGPU; the other backends keep the tight rows. Needs campello_gpu v0.33.2 (whole-block copies for mips smaller than a block, and `Texture::upload()`'s mip offsets).
+  - Web test suite: `CompressedTexturesDrawAsTheirPixels` passes (Edge, Intel UHD 630, against campello_gpu's fix).
+
 ## [0.27.0] - 2026-11-19
 
 ### Added

@@ -759,44 +759,65 @@ static bool uploadTextureDataWithMips(
 {
     using namespace systems::leal::campello_gpu;
 
-    // Calculate total staging size.
-    size_t totalBytes = 0;
+    // Each mip's rows: block rows for compressed formats, pixel rows
+    // otherwise. TextureData packs them tightly. WebGPU's copyBufferToTexture()
+    // needs bytesPerRow to be a multiple of 256 (a 32x32 BC7 mip has 128-byte
+    // rows), so there they're padded in the staging buffer; the other
+    // backends copy the tight rows.
+    struct MipLayout {
+        uint64_t offset = 0;
+        uint64_t rowBytes = 0;     // tight, as TextureData stores them
+        uint64_t bytesPerRow = 0;  // in the staging buffer
+        uint32_t rows = 0;
+    };
+    const uint32_t blockW = texData.getBlockWidth();
+    const uint32_t blockH = texData.getBlockHeight();
+    const uint32_t blockBytes = texData.getBlockBytes();
+    std::vector<MipLayout> layouts;
+    uint64_t totalBytes = 0;
     for (uint32_t mip = 0; mip < texData.getMipLevelCount(); ++mip) {
-        totalBytes += texData.getDataSize(mip);
+        const uint32_t mipWidth  = std::max(1u, texData.getWidth()  >> mip);
+        const uint32_t mipHeight = std::max(1u, texData.getHeight() >> mip);
+        MipLayout l;
+        if (texData.isCompressed()) {
+            l.rowBytes = static_cast<uint64_t>((mipWidth + blockW - 1) / blockW) * blockBytes;
+            l.rows = (mipHeight + blockH - 1) / blockH;
+        } else {
+            l.rowBytes = static_cast<uint64_t>(mipWidth) * blockBytes;
+            l.rows = mipHeight;
+        }
+#if defined(__EMSCRIPTEN__)
+        l.bytesPerRow = (l.rowBytes + 255) / 256 * 256;
+#else
+        l.bytesPerRow = l.rowBytes;
+#endif
+        l.offset = totalBytes;
+        totalBytes += l.bytesPerRow * l.rows;
+        layouts.push_back(l);
     }
 
     auto staging = device->createBuffer(totalBytes, BufferUsage::copySrc);
     if (!staging) return false;
 
-    size_t offset = 0;
+    std::vector<uint8_t> padded;
     for (uint32_t mip = 0; mip < texData.getMipLevelCount(); ++mip) {
-        staging->upload(offset, texData.getDataSize(mip),
-                        const_cast<void*>(texData.getData(mip)));
-        offset += texData.getDataSize(mip);
+        const MipLayout& l = layouts[mip];
+        const auto* src = static_cast<const uint8_t*>(texData.getData(mip));
+        if (l.bytesPerRow == l.rowBytes) {
+            staging->upload(l.offset, texData.getDataSize(mip), const_cast<uint8_t*>(src));
+            continue;
+        }
+        padded.assign(l.bytesPerRow * l.rows, 0);
+        for (uint32_t row = 0; row < l.rows; ++row) {
+            std::memcpy(padded.data() + row * l.bytesPerRow, src + row * l.rowBytes, l.rowBytes);
+        }
+        staging->upload(l.offset, padded.size(), padded.data());
     }
 
     auto encoder = device->createCommandEncoder();
     if (!encoder) return false;
-
-    offset = 0;
     for (uint32_t mip = 0; mip < texData.getMipLevelCount(); ++mip) {
-        uint32_t mipWidth  = std::max(1u, texData.getWidth()  >> mip);
-        uint32_t mipHeight = std::max(1u, texData.getHeight() >> mip);
-
-        uint32_t blockW = texData.getBlockWidth();
-        uint32_t blockH = texData.getBlockHeight();
-        uint32_t blockBytes = texData.getBlockBytes();
-
-        uint64_t bytesPerRow = 0;
-        if (texData.isCompressed()) {
-            uint32_t blocksX = (mipWidth + blockW - 1) / blockW;
-            bytesPerRow = static_cast<uint64_t>(blocksX) * blockBytes;
-        } else {
-            bytesPerRow = static_cast<uint64_t>(mipWidth) * blockBytes;
-        }
-
-        encoder->copyBufferToTexture(staging, offset, bytesPerRow, texture, mip, 0);
-        offset += texData.getDataSize(mip);
+        encoder->copyBufferToTexture(staging, layouts[mip].offset, layouts[mip].bytesPerRow, texture, mip, 0);
     }
 
     auto fence = device->createFence();
