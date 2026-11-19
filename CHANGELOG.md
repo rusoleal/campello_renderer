@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **Procedural textures (KHR_texture_procedurals) are baked by campello_procedural v0.1.0**, a new library: MaterialX 1.39 standard library nodes (about 70, against about 20 before), with noise ported from MaterialX, so graphs bake as MaterialX renders them. Linked privately; the public API is unchanged.
+  - **Standalone materials bake their graphs too.** `uploadMaterial()` resolves procedural texture slots, as `setScene()` does; before, only the scene asset's materials did, so materials built at run time (BIM's) showed their fallback texture.
+  - **One bake per graph.** A material's slots fed by one graph's outputs (base colour, normal, roughness from the same pattern) come from a single evaluation. Textures are cached by the graph's content, so materials with the same graph and values share them, whatever asset they come from.
+  - **Encoding and sampling.** Colour slots (base colour, emissive, specular colour, sheen colour) get sRGB textures; the rest stay linear. Before, everything was 8-bit linear, which lost dark detail. Baked textures have a mip chain (before, one level, which shimmered in the distance) and their own repeat, trilinear sampler, since the draft says the glTF texture's sampler is ignored. They also record an average colour for the path tracer.
+  - New test `ProceduralMaterialsBakeInUploadMaterial`: an sRGB, mipmapped texture, shared by two assets with the same graph, and a quad showing the checkerboard the right way up.
+- **The bake follows MaterialX semantics** (`bakeProceduralTexture()`):
+  - Texture coordinates have v up, so row 0 of the image is v = 1 and the image is a glTF texture as it is.
+  - `place2d` subtracts its offset.
+  - Float outputs are grey, (v, v, v, 1).
+  - Values are rounded to 8 bits, not truncated.
+  - Only MaterialX names are accepted: the old baker's `abs`, `combine` and `noise2d`'s `position` input are now `absval`, `combine2/3/4` and `texcoord`.
+  - A graph that doesn't compile logs why and bakes black.
+
+### Deprecated
+- **`bakeProceduralTextureGPU()`** is now the CPU bake (the device is unused). The GPU baker evaluated its own subset of nodes with its own noise, and its results differed from the CPU's. Its compute kernels are still in the shader sources, unused, until they're removed or rebuilt on campello_procedural's programs. Its 7 GPU-vs-CPU tests are removed.
+
 ## [0.25.0] - 2026-11-19
 
 ### Added

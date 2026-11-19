@@ -553,9 +553,9 @@ TEST(ProceduralBakerTest, MixNode) {
 
     ASSERT_EQ(pixels.size(), 4u * 4u * 4u);
     size_t idx = (2 * 4 + 2) * 4;
-    EXPECT_EQ(pixels[idx + 0], 127); // 0.5 * 255 = 127.5 → 127
+    EXPECT_EQ(pixels[idx + 0], 128); // 0.5 * 255 = 127.5, rounded
     EXPECT_EQ(pixels[idx + 1], 0);
-    EXPECT_EQ(pixels[idx + 2], 127); // 0.5 * 255 = 127.5 → 127
+    EXPECT_EQ(pixels[idx + 2], 128);
     EXPECT_EQ(pixels[idx + 3], 255);
 }
 
@@ -580,7 +580,7 @@ TEST(ProceduralBakerTest, Noise2DNode) {
     noiseNode.nodetype = "noise2d";
     noiseNode.type = "float";
     ProceduralNodeInput posIn;
-    posIn.name = "position";
+    posIn.name = "texcoord";  // MaterialX noise2d
     posIn.type = "vector2";
     posIn.nodeIndex = 0;
     noiseNode.inputs.push_back(posIn);
@@ -737,8 +737,8 @@ TEST(ProceduralBakerTest, SinNode) {
     ASSERT_EQ(pixels.size(), 4u * 4u * 4u);
     size_t idx = (2 * 4 + 2) * 4;
     EXPECT_EQ(pixels[idx + 0], 255); // sin(pi/2) = 1.0
-    EXPECT_EQ(pixels[idx + 1], 0);
-    EXPECT_EQ(pixels[idx + 2], 0);
+    EXPECT_EQ(pixels[idx + 1], 255);  // float outputs are grey: (v, v, v, 1)
+    EXPECT_EQ(pixels[idx + 2], 255);
     EXPECT_EQ(pixels[idx + 3], 255);
 }
 
@@ -800,11 +800,12 @@ TEST(ProceduralBakerTest, Place2DNode) {
         *dummyAsset, graph, "result", 4, 4);
 
     ASSERT_EQ(pixels.size(), 4u * 4u * 4u);
-    // Center pixel (x=2,y=2) uv = (2.5/4, 2.5/4) = (0.625,0.625)
-    // place2d: (0.625,0.625) - pivot(0.5,0.5) + pivot(0.5,0.5) + offset(0.25,0.25) = (0.875,0.875)
+    // Pixel (2, 2): MaterialX coordinates (v up) (0.625, 0.375); place2d
+    // moves the texture by the offset, so the coordinates are minus it:
+    // (0.375, 0.125).
     size_t idx = (2 * 4 + 2) * 4;
-    EXPECT_EQ(pixels[idx + 0], 223); // R = 0.875 * 255 = 223.125 -> 223
-    EXPECT_EQ(pixels[idx + 1], 223); // G = 0.875 * 255
+    EXPECT_EQ(pixels[idx + 0], 96);  // 0.375 * 255 = 95.6
+    EXPECT_EQ(pixels[idx + 1], 32);  // 0.125 * 255 = 31.9
     EXPECT_EQ(pixels[idx + 2], 0);   // B unused for vector2
     EXPECT_EQ(pixels[idx + 3], 255);
 }
@@ -972,9 +973,9 @@ TEST(ProceduralBakerTest, SwizzleNode) {
 
     ASSERT_EQ(pixels.size(), 4u * 4u * 4u);
     size_t idx = (2 * 4 + 2) * 4;
-    // bbr: blue=0.25, blue=0.25, red=1.0 -> (63, 63, 255) because 0.25*255=63.75 truncates to 63
-    EXPECT_EQ(pixels[idx + 0], 63);
-    EXPECT_EQ(pixels[idx + 1], 63);
+    // bbr: blue=0.25, blue=0.25, red=1.0 -> (64, 64, 255) (0.25 * 255 = 63.75, rounded)
+    EXPECT_EQ(pixels[idx + 0], 64);
+    EXPECT_EQ(pixels[idx + 1], 64);
     EXPECT_EQ(pixels[idx + 2], 255);
     EXPECT_EQ(pixels[idx + 3], 255);
 }
@@ -1017,7 +1018,7 @@ TEST(ProceduralBakerTest, CombineNode) {
     // Node 2: combine (1, 0, 0) -> red
     ProceduralNode combNode;
     combNode.name = "comb";
-    combNode.nodetype = "combine";
+    combNode.nodetype = "combine3";  // MaterialX
     combNode.type = "color3";
     ProceduralNodeInput c1;
     c1.name = "in1";
@@ -1107,9 +1108,9 @@ TEST(ProceduralBakerTest, ExtractNode) {
 
     ASSERT_EQ(pixels.size(), 4u * 4u * 4u);
     size_t idx = (2 * 4 + 2) * 4;
-    EXPECT_EQ(pixels[idx + 0], 127); // 0.5 * 255 = 127.5 -> 127
-    EXPECT_EQ(pixels[idx + 1], 0);
-    EXPECT_EQ(pixels[idx + 2], 0);
+    EXPECT_EQ(pixels[idx + 0], 128); // 0.5 * 255 = 127.5, rounded
+    EXPECT_EQ(pixels[idx + 1], 128); // float outputs are grey: (v, v, v, 1)
+    EXPECT_EQ(pixels[idx + 2], 128);
     EXPECT_EQ(pixels[idx + 3], 255);
 }
 
@@ -1243,8 +1244,8 @@ TEST(ProceduralBakerTest, LengthNode) {
     ASSERT_EQ(pixels.size(), 4u * 4u * 4u);
     size_t idx = (2 * 4 + 2) * 4;
     EXPECT_EQ(pixels[idx + 0], 255); // length = 5.0 -> 255
-    EXPECT_EQ(pixels[idx + 1], 0);
-    EXPECT_EQ(pixels[idx + 2], 0);
+    EXPECT_EQ(pixels[idx + 1], 255);  // float outputs are grey: (v, v, v, 1)
+    EXPECT_EQ(pixels[idx + 2], 255);
     EXPECT_EQ(pixels[idx + 3], 255);
 }
 
@@ -1315,8 +1316,8 @@ TEST(ProceduralBakerTest, DistanceNode) {
     size_t idx = (2 * 4 + 2) * 4;
     // sqrt(2) = 1.4142 -> clamped to 1.0 -> 255
     EXPECT_EQ(pixels[idx + 0], 255);
-    EXPECT_EQ(pixels[idx + 1], 0);
-    EXPECT_EQ(pixels[idx + 2], 0);
+    EXPECT_EQ(pixels[idx + 1], 255);  // float outputs are grey: (v, v, v, 1)
+    EXPECT_EQ(pixels[idx + 2], 255);
     EXPECT_EQ(pixels[idx + 3], 255);
 }
 
@@ -1446,419 +1447,6 @@ TEST(ProceduralBakerTest, NormalizeNode) {
 }
 
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// GPU procedural baker tests — compare GPU output against CPU reference.
-// ---------------------------------------------------------------------------
-
-class ProceduralBakerGPUTest : public testing::Test {
-protected:
-    std::shared_ptr<systems::leal::campello_gpu::Device> device;
-
-    void SetUp() override {
-        device = systems::leal::campello_gpu::Device::createDefaultDevice(nullptr);
-    }
-};
-
-static bool comparePixels(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, int tolerance = 2) {
-    if (a.size() != b.size()) {
-        std::printf("pixel count differs: %zu vs %zu\n", a.size(), b.size());
-        return false;
-    }
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (std::abs((int)a[i] - (int)b[i]) > tolerance) {
-            size_t p = i / 4 * 4;
-            std::printf("first mismatch at pixel %zu: cpu (%d %d %d %d) gpu (%d %d %d %d)\n", i / 4,
-                        a[p], a[p + 1], a[p + 2], a[p + 3], b[p], b[p + 1], b[p + 2], b[p + 3]);
-            return false;
-        }
-    }
-    return true;
-}
-
-TEST_F(ProceduralBakerGPUTest, ConstantColor3MatchesCPU) {
-    if (!device) GTEST_SKIP() << "No GPU device available";
-    using namespace systems::leal::gltf;
-    ProceduralGraph graph;
-    graph.name = "gpu_const_test";
-    graph.nodetype = "nodegraph";
-    graph.type = "color3";
-
-    ProceduralNode constNode;
-    constNode.name = "c";
-    constNode.nodetype = "constant";
-    constNode.type = "color3";
-    ProceduralNodeInput valIn;
-    valIn.name = "value";
-    valIn.type = "color3";
-    valIn.value = std::make_shared<ProceduralValue>("color3");
-    valIn.value->values = {1.0f, 0.5f, 0.25f};
-    constNode.inputs.push_back(valIn);
-    constNode.outputs.push_back({"out", "color3"});
-    graph.nodes.push_back(constNode);
-
-    ProceduralGraphOutput gout;
-    gout.name = "result";
-    gout.type = "color3";
-    gout.nodeIndex = 0;
-    graph.outputs.push_back(gout);
-
-    auto dummyAsset = GLTF::loadGLTF(R"({"asset":{"version":"2.0"}})", kNoOpLoader);
-    auto cpuPixels = systems::leal::campello_renderer::bakeProceduralTexture(
-        *dummyAsset, graph, "result", 4, 4);
-    auto gpuPixels = systems::leal::campello_renderer::bakeProceduralTextureGPU(
-        device, *dummyAsset, graph, "result", 4, 4);
-
-    EXPECT_TRUE(comparePixels(cpuPixels, gpuPixels));
-}
-
-TEST_F(ProceduralBakerGPUTest, MixNodeMatchesCPU) {
-    if (!device) GTEST_SKIP() << "No GPU device available";
-    using namespace systems::leal::gltf;
-    ProceduralGraph graph;
-    graph.name = "gpu_mix_test";
-    graph.nodetype = "nodegraph";
-    graph.type = "color3";
-
-    // Node 0: constant red
-    ProceduralNode red;
-    red.name = "red";
-    red.nodetype = "constant";
-    red.type = "color3";
-    ProceduralNodeInput redVal;
-    redVal.name = "value";
-    redVal.type = "color3";
-    redVal.value = std::make_shared<ProceduralValue>("color3");
-    redVal.value->values = {1.0f, 0.0f, 0.0f};
-    red.inputs.push_back(redVal);
-    red.outputs.push_back({"out", "color3"});
-    graph.nodes.push_back(red);
-
-    // Node 1: constant blue
-    ProceduralNode blue;
-    blue.name = "blue";
-    blue.nodetype = "constant";
-    blue.type = "color3";
-    ProceduralNodeInput blueVal;
-    blueVal.name = "value";
-    blueVal.type = "color3";
-    blueVal.value = std::make_shared<ProceduralValue>("color3");
-    blueVal.value->values = {0.0f, 0.0f, 1.0f};
-    blue.inputs.push_back(blueVal);
-    blue.outputs.push_back({"out", "color3"});
-    graph.nodes.push_back(blue);
-
-    // Node 2: mix(0.5)
-    ProceduralNode mixNode;
-    mixNode.name = "mix";
-    mixNode.nodetype = "mix";
-    mixNode.type = "color3";
-    ProceduralNodeInput fg;
-    fg.name = "fg";
-    fg.type = "color3";
-    fg.nodeIndex = 0;
-    mixNode.inputs.push_back(fg);
-    ProceduralNodeInput bg;
-    bg.name = "bg";
-    bg.type = "color3";
-    bg.nodeIndex = 1;
-    mixNode.inputs.push_back(bg);
-    ProceduralNodeInput mixVal;
-    mixVal.name = "mix";
-    mixVal.type = "float";
-    mixVal.value = std::make_shared<ProceduralValue>("float");
-    mixVal.value->values = {0.5f};
-    mixNode.inputs.push_back(mixVal);
-    mixNode.outputs.push_back({"out", "color3"});
-    graph.nodes.push_back(mixNode);
-
-    ProceduralGraphOutput gout;
-    gout.name = "result";
-    gout.type = "color3";
-    gout.nodeIndex = 2;
-    graph.outputs.push_back(gout);
-
-    auto dummyAsset = GLTF::loadGLTF(R"({"asset":{"version":"2.0"}})", kNoOpLoader);
-    auto cpuPixels = systems::leal::campello_renderer::bakeProceduralTexture(
-        *dummyAsset, graph, "result", 4, 4);
-    auto gpuPixels = systems::leal::campello_renderer::bakeProceduralTextureGPU(
-        device, *dummyAsset, graph, "result", 4, 4);
-
-    EXPECT_TRUE(comparePixels(cpuPixels, gpuPixels));
-}
-
-TEST_F(ProceduralBakerGPUTest, Noise2DNodeMatchesCPU) {
-    if (!device) GTEST_SKIP() << "No GPU device available";
-    using namespace systems::leal::gltf;
-    ProceduralGraph graph;
-    graph.name = "gpu_noise_test";
-    graph.nodetype = "nodegraph";
-    graph.type = "float";
-
-    // Node 0: texcoord
-    ProceduralNode tc;
-    tc.name = "tc";
-    tc.nodetype = "texcoord";
-    tc.type = "vector2";
-    tc.outputs.push_back({"out", "vector2"});
-    graph.nodes.push_back(tc);
-
-    // Node 1: noise2d
-    ProceduralNode noise;
-    noise.name = "noise";
-    noise.nodetype = "noise2d";
-    noise.type = "float";
-    ProceduralNodeInput posIn;
-    posIn.name = "position";
-    posIn.type = "vector2";
-    posIn.nodeIndex = 0;
-    noise.inputs.push_back(posIn);
-    noise.outputs.push_back({"out", "float"});
-    graph.nodes.push_back(noise);
-
-    ProceduralGraphOutput gout;
-    gout.name = "result";
-    gout.type = "float";
-    gout.nodeIndex = 1;
-    graph.outputs.push_back(gout);
-
-    auto dummyAsset = GLTF::loadGLTF(R"({"asset":{"version":"2.0"}})", kNoOpLoader);
-    auto cpuPixels = systems::leal::campello_renderer::bakeProceduralTexture(
-        *dummyAsset, graph, "result", 8, 8);
-    auto gpuPixels = systems::leal::campello_renderer::bakeProceduralTextureGPU(
-        device, *dummyAsset, graph, "result", 8, 8);
-
-    EXPECT_TRUE(comparePixels(cpuPixels, gpuPixels, 3));
-}
-
-TEST_F(ProceduralBakerGPUTest, CheckerboardNodeMatchesCPU) {
-    if (!device) GTEST_SKIP() << "No GPU device available";
-    using namespace systems::leal::gltf;
-    ProceduralGraph graph;
-    graph.name = "gpu_checker_test";
-    graph.nodetype = "nodegraph";
-    graph.type = "color3";
-
-    // Node 0: texcoord
-    ProceduralNode tc;
-    tc.name = "tc";
-    tc.nodetype = "texcoord";
-    tc.type = "vector2";
-    tc.outputs.push_back({"out", "vector2"});
-    graph.nodes.push_back(tc);
-
-    // Node 1: checkerboard
-    ProceduralNode cb;
-    cb.name = "cb";
-    cb.nodetype = "checkerboard";
-    cb.type = "color3";
-    ProceduralNodeInput texIn;
-    texIn.name = "texcoord";
-    texIn.type = "vector2";
-    texIn.nodeIndex = 0;
-    cb.inputs.push_back(texIn);
-    cb.outputs.push_back({"out", "color3"});
-    graph.nodes.push_back(cb);
-
-    ProceduralGraphOutput gout;
-    gout.name = "result";
-    gout.type = "color3";
-    gout.nodeIndex = 1;
-    graph.outputs.push_back(gout);
-
-    auto dummyAsset = GLTF::loadGLTF(R"({"asset":{"version":"2.0"}})", kNoOpLoader);
-    auto cpuPixels = systems::leal::campello_renderer::bakeProceduralTexture(
-        *dummyAsset, graph, "result", 4, 4);
-    auto gpuPixels = systems::leal::campello_renderer::bakeProceduralTextureGPU(
-        device, *dummyAsset, graph, "result", 4, 4);
-
-    EXPECT_TRUE(comparePixels(cpuPixels, gpuPixels));
-}
-
-TEST_F(ProceduralBakerGPUTest, SwizzleNodeMatchesCPU) {
-    if (!device) GTEST_SKIP() << "No GPU device available";
-    using namespace systems::leal::gltf;
-    ProceduralGraph graph;
-    graph.name = "gpu_swizzle_test";
-    graph.nodetype = "nodegraph";
-    graph.type = "color3";
-
-    // Node 0: constant color3 (1, 0.5, 0.25)
-    ProceduralNode constNode;
-    constNode.name = "c";
-    constNode.nodetype = "constant";
-    constNode.type = "color3";
-    ProceduralNodeInput valIn;
-    valIn.name = "value";
-    valIn.type = "color3";
-    valIn.value = std::make_shared<ProceduralValue>("color3");
-    valIn.value->values = {1.0f, 0.5f, 0.25f};
-    constNode.inputs.push_back(valIn);
-    constNode.outputs.push_back({"out", "color3"});
-    graph.nodes.push_back(constNode);
-
-    // Node 1: swizzle "bbr"
-    ProceduralNode swizNode;
-    swizNode.name = "swiz";
-    swizNode.nodetype = "swizzle";
-    swizNode.type = "color3";
-    ProceduralNodeInput in;
-    in.name = "in";
-    in.type = "color3";
-    in.nodeIndex = 0;
-    swizNode.inputs.push_back(in);
-    ProceduralNodeInput chIn;
-    chIn.name = "channels";
-    chIn.type = "string";
-    chIn.value = std::make_shared<ProceduralValue>("string");
-    chIn.value->stringValue = "bbr";
-    swizNode.inputs.push_back(chIn);
-    swizNode.outputs.push_back({"out", "color3"});
-    graph.nodes.push_back(swizNode);
-
-    ProceduralGraphOutput gout;
-    gout.name = "result";
-    gout.type = "color3";
-    gout.nodeIndex = 1;
-    graph.outputs.push_back(gout);
-
-    auto dummyAsset = GLTF::loadGLTF(R"({"asset":{"version":"2.0"}})", kNoOpLoader);
-    auto cpuPixels = systems::leal::campello_renderer::bakeProceduralTexture(
-        *dummyAsset, graph, "result", 4, 4);
-    auto gpuPixels = systems::leal::campello_renderer::bakeProceduralTextureGPU(
-        device, *dummyAsset, graph, "result", 4, 4);
-
-    EXPECT_TRUE(comparePixels(cpuPixels, gpuPixels));
-}
-
-TEST_F(ProceduralBakerGPUTest, IfGreaterNodeMatchesCPU) {
-    if (!device) GTEST_SKIP() << "No GPU device available";
-    using namespace systems::leal::gltf;
-    ProceduralGraph graph;
-    graph.name = "gpu_if_test";
-    graph.nodetype = "nodegraph";
-    graph.type = "color3";
-
-    // Node 0: constant 0.5
-    ProceduralNode half;
-    half.name = "half";
-    half.nodetype = "constant";
-    half.type = "float";
-    ProceduralNodeInput halfVal;
-    halfVal.name = "value";
-    halfVal.type = "float";
-    halfVal.value = std::make_shared<ProceduralValue>("float");
-    halfVal.value->values = {0.5f};
-    half.inputs.push_back(halfVal);
-    half.outputs.push_back({"out", "float"});
-    graph.nodes.push_back(half);
-
-    // Node 1: constant red
-    ProceduralNode red;
-    red.name = "red";
-    red.nodetype = "constant";
-    red.type = "color3";
-    ProceduralNodeInput redVal;
-    redVal.name = "value";
-    redVal.type = "color3";
-    redVal.value = std::make_shared<ProceduralValue>("color3");
-    redVal.value->values = {1.0f, 0.0f, 0.0f};
-    red.inputs.push_back(redVal);
-    red.outputs.push_back({"out", "color3"});
-    graph.nodes.push_back(red);
-
-    // Node 2: constant green
-    ProceduralNode green;
-    green.name = "green";
-    green.nodetype = "constant";
-    green.type = "color3";
-    ProceduralNodeInput greenVal;
-    greenVal.name = "value";
-    greenVal.type = "color3";
-    greenVal.value = std::make_shared<ProceduralValue>("color3");
-    greenVal.value->values = {0.0f, 1.0f, 0.0f};
-    green.inputs.push_back(greenVal);
-    green.outputs.push_back({"out", "color3"});
-    graph.nodes.push_back(green);
-
-    // Node 3: ifgreater(0.5 > 0.0) -> red
-    ProceduralNode ifNode;
-    ifNode.name = "if";
-    ifNode.nodetype = "ifgreater";
-    ifNode.type = "color3";
-    ProceduralNodeInput v1;
-    v1.name = "value1";
-    v1.type = "float";
-    v1.nodeIndex = 0;
-    ifNode.inputs.push_back(v1);
-    ProceduralNodeInput v2;
-    v2.name = "value2";
-    v2.type = "float";
-    v2.value = std::make_shared<ProceduralValue>("float");
-    v2.value->values = {0.0f};
-    ifNode.inputs.push_back(v2);
-    ProceduralNodeInput in1;
-    in1.name = "in1";
-    in1.type = "color3";
-    in1.nodeIndex = 1;
-    ifNode.inputs.push_back(in1);
-    ProceduralNodeInput in2;
-    in2.name = "in2";
-    in2.type = "color3";
-    in2.nodeIndex = 2;
-    ifNode.inputs.push_back(in2);
-    ifNode.outputs.push_back({"out", "color3"});
-    graph.nodes.push_back(ifNode);
-
-    ProceduralGraphOutput gout;
-    gout.name = "result";
-    gout.type = "color3";
-    gout.nodeIndex = 3;
-    graph.outputs.push_back(gout);
-
-    auto dummyAsset = GLTF::loadGLTF(R"({"asset":{"version":"2.0"}})", kNoOpLoader);
-    auto cpuPixels = systems::leal::campello_renderer::bakeProceduralTexture(
-        *dummyAsset, graph, "result", 4, 4);
-    auto gpuPixels = systems::leal::campello_renderer::bakeProceduralTextureGPU(
-        device, *dummyAsset, graph, "result", 4, 4);
-
-    EXPECT_TRUE(comparePixels(cpuPixels, gpuPixels));
-}
-
-TEST_F(ProceduralBakerGPUTest, ImageNodeFallsBackToCPU) {
-    if (!device) GTEST_SKIP() << "No GPU device available";
-    using namespace systems::leal::gltf;
-    ProceduralGraph graph;
-    graph.name = "gpu_image_fallback";
-    graph.nodetype = "nodegraph";
-    graph.type = "color3";
-
-    // Node 0: image (unsupported on GPU)
-    ProceduralNode imgNode;
-    imgNode.name = "img";
-    imgNode.nodetype = "image";
-    imgNode.type = "color3";
-    ProceduralNodeInput fileIn;
-    fileIn.name = "file";
-    fileIn.type = "filename";
-    fileIn.value = std::make_shared<ProceduralValue>("filename");
-    fileIn.value->stringValue = "nonexistent.png";
-    imgNode.inputs.push_back(fileIn);
-    imgNode.outputs.push_back({"out", "color3"});
-    graph.nodes.push_back(imgNode);
-
-    ProceduralGraphOutput gout;
-    gout.name = "result";
-    gout.type = "color3";
-    gout.nodeIndex = 0;
-    graph.outputs.push_back(gout);
-
-    auto dummyAsset = GLTF::loadGLTF(R"({"asset":{"version":"2.0"}})", kNoOpLoader);
-    // Should not crash and should fall back to CPU (producing magenta for missing image).
-    auto gpuPixels = systems::leal::campello_renderer::bakeProceduralTextureGPU(
-        device, *dummyAsset, graph, "result", 4, 4);
-    EXPECT_EQ(gpuPixels.size(), 4u * 4u * 4u);
-}
 
 // ---------------------------------------------------------------------------
 // Offscreen rendering tests
@@ -8592,6 +8180,104 @@ TEST_F(OffscreenRenderTest, SpecializedMaterialsRenderAsTheGeneralShader) {
     EXPECT_NE(plain, at(general, 53, 24)) << "clearcoat";
     EXPECT_NE(plain, at(general, 85, 24)) << "sheen";
     EXPECT_NE(plain, at(general, 53, 42)) << "unlit";
+}
+
+// KHR_texture_procedurals through uploadMaterial() (standalone materials,
+// as BIM uploads them): the graph is baked by campello_procedural into an
+// sRGB, mipmapped base colour texture, materials with the same graph from
+// another asset share it, and a quad shows the checkerboard the right way up
+// (MaterialX v up: the top-left square is colour1).
+static const char* kGltfProceduralChecker = R"({
+    "asset": {"version": "2.0"},
+    "extensionsUsed": ["KHR_texture_procedurals", "KHR_materials_unlit"],
+    "images": [{"uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVQI12P4z/AfAAQAAf/zKSWvAAAAAElFTkSuQmCC"}],
+    "textures": [{"source": 0}],
+    "extensions": {"KHR_texture_procedurals": {"procedurals": [{
+        "name": "checker", "nodetype": "nodegraph", "type": "color3",
+        "inputs": {"first": {"nodetype": "input", "type": "color3", "value": [1, 0, 0]},
+                   "second": {"nodetype": "input", "type": "color3", "value": [0, 0, 1]}},
+        "nodes": [{"name": "board", "nodetype": "checkerboard", "type": "color3",
+                   "inputs": {"color1": {"nodetype": "input", "type": "color3", "input": "first"},
+                              "color2": {"nodetype": "input", "type": "color3", "input": "second"},
+                              "uvtiling": {"nodetype": "input", "type": "vector2", "value": [2, 2]}},
+                   "outputs": {"out": {"nodetype": "output", "type": "color3"}}}],
+        "outputs": {"base_color": {"nodetype": "output", "type": "color3", "node": 0}}}]}},
+    "materials": [{"name": "checker",
+                   "pbrMetallicRoughness": {"baseColorTexture": {"index": 0, "extensions": {
+                       "KHR_texture_procedurals": {"index": 0, "output": "base_color"}}}},
+                   "extensions": {"KHR_materials_unlit": {}}}]
+})";
+
+TEST_F(OffscreenRenderTest, ProceduralMaterialsBakeInUploadMaterial) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfProceduralChecker, kNoOpLoader);
+    auto sameGraph = GLTF::loadGLTF(kGltfProceduralChecker, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    ASSERT_TRUE(asset->khrTextureProcedurals && asset->khrTextureProcedurals->procedurals.size() == 1);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    renderer->setProceduralBakeSize(64);
+
+    GpuMaterial* material = renderer->uploadMaterial((*asset->materials)[0], *asset);
+    ASSERT_NE(material, nullptr);
+    ASSERT_NE(material->baseColorTexture, nullptr) << "the graph wasn't baked";
+    EXPECT_EQ(material->baseColorTexture->getFormat(), GPU::PixelFormat::rgba8unorm_srgb);
+    EXPECT_EQ(material->baseColorTexture->getWidth(), 64u);
+    EXPECT_EQ(material->baseColorTexture->getMipLevelCount(), 7u) << "64 down to 1";
+    GpuMaterial* other = renderer->uploadMaterial((*sameGraph->materials)[0], *sameGraph);
+    ASSERT_NE(other, nullptr);
+    EXPECT_EQ(other->baseColorTexture, material->baseColorTexture) << "the same graph and values share one bake";
+
+    // A quad facing the camera, texture coordinates glTF's way (v down).
+    std::vector<float> positions = {-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0};
+    std::vector<float> normals = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    std::vector<float> uvs = {0, 1, 1, 1, 1, 0, 0, 0};
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] = device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] = device->createBuffer(normals.size() * 4, GPU::BufferUsage::vertex, normals.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_TEXCOORD0] = device->createBuffer(uvs.size() * 4, GPU::BufferUsage::vertex, uvs.data());
+    quad.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = nullptr;
+    quad.setBoundsFromPositions(positions.data(), 4);
+
+    RenderScene scene;
+    const VM::Vector3<double> eye(0.0, 0.0, 2.5);
+    scene.camera.view = VM::Matrix4<double>::lookAt(eye, VM::Vector3<double>(0.0, 0.0, 0.0), VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(45.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = eye;
+    DrawCall draw;
+    draw.mesh = &quad;
+    draw.material = material;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(draw);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    renderer->render(scene, view);
+    renderer->render(scene, view);
+    const auto pixels = readBackPixels(tex);
+    const auto isRed = [&](int x, int y) {
+        const size_t i = (size_t(y) * 64 + size_t(x)) * 4;
+        return pixels[i] > 128 && pixels[i + 2] < 64;
+    };
+    const auto isBlue = [&](int x, int y) {
+        const size_t i = (size_t(y) * 64 + size_t(x)) * 4;
+        return pixels[i + 2] > 128 && pixels[i] < 64;
+    };
+    EXPECT_TRUE(isRed(16, 16)) << "top left: colour1";
+    EXPECT_TRUE(isBlue(48, 16)) << "top right";
+    EXPECT_TRUE(isBlue(16, 48)) << "bottom left";
+    EXPECT_TRUE(isRed(48, 48)) << "bottom right";
 }
 
 // OpaqueOrder::frontToBack only reorders draws: whatever order the scene

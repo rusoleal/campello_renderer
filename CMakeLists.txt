@@ -36,6 +36,8 @@ set(DEPENDENCIES
     gltf
 )
 
+include(${PROJECT_SOURCE_DIR}/dependencies/campello_procedural.cmake)
+
 include(${PROJECT_SOURCE_DIR}/dependencies/campello_image.cmake)
 set(DEPENDENCIES
     ${DEPENDENCIES}
@@ -52,6 +54,10 @@ add_library(${PROJECT_NAME} SHARED
     src/animation.cpp
     src/procedural_texture_baker.cpp
 )
+
+# Procedural textures (KHR_texture_procedurals): graphs baked by
+# campello_procedural, a static library linked in privately.
+target_link_libraries(${PROJECT_NAME} PRIVATE campello_procedural)
 
 # Path tracer denoising (Intel Open Image Denoise, prebuilt): on by default
 # where the path tracer runs (macOS).
