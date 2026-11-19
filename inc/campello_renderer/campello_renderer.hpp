@@ -1090,6 +1090,26 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> webgpuDrawBindGroupLayout;
         std::unordered_map<const void*, std::shared_ptr<systems::leal::campello_gpu::BindGroup>> webgpuDrawBindGroups;
         const void* webgpuBoundDrawGroup = nullptr;
+        // WebGPU: skinned and morphed draws (vs_skinned). WebGPU allows four
+        // bind groups and group 2 holds the transforms, so the joint palette
+        // and the morph targets share group 3 (bindings 0: palette, 1:
+        // MorphInfo, 2/3: POSITION/NORMAL deltas). Only vs_skinned's
+        // pipelines have group 3 in their layout (WebGPU requires every group
+        // of a pipeline's layout to be bound). bindSkin() keeps the palette
+        // for the bindMorph() call that follows it, which binds the group.
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> webgpuDeformBindGroupLayout;
+        std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> webgpuSkinnedPipelineLayout;
+        struct WebGpuDeformBindGroup {
+            std::weak_ptr<systems::leal::campello_gpu::Buffer> palette;
+            std::weak_ptr<systems::leal::campello_gpu::Buffer> info;
+            std::weak_ptr<systems::leal::campello_gpu::Buffer> positions;
+            std::weak_ptr<systems::leal::campello_gpu::Buffer> normals;
+            std::shared_ptr<systems::leal::campello_gpu::BindGroup> group;
+        };
+        std::unordered_map<uint64_t, WebGpuDeformBindGroup> webgpuDeformBindGroups;
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> webgpuPendingPalette;
+        uint64_t webgpuPendingPaletteOffset = 0;
+        uint64_t webgpuPendingPaletteSize = 0;
         // The mesh bind groups (sets 0-3) bound on the current render pass
         // encoder, so the draw loops skip rebinding the same ones; reset
         // wherever the encoder's bindings are unknown (with

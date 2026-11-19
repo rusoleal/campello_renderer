@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+- **Skinning and morph targets on WebGPU.** The web build drew skinned meshes in their rest pose and ignored morph weights: `shaders/webgpu/default.wgsl` had no deforming vertex stage. New entry point `vs_skinned` (a port of `skinning.glsl`: morph targets, then up to four joints per vertex; weights summing to zero leave the vertex unskinned), which `meshPipeline()` picks only for draws with a skin or morph targets, as on Vulkan and DirectX (`CAMPELLO_RENDERER_SPLIT_DEFORM` now includes WebGPU).
+  - WebGPU allows four bind groups and group 2 already holds the per-draw transforms, so the joint palette and the morph targets share **group 3** (binding 0: palette, 1: MorphInfo, 2/3: POSITION/NORMAL deltas), instead of Vulkan's sets 2 and 3. Only `vs_skinned`'s pipelines have group 3 in their layout (`webgpuSkinnedPipelineLayout`), since WebGPU requires every group of a pipeline's layout to be bound. `bindSkin()` keeps the palette for the `bindMorph()` call that follows; that one builds and caches the combined group.
+  - The joint palettes, morph buffers and the per-vertex fallback buffers are created with storage usage on WebGPU too (`kDeformBufferUsage`): the fallback tangent buffer is the "no morph deltas" binding, and WebGPU rejected it as vertex-only.
+  - `test/webgpu/run_wgsl_check.sh`: a skinned pipeline against the four-group layout and three renders (a joint moves the quad, a morph target moves it, a zero weight keeps the rest pose).
+  - Web test suite (`test/webgpu/run_web_tests.sh`, Edge on an Intel UHD 630): `GltfSkinPosesTheMesh`, `DrawCallJointsPoseTheMesh` and `MorphTargetMovesEveryVertex` now pass on WebGPU.
+  - Not yet on WebGPU: skinned and instanced shadow casters (still drawn at rest), and the G-buffer's previous palette (no G-buffer on WebGPU).
+
 ### Changed
 - **Procedural textures (KHR_texture_procedurals) are baked by campello_procedural v0.1.0**, a new library: MaterialX 1.39 standard library nodes (about 70, against about 20 before), with noise ported from MaterialX, so graphs bake as MaterialX renders them. Linked privately; the public API is unchanged.
   - **Standalone materials bake their graphs too.** `uploadMaterial()` resolves procedural texture slots, as `setScene()` does; before, only the scene asset's materials did, so materials built at run time (BIM's) showed their fallback texture.

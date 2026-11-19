@@ -56,11 +56,19 @@
 #else
 #define CAMPELLO_RENDERER_DIRECTX 0
 #endif
+// The WebGPU backend (web builds).
+#if defined(__EMSCRIPTEN__)
+#define CAMPELLO_RENDERER_WEBGPU 1
+#else
+#define CAMPELLO_RENDERER_WEBGPU 0
+#endif
 // Skinning and morph targets in their own vertex stages, which meshPipeline()
 // picks only for draws that deform, with the joint palettes and morph
 // targets as bind groups 2 and 3 (bindSkin(), bindMorph()): Vulkan and
-// DirectX. Metal's one stage reads them as raw buffers instead.
-#define CAMPELLO_RENDERER_SPLIT_DEFORM (CAMPELLO_RENDERER_VULKAN || CAMPELLO_RENDERER_DIRECTX)
+// DirectX; on WebGPU both share group 3 (vs_skinned, see
+// webgpuDeformBindGroupLayout). Metal's one stage reads them as raw buffers instead.
+#define CAMPELLO_RENDERER_SPLIT_DEFORM \
+    (CAMPELLO_RENDERER_VULKAN || CAMPELLO_RENDERER_DIRECTX || CAMPELLO_RENDERER_WEBGPU)
 // The built-in PBR program's bind groups as material (group 0, built once
 // per material) + frame (group 1: lights, camera, environment, scene colour,
 // shadows; rebuilt per frame/pass), with Vulkan's layouts
@@ -69,11 +77,12 @@
 #define CAMPELLO_RENDERER_PBR_BIND_GROUPS (CAMPELLO_RENDERER_VK_BINDINGS || CAMPELLO_RENDERER_DIRECTX)
 
 // Joint palettes and morph target data: vertex (raw) buffers on Metal,
-// storage buffers on Vulkan (bind groups 2 and 3 of the mesh pipelines,
-// bindSkin() and bindMorph()). DirectX reads them through the same bind
-// groups but keeps them CPU-written upload buffers (storage usage would put
-// them in the GPU-only heap): campello_gpu views them as raw buffers there.
-#if CAMPELLO_RENDERER_VULKAN
+// storage buffers on Vulkan and WebGPU (bind groups 2 and 3 of the mesh
+// pipelines on Vulkan, group 3 on WebGPU; bindSkin() and bindMorph()).
+// DirectX reads them through the same bind groups but keeps them CPU-written
+// upload buffers (storage usage would put them in the GPU-only heap):
+// campello_gpu views them as raw buffers there.
+#if CAMPELLO_RENDERER_VULKAN || CAMPELLO_RENDERER_WEBGPU
 static constexpr auto kDeformBufferUsage = static_cast<systems::leal::campello_gpu::BufferUsage>(
     static_cast<int>(systems::leal::campello_gpu::BufferUsage::vertex) |
     static_cast<int>(systems::leal::campello_gpu::BufferUsage::storage));
@@ -937,10 +946,12 @@ void Renderer::setCamera(uint32_t index) {
 void Renderer::ensureFallbackBuffer(std::shared_ptr<systems::leal::campello_gpu::Buffer> &buf,
                                      uint64_t requiredBytes)
 {
-    namespace GPU = systems::leal::campello_gpu;
     if (buf && buf->getLength() >= requiredBytes) return;
     std::vector<uint8_t> zeros(requiredBytes, 0);
-    buf = device->createBuffer(requiredBytes, GPU::BufferUsage::vertex, zeros.data());
+    // kDeformBufferUsage: also a storage buffer where the deforming stages
+    // read them (Vulkan, WebGPU): fallbackTangentBuffer is the morph delta
+    // fallback bound to bindMorph() for draws without morph targets.
+    buf = device->createBuffer(requiredBytes, kDeformBufferUsage, zeros.data());
 }
 
 void Renderer::ensureBindGroupLayout() {
@@ -3336,6 +3347,13 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     MeshPipelineEntry entry;
     entry.slots.fill(-1);
     entry.skinned = (stage->readMask & semanticBit(VertexSemantic::joints)) != 0;
+#if CAMPELLO_RENDERER_WEBGPU
+    // vs_skinned reads group 3; the other stages' layouts stop at group 2
+    // (WebGPU wants every group of the layout bound at each draw).
+    if (entry.skinned && programHandle == kPbrProgram && webgpuSkinnedPipelineLayout) {
+        d.layout = webgpuSkinnedPipelineLayout;
+    }
+#endif
     d.vertex.buffers.clear();
     for (const auto& a : read.attributes) {
         GPU::VertexLayout buffer{};
@@ -4860,6 +4878,28 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     plDesc.bindGroupLayouts = { vulkanMaterialBindGroupLayout, vulkanFrameBindGroupLayout };
 #if defined(__EMSCRIPTEN__)
     plDesc.bindGroupLayouts.push_back(webgpuDrawBindGroupLayout);
+    // vs_skinned's pipelines: the same groups plus group 3, the joint
+    // palette and the morph targets (webgpuDeformBindGroupLayout).
+    if (!webgpuDeformBindGroupLayout) {
+        GPU::BindGroupLayoutDescriptor deformDesc{};
+        uint32_t binding = 0;
+        for (uint64_t minSize : {64ull, 44ull, 12ull, 12ull}) {  // one joint; MorphInfo; one delta each
+            GPU::EntryObject e{};
+            e.binding = binding++;
+            e.visibility = GPU::ShaderStage::vertex;
+            e.type = GPU::EntryObjectType::buffer;
+            e.data.buffer.hasDinamicOffaset = false;
+            e.data.buffer.minBindingSize = minSize;
+            e.data.buffer.type = GPU::EntryObjectBufferType::readOnlyStorage;
+            deformDesc.entries.push_back(e);
+        }
+        webgpuDeformBindGroupLayout = device->createBindGroupLayout(deformDesc);
+    }
+    if (webgpuDeformBindGroupLayout) {
+        GPU::PipelineLayoutDescriptor skinnedDesc = plDesc;
+        skinnedDesc.bindGroupLayouts.push_back(webgpuDeformBindGroupLayout);
+        webgpuSkinnedPipelineLayout = device->createPipelineLayout(skinnedDesc);
+    }
 #else
     // Sets 2 and 3: skinned and morphed draws' deformation (ensureDeformBindGroupLayouts()).
     ensureDeformBindGroupLayouts(*device, skinBindGroupLayout, morphBindGroupLayout);
@@ -5040,6 +5080,13 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             semanticBit(VertexSemantic::color0) | semanticBit(VertexSemantic::texcoord1);
 #if defined(__EMSCRIPTEN__)
         programs[kPbrProgram].vertexStages.push_back({standardReads, vertModule, "vs_main"});
+        // Skinned and morphed draws: JOINTS_0/WEIGHTS_0 and group 3;
+        // meshPipeline() picks it only for draws with a skin or morph targets.
+        if (webgpuSkinnedPipelineLayout) {
+            const uint32_t skinnedReads =
+                standardReads | semanticBit(VertexSemantic::joints) | semanticBit(VertexSemantic::weights);
+            programs[kPbrProgram].vertexStages.push_back({skinnedReads, vertModule, "vs_skinned"});
+        }
         programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), vertModule, "vs_lean"});
         programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), vertModule, "vs_line", true});
         programs[kPbrProgram].fragmentModule = fragModule;
@@ -11787,6 +11834,20 @@ void Renderer::bindSkin(const std::shared_ptr<systems::leal::campello_gpu::Rende
                               uint64_t currentSize, const std::shared_ptr<systems::leal::campello_gpu::Buffer> &previous,
                               uint64_t previousOffset, uint64_t previousSize) {
     namespace GPU = systems::leal::campello_gpu;
+#if CAMPELLO_RENDERER_WEBGPU
+    // WebGPU: group 3 holds the palette and the morph targets together;
+    // bindMorph(), always called next, binds it. No previous palette (no
+    // G-buffer on WebGPU).
+    (void)previous;
+    (void)previousOffset;
+    (void)previousSize;
+    webgpuPendingPalette.reset();
+    if (!current || currentOffset >= current->getLength()) return;
+    webgpuPendingPalette = current;
+    webgpuPendingPaletteOffset = currentOffset;
+    webgpuPendingPaletteSize = currentSize == 0 ? current->getLength() - currentOffset
+                                                : std::min(currentSize, current->getLength() - currentOffset);
+#else
     if (!skinBindGroupLayout || !current || !previous) return;
     const auto range = [](const std::shared_ptr<GPU::Buffer>& buffer, uint64_t offset, uint64_t size) {
         const uint64_t length = buffer->getLength();
@@ -11816,6 +11877,7 @@ void Renderer::bindSkin(const std::shared_ptr<systems::leal::campello_gpu::Rende
         it = skinBindGroups.insert_or_assign(key, SkinBindGroup{current, previous, group}).first;
     }
     setMeshBindGroup(rpe, 2, it->second.group);
+#endif
 }
 
 void Renderer::bindMorph(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
@@ -11823,6 +11885,35 @@ void Renderer::bindMorph(const std::shared_ptr<systems::leal::campello_gpu::Rend
                                const std::shared_ptr<systems::leal::campello_gpu::Buffer> &positions,
                                const std::shared_ptr<systems::leal::campello_gpu::Buffer> &normals) {
     namespace GPU = systems::leal::campello_gpu;
+#if CAMPELLO_RENDERER_WEBGPU
+    // WebGPU: one group 3 with the palette bindSkin() kept and the morph targets.
+    const auto palette = std::move(webgpuPendingPalette);
+    webgpuPendingPalette.reset();
+    if (!webgpuDeformBindGroupLayout || !palette || !info || !positions || !normals) return;
+    uint64_t key = 0;
+    for (uint64_t v : {(uint64_t)(uintptr_t)palette.get(), webgpuPendingPaletteOffset, webgpuPendingPaletteSize,
+                       (uint64_t)(uintptr_t)info.get(), (uint64_t)(uintptr_t)positions.get(),
+                       (uint64_t)(uintptr_t)normals.get()}) {
+        key ^= std::hash<uint64_t>{}(v) + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    }
+    // Reused only while its buffers are the same live ones (as bindSkin()'s).
+    auto it = webgpuDeformBindGroups.find(key);
+    if (it == webgpuDeformBindGroups.end() || it->second.palette.lock() != palette || it->second.info.lock() != info ||
+        it->second.positions.lock() != positions || it->second.normals.lock() != normals) {
+        if (webgpuDeformBindGroups.size() > 1024) webgpuDeformBindGroups.clear();
+        GPU::BindGroupDescriptor desc{};
+        desc.layout = webgpuDeformBindGroupLayout;
+        desc.entries = {{0, GPU::BufferBinding{palette, webgpuPendingPaletteOffset, webgpuPendingPaletteSize}},
+                        {1, GPU::BufferBinding{info, 0, info->getLength()}},
+                        {2, GPU::BufferBinding{positions, 0, positions->getLength()}},
+                        {3, GPU::BufferBinding{normals, 0, normals->getLength()}}};
+        auto group = device->createBindGroup(desc);
+        if (!group) return;
+        it = webgpuDeformBindGroups.insert_or_assign(key, WebGpuDeformBindGroup{palette, info, positions, normals, group})
+                 .first;
+    }
+    setMeshBindGroup(rpe, 3, it->second.group);
+#else
     if (!morphBindGroupLayout || !info || !positions || !normals) return;
     uint64_t key = 0;
     for (const auto* buffer : {info.get(), positions.get(), normals.get()}) {
@@ -11843,6 +11934,7 @@ void Renderer::bindMorph(const std::shared_ptr<systems::leal::campello_gpu::Rend
         it = morphBindGroups.insert_or_assign(key, MorphBindGroup{info, positions, normals, group}).first;
     }
     setMeshBindGroup(rpe, 3, it->second.group);
+#endif
 }
 #else
 void Renderer::bindSkin(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &,

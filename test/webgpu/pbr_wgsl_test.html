@@ -267,6 +267,82 @@ async function main() {
     c[2] > c[0] + 40 && c[0] > 20 && c[0] < 200 ? pass('glTF layout + alpha blending') : fail('glTF layout + blend', `${c}`);
   }
 
+  // vs_skinned: the deform group (group 3: joint palette, MorphInfo,
+  // POSITION/NORMAL deltas) and a pipeline layout with it, as
+  // webgpuDeformBindGroupLayout / webgpuSkinnedPipelineLayout.
+  {
+    const V = GPUShaderStage.VERTEX;
+    const storage = (binding) => ({ binding, visibility: V, buffer: { type: 'read-only-storage' } });
+    const deformLayout = device.createBindGroupLayout({ entries: [storage(0), storage(1), storage(2), storage(3)] });
+    const skinnedLayout = device.createPipelineLayout({ bindGroupLayouts: [materialLayout, frameLayout, drawLayout, deformLayout] });
+    // The standard buffers plus JOINTS_0 (uint16x4, location 4) and
+    // WEIGHTS_0 (float32x4, location 5), in semantic order: 8 buffers.
+    const skinnedBuffers = [attr('float32x3', 0, 12), attr('float32x3', 1, 12), attr('float32x2', 2, 8),
+                            attr('float32x4', 3, 16), attr('uint16x4', 4, 8), attr('float32x4', 5, 16),
+                            attr('float32x4', 6, 16), attr('float32x2', 7, 8)];
+    const { value: skinnedPipeline, error } = await scoped(device, () => device.createRenderPipeline({
+      layout: skinnedLayout,
+      vertex: { module, entryPoint: 'vs_skinned', buffers: skinnedBuffers },
+      fragment: { module, entryPoint: 'fs_main', targets: [{ format }] },
+      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+    }));
+    if (error) { fail('pipeline skinned', error.message); return done(); }
+    pass('pipeline skinned');
+
+    const storageBuf = (arr) => { const b = device.createBuffer({ size: Math.max(arr.byteLength, 16), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); device.queue.writeBuffer(b, 0, arr); return b; };
+    const n = vbuf(new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]));
+    const uv = vbuf(new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]));
+    const tangent = vbuf(new Float32Array([1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1]));
+    const color = vbuf(new Float32Array(Array(16).fill(1)));
+    const joints = vbuf(new Uint16Array(16));  // every vertex: joint 0
+    const weights = vbuf(new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]));
+    const translateX = (x) => new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, 0, 0, 1]);
+    // MorphInfo: target count, has normals, vertex count, 8 weights.
+    const morphInfo = (targets, w) => storageBuf(new Float32Array([targets, 0, 4, w, 0, 0, 0, 0, 0, 0, 0]));
+    const up = storageBuf(new Float32Array([0, 0.5, 0, 0, 0.5, 0, 0, 0.5, 0, 0, 0.5, 0]));  // target 0: +0.5 y
+    const zeros = storageBuf(new Float32Array(12));
+    const drawSkinned = async (palette, info, deltas) => {
+      const group3 = device.createBindGroup({ layout: deformLayout, entries: [
+        { binding: 0, resource: { buffer: palette } }, { binding: 1, resource: { buffer: info } },
+        { binding: 2, resource: { buffer: deltas } }, { binding: 3, resource: { buffer: zeros } }] });
+      const colorTex = device.createTexture({ size: [size, size], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+      const depth = device.createTexture({ size: [size, size], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT });
+      const enc = device.createCommandEncoder();
+      const rp = enc.beginRenderPass({
+        colorAttachments: [{ view: colorTex.createView(), clearValue: [0, 0, 0, 1], loadOp: 'clear', storeOp: 'store' }],
+        depthStencilAttachment: { view: depth.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'discard' } });
+      rp.setPipeline(skinnedPipeline);
+      rp.setBindGroup(0, materialGroup(grey));
+      rp.setBindGroup(1, frameGroup(camera()));
+      rp.setBindGroup(2, drawGroup);
+      rp.setBindGroup(3, group3);
+      [quadPositions, n, uv, tangent, joints, weights, color, uv].forEach((b, slot) => rp.setVertexBuffer(slot, b));
+      rp.setIndexBuffer(quadFront, 'uint32');
+      rp.drawIndexed(6, 1, 0, 0, 1);
+      rp.end();
+      const read = device.createBuffer({ size: size * size * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      enc.copyTextureToBuffer({ texture: colorTex }, { buffer: read, bytesPerRow: size * 4 }, [size, size]);
+      device.queue.submit([enc.finish()]);
+      await read.mapAsync(GPUMapMode.READ);
+      const px = new Uint8Array(read.getMappedRange().slice(0)); read.unmap();
+      return (x, y) => Array.from(px.slice((y * size + x) * 4, (y * size + x) * 4 + 3));
+    };
+    // Skinning: joint 0 moves the quad right by 0.5 (about 9 pixels): its
+    // left edge leaves x = 26, the right side reaches x = 46.
+    let at = await drawSkinned(storageBuf(translateX(0.5)), morphInfo(0, 0), zeros);
+    !lit(at(26, 32)) && lit(at(46, 32)) ? pass('vs_skinned: joint palette poses the mesh')
+                                        : fail('vs_skinned joints', `left ${at(26, 32)} right ${at(46, 32)}`);
+    // Morph target: weight 1 moves it up by 0.5 (screen y grows down).
+    at = await drawSkinned(storageBuf(identity), morphInfo(1, 1), up);
+    !lit(at(32, 40)) && lit(at(32, 18)) ? pass('vs_skinned: morph target moves the vertices')
+                                        : fail('vs_skinned morph', `low ${at(32, 40)} high ${at(32, 18)}`);
+    // Weight 0: the rest pose.
+    at = await drawSkinned(storageBuf(identity), morphInfo(1, 0), up);
+    lit(at(32, 32)) && !lit(at(32, 18)) ? pass('vs_skinned: zero weight keeps the rest pose')
+                                        : fail('vs_skinned rest', `centre ${at(32, 32)} high ${at(32, 18)}`);
+  }
+
   done();
 }
 
