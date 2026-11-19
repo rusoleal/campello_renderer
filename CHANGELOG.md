@@ -16,6 +16,8 @@
   - Only MaterialX names are accepted: the old baker's `abs`, `combine` and `noise2d`'s `position` input are now `absval`, `combine2/3/4` and `texcoord`.
   - A graph that doesn't compile logs why and bakes black.
 
+- **gltf v0.5.3**: procedural graphs without `inputs` (no parameters) no longer abort the load.
+
 ### Deprecated
 - **`bakeProceduralTextureGPU()`** is now the CPU bake (the device is unused). The GPU baker evaluated its own subset of nodes with its own noise, and its results differed from the CPU's. Its compute kernels are still in the shader sources, unused, until they're removed or rebuilt on campello_procedural's programs. Its 7 GPU-vs-CPU tests are removed.
 
