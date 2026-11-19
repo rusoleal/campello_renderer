@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.28.0] - 2026-11-19
 
 ### Added
 - **`canCompressTextures(srgb)`**: whether this device keeps KTX2 (Basis) textures of a kind compressed on the GPU: colour data, or linear data such as normal maps. An app encoding its own KTX2 textures (campello_bim, a frame at a time) can skip the linear ones where they would become RGBA8.
