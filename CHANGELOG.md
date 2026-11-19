@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.27.0] - 2026-11-19
 
 ### Added
 - **Compressed textures** (`setTextureCompression()`, off by default). `uploadMaterial()`'s 8-bit images and baked procedural textures are encoded once (KTX2 UASTC, campello_image v0.6.0) and uploaded in the device's compressed format, with their mip chain: BC7 on desktop GPUs, ASTC 4x4 on Apple and most mobile GPUs, ETC2 on older ones. That's about a quarter of the GPU memory of RGBA8.
