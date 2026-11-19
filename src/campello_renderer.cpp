@@ -768,6 +768,24 @@ static systems::leal::campello_gpu::PixelFormat textureDataFormatToPixelFormat(
     }
 }
 
+// The mips of a texture uploaded by uploadTextureDataWithMips(): a
+// compressed texture's stop at the last one still a whole block across
+// (4x4 for BC7, ASTC 4x4, ETC2). Smaller ones hold that one block anyway,
+// and WebGPU copies only whole blocks into a texture, which campello_gpu
+// doesn't round a 2x2 or 1x1 mip's copy up to.
+static uint32_t uploadedMipCount(const systems::leal::campello_image::TextureData& texData)
+{
+    uint32_t count = std::max(1u, texData.getMipLevelCount());
+    if (!texData.isCompressed()) return count;
+    while (count > 1) {
+        const uint32_t w = std::max(1u, texData.getWidth() >> (count - 1));
+        const uint32_t h = std::max(1u, texData.getHeight() >> (count - 1));
+        if (w >= texData.getBlockWidth() && h >= texData.getBlockHeight()) break;
+        --count;
+    }
+    return count;
+}
+
 static bool uploadTextureDataWithMips(
     const std::shared_ptr<systems::leal::campello_gpu::Device>& device,
     const std::shared_ptr<systems::leal::campello_gpu::Texture>& texture,
@@ -775,44 +793,51 @@ static bool uploadTextureDataWithMips(
 {
     using namespace systems::leal::campello_gpu;
 
-    // Calculate total staging size.
-    size_t totalBytes = 0;
-    for (uint32_t mip = 0; mip < texData.getMipLevelCount(); ++mip) {
-        totalBytes += texData.getDataSize(mip);
+    // Each mip's rows padded to 256 bytes and its start to 512: WebGPU
+    // (and D3D12) copy rows from a buffer only at that pitch, which a
+    // compressed mip narrower than 64 texels (or an RGBA8 one) doesn't have
+    // packed. Metal and Vulkan take any pitch.
+    const uint32_t mipCount = uploadedMipCount(texData);
+    constexpr uint64_t ROW_ALIGNMENT = 256;
+    constexpr uint64_t MIP_ALIGNMENT = 512;
+    struct MipCopy {
+        uint64_t offset;
+        uint64_t rowBytes;
+        uint64_t pitch;
+        uint32_t rows;
+    };
+    std::vector<MipCopy> copies;
+    uint64_t totalBytes = 0;
+    for (uint32_t mip = 0; mip < mipCount; ++mip) {
+        const uint32_t mipWidth  = std::max(1u, texData.getWidth()  >> mip);
+        const uint32_t mipHeight = std::max(1u, texData.getHeight() >> mip);
+        const uint32_t blockW = texData.isCompressed() ? texData.getBlockWidth() : 1u;
+        const uint32_t blockH = texData.isCompressed() ? texData.getBlockHeight() : 1u;
+        const uint64_t rowBytes = static_cast<uint64_t>((mipWidth + blockW - 1) / blockW) * texData.getBlockBytes();
+        const uint32_t rows = (mipHeight + blockH - 1) / blockH;
+        if (rowBytes * rows > texData.getDataSize(mip)) return false;
+        const uint64_t pitch = (rowBytes + ROW_ALIGNMENT - 1) / ROW_ALIGNMENT * ROW_ALIGNMENT;
+        totalBytes = (totalBytes + MIP_ALIGNMENT - 1) / MIP_ALIGNMENT * MIP_ALIGNMENT;
+        copies.push_back({totalBytes, rowBytes, pitch, rows});
+        totalBytes += pitch * rows;
     }
 
+    std::vector<uint8_t> staged(totalBytes, 0);
+    for (uint32_t mip = 0; mip < mipCount; ++mip) {
+        const auto& copy = copies[mip];
+        const auto* src = static_cast<const uint8_t*>(texData.getData(mip));
+        for (uint32_t row = 0; row < copy.rows; ++row) {
+            std::memcpy(staged.data() + copy.offset + row * copy.pitch, src + row * copy.rowBytes, copy.rowBytes);
+        }
+    }
     auto staging = device->createBuffer(totalBytes, BufferUsage::copySrc);
     if (!staging) return false;
-
-    size_t offset = 0;
-    for (uint32_t mip = 0; mip < texData.getMipLevelCount(); ++mip) {
-        staging->upload(offset, texData.getDataSize(mip),
-                        const_cast<void*>(texData.getData(mip)));
-        offset += texData.getDataSize(mip);
-    }
+    staging->upload(0, totalBytes, staged.data());
 
     auto encoder = device->createCommandEncoder();
     if (!encoder) return false;
-
-    offset = 0;
-    for (uint32_t mip = 0; mip < texData.getMipLevelCount(); ++mip) {
-        uint32_t mipWidth  = std::max(1u, texData.getWidth()  >> mip);
-        uint32_t mipHeight = std::max(1u, texData.getHeight() >> mip);
-
-        uint32_t blockW = texData.getBlockWidth();
-        uint32_t blockH = texData.getBlockHeight();
-        uint32_t blockBytes = texData.getBlockBytes();
-
-        uint64_t bytesPerRow = 0;
-        if (texData.isCompressed()) {
-            uint32_t blocksX = (mipWidth + blockW - 1) / blockW;
-            bytesPerRow = static_cast<uint64_t>(blocksX) * blockBytes;
-        } else {
-            bytesPerRow = static_cast<uint64_t>(mipWidth) * blockBytes;
-        }
-
-        encoder->copyBufferToTexture(staging, offset, bytesPerRow, texture, mip, 0);
-        offset += texData.getDataSize(mip);
+    for (uint32_t mip = 0; mip < mipCount; ++mip) {
+        encoder->copyBufferToTexture(staging, copies[mip].offset, copies[mip].pitch, texture, mip, 0);
     }
 
     auto fence = device->createFence();
@@ -1910,7 +1935,7 @@ void Renderer::setScene(uint32_t index) {
                         auto texture = device->createTexture(
                             GPU::TextureType::tt2d, fmt,
                             texData->getWidth(), texData->getHeight(), 1,
-                            texData->getMipLevelCount(), 1,
+                            uploadedMipCount(*texData), 1,
                             (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                                 (uint32_t)GPU::TextureUsage::copyDst));
                         if (texture != nullptr) {
@@ -9770,7 +9795,7 @@ std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::compressedTextur
     const auto data = CI::compressRGBA8(rgba, width, height, target, options);
     if (!data) return nullptr;
     auto texture = device->createTexture(GPU::TextureType::tt2d, textureDataFormatToPixelFormat(data->getFormat(), srgb),
-                                         width, height, 1, data->getMipLevelCount(), 1,
+                                         width, height, 1, uploadedMipCount(*data), 1,
                                          (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                                              (uint32_t)GPU::TextureUsage::copyDst));
     if (!texture || !uploadTextureDataWithMips(device, texture, *data)) return nullptr;
@@ -10017,7 +10042,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
             auto texture = device->createTexture(
                 GPU::TextureType::tt2d, fmt,
                 texData->getWidth(), texData->getHeight(), 1,
-                texData->getMipLevelCount(), 1,
+                uploadedMipCount(*texData), 1,
                 (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                     (uint32_t)GPU::TextureUsage::copyDst));
             if (texture && !uploadTextureDataWithMips(device, texture, *texData)) {
