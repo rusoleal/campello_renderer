@@ -8422,6 +8422,83 @@ TEST_F(OffscreenRenderTest, ProceduralMaterialsBakeInUploadMaterial) {
     EXPECT_TRUE(isRed(48, 48)) << "bottom right";
 }
 
+// setTextureCompression(): the baked checkerboard is uploaded in the
+// device's compressed format (BC7 here, ASTC or ETC2 on mobile GPUs), sRGB,
+// with its mips, and still draws its squares; off, it stays RGBA8.
+TEST_F(OffscreenRenderTest, CompressedTexturesDrawAsTheirPixels) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfProceduralChecker, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    renderer->setProceduralBakeSize(64);
+    const auto features = device->getFeatures();
+    const bool compressible = features.count(GPU::Feature::bcTextureCompression) ||
+                              features.count(GPU::Feature::astcTextureCompression) ||
+                              features.count(GPU::Feature::etc2TextureCompression);
+    if (!compressible) GTEST_SKIP() << "No compressed texture format on this device";
+
+    renderer->setTextureCompression(true);
+    GpuMaterial* material = renderer->uploadMaterial((*asset->materials)[0], *asset);
+    renderer->setTextureCompression(false);
+    ASSERT_NE(material, nullptr);
+    ASSERT_NE(material->baseColorTexture, nullptr);
+    const auto format = material->baseColorTexture->getFormat();
+    EXPECT_TRUE(format == GPU::PixelFormat::bc7_rgba_unorm_srgb || format == GPU::PixelFormat::astc_4x4_unorm_srgb ||
+                format == GPU::PixelFormat::etc2_rgb8unorm_srgb)
+        << "compressed sRGB, got " << int(format);
+    EXPECT_EQ(material->baseColorTexture->getMipLevelCount(), 7u);
+
+    std::vector<float> positions = {-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0};
+    std::vector<float> normals = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    std::vector<float> uvs = {0, 1, 1, 1, 1, 0, 0, 0};
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    GpuMesh quad;
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_POSITION] = device->createBuffer(positions.size() * 4, GPU::BufferUsage::vertex, positions.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_NORMAL] = device->createBuffer(normals.size() * 4, GPU::BufferUsage::vertex, normals.data());
+    quad.vertexBuffers[Renderer::VERTEX_SLOT_TEXCOORD0] = device->createBuffer(uvs.size() * 4, GPU::BufferUsage::vertex, uvs.data());
+    quad.indexBuffer = device->createBuffer(indices.size() * 4, GPU::BufferUsage::index, indices.data());
+    quad.indexCount = 6;
+    quad.indexFormat = GPU::IndexFormat::uint32;
+    quad.vertexCount = 4;
+    quad.layout = nullptr;
+    quad.setBoundsFromPositions(positions.data(), 4);
+    RenderScene scene;
+    const VM::Vector3<double> eye(0.0, 0.0, 2.5);
+    scene.camera.view = VM::Matrix4<double>::lookAt(eye, VM::Vector3<double>(0.0, 0.0, 0.0), VM::Vector3<double>(0.0, 1.0, 0.0));
+    scene.camera.projection = VM::Matrix4<double>::perspective(45.0 * 3.14159265358979323846 / 180.0, 1.0, 0.1, 100.0);
+    scene.camera.position = eye;
+    DrawCall draw;
+    draw.mesh = &quad;
+    draw.material = material;
+    draw.worldTransform = VM::Matrix4<double>::identity();
+    scene.opaque.push_back(draw);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(GPU::PixelFormat::rgba8unorm, 1);
+    renderer->render(scene, view);
+    renderer->render(scene, view);
+    const auto pixels = readBackPixels(tex);
+    const auto at = [&](int x, int y, int c) { return int(pixels[(size_t(y) * 64 + size_t(x)) * 4 + size_t(c)]); };
+    EXPECT_TRUE(at(16, 16, 0) > 128 && at(16, 16, 2) < 64) << "top left: red, got " << at(16, 16, 0) << " " << at(16, 16, 1)
+                                                            << " " << at(16, 16, 2) << " (format " << int(format) << ")";
+    EXPECT_TRUE(at(48, 16, 2) > 128 && at(48, 16, 0) < 64) << "top right: blue";
+    EXPECT_TRUE(at(48, 48, 0) > 128 && at(48, 48, 2) < 64) << "bottom right: red";
+
+    // Off: the same graph from another asset (materials are cached per
+    // asset), another bake size (a new texture), stays RGBA8.
+    auto again = GLTF::loadGLTF(kGltfProceduralChecker, kNoOpLoader);
+    renderer->setProceduralBakeSize(32);
+    GpuMaterial* plain = renderer->uploadMaterial((*again->materials)[0], *again);
+    ASSERT_NE(plain, nullptr);
+    EXPECT_EQ(plain->baseColorTexture->getFormat(), GPU::PixelFormat::rgba8unorm_srgb);
+}
+
 // OpaqueOrder::frontToBack only reorders draws: whatever order the scene
 // lists them in, the nearer of two overlapping quads must win, exactly as
 // with the default byState order.
