@@ -1,5 +1,6 @@
 #include "element_id_shaders.h"
 #include "custom_lit_shaders.h"
+#include <campello_image/texture_encoder.hpp>
 #include <gtest/gtest.h>
 #include <campello_renderer/campello_renderer.hpp>
 #include <campello_renderer/procedural_texture_baker.hpp>
@@ -8453,7 +8454,8 @@ TEST_F(OffscreenRenderTest, CompressedTexturesDrawAsTheirPixels) {
     EXPECT_TRUE(format == GPU::PixelFormat::bc7_rgba_unorm_srgb || format == GPU::PixelFormat::astc_4x4_unorm_srgb ||
                 format == GPU::PixelFormat::etc2_rgb8unorm_srgb)
         << "compressed sRGB, got " << int(format);
-    EXPECT_EQ(material->baseColorTexture->getMipLevelCount(), 7u);
+    // 64 down to 4: mips below a 4x4 block aren't uploaded (WebGPU copies only whole blocks).
+    EXPECT_EQ(material->baseColorTexture->getMipLevelCount(), 5u);
 
     std::vector<float> positions = {-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0};
     std::vector<float> normals = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
@@ -8497,6 +8499,80 @@ TEST_F(OffscreenRenderTest, CompressedTexturesDrawAsTheirPixels) {
     GpuMaterial* plain = renderer->uploadMaterial((*again->materials)[0], *again);
     ASSERT_NE(plain, nullptr);
     EXPECT_EQ(plain->baseColorTexture->getFormat(), GPU::PixelFormat::rgba8unorm_srgb);
+}
+
+// KTX2 (KHR_texture_basisu) textures transcode for their data: a colour
+// map to the GPU's compressed sRGB format, a normal map (linear) to a
+// linear format, compressed where canCompressTextures(false) says so. (A
+// normal map went to ASTC, which campello_gpu has only as sRGB, on Apple and
+// most mobile GPUs.)
+TEST_F(OffscreenRenderTest, Ktx2TexturesTranscodeForTheirData) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace CI = systems::leal::campello_image;
+    if (!CI::canEncode()) GTEST_SKIP() << "campello_image built without its encoder";
+    const auto features = device->getFeatures();
+    if (!features.count(GPU::Feature::bcTextureCompression) && !features.count(GPU::Feature::astcTextureCompression) &&
+        !features.count(GPU::Feature::etc2TextureCompression)) {
+        GTEST_SKIP() << "No compressed texture format on this device";
+    }
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    renderer->setAsset(sceneAsset);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+
+    std::vector<uint8_t> pixels(32 * 32 * 4);
+    for (size_t i = 0; i < pixels.size(); i += 4) {
+        pixels[i] = 128;
+        pixels[i + 1] = uint8_t(i % 251);
+        pixels[i + 2] = 255;
+        pixels[i + 3] = 255;
+    }
+    const auto base64 = [](const std::vector<uint8_t>& data) {
+        static const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        for (size_t i = 0; i < data.size(); i += 3) {
+            const uint32_t n = (uint32_t(data[i]) << 16) | (i + 1 < data.size() ? uint32_t(data[i + 1]) << 8 : 0) |
+                               (i + 2 < data.size() ? data[i + 2] : 0);
+            out += table[(n >> 18) & 63];
+            out += table[(n >> 12) & 63];
+            out += i + 1 < data.size() ? table[(n >> 6) & 63] : '=';
+            out += i + 2 < data.size() ? table[n & 63] : '=';
+        }
+        return out;
+    };
+    CI::EncodeOptions colour;
+    CI::EncodeOptions linear;
+    linear.srgb = false;
+    const auto colourKtx2 = CI::encodeKtx2(pixels.data(), 32, 32, colour);
+    const auto normalKtx2 = CI::encodeKtx2(pixels.data(), 32, 32, linear);
+    ASSERT_FALSE(colourKtx2.empty());
+    const std::string json = std::string(R"({"asset": {"version": "2.0"}, "extensionsUsed": ["KHR_texture_basisu"],
+        "extensionsRequired": ["KHR_texture_basisu"],
+        "images": [{"uri": "data:image/ktx2;base64,)") + base64(colourKtx2) + R"("}, {"uri": "data:image/ktx2;base64,)" +
+                             base64(normalKtx2) + R"("}],
+        "textures": [{"extensions": {"KHR_texture_basisu": {"source": 0}}}, {"extensions": {"KHR_texture_basisu": {"source": 1}}}],
+        "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}, "normalTexture": {"index": 1}}]})";
+    auto asset = GLTF::loadGLTF(json, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    GpuMaterial* material = renderer->uploadMaterial((*asset->materials)[0], *asset);
+    ASSERT_NE(material, nullptr);
+    ASSERT_NE(material->baseColorTexture, nullptr);
+    ASSERT_NE(material->normalTexture, nullptr);
+    const auto colourFormat = material->baseColorTexture->getFormat();
+    EXPECT_TRUE(colourFormat == GPU::PixelFormat::bc7_rgba_unorm_srgb || colourFormat == GPU::PixelFormat::astc_4x4_unorm_srgb ||
+                colourFormat == GPU::PixelFormat::etc2_rgb8unorm_srgb)
+        << "compressed sRGB, got " << int(colourFormat);
+    const auto normalFormat = material->normalTexture->getFormat();
+    EXPECT_NE(normalFormat, GPU::PixelFormat::astc_4x4_unorm_srgb) << "a normal map decoded as sRGB";
+    // 32 down to 4: the whole-block mips (WebGPU copies only whole blocks).
+    EXPECT_EQ(material->baseColorTexture->getMipLevelCount(), 4u);
+    if (renderer->canCompressTextures(false)) {
+        EXPECT_TRUE(normalFormat == GPU::PixelFormat::bc7_rgba_unorm || normalFormat == GPU::PixelFormat::etc2_rgb8unorm)
+            << "compressed linear, got " << int(normalFormat);
+    } else {
+        EXPECT_EQ(normalFormat, GPU::PixelFormat::rgba8unorm);
+    }
+    EXPECT_TRUE(renderer->canCompressTextures(true));
 }
 
 // OpaqueOrder::frontToBack only reorders draws: whatever order the scene

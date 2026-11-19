@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **`canCompressTextures(srgb)`**: whether this device keeps KTX2 (Basis) textures of a kind compressed on the GPU: colour data, or linear data such as normal maps. An app encoding its own KTX2 textures (campello_bim, a frame at a time) can skip the linear ones where they would become RGBA8.
+
+### Fixed
+- **KTX2 normal maps on Apple and most mobile GPUs** (and other linear KTX2 data): they were transcoded to ASTC, which campello_gpu has only as sRGB, so the GPU decoded them as sRGB and skewed them. Linear KTX2 data now goes to BC7 where the GPU has it, else RGBA8 (`basisTargetFormatFor()`, used by `setScene()` and `uploadMaterial()`).
+- **KTX2 base colour textures had no average colour**, so `uploadMaterial()` didn't record them as `GpuMaterial::baseColorTexture`, and the path tracer shaded them with the factor alone. The average now comes from the texture's smallest mip, transcoded to RGBA8.
+- **Compressed textures on WebGPU** (KTX2, and `setTextureCompression()`'s): their uploads failed validation, so they never reached the GPU. A mip's rows went to the GPU packed, and WebGPU copies rows from a buffer only at a 256-byte pitch, which compressed mips under 64 texels across don't have; and mips under a 4x4 block were copied with their own size, where WebGPU takes whole blocks. `uploadTextureDataWithMips()` now pads rows to 256 bytes and mips to 512 (which D3D12 asks too), and compressed textures stop at their last whole-block mip (`uploadedMipCount()`; a 512 one has 8 mips, not 10).
+- New test `Ktx2TexturesTranscodeForTheirData`: a KTX2 colour map is uploaded compressed sRGB and recorded; a KTX2 normal map gets a linear format, compressed where `canCompressTextures(false)` says so. Passes on macOS (BC7) and on an Adreno 642L (ASTC colour, RGBA8 normal).
+
 ## [0.27.0] - 2026-11-19
 
 ### Added
