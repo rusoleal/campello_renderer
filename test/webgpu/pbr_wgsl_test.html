@@ -267,6 +267,67 @@ async function main() {
     c[2] > c[0] + 40 && c[0] > 20 && c[0] < 200 ? pass('glTF layout + alpha blending') : fail('glTF layout + blend', `${c}`);
   }
 
+  // vs_instanced: group 2 is the draw's transform (a uniform at binding 1,
+  // webgpuInstancedDrawBindGroupLayout); the instance matrices are a
+  // per-instance vertex buffer at locations 8-11; the draw starts at instance 0.
+  {
+    const drawTransformLayout = device.createBindGroupLayout({ entries: [
+      { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } }] });
+    const instancedLayout = device.createPipelineLayout({ bindGroupLayouts: [materialLayout, frameLayout, drawTransformLayout] });
+    const instanceBuffer = { arrayStride: 64, stepMode: 'instance', attributes: [0, 1, 2, 3].map((c) => (
+      { format: 'float32x4', offset: c * 16, shaderLocation: 8 + c })) };
+    const { value: instancedPipeline, error } = await scoped(device, () => device.createRenderPipeline({
+      layout: instancedLayout,
+      vertex: { module, entryPoint: 'vs_instanced', buffers: [...standardBuffers, instanceBuffer] },
+      fragment: { module, entryPoint: 'fs_main', targets: [{ format }] },
+      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+    }));
+    if (error) { fail('pipeline instanced', error.message); return done(); }
+    pass('pipeline instanced');
+    const lean = await scoped(device, () => device.createRenderPipeline({
+      layout: instancedLayout,
+      vertex: { module, entryPoint: 'vs_lean_instanced', buffers: [...positionBuffers, instanceBuffer] },
+      fragment: { module, entryPoint: 'fs_main', targets: [{ format }] },
+      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+    }));
+    if (lean.error) fail('pipeline lean instanced', lean.error.message); else pass('pipeline lean instanced');
+
+    const drawTransform = uniformBuffer(new Float32Array([...mul(proj, view), ...identity]));
+    const group2 = device.createBindGroup({ layout: drawTransformLayout, entries: [{ binding: 1, resource: { buffer: drawTransform } }] });
+    const at2 = (x) => new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, 0, 0, 1]);
+    const instances = vbuf(new Float32Array([...at2(-0.6), ...at2(0.6)]));
+    const n = vbuf(new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]));
+    const uv = vbuf(new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]));
+    const tangent = vbuf(new Float32Array([1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1]));
+    const color = vbuf(new Float32Array(Array(16).fill(1)));
+    const small = vbuf(new Float32Array([-0.25, -0.25, 0, 0.25, -0.25, 0, 0.25, 0.25, 0, -0.25, 0.25, 0]));
+    const colorTex = device.createTexture({ size: [size, size], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    const depth = device.createTexture({ size: [size, size], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT });
+    const enc = device.createCommandEncoder();
+    const rp = enc.beginRenderPass({
+      colorAttachments: [{ view: colorTex.createView(), clearValue: [0, 0, 0, 1], loadOp: 'clear', storeOp: 'store' }],
+      depthStencilAttachment: { view: depth.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'discard' } });
+    rp.setPipeline(instancedPipeline);
+    rp.setBindGroup(0, materialGroup(grey));
+    rp.setBindGroup(1, frameGroup(camera()));
+    rp.setBindGroup(2, group2);
+    [small, n, uv, tangent, color, uv, instances].forEach((b, slot) => rp.setVertexBuffer(slot, b));
+    rp.setIndexBuffer(quadFront, 'uint32');
+    rp.drawIndexed(6, 2, 0, 0, 0);
+    rp.end();
+    const read = device.createBuffer({ size: size * size * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyTextureToBuffer({ texture: colorTex }, { buffer: read, bytesPerRow: size * 4 }, [size, size]);
+    device.queue.submit([enc.finish()]);
+    await read.mapAsync(GPUMapMode.READ);
+    const px = new Uint8Array(read.getMappedRange().slice(0)); read.unmap();
+    const at = (x, y) => Array.from(px.slice((y * size + x) * 4, (y * size + x) * 4 + 3));
+    // 0.6 units is about 11 pixels from the centre; the quads are about 9 wide.
+    lit(at(21, 32)) && lit(at(43, 32)) && !lit(at(32, 32)) ? pass('vs_instanced: each instance at its matrix')
+      : fail('vs_instanced', `left ${at(21, 32)} right ${at(43, 32)} centre ${at(32, 32)}`);
+  }
+
   // vs_skinned: the deform group (group 3: joint palette, MorphInfo,
   // POSITION/NORMAL deltas) and a pipeline layout with it, as
   // webgpuDeformBindGroupLayout / webgpuSkinnedPipelineLayout.

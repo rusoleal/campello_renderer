@@ -467,6 +467,7 @@ namespace systems::leal::campello_renderer {
             std::string entryPoint;
             bool lines = false;     // stage for line/point topologies (vs triangles)
             bool wide = false;      // stage for wide line quads (GpuMesh::wideLines)
+            bool instanced = false; // stage for instanced draws (WebGPU's vs_instanced)
         };
         // One registered program: its shaders (index = ProgramHandle;
         // 0 = built-in PBR, rebuilt by createDefaultPipelines(), app programs
@@ -525,6 +526,9 @@ namespace systems::leal::campello_renderer {
             // also morphs: the draw binds its joint palette at set 2
             // (bindSkin()) and its morph targets at set 3 (bindMorph()).
             bool skinned = false;
+            // WebGPU: vs_instanced (EXT_mesh_gpu_instancing): the draw binds
+            // its transform with bindWebGpuInstanced() and draws from instance 0.
+            bool instanced = false;
         };
         MeshPipelineRecipe meshRecipe;
         std::unordered_map<uint64_t, MeshPipelineEntry> meshPipelineCache;
@@ -539,6 +543,7 @@ namespace systems::leal::campello_renderer {
             systems::leal::campello_gpu::PrimitiveTopology topology{};
             bool wideLines = false, skinned = false;
             uint32_t features = 0;
+            bool instanced = false;
         } lastMeshPipeline;
         // Slot map of the pipeline renderPrimitive() bound; nullptr = identity.
         const std::array<int8_t, kLogicalSlotCount>* activeMeshSlots = nullptr;
@@ -555,9 +560,10 @@ namespace systems::leal::campello_renderer {
         VertexLayout standardLayout = VertexLayout::standard();
 
         // excludeMask: semantics the layout has that the stage mustn't read
-        // (an unskinned draw's JOINTS_0/WEIGHTS_0 on Vulkan).
+        // (an unskinned draw's JOINTS_0/WEIGHTS_0 on Vulkan). instanced: only
+        // the stages for instanced draws (MeshVertexStage::instanced, WebGPU).
         const MeshVertexStage* vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines = false,
-                                              bool wide = false, uint32_t excludeMask = 0) const;
+                                              bool wide = false, uint32_t excludeMask = 0, bool instanced = false) const;
         // colorFormat: invalid = the recipe's (createDefaultPipelines()) format.
         // features: the built-in PBR textured fragment's specialization
         // (kAllMaterialFeatures: the general pipeline; other programs and
@@ -567,13 +573,15 @@ namespace systems::leal::campello_renderer {
             systems::leal::campello_gpu::PixelFormat colorFormat = systems::leal::campello_gpu::PixelFormat::invalid,
             systems::leal::campello_gpu::PrimitiveTopology topology =
                 systems::leal::campello_gpu::PrimitiveTopology::triangleList,
-            bool wideLines = false, bool skinned = true, uint32_t features = 0xFFFFFFFFu);
+            bool wideLines = false, bool skinned = true, uint32_t features = 0xFFFFFFFFu,
+            bool instanced = false);  // instanced: an EXT_mesh_gpu_instancing draw (only WebGPU distinguishes it)
         const MeshPipelineEntry* meshPipeline(
             MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend, bool skinned = true,
-            uint32_t features = 0xFFFFFFFFu) {
+            uint32_t features = 0xFFFFFFFFu, bool instanced = false) {
             return meshPipeline(kPbrProgram, variant, layout, doubleSided, blend,
                                 systems::leal::campello_gpu::PixelFormat::invalid,
-                                systems::leal::campello_gpu::PrimitiveTopology::triangleList, false, skinned, features);
+                                systems::leal::campello_gpu::PrimitiveTopology::triangleList, false, skinned, features,
+                                instanced);
         }
         // Material specialization (setMaterialSpecialization()): the
         // optional PBR features each material slot uses (kMaterialFeature*
@@ -1107,6 +1115,23 @@ namespace systems::leal::campello_renderer {
             std::shared_ptr<systems::leal::campello_gpu::BindGroup> group;
         };
         std::unordered_map<uint64_t, WebGpuDeformBindGroup> webgpuDeformBindGroups;
+        // WebGPU: instanced draws (vs_instanced). The draw's transforms are
+        // found through firstInstance, which instancing needs for the
+        // instance index, so an instanced draw takes its transform from a
+        // uniform slot instead: group 2 of webgpuInstancedPipelineLayout,
+        // binding 1, a 256-byte slot of webgpuInstanceTransformBuffer filled
+        // from the CPU copy of the transform (slots reset per render() call,
+        // never reused within one submit). The instance matrices stay a
+        // per-instance vertex buffer (locations 8-11), read from instance 0.
+        std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> webgpuInstancedDrawBindGroupLayout;
+        std::shared_ptr<systems::leal::campello_gpu::PipelineLayout> webgpuInstancedPipelineLayout;
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> webgpuInstanceTransformBuffer;
+        uint32_t webgpuInstanceSlot = 0;
+        std::unordered_map<uint64_t, std::shared_ptr<systems::leal::campello_gpu::BindGroup>> webgpuInstancedGroups;
+        // Binds `transform` (32 floats: clip from local, world from local,
+        // column-major) for an instanced draw and makes it draw from instance 0.
+        void bindWebGpuInstanced(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+                                 const float* transform);
         std::shared_ptr<systems::leal::campello_gpu::Buffer> webgpuPendingPalette;
         uint64_t webgpuPendingPaletteOffset = 0;
         uint64_t webgpuPendingPaletteSize = 0;
