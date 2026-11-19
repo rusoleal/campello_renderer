@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`campello_renderer` (v0.25.0) is a C++20 shared library that provides a 3D rendering layer on top of custom dependencies:
-- **campello_gpu** (v0.33.0) — low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
+`campello_renderer` (v0.27.0) is a C++20 shared library that provides a 3D rendering layer on top of custom dependencies:
+- **campello_gpu** (v0.33.1) — low-level multiplatform GPU abstraction (Vulkan, Metal, DirectX)
 - **gltf** (v0.5.3) — GLTF/GLB asset loader
 - **campello_procedural** (v0.1.0) — procedural texture graphs (MaterialX nodes, KHR_texture_procedurals), baked on the CPU
-- **campello_image** (v0.5.2) — image decoding (PNG, JPEG, WebP, HDR, OpenEXR)
+- **campello_image** (v0.6.0) — image decoding (PNG, JPEG, WebP, HDR, OpenEXR)
 
 The library is consumed as a CMake dependency and targets Android, macOS, iOS, Windows, and Linux. macOS is the primary development/test platform.
 
@@ -139,6 +139,7 @@ Two variants are created by `createDefaultPipelines()`:
 - `src/realtime_denoiser.cpp`, `shaders/metal/denoiser.metal` — `RealtimeDenoiser` (SVGF, G-buffer guided)
 - `src/rt_effects.cpp`, `shaders/metal/rt_effects.metal` — `RayTracingScene`, `RayTracedShadows`, `RayTracedAmbientOcclusion`, `RestirDirectLighting`, `RestirGlobalIllumination`, `SkinnedMeshes` (skinned draws posed for ray tracing; alpha-masked casters alpha tested via `intersection_query`) (ray traced effects on the raster renderer; ReSTIR DI feeds `Renderer::setDirectLighting()`, ReSTIR GI `setIndirectDiffuse()` with samples from `PathTracer::traceGlobalIllumination()`)
 - `src/realtime_effects.cpp` — `RealtimeEffects`: the effect chain with quality presets (`EffectQuality`), per-effect GPU timings (`GpuTiming`, `gpu_timing.hpp`) and dynamic resolution
+- `Renderer::compressedTexture()` (`setTextureCompression()`): RGBA8 pixels encoded with campello_image's `compressRGBA8()` to the device's format (`chooseBasisTargetFormat()`: ASTC, BC7, ETC2), with mips, uploaded by `uploadTextureDataWithMips()`. Null where it doesn't apply, and the caller uploads RGBA8. Used by `uploadMaterial()`'s images and `proceduralTexture()`.
 - `src/procedural_texture_baker.cpp`, `src/procedural_bridge.hpp` — KHR_texture_procedurals: gltf's graphs converted to campello_procedural graphs (`procedural::toGraph()`), images for `image` nodes, `bakeProceduralTexture()`. `Renderer::proceduralTexture()` bakes a material slot: one bake per graph (`proceduralBakes`, released once `setScene()`/`uploadMaterial()` has made the textures), textures cached by graph content, output, encoding and size (`proceduralBakedTextures`), sRGB for colour slots, mipmapped, `proceduralSampler`. campello_procedural is linked privately (`dependencies/campello_procedural.cmake`; `CAMPELLO_PROCEDURAL_SOURCE=<checkout>` for a local one). The GPU bake kernels (`proceduralBakeKernel`, `procedural_bake.comp`) are unused.
 - `src/ddgi.cpp`, `shaders/metal/ddgi.metal` — `DdgiVolume` (probe-based GI; rays traced by `PathTracer::traceProbeRays()`)
 - `src/shaders/vulkan_default.h`, `vulkan_denoiser.h` — embedded Vulkan SPIR-V (`build_vulkan_shaders.sh`)
@@ -159,7 +160,7 @@ Tests cover: version string, construction, `setAsset`/`getAsset`, `setScene`, `s
 
 ## Versioning
 
-Version is defined in `CMakeLists.txt` (`project(campello_renderer VERSION 0.25.0)`) and propagated to `campello_renderer_config.h` via `configure_file`.
+Version is defined in `CMakeLists.txt` (`project(campello_renderer VERSION 0.27.0)`) and propagated to `campello_renderer_config.h` via `configure_file`.
 
 **When upgrading the package version, update the version string in ALL of these locations:**
 1. `CMakeLists.txt` — `project(campello_renderer VERSION x.x.x)`

@@ -1237,6 +1237,11 @@ namespace systems::leal::campello_renderer {
         std::unordered_map<std::string, std::shared_ptr<const campello_procedural::BakeResult>> proceduralBakes;
         std::shared_ptr<systems::leal::campello_gpu::Sampler> proceduralSampler;
         int proceduralBakeSize = 1024;
+        bool textureCompression = false;  // setTextureCompression()
+        // RGBA8 pixels as a compressed texture with mips (setTextureCompression()),
+        // or null where compression doesn't apply (the caller uploads RGBA8).
+        std::shared_ptr<systems::leal::campello_gpu::Texture> compressedTexture(const uint8_t* rgba, uint32_t width,
+                                                                                uint32_t height, bool srgb);
         // The texture a procedural texture slot bakes to (null when the slot
         // has no graph or the graph doesn't compile).
         std::shared_ptr<systems::leal::campello_gpu::Texture> proceduralTexture(
@@ -1745,6 +1750,20 @@ namespace systems::leal::campello_renderer {
         // Sets the resolution for load-time procedural texture baking.
         // Default is 1024. Must be called before setScene() to take effect.
         void setProceduralBakeSize(int size);
+
+        /// Compress 8-bit textures for the GPU (off by default):
+        /// uploadMaterial()'s images and baked procedural textures are
+        /// encoded once (KTX2 UASTC, campello_image) and uploaded as the
+        /// device's compressed format (BC7, ASTC 4x4 or ETC2) with their mip
+        /// chain, about a quarter of the memory of RGBA8. Encoding costs
+        /// about 0.1 s per 512x512 texture on a desktop CPU (more on one
+        /// thread, as on the web), once per texture. Textures stay RGBA8
+        /// where it doesn't apply: no compressed format on the device,
+        /// linear data where the format is sRGB-only (ASTC here), alpha on
+        /// ETC2 RGB, sizes that aren't whole 4x4 blocks. Set before the
+        /// textures are uploaded.
+        void setTextureCompression(bool enabled) { textureCompression = enabled; }
+        bool getTextureCompression() const { return textureCompression; }
         int getProceduralBakeSize() const;
 
         std::shared_ptr<systems::leal::campello_gpu::Device> getDevice() const { return device; }

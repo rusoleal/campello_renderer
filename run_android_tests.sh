@@ -11,6 +11,7 @@
 #   ANDROID_NDK           an NDK (default: the newest under $ANDROID_HOME/ndk)
 #   CAMPELLO_GPU_SOURCE   a local campello_gpu checkout to build against instead of the
 #                         released one (FetchContent source override)
+#   CAMPELLO_IMAGE_SOURCE a local campello_image checkout, likewise
 #   ANDROID_SERIAL        the device, when more than one is connected (adb)
 set -euo pipefail
 
@@ -42,6 +43,11 @@ if [ -n "${CAMPELLO_GPU_SOURCE:-}" ]; then
     CONFIGURE+=(-DFETCHCONTENT_SOURCE_DIR_EXTERN_CAMPELLO_GPU="$CAMPELLO_GPU_SOURCE")
 else
     CONFIGURE+=(-UFETCHCONTENT_SOURCE_DIR_EXTERN_CAMPELLO_GPU)
+fi
+if [ -n "${CAMPELLO_IMAGE_SOURCE:-}" ]; then
+    CONFIGURE+=(-DFETCHCONTENT_SOURCE_DIR_EXTERN_CAMPELLO_IMAGE="$CAMPELLO_IMAGE_SOURCE")
+else
+    CONFIGURE+=(-UFETCHCONTENT_SOURCE_DIR_EXTERN_CAMPELLO_IMAGE)
 fi
 "$CMAKE_DIR/bin/cmake" "${CONFIGURE[@]}" >/dev/null
 "$CMAKE_DIR/bin/ninja" -C "$BUILD_DIR" campello_renderer_test

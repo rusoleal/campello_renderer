@@ -1,6 +1,16 @@
 # Changelog
 
-## [Unreleased]
+## [0.27.0] - 2026-11-19
+
+### Added
+- **Compressed textures** (`setTextureCompression()`, off by default). `uploadMaterial()`'s 8-bit images and baked procedural textures are encoded once (KTX2 UASTC, campello_image v0.6.0) and uploaded in the device's compressed format, with their mip chain: BC7 on desktop GPUs, ASTC 4x4 on Apple and most mobile GPUs, ETC2 on older ones. That's about a quarter of the GPU memory of RGBA8.
+  - **Cost:** encoding takes about 0.1 s per 512x512 texture on a desktop CPU at the fastest setting (more on one thread, as on the web), once per texture.
+  - **Where it stays RGBA8:** a device without a compressed format; linear data such as normal maps where the only format is sRGB (campello_gpu's ASTC); alpha on ETC2 RGB; sizes that aren't whole 4x4 blocks.
+  - **Not yet:** `setScene()`'s images (the scene asset's own glTF textures).
+  - New test `CompressedTexturesDrawAsTheirPixels`: the baked checkerboard is uploaded compressed (BC7 sRGB here) with its mips and draws its squares; with compression off it stays RGBA8.
+- **campello_image v0.6.0** (KTX2 encoding).
+- **campello_gpu v0.33.1**: compressed formats on Intel Macs (ASTC was reported, and its textures failed Metal validation) and compressed uploads on Vulkan (rows were skewed). Compressed textures need both.
+- `run_android_tests.sh`: `CAMPELLO_IMAGE_SOURCE` builds against a local campello_image, as `CAMPELLO_GPU_SOURCE` does for campello_gpu.
 
 ### Added
 - **Skinning and morph targets on WebGPU.** The web build drew skinned meshes in their rest pose and ignored morph weights: `shaders/webgpu/default.wgsl` had no deforming vertex stage. New entry point `vs_skinned` (a port of `skinning.glsl`: morph targets, then up to four joints per vertex; weights summing to zero leave the vertex unskinned), which `meshPipeline()` picks only for draws with a skin or morph targets, as on Vulkan and DirectX (`CAMPELLO_RENDERER_SPLIT_DEFORM` now includes WebGPU).
