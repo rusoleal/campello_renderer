@@ -31,21 +31,23 @@
 // clamping of indirect light against fireflies (setIndirectClamp()), fewer
 // bounces or a reduced resolution for an image's first samples
 // (setProgressiveBounces(), setPreviewResolution()), several samples per
-// render() or a GPU time budget (setSamplesPerRender(), setFrameBudget());
-// stats()
-// times the samples, rebuilds and denoising.
+// render() or a GPU time budget (setSamplesPerRender(), setFrameBudget(),
+// which splits a sample into bands of rows when one takes longer than the
+// budget); stats() times the samples, rebuilds and denoising.
 //
 // Presentation images: setProjection(Projection::panorama) traces a 360 x 180
 // degree equirectangular panorama around the camera (use a 2:1 size);
 // denoise() cleans up the image so far with Intel Open Image Denoise where
-// the library was built with it (denoiserAvailable()); readOutput() and
-// readLinear() read the image back.
+// the library was built with it (denoiserAvailable()), and denoiseAsync()
+// does it on a worker thread while tracing goes on (interactive viewers);
+// readOutput() and readLinear() read the image back.
 
 #include <campello_renderer/campello_renderer.hpp>
 #include <campello_renderer/gpu_timing.hpp>
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
@@ -86,31 +88,40 @@ public:
     /// Adds samples per pixel of `scene` at `width` x `height` to output()
     /// (one, or setSamplesPerRender() / setFrameBudget()'s); starts again when the scene, its materials, lights,
     /// camera or the size changed. Doesn't wait for the GPU: work submitted
-    /// afterwards on the device's queue sees the sample; the next render()
-    /// and the read and denoise calls wait for it. `renderer` gives materials, environment,
+    /// afterwards on the device's queue sees the sample. Up to two calls'
+    /// work can be on the GPU at once, so it doesn't idle between them; a
+    /// third call waits for the first (as do a rebuild, a new size and the
+    /// read and denoise calls, for all of it). `renderer` gives materials, environment,
     /// exposure and clear colour. Returns false if nothing was traced.
     bool render(const RenderScene& scene, const Renderer& renderer, uint32_t width, uint32_t height);
 
-    /// Whether the last render()'s sample is still on the GPU. An
-    /// interactive caller can skip render() until it isn't, so it never
-    /// waits for the GPU (the next render() would).
+    /// Whether the next render() would wait for the GPU: two calls' work
+    /// is still on it. An interactive caller skips render() while it
+    /// would, so it never waits (and the GPU keeps the other call's work).
     [[nodiscard]] bool sampleInFlight() const;
 
     /// The image so far (rgba8unorm, width x height; display-encoded).
     [[nodiscard]] std::shared_ptr<systems::leal::campello_gpu::Texture> output() const noexcept {
         return output_;
     }
-    /// Samples per pixel in output().
+    /// Samples per pixel in output() (every pixel's: a sample traced in
+    /// bands (setFrameBudget()) counts once its last band is submitted).
     [[nodiscard]] uint32_t sampleCount() const noexcept {
         return samples_;
     }
+    /// Counts the images traced: a new number each time render() starts
+    /// an image (another view, size, setting or scene), so a caller can
+    /// tell whether what it kept is of the image being traced.
+    [[nodiscard]] uint64_t imageNumber() const noexcept {
+        return image_;
+    }
     /// Starts the image again on the next render().
     void reset() noexcept {
-        samples_ = 0;
+        restart();
     }
     /// How camera rays leave the camera (default: perspective).
     void setProjection(Projection projection) noexcept {
-        if (projection_ != projection) samples_ = 0;
+        if (projection_ != projection) restart();
         projection_ = projection;
     }
     [[nodiscard]] Projection projection() const noexcept {
@@ -123,8 +134,36 @@ public:
     /// Denoises the image so far, guided by the first surfaces' albedo and
     /// normals, and shows the result in output() until the next render().
     /// Blocks until done (on the CPU, or the denoiser's GPU device).
-    /// Returns false without a denoiser or an image.
+    /// Returns false without a denoiser or an image. Waits for a
+    /// denoiseAsync() still running, and drops its result.
     bool denoise();
+
+    /// Denoises the image so far without blocking the caller (an
+    /// interactive viewer's UI thread): its samples are copied on the GPU
+    /// (submitted, not waited for), and a worker thread reads the copy
+    /// back, filters it as denoise() does and tone maps it. render() can
+    /// go on meanwhile; output() isn't changed. collectDenoised() picks the
+    /// result up. Returns false without a denoiser or an image, or while
+    /// the last one is still running (denoising()); an uncollected
+    /// finished one is dropped.
+    bool denoiseAsync();
+    /// Whether a denoiseAsync() is still running.
+    [[nodiscard]] bool denoising() const;
+    /// Picks up a finished denoiseAsync(), never waiting: true when
+    /// denoisedOutput() now holds its image. The result of an image that
+    /// started again since (another view, size or setting) is dropped
+    /// (false), as is a failed one.
+    bool collectDenoised();
+    /// The image collectDenoised() last picked up: rgba8unorm, display
+    /// encoded, at the size it was traced for; a new texture each time
+    /// (copy it where it's shown). Null before the first.
+    [[nodiscard]] std::shared_ptr<systems::leal::campello_gpu::Texture> denoisedOutput() const noexcept {
+        return denoisedOutput_;
+    }
+    /// Samples per pixel denoisedOutput() was made from.
+    [[nodiscard]] uint32_t denoisedSamples() const noexcept {
+        return denoisedSamples_;
+    }
 
     enum class DenoiserDevice {
         automatic,  ///< a GPU device of Open Image Denoise where it has one (Metal on Apple
@@ -251,7 +290,7 @@ public:
     void setDepthOfField(float apertureRadius, float focusDistance) noexcept {
         apertureRadius_ = apertureRadius > 0.0f ? apertureRadius : 0.0f;
         focusDistance_ = focusDistance > 0.0f ? focusDistance : 1.0f;
-        samples_ = 0;
+        restart();
     }
     /// A physical camera's exposure for Renderer::setExposure() (EV, the
     /// image scaled by 2^EV): f-number, shutter time (s) and ISO, with the
@@ -267,7 +306,7 @@ public:
     /// Light bounces after the first hit (default 4).
     void setMaxBounces(uint32_t bounces) noexcept {
         maxBounces_ = bounces;
-        samples_ = 0;
+        restart();
     }
 
     /// Fewer bounces for the first `samples` samples of every image (a
@@ -278,7 +317,7 @@ public:
     void setProgressiveBounces(uint32_t bounces, uint32_t samples) noexcept {
         progressiveBounces_ = bounces;
         progressiveSamples_ = samples;
-        samples_ = 0;
+        restart();
     }
 
     /// Samples per pixel each render() adds, traced in one GPU dispatch
@@ -289,9 +328,16 @@ public:
     }
     /// A GPU time budget per render(), in milliseconds: the samples each
     /// render() adds are chosen from the last measured GPU time per sample
-    /// and pixel to fill it (1 to 64). render() still doesn't wait: an
-    /// interactive caller skips frames while sampleInFlight(). 0: off,
-    /// setSamplesPerRender()'s count (the default).
+    /// and pixel to fill it (1 to 64). When one sample of the whole image
+    /// takes longer than the budget, each render() traces one band of rows
+    /// of the sample instead, as many rows as fit at each row's cost
+    /// measured in the last sample (the first render() of a tracer, not
+    /// measured yet, an eighth of the image): a GPU that one
+    /// sample keeps busy for 100 ms then never holds back the caller's
+    /// other GPU work (its UI) for longer than the budget. render() still
+    /// doesn't wait: an interactive caller skips frames while
+    /// sampleInFlight(). 0: off, setSamplesPerRender()'s count (the
+    /// default).
     void setFrameBudget(double milliseconds) noexcept {
         frameBudgetMs_ = milliseconds > 0.0 ? milliseconds : 0.0;
     }
@@ -308,7 +354,7 @@ public:
     void setNoiseTarget(float relativeError, uint32_t minSamples = 16) noexcept {
         noiseTarget_ = relativeError > 0.0f ? relativeError : 0.0f;
         noiseMinSamples_ = std::max<uint32_t>(minSamples, 2);
-        samples_ = 0;
+        restart();
     }
 
     /// A faster first image: the first `samples` samples of every image
@@ -320,7 +366,7 @@ public:
     void setPreviewResolution(uint32_t divisor, uint32_t samples) noexcept {
         previewDivisor_ = divisor > 0 ? divisor : 1;
         previewSamples_ = samples;
-        samples_ = 0;
+        restart();
     }
     /// Whether output() shows the reduced resolution preview.
     [[nodiscard]] bool previewing() const noexcept {
@@ -334,7 +380,7 @@ public:
     /// cost of some indirect energy. 0: no clamp (the default; for stills).
     void setIndirectClamp(float maxRadiance) noexcept {
         indirectClamp_ = maxRadiance > 0.0f ? maxRadiance : 0.0f;
-        samples_ = 0;
+        restart();
     }
 
     enum class Sampler {
@@ -342,7 +388,7 @@ public:
         random,  ///< independent random numbers (PCG), for comparisons
     };
     void setSampler(Sampler sampler) noexcept {
-        if (sampler_ != sampler) samples_ = 0;
+        if (sampler_ != sampler) restart();
         sampler_ = sampler;
     }
 
@@ -350,7 +396,7 @@ public:
     /// shadow rays (multiple importance sampling with the BSDF's
     /// directions). Default on; off finds the sky only by bounces that hit it.
     void setEnvironmentSampling(bool enabled) noexcept {
-        if (environmentSampling_ != enabled) samples_ = 0;
+        if (environmentSampling_ != enabled) restart();
         environmentSampling_ = enabled;
     }
 
@@ -388,7 +434,7 @@ public:
     /// importance sampling against the BSDF. Default on; off finds them
     /// only by bounces that hit them. Up to 2^20 emissive triangles.
     void setEmissiveSampling(bool enabled) noexcept {
-        if (emissiveSampling_ != enabled) samples_ = 0;
+        if (emissiveSampling_ != enabled) restart();
         emissiveSampling_ = enabled;
     }
 
@@ -428,6 +474,11 @@ private:
     // structure only (the same draws, meshes and materials as the last).
     bool rebuild(const RenderScene& scene, const Renderer& renderer, bool transformsOnly);
     void waitForSample() const;  // the last render()'s GPU work
+    // Starts the image again on the next render() (also a sample's bands).
+    void restart() noexcept {
+        samples_ = 0;
+        bandRow_ = 0;
+    }
     // The accumulated image at the traced size (traceWidth_ x traceHeight_).
     bool readTraced(std::vector<float>& rgb, std::vector<float>* albedo, std::vector<float>* normal) const;
     std::vector<DrawCall> traced(const RenderScene& scene) const;
@@ -455,17 +506,36 @@ private:
     bool emissiveSampling_ = true;
     std::vector<std::shared_ptr<systems::leal::campello_gpu::Texture>> textures_;  // base colour textures bound
     std::shared_ptr<systems::leal::campello_gpu::Texture> blank_;  // the unused texture bindings
-    std::shared_ptr<systems::leal::campello_gpu::Buffer> uniforms_;
     std::shared_ptr<systems::leal::campello_gpu::Buffer> accum_;
     std::shared_ptr<systems::leal::campello_gpu::Buffer> aux_;  // albedo, then normal sums
     std::shared_ptr<systems::leal::campello_gpu::Buffer> moments_;    // per pixel: sum of squared luminance
-    std::shared_ptr<systems::leal::campello_gpu::Buffer> converged_;  // pixels under the noise target, a counter
     float noiseTarget_ = 0.0f;
     uint32_t noiseMinSamples_ = 16;
     mutable uint32_t convergedPixels_ = 0;
     mutable uint32_t convergedOf_ = 0;
     std::shared_ptr<systems::leal::campello_gpu::Texture> output_;
-    mutable std::shared_ptr<systems::leal::campello_gpu::Fence> pending_;  // the last sample, not yet waited for
+    // render() calls' work on the GPU, oldest first (up to MAX_IN_FLIGHT):
+    // its fence, and for the progressive image what it traced (stats(),
+    // the rows' costs).
+    struct Dispatch {
+        std::shared_ptr<systems::leal::campello_gpu::Fence> fence;
+        std::shared_ptr<systems::leal::campello_gpu::CommandBuffer> commands;  // null: not timed here
+        std::shared_ptr<systems::leal::campello_gpu::Buffer> converged;      // its converged-pixel counter
+        uint32_t samples = 1;
+        uint64_t pixels = 0;
+        double share = 1.0;  // of the image (a band: under 1)
+        uint32_t row = 0;
+        uint32_t rows = 0;
+    };
+    static constexpr size_t MAX_IN_FLIGHT = 2;
+    mutable std::deque<Dispatch> inFlight_;
+    // Per slot (alternate calls), so a call doesn't rewrite what the other
+    // call's work still reads.
+    std::shared_ptr<systems::leal::campello_gpu::Buffer> uniformSlots_[MAX_IN_FLIGHT];
+    std::shared_ptr<systems::leal::campello_gpu::Buffer> convergedSlots_[MAX_IN_FLIGHT];  // pixels under the noise target
+    uint32_t slot_ = 0;
+    // Waits until at most `keep` calls' work is on the GPU, timing what finished.
+    void retire(size_t keep) const;
     uint64_t geometryKey_ = 0;   // draws' meshes and materials: a full rebuild
     uint64_t transformKey_ = 0;  // their transforms: the instances and the scene's structure
     uint64_t lightingKey_ = 0;   // lights and lighting settings: the image starts again
@@ -480,6 +550,8 @@ private:
     uint32_t previewSamples_ = 0;
     bool previewActive_ = false;
     uint32_t samples_ = 0;
+    uint32_t bandRow_ = 0;  // the next row of a sample traced in bands (setFrameBudget()); 0: none in progress
+    uint64_t image_ = 0;    // counts images (each start of one), so a late denoiseAsync() result is dropped
     uint32_t maxBounces_ = 4;
     float exposure_ = 0.0f;  // of the last render(), for readLinear()
     Projection projection_ = Projection::perspective;
@@ -503,6 +575,14 @@ private:
     std::shared_ptr<systems::leal::campello_gpu::Texture> probeRayTarget_;
     uint32_t probeBounces_ = 1;
     std::shared_ptr<void> denoiser_;  // Open Image Denoise device, filter and buffers (path_tracer.cpp)
+    // denoiseAsync(): the job running (its worker thread), the copies of
+    // the samples it reads, its last result.
+    struct DenoiseJob;
+    std::shared_ptr<DenoiseJob> denoiseJob_;
+    std::shared_ptr<systems::leal::campello_gpu::Buffer> snapshotAccum_;
+    std::shared_ptr<systems::leal::campello_gpu::Buffer> snapshotAux_;
+    std::shared_ptr<systems::leal::campello_gpu::Texture> denoisedOutput_;
+    uint32_t denoisedSamples_ = 0;
     // Skinned draws posed for tracing (rt_effects.hpp), and a counter that
     // makes each frame with posed draws new geometry.
     std::unique_ptr<SkinnedMeshes> skinned_;
@@ -535,17 +615,22 @@ private:
     uint32_t envResolution_ = 0;            // per cube face; 0: no table
 
     // Timings (stats()).
-    void collectTiming() const;  // the finished sample's GPU time
-    mutable std::shared_ptr<systems::leal::campello_gpu::CommandBuffer> pendingCommands_;
-    uint32_t pendingSamples_ = 1;            // samples of pendingCommands_
-    uint64_t pendingPixels_ = 0;             // and its traced pixels
+    void collectTiming() const;  // the finished calls' GPU times (doesn't wait)
+    void timeDispatch(const Dispatch& dispatch) const;
+    // Measured GPU time per pixel and sample of each traced row (ns; 0:
+    // not yet), from the dispatch that last covered it: rows cost very
+    // different amounts (sky, glass, interiors), so bands are sized from them.
+    mutable std::vector<double> rowCost_;
+    [[nodiscard]] double rowCostNs(uint32_t row) const {
+        return row < rowCost_.size() && rowCost_[row] > 0.0 ? rowCost_[row] : nsPerPixelSample_;
+    }
     mutable double nsPerPixelSample_ = 0.0;  // measured: GPU time per sample and pixel
     uint32_t samplesPerRender_ = 1;
     double frameBudgetMs_ = 0.0;
     uint32_t lastRenderSamples_ = 0;
     mutable double lastSampleGpuMs_ = 0.0;
     mutable double imageGpuMs_ = 0.0;
-    mutable uint32_t imageTimedSamples_ = 0;
+    mutable double imageTimedSamples_ = 0.0;  // (bands count as their share of a sample)
     double rebuildMs_ = 0.0;
     double denoiseMs_ = 0.0;
     double firstDenoisedMs_ = 0.0;

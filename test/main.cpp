@@ -11,6 +11,8 @@
 #include <campello_renderer/ddgi.hpp>
 #include <gltf/gltf.hpp>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <future>
 #include <vector>
 #include <fstream>
@@ -135,7 +137,7 @@ static const char *kGltfWithBasisuTexture = R"({
 // ---------------------------------------------------------------------------
 
 TEST(VersionTest, ReturnsExpectedVersion) {
-    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.25.0");
+    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.26.0");
 }
 
 TEST(VersionTest, VersionIsNonEmpty) {
@@ -7252,6 +7254,146 @@ TEST_F(OffscreenRenderTest, PathTracerAddsSeveralSamplesPerRender) {
     EXPECT_FALSE(tracer.previewing());
     EXPECT_EQ(tracer.sampleCount(), 5u);
     renderer->setSkyboxEnabled(true);
+}
+
+// A budget under one sample's GPU time: each render() traces a band of
+// rows of the sample, and the bands add up to the same image as whole
+// samples (an interactive viewer's UI never waits behind a long sample).
+// A new view in the middle of a sample starts the image again cleanly.
+TEST_F(OffscreenRenderTest, PathTracerTracesASampleInBandsWithinTheBudget) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    PathTracer whole(device);
+    if (!whole.supported()) GTEST_SKIP() << "No path tracing on this device";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+    auto sky = makeSkyPatchScene(device, *renderer, red);
+    constexpr uint32_t S = 256;  // (bands are at least 4k pixels: 16 rows here)
+
+    std::vector<float> reference, banded;
+    for (int i = 0; i < 3; ++i) ASSERT_TRUE(whole.render(sky.scene, *renderer, S, S));
+    ASSERT_TRUE(whole.readLinear(reference));
+
+    PathTracer tracer(device);
+    tracer.setFrameBudget(1e-6);  // far under any sample
+    int renders = 0;
+    int firstSample = 0;
+    while (tracer.sampleCount() < 3 && renders < 100) {
+        ASSERT_TRUE(tracer.render(sky.scene, *renderer, S, S));
+        ++renders;
+        if (renders == 1) EXPECT_EQ(tracer.sampleCount(), 0u) << "a band: the sample isn't complete";
+        if (tracer.sampleCount() == 1 && firstSample == 0) firstSample = renders;
+    }
+    EXPECT_EQ(tracer.sampleCount(), 3u);
+    // The first sample: eighths until one is measured, then 16-row bands;
+    // the next ones in 16-row bands.
+    EXPECT_GE(firstSample, 2) << "bands of the first sample";
+    EXPECT_EQ(renders - firstSample, 16 + 16) << "bands per sample";
+    EXPECT_GT(tracer.stats().sampleGpuMs, 0.0) << "a band's time counts as its share of a sample";
+    ASSERT_TRUE(tracer.readLinear(banded));
+    ASSERT_EQ(banded.size(), reference.size());
+    EXPECT_EQ(rmsError(reference, banded), 0.0) << "the same samples, in bands";
+
+    // Another view after one band of a sample: a new image from row 0.
+    tracer.reset();
+    ASSERT_TRUE(tracer.render(sky.scene, *renderer, S, S));
+    EXPECT_EQ(tracer.sampleCount(), 0u);
+    sky.scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 1.0, 1.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                        VM::Vector3<double>(0.0, 1.0, 0.0));
+    sky.scene.camera.position = VM::Vector3<double>(0.0, 1.0, 1.5);
+    renders = 0;
+    while (tracer.sampleCount() < 2 && renders < 100) {
+        ASSERT_TRUE(tracer.render(sky.scene, *renderer, S, S));
+        ++renders;
+    }
+    whole.reset();
+    for (int i = 0; i < 2; ++i) ASSERT_TRUE(whole.render(sky.scene, *renderer, S, S));
+    ASSERT_TRUE(whole.readLinear(reference));
+    ASSERT_TRUE(tracer.readLinear(banded));
+    EXPECT_EQ(rmsError(reference, banded), 0.0) << "nothing of the old view's band stays";
+
+    // A budget that holds whole samples again: one render() a sample (or more).
+    tracer.setFrameBudget(1000.0);
+    const uint32_t before = tracer.sampleCount();
+    ASSERT_TRUE(tracer.render(sky.scene, *renderer, S, S));
+    EXPECT_GT(tracer.sampleCount(), before);
+}
+
+// denoiseAsync(): the same image as denoise(), made on a worker thread
+// while tracing goes on; a result for a view that has changed since is
+// dropped.
+TEST_F(OffscreenRenderTest, PathTracerDenoisesOnAWorkerThread) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    if (!PathTracer::denoiserAvailable()) GTEST_SKIP() << "Built without the denoiser";
+    namespace GPU = systems::leal::campello_gpu;
+    namespace VM = systems::leal::vector_math;
+    auto sceneAsset = GLTF::loadGLTF(kGltfTriangleWithData, kNoOpLoader);
+    auto asset = GLTF::loadGLTF(kGltfLineMaterials, kNoOpLoader);
+    ASSERT_NE(sceneAsset, nullptr);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(sceneAsset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    PathTracer reference(device);
+    if (!reference.supported()) GTEST_SKIP() << "No path tracing on this device";
+    GpuMaterial* red = renderer->uploadMaterial((*asset->materials)[1], *asset);
+    ASSERT_NE(red, nullptr);
+    auto sky = makeSkyPatchScene(device, *renderer, red);
+
+    for (int i = 0; i < 2; ++i) ASSERT_TRUE(reference.render(sky.scene, *renderer, 64, 64));
+    ASSERT_TRUE(reference.denoise());
+    std::vector<uint8_t> expected;
+    ASSERT_TRUE(reference.readOutput(expected));
+
+    PathTracer tracer(device);
+    EXPECT_FALSE(tracer.denoiseAsync()) << "no image yet";
+    for (int i = 0; i < 2; ++i) ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    ASSERT_TRUE(tracer.denoiseAsync());
+    // Tracing goes on meanwhile.
+    for (int i = 0; i < 2; ++i) ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    const auto collect = [&] {
+        for (int i = 0; i < 2000; ++i) {
+            if (tracer.collectDenoised()) return true;
+            if (!tracer.denoising()) return tracer.collectDenoised();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+    };
+    ASSERT_TRUE(collect());
+    EXPECT_FALSE(tracer.denoising());
+    EXPECT_FALSE(tracer.denoised()) << "output() is the traced image still";
+    EXPECT_EQ(tracer.denoisedSamples(), 2u);
+    EXPECT_GT(tracer.stats().denoiseMs, 0.0);
+    auto out = tracer.denoisedOutput();
+    ASSERT_NE(out, nullptr);
+    ASSERT_EQ(out->getWidth(), 64u);
+    std::vector<uint8_t> got(expected.size());
+    ASSERT_TRUE(out->download(0, 0, got.data(), got.size()));
+    int worst = 0;
+    for (size_t i = 0; i < got.size(); ++i) worst = std::max(worst, std::abs(int(got[i]) - int(expected[i])));
+    EXPECT_LE(worst, 1) << "the image denoise() makes of the same samples";
+
+    // One at a time; a result for an older view is dropped.
+    ASSERT_TRUE(tracer.denoiseAsync());
+    EXPECT_FALSE(tracer.denoiseAsync()) << "one still running";
+    sky.scene.camera.view = VM::Matrix4<double>::lookAt(VM::Vector3<double>(0.0, 1.0, 1.5), VM::Vector3<double>(0.0, 0.0, 0.0),
+                                                        VM::Vector3<double>(0.0, 1.0, 0.0));
+    sky.scene.camera.position = VM::Vector3<double>(0.0, 1.0, 1.5);
+    ASSERT_TRUE(tracer.render(sky.scene, *renderer, 64, 64));
+    EXPECT_FALSE(collect()) << "another view since";
+    EXPECT_EQ(tracer.denoisedOutput(), out) << "the last image kept";
+    // A synchronous denoise() waits for a running one.
+    ASSERT_TRUE(tracer.denoiseAsync());
+    EXPECT_TRUE(tracer.denoise());
+    EXPECT_FALSE(tracer.denoising());
 }
 
 // Rebuilds by what changed: moving an instance rebuilds the instances only

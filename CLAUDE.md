@@ -134,7 +134,7 @@ Two variants are created by `createDefaultPipelines()`:
 - `inc/campello_renderer/image.hpp` — legacy `Image` struct (not used by renderer internals; kept for API compatibility)
 - `src/campello_renderer.cpp` — full implementation (~1050 lines)
 - `src/shaders/metal_default.h` — embedded Metal shader library
-- `src/path_tracer.cpp`, `shaders/metal/path_tracer.metal` — `PathTracer` (progressive GPU path tracing)
+- `src/path_tracer.cpp`, `shaders/metal/path_tracer.metal` — `PathTracer` (progressive GPU path tracing; `setFrameBudget()` traces a sample in bands of rows, up to two calls in flight; `denoiseAsync()` denoises on a worker thread)
 - `src/realtime_denoiser.cpp`, `shaders/metal/denoiser.metal` — `RealtimeDenoiser` (SVGF, G-buffer guided)
 - `src/rt_effects.cpp`, `shaders/metal/rt_effects.metal` — `RayTracingScene`, `RayTracedShadows`, `RayTracedAmbientOcclusion`, `RestirDirectLighting`, `RestirGlobalIllumination`, `SkinnedMeshes` (skinned draws posed for ray tracing; alpha-masked casters alpha tested via `intersection_query`) (ray traced effects on the raster renderer; ReSTIR DI feeds `Renderer::setDirectLighting()`, ReSTIR GI `setIndirectDiffuse()` with samples from `PathTracer::traceGlobalIllumination()`)
 - `src/realtime_effects.cpp` — `RealtimeEffects`: the effect chain with quality presets (`EffectQuality`), per-effect GPU timings (`GpuTiming`, `gpu_timing.hpp`) and dynamic resolution

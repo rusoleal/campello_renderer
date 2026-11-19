@@ -24,9 +24,11 @@
 #include <campello_gpu/texture.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <thread>
 
 #if defined(__APPLE__)
 #include "shaders/metal_path_tracer.h"
@@ -71,7 +73,7 @@ struct TraceUniforms {
     float cameraUp[4];
     float tuning[4];         // x indirect clamp (0 off), y sampler (0 random, 1 Sobol)
     uint32_t envSampling[4]; // x environment table resolution per face (0: none)
-    uint32_t lights[4];      // x emissive triangles sampled as lights
+    uint32_t lights[4];      // x emissive triangles sampled as lights, y the band's first row
     float camera[4];         // x lens aperture radius, y focus distance, z tone mapping
     float probeOrigin[4];
     float probeSpacing[4];
@@ -142,6 +144,10 @@ void upscale(const std::vector<float>& src, uint32_t w, uint32_t h, std::vector<
             }
         }
     }
+}
+
+int64_t nowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 double millisecondsSince(std::chrono::steady_clock::time_point start) {
@@ -373,7 +379,8 @@ PathTracer::PathTracer(std::shared_ptr<GPU::Device> device)
 }
 
 PathTracer::~PathTracer() {
-    waitForSample();  // the GPU may still be using the buffers
+    denoiseJob_.reset();  // its worker reads buffers of this device
+    waitForSample();      // the GPU may still be using the buffers
 }
 
 std::vector<DrawCall> PathTracer::traced(const RenderScene& scene) const {
@@ -731,31 +738,48 @@ bool PathTracer::rebuild(const RenderScene& scene, const Renderer& renderer, boo
 }
 
 bool PathTracer::sampleInFlight() const {
-    return pending_ && !pending_->isSignaled();
+    return inFlight_.size() >= MAX_IN_FLIGHT && inFlight_.front().fence && !inFlight_.front().fence->isSignaled();
+}
+
+void PathTracer::retire(size_t keep) const {
+    while (!inFlight_.empty()) {
+        Dispatch& oldest = inFlight_.front();
+        if (oldest.fence && !oldest.fence->isSignaled()) {
+            if (inFlight_.size() <= keep) break;
+            oldest.fence->wait();
+        }
+        timeDispatch(oldest);
+        inFlight_.pop_front();
+    }
 }
 
 void PathTracer::waitForSample() const {
-    if (pending_) {
-        pending_->wait();
-        pending_.reset();
-    }
-    collectTiming();
+    retire(0);
 }
 
 void PathTracer::collectTiming() const {
-    if (!pendingCommands_ || (pending_ && !pending_->isSignaled())) return;
-    const uint64_t ns = pendingCommands_->getGPUExecutionTime();
-    pendingCommands_.reset();
+    retire(MAX_IN_FLIGHT);  // (only what finished)
+}
+
+void PathTracer::timeDispatch(const Dispatch& dispatch) const {
+    if (!dispatch.commands) return;
+    const uint64_t ns = dispatch.commands->getGPUExecutionTime();
     if (ns == 0) return;  // not measured by this backend
-    const double samples = std::max<uint32_t>(pendingSamples_, 1);
-    lastSampleGpuMs_ = static_cast<double>(ns) * 1e-6 / samples;
-    if (pendingPixels_ > 0) nsPerPixelSample_ = static_cast<double>(ns) / samples / static_cast<double>(pendingPixels_);
+    const double samples = std::max<uint32_t>(dispatch.samples, 1);
+    // (A band: its time scaled to the whole image's.)
+    lastSampleGpuMs_ = static_cast<double>(ns) * 1e-6 / samples / dispatch.share;
+    if (dispatch.pixels > 0) {
+        nsPerPixelSample_ = static_cast<double>(ns) / samples / static_cast<double>(dispatch.pixels);
+        for (uint32_t r = dispatch.row; r < dispatch.row + dispatch.rows && r < rowCost_.size(); ++r) rowCost_[r] = nsPerPixelSample_;
+    }
     imageGpuMs_ += static_cast<double>(ns) * 1e-6;
-    imageTimedSamples_ += pendingSamples_;
+    imageTimedSamples_ += dispatch.samples * dispatch.share;
+    // The converged pixels (setNoiseTarget()): only with a target, as
+    // reading the counter back waits for the GPU's queue.
     uint32_t count[4] = {0, 0, 0, 0};
-    if (converged_ && converged_->download(0, sizeof(count), count)) {
+    if (noiseTarget_ > 0.0f && dispatch.converged && dispatch.converged->download(0, sizeof(count), count)) {
         convergedPixels_ = count[0];
-        convergedOf_ = static_cast<uint32_t>(pendingPixels_);
+        convergedOf_ = static_cast<uint32_t>(dispatch.pixels);
     }
 }
 
@@ -763,7 +787,7 @@ PathTracer::Stats PathTracer::stats() const {
     collectTiming();
     Stats out;
     out.sampleGpuMs = lastSampleGpuMs_;
-    out.averageSampleGpuMs = imageTimedSamples_ > 0 ? imageGpuMs_ / imageTimedSamples_ : 0.0;
+    out.averageSampleGpuMs = imageTimedSamples_ > 0.0 ? imageGpuMs_ / imageTimedSamples_ : 0.0;
     out.rebuildMs = rebuildMs_;
     out.denoiseMs = denoiseMs_;
     out.firstDenoisedMs = firstDenoisedMs_;
@@ -780,7 +804,7 @@ PathTracer::Stats PathTracer::stats() const {
 void PathTracer::setPortals(std::vector<Portal> portals) {
     portals_ = std::move(portals);
     portalsDirty_ = true;
-    samples_ = 0;
+    restart();
 }
 
 std::vector<PathTracer::Portal> PathTracer::portalsFromGlass(const RenderScene& scene, const Renderer& renderer) {
@@ -926,9 +950,10 @@ bool PathTracer::render(const RenderScene& sceneIn, const Renderer& renderer, ui
     // Reflections and probe rays (one sample, their own output; the
     // progressive image's state untouched).
     const bool reflectionPass = reflectionGBuffer_ != nullptr || probeRequest_ != nullptr;
-    // The previous sample (usually done by now, a frame later): its
-    // uniforms and buffers are rewritten below.
-    waitForSample();
+    // Room for this call's work: at most one earlier call's still on the
+    // GPU (it uses the other slot's uniforms). Rebuilds and new buffers
+    // below wait for all of it.
+    retire(MAX_IN_FLIGHT - 1);
 
     // What the image depends on besides the camera, by the work a change
     // needs: the draws' meshes and materials (a full rebuild), their
@@ -980,6 +1005,7 @@ bool PathTracer::render(const RenderScene& sceneIn, const Renderer& renderer, ui
 
     if (!tlas_ || geometryKey != geometryKey_ || transformKey != transformKey_) {
         const bool transformsOnly = tlas_ && geometryKey == geometryKey_;
+        waitForSample();  // (the structures and buffers in use)
         const auto start = std::chrono::steady_clock::now();
         if (!rebuild(scene, renderer, transformsOnly)) {
             tlas_.reset();  // a full rebuild next time
@@ -989,26 +1015,28 @@ bool PathTracer::render(const RenderScene& sceneIn, const Renderer& renderer, ui
         geometryKey_ = geometryKey;
         transformKey_ = transformKey;
         ++(transformsOnly ? transformRebuilds_ : fullRebuilds_);
-        samples_ = 0;
+        restart();
     }
     if (lightingKey != lightingKey_) {
         lightingKey_ = lightingKey;
-        samples_ = 0;
+        restart();
     }
     if (viewKey != viewKey_) {
         viewKey_ = viewKey;
-        samples_ = 0;
+        restart();
     }
     if (!environment) return false;
     if (environmentSampling_ && environment.get() != envTableSource_) {
+        waitForSample();
         const auto start = std::chrono::steady_clock::now();
         buildEnvironmentTable(environment);
         rebuildMs_ += millisecondsSince(start);
-        samples_ = 0;
+        restart();
     }
     // (Reflections and probes don't use the image's buffers, only bind
     // them: no reallocation when their sizes alternate.)
     if (!accum_ || !output_ || (!reflectionPass && (width != width_ || height != height_))) {
+        waitForSample();
         const auto readable = (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::storage) | uint32_t(GPU::BufferUsage::copyDst) |
                                                  uint32_t(GPU::BufferUsage::copySrc));
         accum_ = device_->createBuffer((uint64_t)width * height * 16, readable);
@@ -1021,19 +1049,20 @@ bool PathTracer::render(const RenderScene& sceneIn, const Renderer& renderer, ui
                                                              uint32_t(GPU::TextureUsage::copyDst)));
         width_ = width;
         height_ = height;
-        samples_ = 0;
+        restart();
         if (!accum_ || !aux_ || !moments_ || !output_) return false;
     }
 
     // The preview at reduced resolution (setPreviewResolution()): an
     // image's first samples, then it starts again at full resolution.
     // (Not for reflections: one sample per frame at the G-buffer's size.)
-    const bool newImage = samples_ == 0 && !reflectionPass;
+    const bool newImage = samples_ == 0 && bandRow_ == 0 && !reflectionPass;
     if (newImage) {
         previewActive_ = previewSamples_ > 0 && previewDivisor_ > 1;
+        ++image_;
     } else if (!reflectionPass && previewActive_ && samples_ >= previewSamples_) {
         previewActive_ = false;
-        samples_ = 0;
+        restart();
     }
     const uint32_t divisor = previewActive_ && !reflectionPass ? previewDivisor_ : 1;
     traceWidth_ = (width + divisor - 1) / divisor;
@@ -1043,10 +1072,40 @@ bool PathTracer::render(const RenderScene& sceneIn, const Renderer& renderer, ui
     // holds at the last measured cost; never past the end of the preview
     // or of the first samples' fewer bounces (they change per phase).
     uint32_t samplesNow = samplesPerRender_;
-    if (frameBudgetMs_ > 0.0 && nsPerPixelSample_ > 0.0) {
-        const double perSample = nsPerPixelSample_ * double(traceWidth_) * double(traceHeight_) * 1e-6;  // ms
-        samplesNow = static_cast<uint32_t>(std::clamp(std::floor(frameBudgetMs_ / perSample), 1.0, 64.0));
+    // Rows of the image this render() traces: all of them, or a band of
+    // one sample when a whole sample doesn't fit the budget (and until a
+    // sample started in bands is finished).
+    uint32_t bandRows = traceHeight_;
+    if (rowCost_.size() != traceHeight_) rowCost_.assign(traceHeight_, 0.0);  // (another size: measured again)
+    if (bandRow_ >= traceHeight_) bandRow_ = 0;  // (the size changed)
+    if (!reflectionPass && frameBudgetMs_ > 0.0) {
+        const double pixelsPerRowMs = double(traceWidth_) * 1e-6;  // ns per pixel -> ms per row
+        double imageMs = 0.0;  // one sample of the whole image, at the rows' measured costs
+        for (uint32_t r = 0; r < traceHeight_; ++r) imageMs += rowCostNs(r) * pixelsPerRowMs;
+        if (nsPerPixelSample_ <= 0.0) {
+            samplesNow = 1;  // not measured yet: an eighth of the image to measure it
+            bandRows = std::max<uint32_t>((traceHeight_ + 7) / 8, 1);
+        } else if (bandRow_ == 0 && imageMs <= frameBudgetMs_) {
+            samplesNow = static_cast<uint32_t>(std::clamp(std::floor(frameBudgetMs_ / imageMs), 1.0, 64.0));
+        } else {
+            samplesNow = 1;
+            // As many rows as the budget holds at their costs; at least
+            // 4k pixels and 8 rows (a dispatch has a fixed cost).
+            const uint32_t minRows = std::max<uint32_t>(4096 / std::max<uint32_t>(traceWidth_, 1), 8);
+            double ms = 0.0;
+            uint32_t rows = 0;
+            while (bandRow_ + rows < traceHeight_) {
+                const double rowMs = rowCostNs(bandRow_ + rows) * pixelsPerRowMs;
+                if (rows >= minRows && ms + rowMs > frameBudgetMs_) break;
+                ms += rowMs;
+                ++rows;
+            }
+            bandRows = std::max(rows, 1u);
+        }
+    } else if (bandRow_ > 0) {
+        samplesNow = 1;  // the budget was turned off mid-sample: its remaining rows at once
     }
+    bandRows = std::min(bandRows, traceHeight_ - bandRow_);
     if (previewActive_) samplesNow = std::min(samplesNow, previewSamples_ - samples_);
     if (samples_ < progressiveSamples_) samplesNow = std::min(samplesNow, progressiveSamples_ - samples_);
     samplesNow = reflectionPass ? 1u : std::max(samplesNow, 1u);
@@ -1142,20 +1201,25 @@ bool PathTracer::render(const RenderScene& sceneIn, const Renderer& renderer, ui
     u.tuning[0] = indirectClamp_;
     u.tuning[2] = reflectionPass ? 0.0f : noiseTarget_;  // (reflections: every pixel every frame)
     u.tuning[3] = static_cast<float>(noiseMinSamples_);
-    if (!converged_) {
-        converged_ = device_->createBuffer(16, (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::storage) |
-                                                                  uint32_t(GPU::BufferUsage::copySrc) |
-                                                                  uint32_t(GPU::BufferUsage::copyDst)));
-        if (!converged_) return false;
+    // This call's slot: the other slot's may still be read by the GPU.
+    const uint32_t slot = slot_;
+    slot_ = (slot_ + 1) % MAX_IN_FLIGHT;
+    auto& converged = convergedSlots_[slot];
+    if (!converged) {
+        converged = device_->createBuffer(16, (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::storage) |
+                                                                 uint32_t(GPU::BufferUsage::copySrc) |
+                                                                 uint32_t(GPU::BufferUsage::copyDst)));
+        if (!converged) return false;
     }
     {
-        uint32_t zero[4] = {0, 0, 0, 0};  // (the last sample is done: waited for above)
-        converged_->upload(0, sizeof(zero), zero);
+        uint32_t zero[4] = {0, 0, 0, 0};  // (this slot's last call is done: retired above)
+        converged->upload(0, sizeof(zero), zero);
     }
     u.tuning[1] = sampler_ == Sampler::sobol ? 1.0f : 0.0f;
     const bool envSampled = environmentSampling_ && envResolution_ > 0 && envTable_;
     u.envSampling[0] = envSampled ? envResolution_ : 0u;
     if (portalsDirty_) {
+        waitForSample();  // (the portal buffer is replaced)
         // Rectangles: unit, perpendicular axes and their lengths.
         std::vector<PortalInfo> infos;
         for (const auto& portal : portals_) {
@@ -1193,18 +1257,20 @@ bool PathTracer::render(const RenderScene& sceneIn, const Renderer& renderer, ui
     u.envSampling[2] = divisor;
     u.envSampling[3] = samplesNow;
     u.lights[0] = emissiveSampling_ ? emissiveCount_ : 0u;
+    u.lights[1] = reflectionPass ? 0u : bandRow_;  // the band's first row
     u.camera[0] = projection_ == Projection::perspective ? apertureRadius_ : 0.0f;
     u.camera[1] = focusDistance_;
     u.camera[2] = static_cast<float>(toneMapping_);
-    if (!uniforms_) uniforms_ = device_->createBuffer(sizeof(TraceUniforms), GPU::BufferUsage::uniform);
-    if (!uniforms_) return false;
-    uniforms_->upload(0, sizeof(u), &u);
+    auto& uniforms = uniformSlots_[slot];
+    if (!uniforms) uniforms = device_->createBuffer(sizeof(TraceUniforms), GPU::BufferUsage::uniform);
+    if (!uniforms) return false;
+    uniforms->upload(0, sizeof(u), &u);
 
     GPU::BindGroupDescriptor desc{};
     desc.layout = traceLayout_;
     desc.entries = {{0, tlas_},
                     {1, GPU::BufferBinding{accum_, 0, accum_->getLength()}},
-                    {2, GPU::BufferBinding{uniforms_, 0, sizeof(TraceUniforms)}},
+                    {2, GPU::BufferBinding{uniforms, 0, sizeof(TraceUniforms)}},
                     {3, GPU::BufferBinding{instances_, 0, instances_->getLength()}},
                     {4, GPU::BufferBinding{materials_, 0, materials_->getLength()}},
                     {5, GPU::BufferBinding{normals_, 0, normals_->getLength()}},
@@ -1215,7 +1281,7 @@ bool PathTracer::render(const RenderScene& sceneIn, const Renderer& renderer, ui
                     {9, portalCount > 0 ? GPU::BufferBinding{portalBuffer_, 0, portalBuffer_->getLength()}
                                         : GPU::BufferBinding{uvs_, 0, uvs_->getLength()}},  // unused without portals
                     {10, GPU::BufferBinding{moments_, 0, moments_->getLength()}},
-                    {11, GPU::BufferBinding{converged_, 0, converged_->getLength()}},
+                    {11, GPU::BufferBinding{converged, 0, converged->getLength()}},
                     {12, GPU::BufferBinding{vertexNormals_, 0, vertexNormals_->getLength()}},
                     {13, GPU::BufferBinding{tangents_, 0, tangents_->getLength()}},
                     {14, emissiveCount_ > 0 ? GPU::BufferBinding{emissives_, 0, emissives_->getLength()}
@@ -1290,7 +1356,7 @@ bool PathTracer::render(const RenderScene& sceneIn, const Renderer& renderer, ui
     if (auto pass = encoder->beginRayTracingPass()) {
         pass->setPipeline(pipeline_);
         pass->setBindGroup(0, group);
-        pass->traceRays(traceWidth_, traceHeight_, 1);
+        pass->traceRays(traceWidth_, reflectionPass ? traceHeight_ : bandRows, 1);
         pass->end();
     }
     // Not waited for here: the GPU traces while the caller goes on (the next
@@ -1301,24 +1367,33 @@ bool PathTracer::render(const RenderScene& sceneIn, const Renderer& renderer, ui
         imageGpuMs_ = 0.0;
         imageTimedSamples_ = 0;
         firstDenoisedMs_ = 0.0;
-        imageStartNs_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch())
-                            .count();
+        imageStartNs_ = nowNs();
     }
     auto fence = device_->createFence();
     auto commands = encoder->finish();
     device_->submit(commands, fence);
-    pending_ = fence;
+    Dispatch dispatch;
+    dispatch.fence = fence;
     if (reflectionPass) {
+        inFlight_.push_back(dispatch);
         passTiming_.begin();
         passTiming_.submitted(commands, fence);
         return true;  // the progressive image's state is untouched
     }
-    pendingCommands_ = commands;
-    pendingSamples_ = samplesNow;
-    pendingPixels_ = uint64_t(traceWidth_) * traceHeight_;
+    dispatch.commands = commands;
+    dispatch.converged = converged;
+    dispatch.samples = samplesNow;
+    dispatch.pixels = uint64_t(traceWidth_) * bandRows;
+    dispatch.share = double(bandRows) / double(traceHeight_);
+    dispatch.row = bandRow_;
+    dispatch.rows = bandRows;
+    inFlight_.push_back(std::move(dispatch));
     lastRenderSamples_ = samplesNow;
-    samples_ += samplesNow;
+    bandRow_ += bandRows;
+    if (bandRow_ >= traceHeight_) {
+        bandRow_ = 0;
+        samples_ += samplesNow;  // every pixel has them now
+    }
     exposure_ = renderer.getExposure();
     denoised_ = false;
     return true;
@@ -1346,37 +1421,48 @@ bool PathTracer::readLinear(std::vector<float>& rgb, std::vector<float>* albedo,
     return true;
 }
 
+namespace {
+/// The accumulation's sums (rgb + count per pixel) as averages, scaled by
+/// 2^exposure; the guides' sums (albedo, then normals) by their own counts.
+void averageSums(const std::vector<float>& sums, const std::vector<float>* aux, size_t pixels, float exposure,
+                 std::vector<float>& rgb, std::vector<float>* albedo, std::vector<float>* normal) {
+    const float scale = std::exp2(exposure);
+    rgb.resize(pixels * 3);
+    for (size_t i = 0; i < pixels; ++i) {
+        const float n = std::max(sums[i * 4 + 3], 1.0f);
+        for (int c = 0; c < 3; ++c) rgb[i * 3 + c] = sums[i * 4 + c] / n * scale;
+    }
+    if (!aux) return;
+    // Each pixel's own count (w): adaptive sampling stops pixels early.
+    if (albedo) {
+        albedo->resize(pixels * 3);
+        for (size_t i = 0; i < pixels; ++i) {
+            const float n = std::max((*aux)[i * 4 + 3], 1.0f);
+            for (int c = 0; c < 3; ++c) (*albedo)[i * 3 + c] = (*aux)[i * 4 + c] / n;
+        }
+    }
+    if (normal) {
+        normal->resize(pixels * 3);
+        for (size_t i = 0; i < pixels; ++i) {
+            const float n = std::max((*aux)[(pixels + i) * 4 + 3], 1.0f);
+            for (int c = 0; c < 3; ++c) (*normal)[i * 3 + c] = (*aux)[(pixels + i) * 4 + c] / n;
+        }
+    }
+}
+} // namespace
+
 bool PathTracer::readTraced(std::vector<float>& rgb, std::vector<float>* albedo, std::vector<float>* normal) const {
     if (!accum_ || !aux_ || samples_ == 0) return false;
     waitForSample();
     const size_t pixels = (size_t)traceWidth_ * traceHeight_;
     std::vector<float> sums(pixels * 4);
     if (!accum_->download(0, sums.size() * 4, sums.data())) return false;
-    const float scale = std::exp2(exposure_);
-    rgb.resize(pixels * 3);
-    for (size_t i = 0; i < pixels; ++i) {
-        const float n = std::max(sums[i * 4 + 3], 1.0f);
-        for (int c = 0; c < 3; ++c) rgb[i * 3 + c] = sums[i * 4 + c] / n * scale;
-    }
+    std::vector<float> aux;
     if (albedo || normal) {
-        std::vector<float> aux(pixels * 8);
+        aux.resize(pixels * 8);
         if (!aux_->download(0, aux.size() * 4, aux.data())) return false;
-        // Each pixel's own count (w): adaptive sampling stops pixels early.
-        if (albedo) {
-            albedo->resize(pixels * 3);
-            for (size_t i = 0; i < pixels; ++i) {
-                const float n = std::max(aux[i * 4 + 3], 1.0f);
-                for (int c = 0; c < 3; ++c) (*albedo)[i * 3 + c] = aux[i * 4 + c] / n;
-            }
-        }
-        if (normal) {
-            normal->resize(pixels * 3);
-            for (size_t i = 0; i < pixels; ++i) {
-                const float n = std::max(aux[(pixels + i) * 4 + 3], 1.0f);
-                for (int c = 0; c < 3; ++c) (*normal)[i * 3 + c] = aux[(pixels + i) * 4 + c] / n;
-            }
-        }
     }
+    averageSums(sums, albedo || normal ? &aux : nullptr, pixels, exposure_, rgb, albedo, normal);
     return true;
 }
 
@@ -1530,8 +1616,92 @@ bool PathTracer::denoiserAvailable() noexcept {
 #endif
 }
 
+#if defined(CAMPELLO_RENDERER_DENOISER)
+namespace {
+/// Filters `color` (w x h rgb, in place) guided by `albedo` and `normal`
+/// on `state`'s device, making its filters and buffers when the size or
+/// settings changed (committing a filter loads its weights) and keeping
+/// them for the next call. False on an error: start afresh with a new
+/// state. May throw (oidn).
+bool filterImage(DenoiserState& state, std::vector<float>& color, std::vector<float>& albedo, std::vector<float>& normal,
+                 uint32_t w, uint32_t h, int quality, bool prefilter) {
+    const size_t bytes = color.size() * sizeof(float);
+    if (state.width != w || state.height != h || state.quality != quality || state.prefilter != prefilter) {
+        if (state.width != w || state.height != h || !state.color) {
+            state.color = state.device.newBuffer(bytes);
+            state.albedo = state.device.newBuffer(bytes);
+            state.normal = state.device.newBuffer(bytes);
+            state.output = state.device.newBuffer(bytes);
+        }
+        state.albedoFilter = {};
+        state.normalFilter = {};
+        if (prefilter) {
+            // The guides denoised in place, each by itself.
+            state.albedoFilter = state.device.newFilter("RT");
+            state.albedoFilter.setImage("albedo", state.albedo, oidn::Format::Float3, w, h);
+            state.albedoFilter.setImage("output", state.albedo, oidn::Format::Float3, w, h);
+            state.albedoFilter.set("quality", quality);
+            state.albedoFilter.commit();
+            state.normalFilter = state.device.newFilter("RT");
+            state.normalFilter.setImage("normal", state.normal, oidn::Format::Float3, w, h);
+            state.normalFilter.setImage("output", state.normal, oidn::Format::Float3, w, h);
+            state.normalFilter.set("quality", quality);
+            state.normalFilter.commit();
+        }
+        state.filter = state.device.newFilter("RT");
+        state.filter.setImage("color", state.color, oidn::Format::Float3, w, h);
+        state.filter.setImage("albedo", state.albedo, oidn::Format::Float3, w, h);
+        state.filter.setImage("normal", state.normal, oidn::Format::Float3, w, h);
+        state.filter.setImage("output", state.output, oidn::Format::Float3, w, h);
+        state.filter.set("hdr", true);
+        state.filter.set("quality", quality);
+        state.filter.set("cleanAux", prefilter);
+        state.filter.commit();
+        state.width = w;
+        state.height = h;
+        state.quality = quality;
+        state.prefilter = prefilter;
+    }
+    state.color.write(0, bytes, color.data());
+    state.albedo.write(0, bytes, albedo.data());
+    state.normal.write(0, bytes, normal.data());
+    if (state.albedoFilter) state.albedoFilter.execute();
+    if (state.normalFilter) state.normalFilter.execute();
+    state.filter.execute();
+    const char* message = nullptr;
+    if (state.device.getError(message) != oidn::Error::None) return false;
+    state.output.read(0, bytes, color.data());
+    return true;
+}
+
+int oidnQuality(PathTracer::DenoiserQuality quality) {
+    return quality == PathTracer::DenoiserQuality::fast       ? int(oidn::Quality::Fast)
+           : quality == PathTracer::DenoiserQuality::balanced ? int(oidn::Quality::Balanced)
+                                                              : int(oidn::Quality::High);
+}
+} // namespace
+#endif
+
+namespace {
+/// Linear rgb at the traced size (w x h) to the image's (W x H) rgba8:
+/// scaled up (a preview), tone mapped.
+std::vector<uint8_t> displayImage(std::vector<float>& color, uint32_t w, uint32_t h, uint32_t W, uint32_t H,
+                                  PathTracer::ToneMapping toneMapping) {
+    if (w != W || h != H) {
+        std::vector<float> small;
+        small.swap(color);
+        upscale(small, w, h, color, W, H, true);
+    }
+    std::vector<uint8_t> rgba((size_t)W * H * 4);
+    PathTracer::toneMap(color.data(), (size_t)W * H, rgba.data(), toneMapping);
+    return rgba;
+}
+
+} // namespace
+
 bool PathTracer::denoise() {
 #if defined(CAMPELLO_RENDERER_DENOISER)
+    denoiseJob_.reset();  // (joins a denoiseAsync() still running: it uses the filters)
     const auto start = std::chrono::steady_clock::now();
     // At the traced size (a preview's is smaller), scaled up after.
     std::vector<float> color, albedo, normal;
@@ -1540,8 +1710,7 @@ bool PathTracer::denoise() {
     try {
         // A GPU device where the library has one, else the CPU
         // (setDenoiserDevice()); no sharing with campello_gpu's device. Its
-        // filter and buffers are kept for the next image of the same size:
-        // committing a filter loads its weights.
+        // filter and buffers are kept for the next image of the same size.
         auto* state = static_cast<DenoiserState*>(denoiser_.get());
         if (!state) {
             auto created = std::make_shared<DenoiserState>();
@@ -1550,83 +1719,146 @@ bool PathTracer::denoise() {
             denoiser_ = created;
             state = created.get();
         }
-        const size_t bytes = color.size() * sizeof(float);
-        const int quality = denoiserQuality_ == DenoiserQuality::fast       ? int(oidn::Quality::Fast)
-                            : denoiserQuality_ == DenoiserQuality::balanced ? int(oidn::Quality::Balanced)
-                                                                            : int(oidn::Quality::High);
-        if (state->width != w || state->height != h || state->quality != quality || state->prefilter != denoiserPrefilter_) {
-            if (state->width != w || state->height != h || !state->color) {
-                state->color = state->device.newBuffer(bytes);
-                state->albedo = state->device.newBuffer(bytes);
-                state->normal = state->device.newBuffer(bytes);
-                state->output = state->device.newBuffer(bytes);
-            }
-            state->albedoFilter = {};
-            state->normalFilter = {};
-            if (denoiserPrefilter_) {
-                // The guides denoised in place, each by itself.
-                state->albedoFilter = state->device.newFilter("RT");
-                state->albedoFilter.setImage("albedo", state->albedo, oidn::Format::Float3, w, h);
-                state->albedoFilter.setImage("output", state->albedo, oidn::Format::Float3, w, h);
-                state->albedoFilter.set("quality", quality);
-                state->albedoFilter.commit();
-                state->normalFilter = state->device.newFilter("RT");
-                state->normalFilter.setImage("normal", state->normal, oidn::Format::Float3, w, h);
-                state->normalFilter.setImage("output", state->normal, oidn::Format::Float3, w, h);
-                state->normalFilter.set("quality", quality);
-                state->normalFilter.commit();
-            }
-            state->filter = state->device.newFilter("RT");
-            state->filter.setImage("color", state->color, oidn::Format::Float3, w, h);
-            state->filter.setImage("albedo", state->albedo, oidn::Format::Float3, w, h);
-            state->filter.setImage("normal", state->normal, oidn::Format::Float3, w, h);
-            state->filter.setImage("output", state->output, oidn::Format::Float3, w, h);
-            state->filter.set("hdr", true);
-            state->filter.set("quality", quality);
-            state->filter.set("cleanAux", denoiserPrefilter_);
-            state->filter.commit();
-            state->width = w;
-            state->height = h;
-            state->quality = quality;
-            state->prefilter = denoiserPrefilter_;
-        }
-        state->color.write(0, bytes, color.data());
-        state->albedo.write(0, bytes, albedo.data());
-        state->normal.write(0, bytes, normal.data());
-        if (state->albedoFilter) state->albedoFilter.execute();
-        if (state->normalFilter) state->normalFilter.execute();
-        state->filter.execute();
-        const char* message = nullptr;
-        if (state->device.getError(message) != oidn::Error::None) {
+        if (!filterImage(*state, color, albedo, normal, w, h, oidnQuality(denoiserQuality_), denoiserPrefilter_)) {
             denoiser_.reset();  // start afresh next time
             return false;
         }
-        state->output.read(0, bytes, color.data());
     } catch (...) {
         denoiser_.reset();
         return false;
     }
-    if (w != width_ || h != height_) {
-        std::vector<float> small;
-        small.swap(color);
-        upscale(small, w, h, color, width_, height_, true);
-    }
-    std::vector<uint8_t> rgba((size_t)width_ * height_ * 4);
-    toneMap(color.data(), (size_t)width_ * height_, rgba.data(), toneMapping_);
+    auto rgba = displayImage(color, w, h, width_, height_, toneMapping_);
     device_->waitForIdle();
     if (!output_->upload(0, rgba.size(), rgba.data())) return false;
     denoised_ = true;
     denoiseMs_ = millisecondsSince(start);
-    if (firstDenoisedMs_ == 0.0) {
-        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch())
-                                .count();
-        firstDenoisedMs_ = static_cast<double>(now - imageStartNs_) * 1e-6;
-    }
+    if (firstDenoisedMs_ == 0.0) firstDenoisedMs_ = static_cast<double>(nowNs() - imageStartNs_) * 1e-6;
     return true;
 #else
     return false;
 #endif
+}
+
+// A denoiseAsync() in progress: its inputs (copies of the samples, made on
+// the GPU), its worker thread and its result.
+struct PathTracer::DenoiseJob {
+    std::thread worker;
+    std::atomic<bool> done{false};
+    bool ok = false;
+    std::shared_ptr<GPU::Buffer> accum, aux;  // the samples' copies (snapshotAccum_, snapshotAux_)
+    std::shared_ptr<void> state;              // the denoiser (DenoiserState), made by the worker when null
+    DenoiserDevice device = DenoiserDevice::automatic;  // the setting it was made for
+    uint64_t image = 0;                       // the image and samples it denoises
+    uint32_t samples = 0;
+    uint32_t traceWidth = 0, traceHeight = 0, width = 0, height = 0;
+    float exposure = 0.0f;
+    std::vector<uint8_t> rgba;  // the result, width x height
+    double ms = 0.0;            // wall clock, start to finish
+    ~DenoiseJob() {
+        if (worker.joinable()) worker.join();
+    }
+};
+
+bool PathTracer::denoising() const {
+    return denoiseJob_ && !denoiseJob_->done.load(std::memory_order_acquire);
+}
+
+bool PathTracer::denoiseAsync() {
+#if defined(CAMPELLO_RENDERER_DENOISER)
+    if (!accum_ || !aux_ || samples_ == 0 || denoising()) return false;
+    denoiseJob_.reset();  // a finished one nobody collected
+    const auto start = std::chrono::steady_clock::now();
+    const size_t pixels = (size_t)traceWidth_ * traceHeight_;
+    // Copies of the samples so far, on the GPU after the samples submitted
+    // (render() goes on writing the accumulation meanwhile).
+    const auto readable = (GPU::BufferUsage)(uint32_t(GPU::BufferUsage::copySrc) | uint32_t(GPU::BufferUsage::copyDst));
+    if (!snapshotAccum_ || snapshotAccum_->getLength() != accum_->getLength()) {
+        snapshotAccum_ = device_->createBuffer(accum_->getLength(), readable);
+        snapshotAux_ = device_->createBuffer(aux_->getLength(), readable);
+        if (!snapshotAccum_ || !snapshotAux_) return false;
+    }
+    auto encoder = device_->createCommandEncoder();
+    if (!encoder) return false;
+    encoder->copyBufferToBuffer(accum_, 0, snapshotAccum_, 0, pixels * 16);
+    encoder->copyBufferToBuffer(aux_, 0, snapshotAux_, 0, pixels * 32);
+    device_->submit(encoder->finish());
+
+    auto job = std::make_shared<DenoiseJob>();
+    job->accum = snapshotAccum_;
+    job->aux = snapshotAux_;
+    // The filters of the last call, or of a device made afresh.
+    job->state = denoiser_;
+    job->device = denoiserDevice_;
+    job->image = image_;
+    job->samples = samples_;
+    job->traceWidth = traceWidth_;
+    job->traceHeight = traceHeight_;
+    job->width = width_;
+    job->height = height_;
+    job->exposure = exposure_;
+    DenoiseJob* j = job.get();
+    const DenoiserDevice want = denoiserDevice_;
+    const int quality = oidnQuality(denoiserQuality_);
+    const bool prefilter = denoiserPrefilter_;
+    const ToneMapping toneMapping = toneMapping_;
+    job->worker = std::thread([j, want, quality, prefilter, toneMapping, start] {
+        const size_t pixels = (size_t)j->traceWidth * j->traceHeight;
+        std::vector<float> sums(pixels * 4), aux(pixels * 8);
+        // (Waits for the copies, on this thread: the queue's work before
+        // them, a band of samples at most, finishes first.)
+        if (j->accum->download(0, sums.size() * 4, sums.data()) && j->aux->download(0, aux.size() * 4, aux.data())) {
+            std::vector<float> color, albedo, normal;
+            averageSums(sums, &aux, pixels, j->exposure, color, &albedo, &normal);
+            try {
+                auto state = std::static_pointer_cast<DenoiserState>(j->state);
+                if (!state) {
+                    state = std::make_shared<DenoiserState>();
+                    state->device = newDenoiserDevice(want, state->type);
+                    if (!state->device) state.reset();
+                }
+                if (state && filterImage(*state, color, albedo, normal, j->traceWidth, j->traceHeight, quality, prefilter)) {
+                    j->rgba = displayImage(color, j->traceWidth, j->traceHeight, j->width, j->height, toneMapping);
+                    j->ok = true;
+                    j->state = state;
+                } else {
+                    j->state.reset();  // start afresh next time
+                }
+            } catch (...) {
+                j->state.reset();
+            }
+        }
+        j->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        j->done.store(true, std::memory_order_release);
+    });
+    denoiseJob_ = std::move(job);
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool PathTracer::collectDenoised() {
+    if (!denoiseJob_ || !denoiseJob_->done.load(std::memory_order_acquire)) return false;
+    auto job = std::move(denoiseJob_);
+    job->worker.join();
+    // The filters it used or made, for the next call (none after an error:
+    // made afresh), unless the device setting changed meanwhile.
+    if (job->device == denoiserDevice_) denoiser_ = job->state;
+    if (!job->ok) return false;
+    // Another image since (restart(): view, size, settings; samples_ back to 0).
+    if (job->image != image_ || samples_ < job->samples) return false;
+    // A new texture (CPU-written, so its upload doesn't wait for the GPU),
+    // not one a frame may still be copying from.
+    auto texture = device_->createTexture(GPU::TextureType::tt2d, GPU::PixelFormat::rgba8unorm, job->width, job->height, 1, 1, 1,
+                                          (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
+                                                              uint32_t(GPU::TextureUsage::copySrc) |
+                                                              uint32_t(GPU::TextureUsage::copyDst)));
+    if (!texture || !texture->upload(0, job->rgba.size(), job->rgba.data())) return false;
+    denoisedOutput_ = std::move(texture);
+    denoisedSamples_ = job->samples;
+    denoiseMs_ = job->ms;
+    if (firstDenoisedMs_ == 0.0) firstDenoisedMs_ = static_cast<double>(nowNs() - imageStartNs_) * 1e-6;
+    return true;
 }
 
 } // namespace systems::leal::campello_renderer
