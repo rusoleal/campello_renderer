@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+- **Compressed textures** (`setTextureCompression()`, off by default). `uploadMaterial()`'s 8-bit images and baked procedural textures are encoded once (KTX2 UASTC, campello_image v0.6.0) and uploaded in the device's compressed format, with their mip chain: BC7 on desktop GPUs, ASTC 4x4 on Apple and most mobile GPUs, ETC2 on older ones. That's about a quarter of the GPU memory of RGBA8.
+  - **Cost:** encoding takes about 0.1 s per 512x512 texture on a desktop CPU at the fastest setting (more on one thread, as on the web), once per texture.
+  - **Where it stays RGBA8:** a device without a compressed format; linear data such as normal maps where the only format is sRGB (campello_gpu's ASTC); alpha on ETC2 RGB; sizes that aren't whole 4x4 blocks.
+  - **Not yet:** `setScene()`'s images (the scene asset's own glTF textures).
+  - New test `CompressedTexturesDrawAsTheirPixels`: the baked checkerboard is uploaded compressed (BC7 sRGB here) with its mips and draws its squares; with compression off it stays RGBA8.
+- `run_android_tests.sh`: `CAMPELLO_IMAGE_SOURCE` builds against a local campello_image, as `CAMPELLO_GPU_SOURCE` does for campello_gpu.
+
 ### Changed
 - **Procedural textures (KHR_texture_procedurals) are baked by campello_procedural v0.1.0**, a new library: MaterialX 1.39 standard library nodes (about 70, against about 20 before), with noise ported from MaterialX, so graphs bake as MaterialX renders them. Linked privately; the public API is unchanged.
   - **Standalone materials bake their graphs too.** `uploadMaterial()` resolves procedural texture slots, as `setScene()` does; before, only the scene asset's materials did, so materials built at run time (BIM's) showed their fallback texture.

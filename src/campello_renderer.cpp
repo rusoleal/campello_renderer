@@ -105,6 +105,7 @@ static void trimWebGpuMaterialEntries(systems::leal::campello_gpu::BindGroupDesc
 
 #include <campello_image/image.hpp>
 #include <campello_image/texture_data.hpp>
+#include <campello_image/texture_encoder.hpp>
 #include <campello_image/gpu_format_bridge.hpp>
 #include "procedural_bridge.hpp"
 
@@ -9691,13 +9692,16 @@ std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::proceduralTextur
         // (patterns shimmer in the distance without one).
         const auto rgba = cp::toRGBA8(*image, srgb ? cp::Encoding::srgb : cp::Encoding::linear);
         const uint32_t mipLevels = 1u + (uint32_t)std::floor(std::log2((double)size));
-        texture = device->createTexture(GPU::TextureType::tt2d,
-                                        srgb ? GPU::PixelFormat::rgba8unorm_srgb : GPU::PixelFormat::rgba8unorm, size,
-                                        size, 1, mipLevels, 1,
-                                        (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
-                                                            (uint32_t)GPU::TextureUsage::copyDst));
+        texture = compressedTexture(rgba.data(), size, size, srgb);
+        if (!texture) {
+            texture = device->createTexture(GPU::TextureType::tt2d,
+                                            srgb ? GPU::PixelFormat::rgba8unorm_srgb : GPU::PixelFormat::rgba8unorm, size,
+                                            size, 1, mipLevels, 1,
+                                            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                                                (uint32_t)GPU::TextureUsage::copyDst));
+            if (texture) uploadWithMips(texture, rgba.data(), size, size, mipLevels, srgb);
+        }
         if (texture) {
-            uploadWithMips(texture, rgba.data(), size, size, mipLevels, srgb);
             // Its average colour (the path tracer's stand-in), linear.
             double sum[3] = {0.0, 0.0, 0.0};
             for (size_t i = 0; i < image->rgba.size(); i += 4) {
@@ -9720,6 +9724,36 @@ std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::proceduralTextur
         proceduralSampler = device->createSampler(sd);
     }
     proceduralBakedTextures[key] = texture;  // (null too: not retried every material)
+    return texture;
+}
+
+std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::compressedTexture(const uint8_t* rgba, uint32_t width,
+                                                                                  uint32_t height, bool srgb) {
+    namespace GPU = systems::leal::campello_gpu;
+    namespace CI = systems::leal::campello_image;
+    if (!textureCompression || !device || !rgba || !CI::canEncode() || width % 4 != 0 || height % 4 != 0) return nullptr;
+    const CI::TextureFormat target = chooseBasisTargetFormat(device);
+    if (target == CI::TextureFormat::rgba8) return nullptr;  // no compressed format on this device
+    // campello_gpu has ASTC only as sRGB: linear data (normal maps) stays RGBA8.
+    if (!srgb && target == CI::TextureFormat::astc_4x4_unorm) return nullptr;
+    // ETC2 RGB has no alpha.
+    if (target == CI::TextureFormat::etc2_rgb8unorm) {
+        for (size_t i = 3; i < (size_t)width * height * 4; i += 4) {
+            if (rgba[i] != 255) return nullptr;
+        }
+    }
+    CI::EncodeOptions options;
+    options.srgb = srgb;
+    options.mipmaps = true;
+    options.wrap = true;  // textures repeat across surfaces
+    options.effort = 0;   // the fastest: encoded at run time
+    const auto data = CI::compressRGBA8(rgba, width, height, target, options);
+    if (!data) return nullptr;
+    auto texture = device->createTexture(GPU::TextureType::tt2d, textureDataFormatToPixelFormat(data->getFormat(), srgb),
+                                         width, height, 1, data->getMipLevelCount(), 1,
+                                         (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                                             (uint32_t)GPU::TextureUsage::copyDst));
+    if (!texture || !uploadTextureDataWithMips(device, texture, *data)) return nullptr;
     return texture;
 }
 
@@ -10013,11 +10047,18 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
         const uint32_t mipLevels = mipmapped
             ? 1u + (uint32_t)std::floor(std::log2((double)std::max(img->getWidth(), img->getHeight())))
             : 1u;
-        auto texture = device->createTexture(
-            GPU::TextureType::tt2d, fmt,
-            img->getWidth(), img->getHeight(), 1, mipLevels, 1,
-            (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
-                                (uint32_t)GPU::TextureUsage::copyDst));
+        // Compressed for the GPU when asked (setTextureCompression()).
+        std::shared_ptr<GPU::Texture> texture =
+            mipmapped ? compressedTexture(static_cast<const uint8_t*>(img->getData()), img->getWidth(), img->getHeight(), srgb)
+                      : nullptr;
+        const bool compressed = texture != nullptr;
+        if (!texture) {
+            texture = device->createTexture(
+                GPU::TextureType::tt2d, fmt,
+                img->getWidth(), img->getHeight(), 1, mipLevels, 1,
+                (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                    (uint32_t)GPU::TextureUsage::copyDst));
+        }
         if (texture && img->getFormat() == systems::leal::campello_image::ImageFormat::rgba8) {
             // Its average colour in linear light (the path tracer's stand-in).
             const auto* px = static_cast<const uint8_t*>(img->getData());
@@ -10033,7 +10074,9 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
                 textureAverages[texture.get()] = {(float)(sum[0] / count), (float)(sum[1] / count), (float)(sum[2] / count)};
             }
         }
-        if (texture && mipLevels == 1) {
+        if (compressed) {
+            // Uploaded with its mips.
+        } else if (texture && mipLevels == 1) {
             texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
         } else if (texture) {
             uploadWithMips(texture, static_cast<const uint8_t*>(img->getData()), img->getWidth(), img->getHeight(),
