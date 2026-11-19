@@ -8,6 +8,8 @@
   - **Where it stays RGBA8:** a device without a compressed format; linear data such as normal maps where the only format is sRGB (campello_gpu's ASTC); alpha on ETC2 RGB; sizes that aren't whole 4x4 blocks.
   - **Not yet:** `setScene()`'s images (the scene asset's own glTF textures).
   - New test `CompressedTexturesDrawAsTheirPixels`: the baked checkerboard is uploaded compressed (BC7 sRGB here) with its mips and draws its squares; with compression off it stays RGBA8.
+- **campello_image v0.6.0** (KTX2 encoding).
+- **campello_gpu v0.33.1**: compressed formats on Intel Macs (ASTC was reported, and its textures failed Metal validation) and compressed uploads on Vulkan (rows were skewed). Compressed textures need both.
 - `run_android_tests.sh`: `CAMPELLO_IMAGE_SOURCE` builds against a local campello_image, as `CAMPELLO_GPU_SOURCE` does for campello_gpu.
 
 ### Changed
