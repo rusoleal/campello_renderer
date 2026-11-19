@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **campello_gpu v0.33.2**, whose WebGPU backend copies compressed mips smaller than a block (2×2, 1×1) as whole blocks. Compressed textures have their whole mip chain again (v0.28.0 stopped them at 4×4 to avoid that bug).
+
 ## [0.28.0] - 2026-11-19
 
 ### Added

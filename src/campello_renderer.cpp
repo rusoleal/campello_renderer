@@ -768,24 +768,6 @@ static systems::leal::campello_gpu::PixelFormat textureDataFormatToPixelFormat(
     }
 }
 
-// The mips of a texture uploaded by uploadTextureDataWithMips(): a
-// compressed texture's stop at the last one still a whole block across
-// (4x4 for BC7, ASTC 4x4, ETC2). Smaller ones hold that one block anyway,
-// and WebGPU copies only whole blocks into a texture, which campello_gpu
-// doesn't round a 2x2 or 1x1 mip's copy up to.
-static uint32_t uploadedMipCount(const systems::leal::campello_image::TextureData& texData)
-{
-    uint32_t count = std::max(1u, texData.getMipLevelCount());
-    if (!texData.isCompressed()) return count;
-    while (count > 1) {
-        const uint32_t w = std::max(1u, texData.getWidth() >> (count - 1));
-        const uint32_t h = std::max(1u, texData.getHeight() >> (count - 1));
-        if (w >= texData.getBlockWidth() && h >= texData.getBlockHeight()) break;
-        --count;
-    }
-    return count;
-}
-
 static bool uploadTextureDataWithMips(
     const std::shared_ptr<systems::leal::campello_gpu::Device>& device,
     const std::shared_ptr<systems::leal::campello_gpu::Texture>& texture,
@@ -797,7 +779,7 @@ static bool uploadTextureDataWithMips(
     // (and D3D12) copy rows from a buffer only at that pitch, which a
     // compressed mip narrower than 64 texels (or an RGBA8 one) doesn't have
     // packed. Metal and Vulkan take any pitch.
-    const uint32_t mipCount = uploadedMipCount(texData);
+    const uint32_t mipCount = std::max(1u, texData.getMipLevelCount());
     constexpr uint64_t ROW_ALIGNMENT = 256;
     constexpr uint64_t MIP_ALIGNMENT = 512;
     struct MipCopy {
@@ -1935,7 +1917,7 @@ void Renderer::setScene(uint32_t index) {
                         auto texture = device->createTexture(
                             GPU::TextureType::tt2d, fmt,
                             texData->getWidth(), texData->getHeight(), 1,
-                            uploadedMipCount(*texData), 1,
+                            texData->getMipLevelCount(), 1,
                             (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                                 (uint32_t)GPU::TextureUsage::copyDst));
                         if (texture != nullptr) {
@@ -9795,7 +9777,7 @@ std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::compressedTextur
     const auto data = CI::compressRGBA8(rgba, width, height, target, options);
     if (!data) return nullptr;
     auto texture = device->createTexture(GPU::TextureType::tt2d, textureDataFormatToPixelFormat(data->getFormat(), srgb),
-                                         width, height, 1, uploadedMipCount(*data), 1,
+                                         width, height, 1, data->getMipLevelCount(), 1,
                                          (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                                              (uint32_t)GPU::TextureUsage::copyDst));
     if (!texture || !uploadTextureDataWithMips(device, texture, *data)) return nullptr;
@@ -10042,7 +10024,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
             auto texture = device->createTexture(
                 GPU::TextureType::tt2d, fmt,
                 texData->getWidth(), texData->getHeight(), 1,
-                uploadedMipCount(*texData), 1,
+                texData->getMipLevelCount(), 1,
                 (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                     (uint32_t)GPU::TextureUsage::copyDst));
             if (texture && !uploadTextureDataWithMips(device, texture, *texData)) {
