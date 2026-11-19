@@ -739,6 +739,22 @@ static systems::leal::campello_image::TextureFormat chooseBasisTargetFormat(
     return TextureFormat::rgba8;
 }
 
+// The format a KTX2/Basis texture transcodes to: chooseBasisTargetFormat(),
+// except for linear data (normal maps, metallic-roughness...) where that is
+// ASTC, which campello_gpu has only as sRGB (decoding linear data as sRGB
+// skews it): BC7 where the GPU has it, else RGBA8.
+static systems::leal::campello_image::TextureFormat basisTargetFormatFor(
+    const std::shared_ptr<systems::leal::campello_gpu::Device>& device, bool srgb)
+{
+    using systems::leal::campello_image::TextureFormat;
+    const TextureFormat format = chooseBasisTargetFormat(device);
+    if (srgb || format != TextureFormat::astc_4x4_unorm) return format;
+    if (device && device->getFeatures().count(systems::leal::campello_gpu::Feature::bcTextureCompression)) {
+        return TextureFormat::bc7_rgba_unorm;
+    }
+    return TextureFormat::rgba8;
+}
+
 static systems::leal::campello_gpu::PixelFormat textureDataFormatToPixelFormat(
     systems::leal::campello_image::TextureFormat tfmt,
     bool wantsSrgb)
@@ -761,6 +777,24 @@ static systems::leal::campello_gpu::PixelFormat textureDataFormatToPixelFormat(
     }
 }
 
+// The mips of a texture uploaded by uploadTextureDataWithMips(): a
+// compressed texture's stop at the last one still a whole block across
+// (4x4 for BC7, ASTC 4x4, ETC2). Smaller ones hold that one block anyway,
+// and WebGPU copies only whole blocks into a texture, which campello_gpu
+// doesn't round a 2x2 or 1x1 mip's copy up to.
+static uint32_t uploadedMipCount(const systems::leal::campello_image::TextureData& texData)
+{
+    uint32_t count = std::max(1u, texData.getMipLevelCount());
+    if (!texData.isCompressed()) return count;
+    while (count > 1) {
+        const uint32_t w = std::max(1u, texData.getWidth() >> (count - 1));
+        const uint32_t h = std::max(1u, texData.getHeight() >> (count - 1));
+        if (w >= texData.getBlockWidth() && h >= texData.getBlockHeight()) break;
+        --count;
+    }
+    return count;
+}
+
 static bool uploadTextureDataWithMips(
     const std::shared_ptr<systems::leal::campello_gpu::Device>& device,
     const std::shared_ptr<systems::leal::campello_gpu::Texture>& texture,
@@ -768,44 +802,51 @@ static bool uploadTextureDataWithMips(
 {
     using namespace systems::leal::campello_gpu;
 
-    // Calculate total staging size.
-    size_t totalBytes = 0;
-    for (uint32_t mip = 0; mip < texData.getMipLevelCount(); ++mip) {
-        totalBytes += texData.getDataSize(mip);
+    // Each mip's rows padded to 256 bytes and its start to 512: WebGPU
+    // (and D3D12) copy rows from a buffer only at that pitch, which a
+    // compressed mip narrower than 64 texels (or an RGBA8 one) doesn't have
+    // packed. Metal and Vulkan take any pitch.
+    const uint32_t mipCount = uploadedMipCount(texData);
+    constexpr uint64_t ROW_ALIGNMENT = 256;
+    constexpr uint64_t MIP_ALIGNMENT = 512;
+    struct MipCopy {
+        uint64_t offset;
+        uint64_t rowBytes;
+        uint64_t pitch;
+        uint32_t rows;
+    };
+    std::vector<MipCopy> copies;
+    uint64_t totalBytes = 0;
+    for (uint32_t mip = 0; mip < mipCount; ++mip) {
+        const uint32_t mipWidth  = std::max(1u, texData.getWidth()  >> mip);
+        const uint32_t mipHeight = std::max(1u, texData.getHeight() >> mip);
+        const uint32_t blockW = texData.isCompressed() ? texData.getBlockWidth() : 1u;
+        const uint32_t blockH = texData.isCompressed() ? texData.getBlockHeight() : 1u;
+        const uint64_t rowBytes = static_cast<uint64_t>((mipWidth + blockW - 1) / blockW) * texData.getBlockBytes();
+        const uint32_t rows = (mipHeight + blockH - 1) / blockH;
+        if (rowBytes * rows > texData.getDataSize(mip)) return false;
+        const uint64_t pitch = (rowBytes + ROW_ALIGNMENT - 1) / ROW_ALIGNMENT * ROW_ALIGNMENT;
+        totalBytes = (totalBytes + MIP_ALIGNMENT - 1) / MIP_ALIGNMENT * MIP_ALIGNMENT;
+        copies.push_back({totalBytes, rowBytes, pitch, rows});
+        totalBytes += pitch * rows;
     }
 
+    std::vector<uint8_t> staged(totalBytes, 0);
+    for (uint32_t mip = 0; mip < mipCount; ++mip) {
+        const auto& copy = copies[mip];
+        const auto* src = static_cast<const uint8_t*>(texData.getData(mip));
+        for (uint32_t row = 0; row < copy.rows; ++row) {
+            std::memcpy(staged.data() + copy.offset + row * copy.pitch, src + row * copy.rowBytes, copy.rowBytes);
+        }
+    }
     auto staging = device->createBuffer(totalBytes, BufferUsage::copySrc);
     if (!staging) return false;
-
-    size_t offset = 0;
-    for (uint32_t mip = 0; mip < texData.getMipLevelCount(); ++mip) {
-        staging->upload(offset, texData.getDataSize(mip),
-                        const_cast<void*>(texData.getData(mip)));
-        offset += texData.getDataSize(mip);
-    }
+    staging->upload(0, totalBytes, staged.data());
 
     auto encoder = device->createCommandEncoder();
     if (!encoder) return false;
-
-    offset = 0;
-    for (uint32_t mip = 0; mip < texData.getMipLevelCount(); ++mip) {
-        uint32_t mipWidth  = std::max(1u, texData.getWidth()  >> mip);
-        uint32_t mipHeight = std::max(1u, texData.getHeight() >> mip);
-
-        uint32_t blockW = texData.getBlockWidth();
-        uint32_t blockH = texData.getBlockHeight();
-        uint32_t blockBytes = texData.getBlockBytes();
-
-        uint64_t bytesPerRow = 0;
-        if (texData.isCompressed()) {
-            uint32_t blocksX = (mipWidth + blockW - 1) / blockW;
-            bytesPerRow = static_cast<uint64_t>(blocksX) * blockBytes;
-        } else {
-            bytesPerRow = static_cast<uint64_t>(mipWidth) * blockBytes;
-        }
-
-        encoder->copyBufferToTexture(staging, offset, bytesPerRow, texture, mip, 0);
-        offset += texData.getDataSize(mip);
+    for (uint32_t mip = 0; mip < mipCount; ++mip) {
+        encoder->copyBufferToTexture(staging, copies[mip].offset, copies[mip].pitch, texture, mip, 0);
     }
 
     auto fence = device->createFence();
@@ -1868,7 +1909,6 @@ void Renderer::setScene(uint32_t index) {
     std::vector<std::shared_ptr<GPU::Texture>> texturesNeedingMips;
 
     // Decode and upload images referenced by this scene.
-    systems::leal::campello_image::TextureFormat basisTargetFormat = chooseBasisTargetFormat(device);
     for (int a = 0; a < (int)info->images.size(); a++) {
         if (info->images[a]) {
             if (gpuTextures[a] == nullptr) {
@@ -1880,6 +1920,7 @@ void Renderer::setScene(uint32_t index) {
                     // ------------------------------------------------------------------
                     // KHR_texture_basisu path — use TextureData for GPU-compressed upload.
                     // ------------------------------------------------------------------
+                    const auto basisTargetFormat = basisTargetFormatFor(device, wantsSrgb);
                     std::shared_ptr<systems::leal::campello_image::TextureData> texData;
                     if (image.data.size() > 0) {
                         texData = systems::leal::campello_image::TextureData::fromMemory(
@@ -1905,7 +1946,7 @@ void Renderer::setScene(uint32_t index) {
                         auto texture = device->createTexture(
                             GPU::TextureType::tt2d, fmt,
                             texData->getWidth(), texData->getHeight(), 1,
-                            texData->getMipLevelCount(), 1,
+                            uploadedMipCount(*texData), 1,
                             (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                                 (uint32_t)GPU::TextureUsage::copyDst));
                         if (texture != nullptr) {
@@ -9883,6 +9924,10 @@ std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::proceduralTextur
     return texture;
 }
 
+bool Renderer::canCompressTextures(bool srgb) const {
+    return basisTargetFormatFor(device, srgb) != systems::leal::campello_image::TextureFormat::rgba8;
+}
+
 std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::compressedTexture(const uint8_t* rgba, uint32_t width,
                                                                                   uint32_t height, bool srgb) {
     namespace GPU = systems::leal::campello_gpu;
@@ -9906,7 +9951,7 @@ std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::compressedTextur
     const auto data = CI::compressRGBA8(rgba, width, height, target, options);
     if (!data) return nullptr;
     auto texture = device->createTexture(GPU::TextureType::tt2d, textureDataFormatToPixelFormat(data->getFormat(), srgb),
-                                         width, height, 1, data->getMipLevelCount(), 1,
+                                         width, height, 1, uploadedMipCount(*data), 1,
                                          (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                                              (uint32_t)GPU::TextureUsage::copyDst));
     if (!texture || !uploadTextureDataWithMips(device, texture, *data)) return nullptr;
@@ -10128,7 +10173,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
             // can't parse KTX2/.basis bytes at all.
             // ------------------------------------------------------------
             std::shared_ptr<systems::leal::campello_image::TextureData> texData;
-            auto basisTargetFormat = chooseBasisTargetFormat(device);
+            const auto basisTargetFormat = basisTargetFormatFor(device, srgb);
             if (!image.data.empty()) {
                 texData = systems::leal::campello_image::TextureData::fromMemory(
                     image.data.data(), image.data.size(), basisTargetFormat);
@@ -10153,11 +10198,46 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
             auto texture = device->createTexture(
                 GPU::TextureType::tt2d, fmt,
                 texData->getWidth(), texData->getHeight(), 1,
-                texData->getMipLevelCount(), 1,
+                uploadedMipCount(*texData), 1,
                 (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
                                     (uint32_t)GPU::TextureUsage::copyDst));
             if (texture && !uploadTextureDataWithMips(device, texture, *texData)) {
                 texture = nullptr;
+            }
+            // A colour texture's average (the path tracer's stand-in, and
+            // what records it as GpuMaterial::baseColorTexture): its smallest
+            // mip, transcoded to RGBA8 (the whole image when it has no mips).
+            const uint8_t* bytes = nullptr;
+            size_t length = 0;
+            if (!image.data.empty()) {
+                bytes = image.data.data();
+                length = image.data.size();
+            } else if (image.bufferView != -1 && asset.bufferViews && asset.buffers) {
+                auto& bufferView = (*asset.bufferViews)[image.bufferView];
+                auto& buffer = (*asset.buffers)[bufferView.buffer];
+                if (!buffer.data.empty()) {
+                    bytes = buffer.data.data() + bufferView.byteOffset;
+                    length = bufferView.byteLength;
+                }
+            }
+            if (texture && srgb && bytes) {
+                if (auto rgba = systems::leal::campello_image::TextureData::fromMemory(
+                        bytes, length, systems::leal::campello_image::TextureFormat::rgba8)) {
+                    const uint32_t level = rgba->getMipLevelCount() - 1;
+                    const auto* px = static_cast<const uint8_t*>(rgba->getData(level));
+                    const size_t count = rgba->getDataSize(level) / 4;
+                    double sum[3] = {0.0, 0.0, 0.0};
+                    for (size_t i = 0; i < count; ++i) {
+                        for (int c = 0; c < 3; ++c) {
+                            const double v = px[i * 4 + (size_t)c] / 255.0;
+                            sum[c] += v <= 0.04045 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4);
+                        }
+                    }
+                    if (count > 0) {
+                        textureAverages[texture.get()] = {(float)(sum[0] / count), (float)(sum[1] / count),
+                                                          (float)(sum[2] / count)};
+                    }
+                }
             }
             *cached = texture;
             return texture;

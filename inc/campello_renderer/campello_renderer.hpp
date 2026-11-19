@@ -1764,6 +1764,13 @@ namespace systems::leal::campello_renderer {
         /// textures are uploaded.
         void setTextureCompression(bool enabled) { textureCompression = enabled; }
         bool getTextureCompression() const { return textureCompression; }
+
+        /// True when this device keeps KTX2 (Basis) textures of this kind
+        /// compressed on the GPU: colour data (`srgb`) or linear data (normal
+        /// maps...). Linear data on a GPU whose compressed format is ASTC (Apple,
+        /// most mobile GPUs) is transcoded to RGBA8, since campello_gpu has ASTC
+        /// only as sRGB; an app encoding its own KTX2 textures can skip those.
+        bool canCompressTextures(bool srgb) const;
         int getProceduralBakeSize() const;
 
         std::shared_ptr<systems::leal::campello_gpu::Device> getDevice() const { return device; }
