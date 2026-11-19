@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.25.0] - 2026-11-19
 
 ### Added
 - **Material specialization** (`setMaterialSpecialization()`, on by default; Metal and Vulkan). The PBR fragment shader is compiled per set of optional features a material uses (KHR_materials_specular, sheen, clearcoat, transmission with volume and dispersion, iridescence, anisotropy, world mapping, unlit, the debug views), through campello_gpu v0.32.0's shader constants (Metal: function constant 0, `kMaterialFeatures`; Vulkan: specialization constant 0 in `default.frag`, which reads the optional features' fields through `MAT_<field>` macros that give the off value as a constant; a first version copied the uniform block into a local struct, which an Adreno 642L kept in scratch memory and ran 7x slower). Unused features' code is left out. On Vulkan the flat variant (the same fragment shader) is specialized too.
@@ -17,7 +17,7 @@
 
 ### Changed
 - **campello_gpu v0.33.0**: pipeline-time shader constants (material specialization), texture views that keep their texture alive on Vulkan, and failed Vulkan submissions reported.
-- **Test results:** macOS 151 passed (also with Metal API validation); Android: Adreno 642L (Galaxy Tab S7 FE, Android 14) 111 passed, 0 failed.
+- **Test results:** macOS 145 passed (also with Metal API validation); Android: Adreno 642L (Galaxy Tab S7 FE, Android 14) 111 passed, 0 failed.
 
 ### Fixed
 - **Nothing drew after the environment bake on some Adreno GPUs** (Vulkan). With pipelines created before `setAsset()` (the usual order), `setAsset()` bakes the environment's image-based lighting, and its 67 jobs were queued at once: an Adreno 642L (Galaxy Tab S7 FE) lost the device, so every later submission failed and frames came out empty, and an Adreno 618 wedged its driver. Natively each job is now waited for before the next. New test `FramesDrawAfterTheEnvironmentBake` (fails on the Adreno 642L without the fix).
