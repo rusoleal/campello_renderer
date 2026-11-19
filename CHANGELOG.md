@@ -19,6 +19,20 @@
 ### Deprecated
 - **`bakeProceduralTextureGPU()`** is now the CPU bake (the device is unused). The GPU baker evaluated its own subset of nodes with its own noise, and its results differed from the CPU's. Its compute kernels are still in the shader sources, unused, until they're removed or rebuilt on campello_procedural's programs. Its 7 GPU-vs-CPU tests are removed.
 
+## [0.26.0] - 2026-11-19
+
+### Added
+- **`PathTracer::denoiseAsync()`**: denoises the image so far without blocking the caller. The samples are copied on the GPU (submitted, not waited for); a worker thread reads the copy back, runs Open Image Denoise as `denoise()` does and tone maps it, while `render()` goes on tracing. `collectDenoised()` picks the result up without waiting into `denoisedOutput()` (a new texture each time, with `denoisedSamples()`), and drops the result of an image that started again since (another view, size or setting). `denoising()` tells whether one is running; `denoise()` waits for a running one first. An interactive viewer's denoise at 8, 32, 128 and 512 samples blocked its UI thread for 380-480 ms each (CPU denoiser, Intel UHD 630, 470x800); now it spends under a millisecond there.
+- **`PathTracer::imageNumber()`**: a new number each time `render()` starts an image, so a caller can tell whether what it kept is of the current one.
+- New tests `PathTracerTracesASampleInBandsWithinTheBudget` and `PathTracerDenoisesOnAWorkerThread`.
+
+### Changed
+- **`setFrameBudget()` splits a sample into bands of rows** when one sample of the whole image takes longer than the budget: each `render()` traces as many rows as fit, sized from each row's GPU time measured in the previous sample (rows cost very different amounts: sky, glass, interiors), at least 4k pixels and 8 rows; until a band is measured, an eighth of the image. `sampleCount()` counts a sample once its last band is submitted, and the bands add up to exactly the image whole samples make. A sample that keeps the GPU busy for 100 ms then never holds back the caller's other GPU work (its UI) for longer than about the budget. Shader: `pathTrace` offsets its rows by `TraceUniforms::lights.y`.
+- **Up to two `render()` calls' work on the GPU at once**, so the GPU doesn't idle between calls (the uniforms and the converged-pixel counter are per slot). A third call waits for the first; rebuilds, a new size, a new environment table, new portals and the read and denoise calls wait for all of it. `sampleInFlight()` now tells whether the next `render()` would wait.
+- **The converged-pixel count is read back only with a noise target** (`setNoiseTarget()`): reading it waits for the GPU's queue, and every finished sample read it.
+- Measured in Campello BIM on a house model (Intel UHD 630, 470x800, 10 ms budget): frame intervals while tracing went from about 110 ms, with 380-480 ms stalls at each denoise, to 7 ms median, 21 ms at the 99th percentile and 44 ms at most; 128 samples take about 21 s instead of about 14 s.
+- **Test results:** macOS 147 passed (the path tracer tests also with Metal API validation).
+
 ## [0.25.0] - 2026-11-19
 
 ### Added

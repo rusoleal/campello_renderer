@@ -130,7 +130,7 @@ struct TraceUniforms {
     float4   cameraUp;      // panorama: up, the poles
     float4   tuning;        // x indirect clamp (0 off), y sampler (0 random, 1 Sobol), z noise target (0 off), w its minimum samples
     uint4    envSampling;   // x environment distribution resolution per cube face (0: none), y light portals, z resolution divisor (preview: 1 / z of the output's), w samples per pixel in this dispatch
-    uint4    lights;        // x emissive triangles sampled as lights
+    uint4    lights;        // x emissive triangles sampled as lights, y first row of this dispatch (a band of a sample)
     float4   camera;        // x lens aperture radius (0: a pinhole), y focus distance, z tone mapping (0 PBR Neutral, 1 ACES, 2 AgX)
     // Probe rays (mode 3, PathTracer::traceProbeRays()): a grid of probes,
     // each tracing rays along rotated spherical Fibonacci directions.
@@ -883,8 +883,11 @@ kernel void pathTrace(instance_acceleration_structure scene      [[buffer(0)]],
                       texture2d<float>                gbufferNormal [[texture(66)]],
                       depth2d<float>                  gbufferDepth  [[texture(67)]],
                       texture2d<float, access::write> reflectionOut [[texture(68)]],
-                      uint2 gid [[thread_position_in_grid]])
+                      uint2 gridPosition [[thread_position_in_grid]])
 {
+    // A band of rows (PathTracer::setFrameBudget()): the grid covers the
+    // band, which starts at row u.lights.y (0 for a whole image).
+    const uint2 gid = uint2(gridPosition.x, gridPosition.y + u.lights.y);
     if (gid.x >= u.size.x || gid.y >= u.size.y) return;
     // Reflections (PathTracer::traceReflections(), mode 2): paths start at
     // the G-buffer's surface, the first direction from its GGX lobe; the
