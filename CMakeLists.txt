@@ -6,6 +6,15 @@ configure_file(src/campello_renderer_config.h.in campello_renderer_config.h)
 
 set(CMAKE_CXX_STANDARD 20)
 
+# WebAssembly SIMD (-msimd128), on by default: every browser with WebGPU has
+# it. Compiles this directory with it (the library and the third-party code it
+# builds); the target passes it on to its consumers below.
+option(CAMPELLO_RENDERER_WASM_SIMD "WebAssembly builds: use SIMD (-msimd128)" ON)
+if(EMSCRIPTEN AND CAMPELLO_RENDERER_WASM_SIMD)
+    add_compile_options(-msimd128)
+    add_link_options(-msimd128)
+endif()
+
 include_directories(inc)
 
 # UWP differs from a desktop Windows build in ways the dependencies don't expect:
@@ -138,6 +147,12 @@ target_include_directories(${PROJECT_NAME} PUBLIC
                            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/inc>
                            $<INSTALL_INTERFACE:include>
                            )
+
+# Consumers compile and link with SIMD too (the link tells wasm-opt to accept it).
+if(EMSCRIPTEN AND CAMPELLO_RENDERER_WASM_SIMD)
+    target_compile_options(${PROJECT_NAME} INTERFACE -msimd128)
+    target_link_options(${PROJECT_NAME} INTERFACE -msimd128)
+endif()
 
 if(CAMPELLO_RENDERER_ECS_SUPPORT)
     # ecs.hpp is header-only; consumers must have campello_core in their include path.

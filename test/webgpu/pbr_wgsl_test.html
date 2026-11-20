@@ -66,7 +66,8 @@ async function main() {
   const smp = (binding) => ({ binding, visibility: F, sampler: { type: 'filtering' } });
   const ubo = (binding) => ({ binding, visibility: F, buffer: { type: 'uniform' } });
   const materialLayout = device.createBindGroupLayout({ entries: [
-    tex(0), smp(1), tex(2), smp(3), tex(4), smp(5), tex(6), smp(7), tex(8), smp(9), ubo(24)] });
+    tex(0), smp(1), tex(2), smp(3), tex(4), smp(5), tex(6), smp(7), tex(8), smp(9),
+    tex(19), tex(20), tex(21), tex(22), ubo(24)] });
   const frameLayout = device.createBindGroupLayout({ entries: [
     ubo(0), ubo(1), tex(2, 'cube'), smp(3), tex(4), smp(5), tex(6, 'cube'), tex(7), smp(8),
     { binding: 9, visibility: F, texture: { sampleType: 'depth', viewDimension: '2d' } },
@@ -134,6 +135,8 @@ async function main() {
     { binding: 4, resource: white2d.createView() }, { binding: 5, resource: sampler },
     { binding: 6, resource: white2d.createView() }, { binding: 7, resource: sampler },
     { binding: 8, resource: white2d.createView() }, { binding: 9, resource: sampler },
+    { binding: 19, resource: white2d.createView() }, { binding: 20, resource: white2d.createView() },
+    { binding: 21, resource: white2d.createView() }, { binding: 22, resource: white2d.createView() },
     { binding: 24, resource: { buffer: ubo } }] });
 
   const proj = perspective(60 * Math.PI / 180, 1, 0.1, 100);

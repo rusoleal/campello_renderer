@@ -7,11 +7,13 @@ namespace systems::leal::campello_renderer::shaders {
 static const char kDefaultWebGpuShader[] = R"WGSL(// campello_renderer built-in PBR mesh shaders, WGSL (WebGPU).
 //
 // Hand-written port of the mesh shaders in shaders/metal/default.metal,
-// limited to WebGPU's default 16 sampled textures per shader stage: glTF
-// core textures (base colour, metallic-roughness, normal, emissive,
-// occlusion) and image-based lighting. Not on WebGPU yet: the KHR extension
-// textures, transmission/volume, sheen, clearcoat, iridescence, anisotropy,
-// dispersion and the flat/debug variants (programmable pipelines phase 7).
+// limited to WebGPU's default 16 sampled textures per shader stage (15 are
+// used): glTF core textures (base colour, metallic-roughness, normal,
+// emissive, occlusion), image-based lighting, and KHR_materials_transmission,
+// _volume (screen-space refraction, attenuation, dispersion) and
+// _iridescence with their textures. Not on WebGPU yet: the specular, sheen,
+// clearcoat and anisotropy extensions and the flat/debug variants
+// (programmable pipelines phase 7).
 //
 // Entry points: vs_main (glTF layout), vs_skinned (glTF layout with
 // JOINTS_0/WEIGHTS_0: skinning and morph targets, group 3), vs_instanced
@@ -131,6 +133,11 @@ struct LightsUniform {
 @group(0) @binding(7)  var emissiveSampler: sampler;
 @group(0) @binding(8)  var occlusionTexture: texture_2d<f32>;
 @group(0) @binding(9)  var occlusionSampler: sampler;
+// KHR extension textures, sampled with baseColorSampler (as on Vulkan).
+@group(0) @binding(19) var transmissionTexture: texture_2d<f32>;          // R = transmission
+@group(0) @binding(20) var thicknessTexture: texture_2d<f32>;             // G = thickness
+@group(0) @binding(21) var iridescenceTexture: texture_2d<f32>;           // R = iridescence
+@group(0) @binding(22) var iridescenceThicknessTexture: texture_2d<f32>;  // G = film thickness
 @group(0) @binding(24) var<uniform> mat: MaterialUniforms;
 
 @group(1) @binding(0)  var<uniform> lights: LightsUniform;
@@ -158,6 +165,10 @@ const kUV1MetallicRoughness: u32 = 2u;
 const kUV1Normal: u32 = 4u;
 const kUV1Emissive: u32 = 8u;
 const kUV1Occlusion: u32 = 16u;
+const kUV1Transmission: u32 = 1u << 12u;
+const kUV1Thickness: u32 = 1u << 13u;
+const kUV1Iridescence: u32 = 1u << 14u;
+const kUV1IridescenceThickness: u32 = 1u << 15u;
 // Line meshes: clip-space depth offset towards the camera (Metal vertexLine).
 const kLineDepthOffset: f32 = 4.0e-6;
 
@@ -486,6 +497,84 @@ fn iblGGXFresnel(NdotV: f32, roughness: f32, F0: vec3f) -> vec3f {
 // their own horizontal direction (u to the right seen from outside, v down),
 // one repeat per `size` world units, so textures run continuously across
 // elements. T and B are the directions u and v grow in (normal mapping).
+// KHR_materials_iridescence (thin-film interference), as in
+// shaders/vulkan/default.frag and the glTF-Sample-Renderer.
+const kXyzToRec709 = mat3x3f(
+    vec3f(3.2404542, -0.9692660, 0.0556434),
+    vec3f(-1.5371385, 1.8760108, -0.2040259),
+    vec3f(-0.4985314, 0.0415560, 1.0572252));
+
+fn fresnel0ToIor(fresnel0: vec3f) -> vec3f {
+    let sqrtF0 = sqrt(clamp(fresnel0, vec3f(0.0), vec3f(0.9999)));
+    return (vec3f(1.0) + sqrtF0) / (vec3f(1.0) - sqrtF0);
+}
+
+fn fresnelDielectric(cosTheta1: f32, n1: f32, n2: f32) -> f32 {
+    let sinTheta2Sq = (n1 * n1) / (n2 * n2) * (1.0 - cosTheta1 * cosTheta1);
+    if (sinTheta2Sq > 1.0) {
+        return 1.0;
+    }
+    let cosTheta2 = sqrt(1.0 - sinTheta2Sq);
+    let rs = (n1 * cosTheta1 - n2 * cosTheta2) / (n1 * cosTheta1 + n2 * cosTheta2);
+    let rp = (n2 * cosTheta1 - n1 * cosTheta2) / (n2 * cosTheta1 + n1 * cosTheta2);
+    return 0.5 * (rs * rs + rp * rp);
+}
+
+fn fresnelDielectric3(cosTheta1: f32, n1: f32, n2: vec3f) -> vec3f {
+    let sinTheta2Sq = (vec3f(n1 * n1) / (n2 * n2)) * (1.0 - cosTheta1 * cosTheta1);
+    let cosTheta2 = sqrt(clamp(vec3f(1.0) - sinTheta2Sq, vec3f(0.0), vec3f(1.0)));
+    let rs = (n1 * cosTheta1 - n2 * cosTheta2) / (n1 * cosTheta1 + n2 * cosTheta2);
+    let rp = (n2 * cosTheta1 - n1 * cosTheta2) / (n2 * cosTheta1 + n1 * cosTheta2);
+    return 0.5 * (rs * rs + rp * rp);
+}
+
+fn evalSensitivity(opd: f32, shift: vec3f) -> vec3f {
+    let phase = 2.0 * PI * opd * 1.0e-9;
+    let val = vec3f(5.4856e-13, 4.4201e-13, 5.2481e-13);
+    let pos = vec3f(1.6810e+06, 1.7953e+06, 2.2084e+06);
+    let vr = vec3f(4.3278e+09, 9.3046e+09, 6.6121e+09);
+    var xyz = val * sqrt(2.0 * PI * vr) * cos(pos * phase + shift) * exp(-phase * phase * vr);
+    xyz.x += 9.7470e-14 * sqrt(2.0 * PI * 4.5282e+09) * cos(2.2399e+06 * phase + shift.x)
+           * exp(-4.5282e+09 * phase * phase);
+    xyz /= 1.0685e-7;
+    return kXyzToRec709 * xyz;
+}
+
+fn evalIridescence(outsideIor: f32, eta2: f32, cosTheta1: f32, thinFilmThickness: f32, baseF0: vec3f) -> vec3f {
+    let iridescenceIor = mix(outsideIor, eta2, smoothstep(0.0, 0.03, thinFilmThickness));
+    let sinTheta2Sq = (outsideIor * outsideIor) / (iridescenceIor * iridescenceIor)
+                    * (1.0 - cosTheta1 * cosTheta1);
+    let cosTheta2Sq = 1.0 - sinTheta2Sq;
+    if (cosTheta2Sq < 0.0) {
+        return vec3f(1.0);
+    }
+    let cosTheta2 = sqrt(cosTheta2Sq);
+
+    let R12 = fresnelDielectric(cosTheta1, outsideIor, iridescenceIor);
+    let T121 = 1.0 - R12;
+    let phi12 = select(0.0, PI, iridescenceIor < outsideIor);
+    let phi21 = PI - phi12;
+
+    let baseIor = fresnel0ToIor(baseF0);
+    let R23 = fresnelDielectric3(cosTheta2, iridescenceIor, baseIor);
+    let phi23 = select(vec3f(0.0), vec3f(PI), baseIor < vec3f(iridescenceIor));
+
+    let opd = 2.0 * iridescenceIor * thinFilmThickness * cosTheta2;
+    let phi = vec3f(phi21) + phi23;
+
+    let R123 = clamp(vec3f(R12) * R23, vec3f(1e-5), vec3f(0.9999));
+    let r123 = sqrt(R123);
+    let Rs = (T121 * T121) * R23 / (vec3f(1.0) - R123);
+
+    var I = vec3f(R12) + Rs;
+    var Cm = Rs - vec3f(T121);
+    for (var m = 1; m <= 2; m++) {
+        Cm *= r123;
+        I += Cm * 2.0 * evalSensitivity(f32(m) * opd, f32(m) * phi);
+    }
+    return max(I, vec3f(0.0));
+}
+
 fn worldMappingFrame(P: vec3f, N: vec3f, size: f32, zUp: bool) -> array<vec3f, 3> {
     let U = select(vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.0, 1.0), zUp);
     let nu = dot(N, U);
@@ -608,6 +697,30 @@ fn fs_main(vIn: VertexOut, @builtin(front_facing) frontFacing: bool) -> @locatio
                                   selectUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1Emissive)).rgb;
     }
 
+    // KHR_materials_transmission / _volume / _iridescence textures (sampled
+    // here, in uniform control flow; used below).
+    var transmission = mat.transmissionFactor;
+    if (mat.hasTransmissionTexture > 0.5) {
+        transmission *= textureSample(transmissionTexture, baseColorSampler,
+                                      selectUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1Transmission)).r;
+    }
+    var thickness = mat.thicknessFactor;
+    if (mat.hasThicknessTexture > 0.5) {
+        thickness *= textureSample(thicknessTexture, baseColorSampler,
+                                   selectUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1Thickness)).g;
+    }
+    var iridescenceFactor = mat.iridescenceFactor;
+    if (mat.hasIridescenceTexture > 0.5) {
+        iridescenceFactor *= textureSample(iridescenceTexture, baseColorSampler,
+                                           selectUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1Iridescence)).r;
+    }
+    var iridescenceThickness = mat.iridescenceThicknessMax;
+    if (mat.hasIridescenceThicknessTexture > 0.5) {
+        iridescenceThickness = mix(mat.iridescenceThicknessMin, mat.iridescenceThicknessMax,
+            textureSample(iridescenceThicknessTexture, baseColorSampler,
+                          selectUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1IridescenceThickness)).g);
+    }
+
     if (mat.viewMode > 0.5) {
         if (abs(mat.viewMode - VIEW_MODE_METALLIC) < 0.5) {
             return vec4f(vec3f(metallic), 1.0);
@@ -647,11 +760,23 @@ fn fs_main(vIn: VertexOut, @builtin(front_facing) frontFacing: bool) -> @locatio
         let envSpecular = textureSampleLevel(environmentMap, environmentSampler, R, roughness * envMaxLod).rgb;
         var f0 = (mat.ior - 1.0) / (mat.ior + 1.0);
         f0 *= f0;
-        let F0 = mix(vec3f(f0) * mat.specularColorFactor.xyz, baseColor.rgb, metallic);
+        var F0 = mix(vec3f(f0) * mat.specularColorFactor.xyz, baseColor.rgb, metallic);
+        if (iridescenceFactor > 0.0) {
+            F0 = mix(F0, evalIridescence(1.0, mat.iridescenceIor, NdotV, iridescenceThickness, F0), iridescenceFactor);
+        }
         iblSpecular = envSpecular * iblGGXFresnel(NdotV, roughness, F0) * mat.environmentIntensity;
     }
 
-    // Punctual lights.
+    // Punctual lights. F0 doesn't depend on the light (iridescence uses
+    // N.V, as on Vulkan), so it's computed once.
+    var lf0 = (mat.ior - 1.0) / (mat.ior + 1.0);
+    lf0 *= lf0;
+    var lightF0 = mix(min(vec3f(lf0) * mat.specularColorFactor.xyz, vec3f(1.0)) * mat.specularFactor,
+                      baseColor.rgb, metallic);
+    if (iridescenceFactor > 0.0) {
+        lightF0 = mix(lightF0, evalIridescence(1.0, mat.iridescenceIor, NdotV, iridescenceThickness, lightF0),
+                      iridescenceFactor);
+    }
     var totalDiffuse = vec3f(0.0);
     var totalSpecular = vec3f(0.0);
     for (var i = 0u; i < min(lights.count, 4u); i++) {
@@ -689,11 +814,7 @@ fn fs_main(vIn: VertexOut, @builtin(front_facing) frontFacing: bool) -> @locatio
         let NdotH = max(dot(N, halfDir), 0.0);
         let VdotH = max(dot(viewDir, halfDir), 0.0);
 
-        var f0 = (mat.ior - 1.0) / (mat.ior + 1.0);
-        f0 *= f0;
-        let F0dielectric = min(vec3f(f0) * mat.specularColorFactor.xyz, vec3f(1.0)) * mat.specularFactor;
-        let F0 = mix(F0dielectric, baseColor.rgb, metallic);
-        let fresnel = F0 + (vec3f(1.0) - F0) * pow(clamp(1.0 - VdotH, 0.0, 1.0), 5.0);
+        let fresnel = lightF0 + (vec3f(1.0) - lightF0) * pow(clamp(1.0 - VdotH, 0.0, 1.0), 5.0);
         let D = D_GGX(roughness, NdotH);
         let Vis = V_SmithGGX(NdotL, NdotV, roughness);
 
@@ -709,21 +830,63 @@ fn fs_main(vIn: VertexOut, @builtin(front_facing) frontFacing: bool) -> @locatio
     if (mat.iblEnabled > 0.5) {
         ambientColor = vec3f(0.0);
     }
-    // KHR_materials_transmission, thin-walled (no refraction offset; volume
-    // isn't on WebGPU): the opaque scene behind, at this fragment's screen
-    // position, blurred by roughness and decoded back to linear light (it's
-    // stored display-encoded). It replaces diffuse light by its share.
+    // KHR_materials_transmission: the opaque scene behind, blurred by
+    // roughness and decoded back to linear light (it's stored
+    // display-encoded). With KHR_materials_volume (thickness > 0) it's
+    // sampled where the refracted ray leaves the volume, per channel with
+    // dispersion, and attenuated (Beer's law); thin-walled, straight behind.
+    // Off screen, the environment along the refracted ray. It replaces
+    // diffuse light by its share. As shaders/vulkan/default.frag.
     var transmitted = vec3f(0.0);
     var transmittance = 0.0;
-    if (mat.transmissionFactor > 0.0 && metallic < 0.99) {
-        let suv = v.clipPosition.xy / camera.screenSize;
+    if (transmission > 0.0 && metallic < 0.99) {
+        let eta = 1.0 / mat.ior;
+        var Trefr = refract(-viewDir, N, eta);
+        if (all(Trefr == vec3f(0.0))) {
+            Trefr = -viewDir;
+        }
+        var sampleUV = array<vec2f, 3>(vec2f(0.0), vec2f(0.0), vec2f(0.0));
+        var uvValid = array<bool, 3>(true, true, true);
+        if (thickness > 0.0) {
+            let viewPos = (camera.viewMatrix * vec4f(v.worldPos, 1.0)).xyz;
+            let viewNormal = normalize((camera.viewMatrix * vec4f(N, 0.0)).xyz);
+            let viewIncident = normalize(viewPos);
+            let spread = mat.dispersion * 0.02;
+            let iorRGB = vec3f(mat.ior + spread, mat.ior, max(mat.ior - spread, 1.001));
+            for (var ch = 0; ch < 3; ch++) {
+                var r = refract(viewIncident, viewNormal, 1.0 / iorRGB[ch]);
+                if (all(r == vec3f(0.0))) {
+                    r = viewIncident;
+                }
+                let backClip = camera.projMatrix * vec4f(viewPos + r * thickness, 1.0);
+                var uvc = backClip.xy / backClip.w * 0.5 + 0.5;
+                uvc.y = 1.0 - uvc.y;
+                sampleUV[ch] = uvc;
+                uvValid[ch] = all(uvc >= vec2f(0.0)) && all(uvc <= vec2f(1.0));
+            }
+        } else {
+            let suv = v.clipPosition.xy / camera.screenSize;
+            sampleUV = array<vec2f, 3>(suv, suv, suv);
+        }
+        // The glTF-Sample-Viewer's LOD.
         let lod = log2(camera.screenSize.x) * roughness * clamp(mat.ior * 2.0 - 2.0, 0.0, 1.0);
-        let behind = textureSampleLevel(sceneColorTexture, sceneColorSampler, suv, lod).rgb;
-        transmitted = pow(max(behind, vec3f(0.0)), vec3f(2.2)) * baseColor.rgb;
+        for (var ch = 0; ch < 3; ch++) {
+            if (uvValid[ch]) {
+                let behind = textureSampleLevel(sceneColorTexture, sceneColorSampler, sampleUV[ch], lod)[ch];
+                transmitted[ch] = pow(max(behind, 0.0), 2.2);
+            } else {
+                transmitted[ch] = textureSampleLevel(environmentMap, environmentSampler, Trefr, 0.0)[ch];
+            }
+        }
+        if (thickness > 0.0 && mat.attenuationDistance > 0.0 && mat.attenuationDistance < 3.0e38) {
+            let attn = (vec3f(1.0) - mat.attenuationColor.xyz) / mat.attenuationDistance;
+            transmitted *= exp(-thickness * attn);
+        }
+        transmitted *= baseColor.rgb;
         var t0 = (mat.ior - 1.0) / (mat.ior + 1.0);
         t0 *= t0;
         let fresnel = t0 + (1.0 - t0) * pow(1.0 - NdotV, 5.0);
-        transmittance = mat.transmissionFactor * (1.0 - fresnel) * (1.0 - metallic);
+        transmittance = transmission * (1.0 - fresnel) * (1.0 - metallic);
     }
     var finalColor = (ambientColor + totalDiffuse + iblDiffuse * occlusion) * (1.0 - transmittance)
                    + totalSpecular + iblSpecular * occlusion + emissive + transmitted * transmittance;

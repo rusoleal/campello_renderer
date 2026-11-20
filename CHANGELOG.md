@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Volume, iridescence and the transmission texture on WebGPU.** The web build drew transmissive materials thin-walled (the scene straight behind, unbent) and ignored KHR_materials_volume, KHR_materials_iridescence and the transmission texture, so glass didn't refract (IridescentDishWithOlives) and a transmission texture's opaque parts were see-through (LightsPunctualLamp's shade). `shaders/webgpu/default.wgsl` now ports the Vulkan shader's code:
+  - KHR_materials_volume: the scene is sampled where the refracted ray leaves the volume (per channel with KHR_materials_dispersion), attenuated by Beer's law; off screen, the environment along the refracted ray.
+  - KHR_materials_iridescence: thin-film interference on the IBL and punctual-light F0.
+  - The transmission, thickness, iridescence and iridescence-thickness textures (material bindings 19-22, sampled with the base colour sampler, as on Vulkan): 15 of WebGPU's 16 sampled textures per stage. `trimWebGpuMaterialEntries()` keeps them.
+  - The thickness texture is read from its G channel, as the glTF spec says (the native shaders read R; see TODO.md).
+
+### Changed
+- **More lights than the shaders take: the strongest are kept.** The shaders take 4 punctual lights; the renderer used the first 4 it found in the scene graph. It now keeps directional lights first, then point and spot lights by intensity times their brightest channel (LightsPunctualLamp has 5: its dimmest, 1.5 cd, is the one left out). Every backend.
+- **WebAssembly builds use SIMD** (`-msimd128`), on by default: every browser with WebGPU supports it. The option `CAMPELLO_RENDERER_WASM_SIMD` turns it off. It applies to the library and is passed on to consumers (compile and link, so wasm-opt accepts the SIMD instructions).
+- campello_gpu v0.34.0, campello_image v0.7.0, campello_procedural v0.4.0, gltf v0.7.0, vector_math v0.7.0 (WebAssembly SIMD).
+
 ## [0.29.0] - 2026-11-20
 
 ### Added
