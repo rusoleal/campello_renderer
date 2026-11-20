@@ -56,11 +56,19 @@
 #else
 #define CAMPELLO_RENDERER_DIRECTX 0
 #endif
+// The WebGPU backend (web builds).
+#if defined(__EMSCRIPTEN__)
+#define CAMPELLO_RENDERER_WEBGPU 1
+#else
+#define CAMPELLO_RENDERER_WEBGPU 0
+#endif
 // Skinning and morph targets in their own vertex stages, which meshPipeline()
 // picks only for draws that deform, with the joint palettes and morph
 // targets as bind groups 2 and 3 (bindSkin(), bindMorph()): Vulkan and
-// DirectX. Metal's one stage reads them as raw buffers instead.
-#define CAMPELLO_RENDERER_SPLIT_DEFORM (CAMPELLO_RENDERER_VULKAN || CAMPELLO_RENDERER_DIRECTX)
+// DirectX; on WebGPU both share group 3 (vs_skinned, see
+// webgpuDeformBindGroupLayout). Metal's one stage reads them as raw buffers instead.
+#define CAMPELLO_RENDERER_SPLIT_DEFORM \
+    (CAMPELLO_RENDERER_VULKAN || CAMPELLO_RENDERER_DIRECTX || CAMPELLO_RENDERER_WEBGPU)
 // The built-in PBR program's bind groups as material (group 0, built once
 // per material) + frame (group 1: lights, camera, environment, scene colour,
 // shadows; rebuilt per frame/pass), with Vulkan's layouts
@@ -69,11 +77,12 @@
 #define CAMPELLO_RENDERER_PBR_BIND_GROUPS (CAMPELLO_RENDERER_VK_BINDINGS || CAMPELLO_RENDERER_DIRECTX)
 
 // Joint palettes and morph target data: vertex (raw) buffers on Metal,
-// storage buffers on Vulkan (bind groups 2 and 3 of the mesh pipelines,
-// bindSkin() and bindMorph()). DirectX reads them through the same bind
-// groups but keeps them CPU-written upload buffers (storage usage would put
-// them in the GPU-only heap): campello_gpu views them as raw buffers there.
-#if CAMPELLO_RENDERER_VULKAN
+// storage buffers on Vulkan and WebGPU (bind groups 2 and 3 of the mesh
+// pipelines on Vulkan, group 3 on WebGPU; bindSkin() and bindMorph()).
+// DirectX reads them through the same bind groups but keeps them CPU-written
+// upload buffers (storage usage would put them in the GPU-only heap):
+// campello_gpu views them as raw buffers there.
+#if CAMPELLO_RENDERER_VULKAN || CAMPELLO_RENDERER_WEBGPU
 static constexpr auto kDeformBufferUsage = static_cast<systems::leal::campello_gpu::BufferUsage>(
     static_cast<int>(systems::leal::campello_gpu::BufferUsage::vertex) |
     static_cast<int>(systems::leal::campello_gpu::BufferUsage::storage));
@@ -961,10 +970,12 @@ void Renderer::setCamera(uint32_t index) {
 void Renderer::ensureFallbackBuffer(std::shared_ptr<systems::leal::campello_gpu::Buffer> &buf,
                                      uint64_t requiredBytes)
 {
-    namespace GPU = systems::leal::campello_gpu;
     if (buf && buf->getLength() >= requiredBytes) return;
     std::vector<uint8_t> zeros(requiredBytes, 0);
-    buf = device->createBuffer(requiredBytes, GPU::BufferUsage::vertex, zeros.data());
+    // kDeformBufferUsage: also a storage buffer where the deforming stages
+    // read them (Vulkan, WebGPU): fallbackTangentBuffer is the morph delta
+    // fallback bound to bindMorph() for draws without morph targets.
+    buf = device->createBuffer(requiredBytes, kDeformBufferUsage, zeros.data());
 }
 
 void Renderer::ensureBindGroupLayout() {
@@ -3255,7 +3266,7 @@ void Renderer::detectQuantizedLayout() {
 }
 
 const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program, const VertexLayout& layout, bool lines,
-                                                          bool wide, uint32_t excludeMask) const {
+                                                          bool wide, uint32_t excludeMask, bool instanced) const {
     const ProgramState* state = programState(program);
     if (!state) return nullptr;
     // The stage that reads the most attributes among those reading only
@@ -3264,7 +3275,7 @@ const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program,
     const uint32_t has = layout.semanticMask() & ~excludeMask;
     const MeshVertexStage* best = nullptr;
     for (const auto& stage : state->vertexStages) {
-        if (stage.lines != lines || stage.wide != wide) continue;
+        if (stage.lines != lines || stage.wide != wide || stage.instanced != instanced) continue;
         if ((stage.readMask & ~has) != 0) continue;
         if (!best || std::popcount(stage.readMask) > std::popcount(best->readMask)) best = &stage;
     }
@@ -3274,21 +3285,25 @@ const Renderer::MeshVertexStage* Renderer::vertexStageFor(ProgramHandle program,
 const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     ProgramHandle programHandle, MeshProgram variant, const VertexLayout& layout, bool doubleSided, bool blend,
     systems::leal::campello_gpu::PixelFormat colorFormat, systems::leal::campello_gpu::PrimitiveTopology topology,
-    bool wideLines, bool skinned, uint32_t features) {
+    bool wideLines, bool skinned, uint32_t features, bool instanced) {
     namespace GPU = systems::leal::campello_gpu;
+#if !CAMPELLO_RENDERER_WEBGPU
+    instanced = false;  // the other backends' stages apply instances always (identity when there are none)
+#endif
     // Consecutive draws mostly ask for the same pipeline (draws are sorted
     // by state): the last request's answer, without the stage search.
     const uint64_t layoutHash = layout.hash();
     const auto& last = lastMeshPipeline;
     if (last.entry && last.program == programHandle && last.variant == variant && last.layoutHash == layoutHash &&
         last.doubleSided == doubleSided && last.blend == blend && last.colorFormat == colorFormat &&
-        last.topology == topology && last.wideLines == wideLines && last.skinned == skinned && last.features == features) {
+        last.topology == topology && last.wideLines == wideLines && last.skinned == skinned && last.features == features &&
+        last.instanced == instanced) {
         return last.entry;
     }
     // Remembered as requested (below they're normalized), so the next
     // identical request matches.
     const LastMeshPipeline request = {nullptr, programHandle, variant,  layoutHash, doubleSided, blend,
-                                      colorFormat, topology,  wideLines, skinned,   features};
+                                      colorFormat, topology,  wideLines, skinned,   features, instanced};
     const auto remember = [&](const MeshPipelineEntry* entry) {
         if (entry) {
             lastMeshPipeline = request;
@@ -3328,8 +3343,16 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     // An unskinned draw doesn't take a skinning stage even when its layout
     // has joints (the glTF standard layout always does).
     const uint32_t skinSemantics = semanticBit(VertexSemantic::joints) | semanticBit(VertexSemantic::weights);
-    const MeshVertexStage* stage =
-        vertexStageFor(programHandle, layout, lines, wideLines, skinned ? 0u : skinSemantics);
+    // WebGPU instanced draws: vs_instanced (built-in PBR, triangles, no
+    // skin); otherwise, or where there's none, the usual stages.
+    const MeshVertexStage* stage = nullptr;
+    if (instanced && !skinned && !lines && !wideLines) {
+        stage = vertexStageFor(programHandle, layout, lines, wideLines, skinSemantics, true);
+    }
+    if (!stage) {
+        instanced = false;
+        stage = vertexStageFor(programHandle, layout, lines, wideLines, skinned ? 0u : skinSemantics);
+    }
     if (!stage) return nullptr;
 
     // Only the attributes the stage reads shape the pipeline (hashed in
@@ -3347,6 +3370,7 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     mix(blend ? 1u : 0u);
     mix(wideLines ? 1u : 0u);
     mix(features);
+    mix(instanced ? 1u : 0u);
     if (auto it = meshPipelineCache.find(key); it != meshPipelineCache.end()) {
         return remember(it->second.pipeline ? &it->second : nullptr);
     }
@@ -3365,6 +3389,16 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
     MeshPipelineEntry entry;
     entry.slots.fill(-1);
     entry.skinned = (stage->readMask & semanticBit(VertexSemantic::joints)) != 0;
+#if CAMPELLO_RENDERER_WEBGPU
+    // vs_skinned reads group 3; the other stages' layouts stop at group 2
+    // (WebGPU wants every group of the layout bound at each draw).
+    if (entry.skinned && programHandle == kPbrProgram && webgpuSkinnedPipelineLayout) {
+        d.layout = webgpuSkinnedPipelineLayout;
+    }
+    // vs_instanced: group 2 is the draw's transform (a uniform).
+    entry.instanced = instanced;
+    if (instanced) d.layout = webgpuInstancedPipelineLayout;
+#endif
     d.vertex.buffers.clear();
     for (const auto& a : read.attributes) {
         GPU::VertexLayout buffer{};
@@ -3384,6 +3418,25 @@ const Renderer::MeshPipelineEntry* Renderer::meshPipeline(
         entry.slots[logical] = (int8_t)d.vertex.buffers.size();
         d.vertex.buffers.push_back(buffer);
     }
+#if CAMPELLO_RENDERER_WEBGPU
+    if (entry.instanced) {
+        // vs_instanced: the instance's float4x4 per instance, locations 8-11
+        // (the draw starts at instance 0, see bindWebGpuInstanced()).
+        GPU::VertexLayout instances{};
+        instances.arrayStride = 64;
+        instances.stepMode = GPU::StepMode::instance;
+        for (uint32_t col = 0; col < 4; ++col) {
+            GPU::VertexAttribute attr{};
+            attr.componentType = GPU::ComponentType::ctFloat;
+            attr.accessorType = GPU::AccessorType::acVec4;
+            attr.offset = col * 16;
+            attr.shaderLocation = 8 + col;
+            instances.attributes.push_back(attr);
+        }
+        entry.slots[VERTEX_SLOT_INSTANCE_MATRIX] = (int8_t)d.vertex.buffers.size();
+        d.vertex.buffers.push_back(instances);
+    }
+#endif
     if (gbuffer && meshRecipe.gbufferPreviousTransforms) {
         entry.previousTransformSlot = (int8_t)d.vertex.buffers.size();
         d.vertex.buffers.push_back(*meshRecipe.gbufferPreviousTransforms);
@@ -4163,6 +4216,38 @@ void Renderer::bindWebGpuTransforms(const std::shared_ptr<systems::leal::campell
     }
     webgpuFirstInstance = (uint32_t)(offset / 128);  // sizeof(NodeTransforms)
 }
+
+void Renderer::bindWebGpuInstanced(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
+                                   const float* transform) {
+    namespace GPU = systems::leal::campello_gpu;
+    if (!webgpuInstancedDrawBindGroupLayout || !transform) return;
+    // One 256-byte slot per instanced draw of this render() call (uniform
+    // buffer offsets must be 256-byte aligned; transforms are 128 bytes
+    // apart). A slot isn't reused until the next render(), whose writes the
+    // queue orders after this call's submit.
+    constexpr uint64_t kSlot = 256;
+    const uint64_t needed = (uint64_t)(webgpuInstanceSlot + 1) * kSlot;
+    if (!webgpuInstanceTransformBuffer || webgpuInstanceTransformBuffer->getLength() < needed) {
+        // Draws already encoded keep the old buffer (their bind groups hold it).
+        webgpuInstanceTransformBuffer = device->createBuffer(std::max<uint64_t>(needed * 2, 64 * kSlot),
+                                                             GPU::BufferUsage::uniform);
+        webgpuInstancedGroups.clear();
+        if (!webgpuInstanceTransformBuffer) return;
+    }
+    const uint64_t offset = (uint64_t)webgpuInstanceSlot++ * kSlot;
+    webgpuInstanceTransformBuffer->upload(offset, 128, const_cast<float*>(transform));
+    auto& group = webgpuInstancedGroups[offset];
+    if (!group) {
+        GPU::BindGroupDescriptor desc{};
+        desc.layout = webgpuInstancedDrawBindGroupLayout;
+        desc.entries = {{1, GPU::BufferBinding{webgpuInstanceTransformBuffer, offset, 128}}};
+        group = device->createBindGroup(desc, /*persistent=*/true);
+        if (!group) return;
+    }
+    rpe->setBindGroup(2, group);
+    webgpuBoundDrawGroup = group.get();  // the next uninstanced draw rebinds its transforms
+    webgpuFirstInstance = 0;             // instance_index is the instance: its matrix
+}
 #endif
 
 void Renderer::prewarmMeshPipelines() {
@@ -4893,6 +4978,49 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
     plDesc.bindGroupLayouts = { vulkanMaterialBindGroupLayout, vulkanFrameBindGroupLayout };
 #if defined(__EMSCRIPTEN__)
     plDesc.bindGroupLayouts.push_back(webgpuDrawBindGroupLayout);
+    // vs_skinned's pipelines: the same groups plus group 3, the joint
+    // palette and the morph targets (webgpuDeformBindGroupLayout).
+    if (!webgpuDeformBindGroupLayout) {
+        GPU::BindGroupLayoutDescriptor deformDesc{};
+        uint32_t binding = 0;
+        for (uint64_t minSize : {64ull, 44ull, 12ull, 12ull}) {  // one joint; MorphInfo; one delta each
+            GPU::EntryObject e{};
+            e.binding = binding++;
+            e.visibility = GPU::ShaderStage::vertex;
+            e.type = GPU::EntryObjectType::buffer;
+            e.data.buffer.hasDinamicOffaset = false;
+            e.data.buffer.minBindingSize = minSize;
+            e.data.buffer.type = GPU::EntryObjectBufferType::readOnlyStorage;
+            deformDesc.entries.push_back(e);
+        }
+        webgpuDeformBindGroupLayout = device->createBindGroupLayout(deformDesc);
+    }
+    if (webgpuDeformBindGroupLayout) {
+        GPU::PipelineLayoutDescriptor skinnedDesc = plDesc;
+        skinnedDesc.bindGroupLayouts.push_back(webgpuDeformBindGroupLayout);
+        webgpuSkinnedPipelineLayout = device->createPipelineLayout(skinnedDesc);
+    }
+    // vs_instanced's pipelines: group 2 is the draw's own transform, a
+    // uniform at binding 1 (bindWebGpuInstanced()), instead of the
+    // transforms storage buffer.
+    if (!webgpuInstancedDrawBindGroupLayout) {
+        GPU::BindGroupLayoutDescriptor instancedDesc{};
+        GPU::EntryObject e{};
+        e.binding = 1;
+        e.visibility = GPU::ShaderStage::vertex;
+        e.type = GPU::EntryObjectType::buffer;
+        e.data.buffer.hasDinamicOffaset = false;
+        e.data.buffer.minBindingSize = 128;  // NodeTransforms
+        e.data.buffer.type = GPU::EntryObjectBufferType::uniform;
+        instancedDesc.entries.push_back(e);
+        webgpuInstancedDrawBindGroupLayout = device->createBindGroupLayout(instancedDesc);
+    }
+    if (webgpuInstancedDrawBindGroupLayout) {
+        GPU::PipelineLayoutDescriptor instancedLayout{};
+        instancedLayout.bindGroupLayouts = {vulkanMaterialBindGroupLayout, vulkanFrameBindGroupLayout,
+                                            webgpuInstancedDrawBindGroupLayout};
+        webgpuInstancedPipelineLayout = device->createPipelineLayout(instancedLayout);
+    }
 #else
     // Sets 2 and 3: skinned and morphed draws' deformation (ensureDeformBindGroupLayouts()).
     ensureDeformBindGroupLayouts(*device, skinBindGroupLayout, morphBindGroupLayout);
@@ -5073,6 +5201,22 @@ void Renderer::createDefaultPipelines(systems::leal::campello_gpu::PixelFormat c
             semanticBit(VertexSemantic::color0) | semanticBit(VertexSemantic::texcoord1);
 #if defined(__EMSCRIPTEN__)
         programs[kPbrProgram].vertexStages.push_back({standardReads, vertModule, "vs_main"});
+        // Instanced draws (EXT_mesh_gpu_instancing): per-instance matrices,
+        // the draw's transform in group 2; meshPipeline() picks it for draws
+        // with instance matrices (not skinned ones: skinned instances keep
+        // their skin and lose the instance placement on WebGPU).
+        if (webgpuInstancedPipelineLayout) {
+            programs[kPbrProgram].vertexStages.push_back({standardReads, vertModule, "vs_instanced", false, false, true});
+            programs[kPbrProgram].vertexStages.push_back(
+                {semanticBit(VertexSemantic::position), vertModule, "vs_lean_instanced", false, false, true});
+        }
+        // Skinned and morphed draws: JOINTS_0/WEIGHTS_0 and group 3;
+        // meshPipeline() picks it only for draws with a skin or morph targets.
+        if (webgpuSkinnedPipelineLayout) {
+            const uint32_t skinnedReads =
+                standardReads | semanticBit(VertexSemantic::joints) | semanticBit(VertexSemantic::weights);
+            programs[kPbrProgram].vertexStages.push_back({skinnedReads, vertModule, "vs_skinned"});
+        }
         programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), vertModule, "vs_lean"});
         programs[kPbrProgram].vertexStages.push_back({semanticBit(VertexSemantic::position), vertModule, "vs_line", true});
         programs[kPbrProgram].fragmentModule = fragModule;
@@ -6930,6 +7074,9 @@ void Renderer::renderToTarget(
     bool useDeviceSwapchain)
 {
     auto frameStart = std::chrono::steady_clock::now();
+#if CAMPELLO_RENDERER_WEBGPU
+    webgpuInstanceSlot = 0;  // bindWebGpuInstanced(): one submit per render()
+#endif
 
     namespace GPU = systems::leal::campello_gpu;
 
@@ -8251,11 +8398,15 @@ void Renderer::renderPrimitive(
     const auto morphData = morphBuffers.find(&primitive);
     const bool hasMorph = morphData != morphBuffers.end() && morphData->second.positionDeltas;
     const bool skinnedStage = !CAMPELLO_RENDERER_SPLIT_DEFORM || hasSkin || hasMorph;
+    // EXT_mesh_gpu_instancing (step 5a binds the matrices): WebGPU's
+    // vs_instanced; the other backends apply instances in every stage.
+    const auto instancedNode = nodeInstanceData.find(nodeIndex);
+    const bool instancedDraw = instancedNode != nodeInstanceData.end() && instancedNode->second.matrixBuffer;
     const MeshPipelineEntry* entry = debugView
-        ? meshPipeline(MeshProgram::debug, *layout, false, false, skinnedStage)
+        ? meshPipeline(MeshProgram::debug, *layout, false, false, skinnedStage, kAllMaterialFeatures, instancedDraw)
         : meshPipeline((hasTexture || clipping) ? MeshProgram::textured : MeshProgram::flat, *layout,
                        doubleSided || clipping, useBlend, skinnedStage,
-                       drawMaterialFeatures(matIdx >= 0 ? (uint32_t)(matIdx + 1) : 0u));
+                       drawMaterialFeatures(matIdx >= 0 ? (uint32_t)(matIdx + 1) : 0u), instancedDraw);
     if (!entry) return;
     activeMeshSlots = &entry->slots;
     if (entry->pipeline.get() != currentPipelineObject) {
@@ -8334,6 +8485,11 @@ void Renderer::renderPrimitive(
         if (instIt->second.visibleCount == 0) return;
         bindMeshBuffer(rpe, VERTEX_SLOT_INSTANCE_MATRIX, instIt->second.matrixBuffer, 0);
         instanceCount = instIt->second.visibleCount;
+#if CAMPELLO_RENDERER_WEBGPU
+        if (entry->instanced && (nodeIndex + 1) * 32 <= nodeTransforms.size()) {
+            bindWebGpuInstanced(rpe, nodeTransforms.data() + nodeIndex * 32);
+        }
+#endif
     } else if (defaultInstanceMatrixBuffer) {
         // Bind identity matrix for non-instanced objects
         bindMeshBuffer(rpe, VERTEX_SLOT_INSTANCE_MATRIX, defaultInstanceMatrixBuffer, 0);
@@ -10490,6 +10646,9 @@ void Renderer::reuploadMaterialSlot(uint32_t uniformSlot,
 void Renderer::render(const RenderScene& scene,
                       std::shared_ptr<systems::leal::campello_gpu::TextureView> colorView) {
     auto frameStart = std::chrono::steady_clock::now();
+#if CAMPELLO_RENDERER_WEBGPU
+    webgpuInstanceSlot = 0;  // bindWebGpuInstanced(): one submit per render()
+#endif
     namespace GPU = systems::leal::campello_gpu;
     namespace VM  = systems::leal::vector_math;
     using M4 = VM::Matrix4<double>;
@@ -11901,6 +12060,20 @@ void Renderer::bindSkin(const std::shared_ptr<systems::leal::campello_gpu::Rende
                               uint64_t currentSize, const std::shared_ptr<systems::leal::campello_gpu::Buffer> &previous,
                               uint64_t previousOffset, uint64_t previousSize) {
     namespace GPU = systems::leal::campello_gpu;
+#if CAMPELLO_RENDERER_WEBGPU
+    // WebGPU: group 3 holds the palette and the morph targets together;
+    // bindMorph(), always called next, binds it. No previous palette (no
+    // G-buffer on WebGPU).
+    (void)previous;
+    (void)previousOffset;
+    (void)previousSize;
+    webgpuPendingPalette.reset();
+    if (!current || currentOffset >= current->getLength()) return;
+    webgpuPendingPalette = current;
+    webgpuPendingPaletteOffset = currentOffset;
+    webgpuPendingPaletteSize = currentSize == 0 ? current->getLength() - currentOffset
+                                                : std::min(currentSize, current->getLength() - currentOffset);
+#else
     if (!skinBindGroupLayout || !current || !previous) return;
     const auto range = [](const std::shared_ptr<GPU::Buffer>& buffer, uint64_t offset, uint64_t size) {
         const uint64_t length = buffer->getLength();
@@ -11930,6 +12103,7 @@ void Renderer::bindSkin(const std::shared_ptr<systems::leal::campello_gpu::Rende
         it = skinBindGroups.insert_or_assign(key, SkinBindGroup{current, previous, group}).first;
     }
     setMeshBindGroup(rpe, 2, it->second.group);
+#endif
 }
 
 void Renderer::bindMorph(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &rpe,
@@ -11937,6 +12111,35 @@ void Renderer::bindMorph(const std::shared_ptr<systems::leal::campello_gpu::Rend
                                const std::shared_ptr<systems::leal::campello_gpu::Buffer> &positions,
                                const std::shared_ptr<systems::leal::campello_gpu::Buffer> &normals) {
     namespace GPU = systems::leal::campello_gpu;
+#if CAMPELLO_RENDERER_WEBGPU
+    // WebGPU: one group 3 with the palette bindSkin() kept and the morph targets.
+    const auto palette = std::move(webgpuPendingPalette);
+    webgpuPendingPalette.reset();
+    if (!webgpuDeformBindGroupLayout || !palette || !info || !positions || !normals) return;
+    uint64_t key = 0;
+    for (uint64_t v : {(uint64_t)(uintptr_t)palette.get(), webgpuPendingPaletteOffset, webgpuPendingPaletteSize,
+                       (uint64_t)(uintptr_t)info.get(), (uint64_t)(uintptr_t)positions.get(),
+                       (uint64_t)(uintptr_t)normals.get()}) {
+        key ^= std::hash<uint64_t>{}(v) + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    }
+    // Reused only while its buffers are the same live ones (as bindSkin()'s).
+    auto it = webgpuDeformBindGroups.find(key);
+    if (it == webgpuDeformBindGroups.end() || it->second.palette.lock() != palette || it->second.info.lock() != info ||
+        it->second.positions.lock() != positions || it->second.normals.lock() != normals) {
+        if (webgpuDeformBindGroups.size() > 1024) webgpuDeformBindGroups.clear();
+        GPU::BindGroupDescriptor desc{};
+        desc.layout = webgpuDeformBindGroupLayout;
+        desc.entries = {{0, GPU::BufferBinding{palette, webgpuPendingPaletteOffset, webgpuPendingPaletteSize}},
+                        {1, GPU::BufferBinding{info, 0, info->getLength()}},
+                        {2, GPU::BufferBinding{positions, 0, positions->getLength()}},
+                        {3, GPU::BufferBinding{normals, 0, normals->getLength()}}};
+        auto group = device->createBindGroup(desc);
+        if (!group) return;
+        it = webgpuDeformBindGroups.insert_or_assign(key, WebGpuDeformBindGroup{palette, info, positions, normals, group})
+                 .first;
+    }
+    setMeshBindGroup(rpe, 3, it->second.group);
+#else
     if (!morphBindGroupLayout || !info || !positions || !normals) return;
     uint64_t key = 0;
     for (const auto* buffer : {info.get(), positions.get(), normals.get()}) {
@@ -11957,6 +12160,7 @@ void Renderer::bindMorph(const std::shared_ptr<systems::leal::campello_gpu::Rend
         it = morphBindGroups.insert_or_assign(key, MorphBindGroup{info, positions, normals, group}).first;
     }
     setMeshBindGroup(rpe, 3, it->second.group);
+#endif
 }
 #else
 void Renderer::bindSkin(const std::shared_ptr<systems::leal::campello_gpu::RenderPassEncoder> &,
@@ -12002,14 +12206,17 @@ void Renderer::renderPrimitive(
     // Vulkan takes the skinning vertex stage only for draws with joints
     // (step 6 binds them); Metal's one stage does both.
     const bool skinnedStage = !CAMPELLO_RENDERER_SPLIT_DEFORM || draw.jointMatrixBuffer || draw.previousJointMatrixBuffer;
+    // Instance matrices (step 4 binds them): WebGPU's vs_instanced.
+    const bool instancedDraw = draw.instanceTransformBuffer != nullptr;
     const MeshPipelineEntry* entry = wideLines
         ? meshPipeline(program, MeshProgram::textured, layout, true, true, colorFormat, draw.mesh->topology, true)
         : debugView
         ? meshPipeline(program, MeshProgram::debug, layout, false, false, colorFormat,
-                       GPU::PrimitiveTopology::triangleList, false, skinnedStage)
+                       GPU::PrimitiveTopology::triangleList, false, skinnedStage, kAllMaterialFeatures, instancedDraw)
         : meshPipeline(program, MeshProgram::textured, layout, doubleSided || (program == kPbrProgram && clippingActive()),
                        useBlend, colorFormat, draw.mesh->topology, false, skinnedStage,
-                       draw.material ? drawMaterialFeatures(draw.material->uniformSlot) : kAllMaterialFeatures);
+                       draw.material ? drawMaterialFeatures(draw.material->uniformSlot) : kAllMaterialFeatures,
+                       instancedDraw);
     if (!entry) return;
     activeMeshSlots = &entry->slots;
     // Wide lines expand in screen space: their vertex stage reads the camera
@@ -12071,6 +12278,11 @@ void Renderer::renderPrimitive(
     if (instanceCount == 0) return;
     if (draw.instanceTransformBuffer) {
         bindMeshBuffer(rpe, VERTEX_SLOT_INSTANCE_MATRIX, draw.instanceTransformBuffer, 0);
+#if CAMPELLO_RENDERER_WEBGPU
+        if (entry->instanced && (transformOffset + 128) / sizeof(float) <= drawTransformStaging.size()) {
+            bindWebGpuInstanced(rpe, drawTransformStaging.data() + transformOffset / sizeof(float));
+        }
+#endif
     } else if (defaultInstanceMatrixBuffer) {
         bindMeshBuffer(rpe, VERTEX_SLOT_INSTANCE_MATRIX, defaultInstanceMatrixBuffer, 0);
     }

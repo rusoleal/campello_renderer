@@ -3,7 +3,7 @@
 
 namespace systems::leal::campello_renderer::shaders {
 
-// Built-in PBR mesh shaders (WGSL): vs_main, vs_lean, vs_line, fs_main.
+// Built-in PBR mesh shaders (WGSL): vs_main, vs_skinned, vs_lean, vs_line, fs_main.
 static const char kDefaultWebGpuShader[] = R"WGSL(// campello_renderer built-in PBR mesh shaders, WGSL (WebGPU).
 //
 // Hand-written port of the mesh shaders in shaders/metal/default.metal,
@@ -13,8 +13,11 @@ static const char kDefaultWebGpuShader[] = R"WGSL(// campello_renderer built-in 
 // textures, transmission/volume, sheen, clearcoat, iridescence, anisotropy,
 // dispersion and the flat/debug variants (programmable pipelines phase 7).
 //
-// Entry points: vs_main (glTF layout), vs_lean (positions only), vs_line
-// (line meshes), fs_main. Bindings follow the Vulkan layout
+// Entry points: vs_main (glTF layout), vs_skinned (glTF layout with
+// JOINTS_0/WEIGHTS_0: skinning and morph targets, group 3), vs_instanced
+// (glTF layout with per-instance matrices, its transform in group 2),
+// vs_lean_instanced (the same for position-only meshes), vs_lean
+// (positions only), vs_line (line meshes), fs_main. Bindings follow the Vulkan layout
 // (ensureVulkanPbrBindGroupLayouts(), trimmed on the web): group 0 =
 // material, group 1 = frame, group 2 = per-draw transforms. WebGPU allows
 // vertex input locations 0-15 only, so instead of the per-instance
@@ -190,36 +193,154 @@ struct VertexOut {
     @location(6) color0: vec4f,
 }
 
-@vertex
-fn vs_main(v: VertexIn, @builtin(instance_index) instance: u32) -> VertexOut {
-    let t = transforms[instance];
-    let localPos = vec4f(v.position, 1.0);
+// The PBR vertex stage shared by vs_main, vs_skinned and vs_instanced:
+// `position`, `normal` and `tangent` are already in the mesh's local space
+// (morphed and skinned, or placed by the instance).
+fn pbrVertex(t: NodeTransforms, position: vec3f, normal: vec3f, tangent: vec4f, texcoord0: vec2f, texcoord1: vec2f,
+             color0: vec4f) -> VertexOut {
+    let localPos = vec4f(position, 1.0);
     var o: VertexOut;
     o.clipPosition = t.mvp * localPos;
     o.worldPos = (t.model * localPos).xyz;
-    let N = normalize((t.model * vec4f(v.normal, 0.0)).xyz);
+    let N = normalize((t.model * vec4f(normal, 0.0)).xyz);
     var T: vec3f;
-    if (length(v.tangent.xyz) < 0.001) {
+    if (length(tangent.xyz) < 0.001) {
         if (abs(N.y) < 0.999) {
             T = normalize(cross(vec3f(0.0, 1.0, 0.0), N));
         } else {
             T = normalize(cross(vec3f(1.0, 0.0, 0.0), N));
         }
     } else {
-        T = normalize((t.model * vec4f(v.tangent.xyz, 0.0)).xyz);
+        T = normalize((t.model * vec4f(tangent.xyz, 0.0)).xyz);
         T = normalize(T - dot(T, N) * N);
     }
     o.worldNormal = N;
     o.worldTangent = T;
     o.worldBitangent = cross(N, T);
-    o.texcoord0 = v.texcoord0;
-    o.texcoord1 = v.texcoord1;
-    o.color0 = v.color0;
+    o.texcoord0 = texcoord0;
+    o.texcoord1 = texcoord1;
+    o.color0 = color0;
     return o;
 }
 
-fn positionOnly(position: vec3f, instance: u32) -> VertexOut {
-    let t = transforms[instance];
+@vertex
+fn vs_main(v: VertexIn, @builtin(instance_index) instance: u32) -> VertexOut {
+    return pbrVertex(transforms[instance], v.position, v.normal, v.tangent, v.texcoord0, v.texcoord1, v.color0);
+}
+
+// ---------------------------------------------------------------------------
+// Instanced draws: vs_instanced (EXT_mesh_gpu_instancing)
+// ---------------------------------------------------------------------------
+// Other draws find their transform through firstInstance (transforms[
+// instance_index]), which an instanced draw needs for the instance index.
+// So its pipeline layout's group 2 holds the draw's own transform as a
+// uniform (binding 1; the renderer copies it to a 256-byte slot), the draw
+// starts at instance 0, and the instance matrices are a per-instance
+// vertex buffer (locations 8-11), applied in model space as on Vulkan.
+@group(2) @binding(1) var<uniform> drawTransform: NodeTransforms;
+
+struct InstancedVertexIn {
+    @location(0)  position: vec3f,
+    @location(1)  normal: vec3f,
+    @location(2)  texcoord0: vec2f,
+    @location(3)  tangent: vec4f,
+    @location(6)  color0: vec4f,
+    @location(7)  texcoord1: vec2f,
+    @location(8)  instance0: vec4f,   // the instance's float4x4, column by column
+    @location(9)  instance1: vec4f,
+    @location(10) instance2: vec4f,
+    @location(11) instance3: vec4f,
+}
+
+@vertex
+fn vs_instanced(v: InstancedVertexIn) -> VertexOut {
+    let m = mat4x4f(v.instance0, v.instance1, v.instance2, v.instance3);
+    let position = (m * vec4f(v.position, 1.0)).xyz;
+    let normal = (m * vec4f(v.normal, 0.0)).xyz;
+    let tangent = vec4f((m * vec4f(v.tangent.xyz, 0.0)).xyz, v.tangent.w);
+    return pbrVertex(drawTransform, position, normal, tangent, v.texcoord0, v.texcoord1, v.color0);
+}
+
+// ---------------------------------------------------------------------------
+// Skinned and morphed draws: vs_skinned (shaders/vulkan/skinning.glsl's port)
+// ---------------------------------------------------------------------------
+// The renderer picks vs_skinned only for draws with a skin or morph
+// targets, with a pipeline layout that has group 3 (WebGPU's default limit
+// is four groups, and group 2 holds the transforms, so the joint palette
+// and the morph targets share one group, unlike Vulkan's sets 2 and 3):
+//   binding 0: the draw's joint palette, a mat4 per joint (column-major);
+//   binding 1: the node's MorphInfo (target count, whether targets have
+//              normals, vertex count, up to 8 weights);
+//   bindings 2 and 3: the primitive's POSITION and NORMAL deltas,
+//              target-major and tightly packed (3 floats per vertex; target
+//              t's delta for vertex v at t * vertexCount + v).
+// Draws without a skin get a one-joint identity palette, without morph
+// targets a MorphInfo with zero targets.
+struct MorphInfo {
+    targetCount: f32,
+    hasNormal: f32,
+    vertexCount: f32,
+    weights: array<f32, 8>,
+}
+@group(3) @binding(0) var<storage, read> jointMatrices: array<mat4x4f>;
+@group(3) @binding(1) var<storage, read> morphInfo: MorphInfo;
+@group(3) @binding(2) var<storage, read> morphPositions: array<f32>;
+@group(3) @binding(3) var<storage, read> morphNormals: array<f32>;
+
+struct SkinnedVertexIn {
+    @location(0)  position: vec3f,
+    @location(1)  normal: vec3f,
+    @location(2)  texcoord0: vec2f,
+    @location(3)  tangent: vec4f,
+    @location(4)  joints: vec4u,    // JOINTS_0 (uint8x4 or uint16x4)
+    @location(5)  weights: vec4f,   // WEIGHTS_0 (float32x4, unorm8x4 or unorm16x4)
+    @location(6)  color0: vec4f,
+    @location(7)  texcoord1: vec2f,
+}
+
+// Up to four joints blended by weight; weights summing to zero leave the
+// vertex unskinned (as Metal and Vulkan do).
+fn skinMatrix(j: vec4u, w: vec4f) -> mat4x4f {
+    if (w.x + w.y + w.z + w.w <= 0.001) {
+        return mat4x4f(vec4f(1.0, 0.0, 0.0, 0.0), vec4f(0.0, 1.0, 0.0, 0.0),
+                       vec4f(0.0, 0.0, 1.0, 0.0), vec4f(0.0, 0.0, 0.0, 1.0));
+    }
+    let count = arrayLength(&jointMatrices);
+    var m = mat4x4f(vec4f(0.0), vec4f(0.0), vec4f(0.0), vec4f(0.0));
+    for (var i = 0u; i < 4u; i++) {
+        if (w[i] > 0.0 && j[i] < count) {
+            m += w[i] * jointMatrices[j[i]];
+        }
+    }
+    return m;
+}
+
+@vertex
+fn vs_skinned(v: SkinnedVertexIn, @builtin(vertex_index) vertex: u32,
+              @builtin(instance_index) instance: u32) -> VertexOut {
+    // glTF's order: morph targets, then the joints.
+    var position = v.position;
+    var normal = v.normal;
+    let targets = min(u32(morphInfo.targetCount), 8u);
+    let vertexCount = u32(morphInfo.vertexCount);
+    let hasNormal = morphInfo.hasNormal > 0.5;
+    for (var t = 0u; t < targets; t++) {
+        let w = morphInfo.weights[t];
+        if (w == 0.0) { continue; }
+        let i = (t * vertexCount + vertex) * 3u;
+        position += w * vec3f(morphPositions[i], morphPositions[i + 1u], morphPositions[i + 2u]);
+        if (hasNormal) {
+            normal += w * vec3f(morphNormals[i], morphNormals[i + 1u], morphNormals[i + 2u]);
+        }
+    }
+    let skin = skinMatrix(v.joints, v.weights);
+    let skinnedPos = (skin * vec4f(position, 1.0)).xyz;
+    let skinnedNormal = (skin * vec4f(normal, 0.0)).xyz;
+    let skinnedTangent = vec4f((skin * vec4f(v.tangent.xyz, 0.0)).xyz, v.tangent.w);
+    return pbrVertex(transforms[instance], skinnedPos, skinnedNormal, skinnedTangent, v.texcoord0, v.texcoord1, v.color0);
+}
+
+fn positionOnly(t: NodeTransforms, position: vec3f) -> VertexOut {
     let localPos = vec4f(position, 1.0);
     var o: VertexOut;
     o.clipPosition = t.mvp * localPos;
@@ -236,13 +357,22 @@ fn positionOnly(position: vec3f, instance: u32) -> VertexOut {
 // Position-only meshes (VertexLayout::positionOnly()).
 @vertex
 fn vs_lean(@location(0) position: vec3f, @builtin(instance_index) instance: u32) -> VertexOut {
-    return positionOnly(position, instance);
+    return positionOnly(transforms[instance], position);
+}
+
+// Position-only meshes drawn with instances (vs_instanced's lean variant:
+// the draw's transform in group 2, the instance's matrix at locations 8-11).
+@vertex
+fn vs_lean_instanced(@location(0) position: vec3f, @location(8) instance0: vec4f, @location(9) instance1: vec4f,
+                     @location(10) instance2: vec4f, @location(11) instance3: vec4f) -> VertexOut {
+    let m = mat4x4f(instance0, instance1, instance2, instance3);
+    return positionOnly(drawTransform, (m * vec4f(position, 1.0)).xyz);
 }
 
 // Line meshes: nudged towards the camera so edges win over their faces.
 @vertex
 fn vs_line(@location(0) position: vec3f, @builtin(instance_index) instance: u32) -> VertexOut {
-    var o = positionOnly(position, instance);
+    var o = positionOnly(transforms[instance], position);
     o.clipPosition.z -= kLineDepthOffset * o.clipPosition.w;
     return o;
 }
