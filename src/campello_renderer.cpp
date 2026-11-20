@@ -20,6 +20,7 @@
 #include <campello_gpu/descriptors/bind_group_descriptor.hpp>
 #include <campello_gpu/bind_group.hpp>
 #include <algorithm>
+#include <limits>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -103,10 +104,14 @@ static constexpr auto kTransformBufferUsage = systems::leal::campello_gpu::Buffe
 #if defined(__EMSCRIPTEN__)
 // WebGPU allows 16 sampled textures per shader stage; the PBR fragment
 // shader (shaders/webgpu/default.wgsl) keeps the glTF core textures
-// (bindings 0-9) and drops the KHR extension textures (10-23), so material
-// bind groups built for the Vulkan layout lose those entries here.
+// (bindings 0-9) and the transmission, thickness, iridescence and
+// iridescence-thickness textures (19-22), and drops the other KHR extension
+// textures (10-18, 23), so material bind groups built for the Vulkan layout
+// lose those entries here.
 static void trimWebGpuMaterialEntries(systems::leal::campello_gpu::BindGroupDescriptor& desc) {
-    std::erase_if(desc.entries, [](const auto& entry) { return entry.binding >= 10 && entry.binding <= 23; });
+    std::erase_if(desc.entries, [](const auto& entry) {
+        return (entry.binding >= 10 && entry.binding <= 18) || entry.binding == 23;
+    });
 }
 #endif
 
@@ -1320,7 +1325,7 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
         addTex(matDesc, 4);  addSamp(matDesc, 5);   // normal
         addTex(matDesc, 6);  addSamp(matDesc, 7);   // emissive
         addTex(matDesc, 8);  addSamp(matDesc, 9);   // occlusion
-#if !defined(__EMSCRIPTEN__)  // WebGPU: core textures only (trimWebGpuMaterialEntries())
+#if !defined(__EMSCRIPTEN__)  // WebGPU: not these (trimWebGpuMaterialEntries())
         addTex(matDesc, 10); addSamp(matDesc, 11);  // specular
         addTex(matDesc, 12); addSamp(matDesc, 13);  // specularColor
         addTex(matDesc, 14);                        // sheenColor (reuses sampler 1)
@@ -1328,10 +1333,12 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
         addTex(matDesc, 16);                        // clearcoat (reuses sampler 1)
         addTex(matDesc, 17);                        // clearcoatRoughness (reuses sampler 1)
         addTex(matDesc, 18);                        // clearcoatNormal (reuses sampler 1)
+#endif
         addTex(matDesc, 19);                        // transmission (reuses sampler 1)
         addTex(matDesc, 20);                        // thickness (reuses sampler 1)
         addTex(matDesc, 21);                        // iridescence (reuses sampler 1)
         addTex(matDesc, 22);                        // iridescenceThickness (reuses sampler 1)
+#if !defined(__EMSCRIPTEN__)
         addTex(matDesc, 23);                        // anisotropic (reuses sampler 1)
 #endif
         // Struct is 372 bytes (see buildSlotRaw()); bind the full 512-byte
@@ -7317,8 +7324,8 @@ void Renderer::renderToTarget(
             lightsData.count = 0;
             
             if (punctualLightsEnabled && asset && asset->khrLightsPunctual && !asset->khrLightsPunctual->empty()) {
-                // Count and collect lights from scene nodes
-                int lightCount = 0;
+                // Collect the scene's lights; the shaders take 4 (below).
+                std::vector<LightData> collected;
                 
                 auto countLights = [&](auto&& self, uint64_t nodeIndex, 
                                        const VM::Matrix4<double>& parentWorld) -> void {
@@ -7327,9 +7334,9 @@ void Renderer::renderToTarget(
                     VM::Matrix4<double> world = parentWorld * nodeLocalMatrix(node);
                     
                     if (node.light >= 0 && node.light < (int64_t)asset->khrLightsPunctual->size()) {
-                        if (lightCount < 4) {
+                        {
                             auto &light = (*asset->khrLightsPunctual)[(size_t)node.light];
-                            LightData &ld = lightsData.lights[lightCount];
+                            LightData &ld = collected.emplace_back();
                             
                             // Type: 0=directional, 1=point, 2=spot
                             float typeVal = 0.0f;
@@ -7390,7 +7397,6 @@ void Renderer::renderToTarget(
                                 ld.spotAngles[1] = (float)light.outerConeAngle;
                             }
                             
-                            lightCount++;
                         }
                     }
                     
@@ -7405,7 +7411,20 @@ void Renderer::renderToTarget(
                         countLights(countLights, rootIdx, M4::identity());
                     }
                 }
-                lightsData.count = (uint32_t)lightCount;
+                // More than the shaders take: keep the strongest. Directional
+                // lights (lux) first, then point and spot lights (candela) by
+                // intensity times their brightest channel; ties keep scene order.
+                auto strength = [](const LightData &ld) {
+                    if (ld.position[3] < 0.5f) return std::numeric_limits<float>::infinity();
+                    return ld.color[3] * std::max({ld.color[0], ld.color[1], ld.color[2]});
+                };
+                if (collected.size() > 4) {
+                    std::stable_sort(collected.begin(), collected.end(),
+                                     [&](const LightData &a, const LightData &b) { return strength(a) > strength(b); });
+                }
+                const size_t kept = std::min(collected.size(), size_t(4));
+                for (size_t i = 0; i < kept; ++i) lightsData.lights[i] = collected[i];
+                lightsData.count = (uint32_t)kept;
             }
 
             // If the asset has no lights, optionally synthesize a default directional light.
