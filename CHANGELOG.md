@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.30.0] - 2026-11-20
 
 ### Added
 - **Volume, iridescence and the transmission texture on WebGPU.** The web build drew transmissive materials thin-walled (the scene straight behind, unbent) and ignored KHR_materials_volume, KHR_materials_iridescence and the transmission texture, so glass didn't refract (IridescentDishWithOlives) and a transmission texture's opaque parts were see-through (LightsPunctualLamp's shade). `shaders/webgpu/default.wgsl` now ports the Vulkan shader's code:
