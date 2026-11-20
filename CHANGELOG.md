@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **A model loaded after another could stay at the old one's transforms on WebGPU.** `bindWebGpuTransforms()` cached each transform buffer's bind group by the buffer's address and kept the cache past `setScene()`. A WebGPU `BindGroup` doesn't keep its buffer alive, so a new transform buffer could get a freed one's address and be drawn with the old bind group. That group's buffer no longer got uploads, so the geometry froze while the camera and background moved. Each cache entry now holds its buffer and is matched on it, and `setScene()` clears the cache.
+  - The same function cleared the map past 8 entries while holding a reference into it, then assigned through that reference. It no longer does.
+  - Found in campello_web_viewer: Cameras.gltf, loaded after CesiumMan and MaterialsVariantsShoe, didn't move with the camera. With the fix it does.
+  - New web test `NewAssetDrawsAtItsOwnTransforms` (five loads alternating a quad's position, three frames each). It can pass without the fix too, since the address reuse depends on the allocator.
+
 ## [0.28.1] - 2026-11-19
 
 ### Changed

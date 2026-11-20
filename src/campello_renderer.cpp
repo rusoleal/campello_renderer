@@ -2053,6 +2053,11 @@ void Renderer::setScene(uint32_t index) {
             frameResources[f].transformBuffer = device->createBuffer(nodeCount * 128, kTransformBufferUsage);
         }
         transformBuffer = frameResources[0].transformBuffer;
+#if defined(__EMSCRIPTEN__)
+        // The previous scene's transform buffers are gone: drop their groups.
+        webgpuDrawBindGroups.clear();
+        webgpuBoundDrawGroup = nullptr;
+#endif
     }
 
     // ------------------------------------------------------------------
@@ -4134,10 +4139,13 @@ void Renderer::bindWebGpuTransforms(const std::shared_ptr<systems::leal::campell
                                     uint64_t offset) {
     namespace GPU = systems::leal::campello_gpu;
     if (!buffer || !webgpuDrawBindGroupLayout) return;
-    auto& group = webgpuDrawBindGroups[buffer.get()];
-    if (!group) {
-        // Transform buffers are reallocated when they grow; drop groups of
-        // buffers that no longer exist so the map stays small.
+    std::shared_ptr<GPU::BindGroup> group;
+    if (auto it = webgpuDrawBindGroups.find(buffer.get());
+        it != webgpuDrawBindGroups.end() && it->second.buffer == buffer) {
+        group = it->second.group;
+    } else {
+        // Transform buffers are reallocated when they grow; drop the groups
+        // of older buffers so the map (which keeps them alive) stays small.
         if (webgpuDrawBindGroups.size() > 8) {
             webgpuDrawBindGroups.clear();
             webgpuBoundDrawGroup = nullptr;
@@ -4146,7 +4154,8 @@ void Renderer::bindWebGpuTransforms(const std::shared_ptr<systems::leal::campell
         GPU::BindGroupDescriptor desc{};
         desc.layout = webgpuDrawBindGroupLayout;
         desc.entries = {{0, GPU::BufferBinding{buffer, 0, buffer->getLength()}}};
-        group = webgpuDrawBindGroups[buffer.get()] = device->createBindGroup(desc, /*persistent=*/true);
+        group = device->createBindGroup(desc, /*persistent=*/true);
+        webgpuDrawBindGroups[buffer.get()] = WebGpuDrawGroup{buffer, group};
     }
     if (group && group.get() != webgpuBoundDrawGroup) {
         rpe->setBindGroup(2, group);
