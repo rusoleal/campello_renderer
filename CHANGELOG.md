@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.29.0] - 2026-11-20
 
 ### Added
 - **Skinning and morph targets on WebGPU.** The web build drew skinned meshes in their rest pose and ignored morph weights: `shaders/webgpu/default.wgsl` had no deforming vertex stage. New entry point `vs_skinned` (a port of `skinning.glsl`: morph targets, then up to four joints per vertex; weights summing to zero leave the vertex unskinned), which `meshPipeline()` picks only for draws with a skin or morph targets, as on Vulkan and DirectX (`CAMPELLO_RENDERER_SPLIT_DEFORM` now includes WebGPU).
