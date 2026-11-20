@@ -12,6 +12,7 @@
 ### Changed
 - **More lights than the shaders take: the strongest are kept.** The shaders take 4 punctual lights; the renderer used the first 4 it found in the scene graph. It now keeps directional lights first, then point and spot lights by intensity times their brightest channel (LightsPunctualLamp has 5: its dimmest, 1.5 cd, is the one left out). Every backend.
 - **WebAssembly builds use SIMD** (`-msimd128`), on by default: every browser with WebGPU supports it. The option `CAMPELLO_RENDERER_WASM_SIMD` turns it off. It applies to the library and is passed on to consumers (compile and link, so wasm-opt accepts the SIMD instructions).
+- campello_gpu v0.34.0, campello_image v0.7.0, campello_procedural v0.4.0, vector_math v0.7.0 (WebAssembly SIMD).
 
 ## [0.29.0] - 2026-11-20
 

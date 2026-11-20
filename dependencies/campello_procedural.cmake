@@ -18,7 +18,7 @@ else()
     FetchContent_Declare(
             extern_campello_procedural
             GIT_REPOSITORY https://github.com/rusoleal/campello_procedural
-            GIT_TAG        v0.1.0
+            GIT_TAG        v0.4.0
     )
 endif()
 
