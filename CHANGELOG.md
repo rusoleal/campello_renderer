@@ -11,6 +11,13 @@
   - Limits on WebGPU: a draw both skinned and instanced keeps its skin and loses the instance placement (the skinned stage already uses WebGPU's 8 vertex buffers); line meshes don't take instances.
 - `test/webgpu/run_wgsl_check.sh`: 18 checks, including the skinned and instanced pipelines and renders (a joint, a morph target and a zero weight; two instances at their matrices).
 - Web test suite (`test/webgpu/run_web_tests.sh`, Edge on an Intel UHD 630, with v0.28.0 merged): **100 passed, 0 failed** (v0.27.0: 6 failures). Fixed: `GltfSkinPosesTheMesh`, `DrawCallJointsPoseTheMesh`, `MorphTargetMovesEveryVertex`, `GltfInstancesDrawAtTheirTransforms`, `DrawCallInstancesDrawAtTheirTransforms` and `FramesDrawAfterTheEnvironmentBake` (it draws the instanced quad).
+
+### Fixed
+- **A model loaded after another could stay at the old one's transforms on WebGPU.** `bindWebGpuTransforms()` cached each transform buffer's bind group by the buffer's address and kept the cache past `setScene()`. A WebGPU `BindGroup` doesn't keep its buffer alive, so a new transform buffer could get a freed one's address and be drawn with the old bind group. That group's buffer no longer got uploads, so the geometry froze while the camera and background moved. Each cache entry now holds its buffer and is matched on it, and `setScene()` clears the cache.
+  - The same function cleared the map past 8 entries while holding a reference into it, then assigned through that reference. It no longer does.
+  - Found in campello_web_viewer: Cameras.gltf, loaded after CesiumMan and MaterialsVariantsShoe, didn't move with the camera. With the fix it does.
+  - New web test `NewAssetDrawsAtItsOwnTransforms` (five loads alternating a quad's position, three frames each). It can pass without the fix too, since the address reuse depends on the allocator.
+
 ## [0.28.1] - 2026-11-19
 
 ### Changed

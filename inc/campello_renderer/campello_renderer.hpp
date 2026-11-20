@@ -1096,7 +1096,14 @@ namespace systems::leal::campello_renderer {
         // storage buffer (group 2) indexed by firstInstance, because WebGPU
         // vertex inputs stop at location 15. Unused elsewhere.
         std::shared_ptr<systems::leal::campello_gpu::BindGroupLayout> webgpuDrawBindGroupLayout;
-        std::unordered_map<const void*, std::shared_ptr<systems::leal::campello_gpu::BindGroup>> webgpuDrawBindGroups;
+        // Keyed by the buffer's address; each entry holds the buffer too, so
+        // that address can't be reused by a new buffer while the entry exists
+        // (a BindGroup doesn't keep its buffers alive). setScene() clears it.
+        struct WebGpuDrawGroup {
+            std::shared_ptr<systems::leal::campello_gpu::Buffer> buffer;
+            std::shared_ptr<systems::leal::campello_gpu::BindGroup> group;
+        };
+        std::unordered_map<const void*, WebGpuDrawGroup> webgpuDrawBindGroups;
         const void* webgpuBoundDrawGroup = nullptr;
         // WebGPU: skinned and morphed draws (vs_skinned). WebGPU allows four
         // bind groups and group 2 holds the transforms, so the joint palette

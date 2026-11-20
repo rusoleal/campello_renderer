@@ -3533,6 +3533,51 @@ static const char *kGltfInstancedQuad = R"({
     "buffers": [{"uri": "data:application/octet-stream;base64,AACAvgAAgL4AAAAAAACAPgAAgL4AAAAAAACAPgAAgD4AAAAAAACAvgAAgD4AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/mpkZvwAAAAAAAAAAmpkZPwAAAAAAAAAAAAABAAIAAAACAAMA", "byteLength": 132}]
 })";
 
+// The same quad as one node translated to x (no instancing).
+static std::string translatedQuadGltf(float x) {
+    std::string json = kGltfInstancedQuad;
+    const std::string node =
+        R"({"mesh": 0, "extensions": {"EXT_mesh_gpu_instancing": {"attributes": {"TRANSLATION": 2}}}})";
+    const size_t at = json.find(node);
+    if (at == std::string::npos) return {};
+    json.replace(at, node.size(), "{\"mesh\": 0, \"translation\": [" + std::to_string(x) + ", 0, 0]}");
+    return json;
+}
+
+// Loading another asset draws it at its own transforms. On WebGPU the
+// transform buffers' bind groups were cached by the buffer's address and kept
+// past setScene(): a new buffer at a freed one's address drew with the old
+// bind group, whose buffer no longer got uploads, so the new model stayed at
+// the previous one's transforms. Same-size buffers each time make that reuse
+// likely, so the loads alternate the quad between x = -0.6 and x = 0.6. The
+// reuse depends on the allocator, so this may pass without the fix; the
+// viewer showed it reliably (a model loaded after two others stayed put).
+TEST_F(OffscreenRenderTest, NewAssetDrawsAtItsOwnTransforms) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+    for (int load = 0; load < 5; ++load) {
+        const bool right = load % 2 == 1;
+        auto asset = GLTF::loadGLTF(translatedQuadGltf(right ? 0.6f : -0.6f), kNoOpLoader);
+        ASSERT_NE(asset, nullptr);
+        renderer->setAsset(asset);
+        renderer->setCameraMatrices(identity, identity);
+        // One frame per frame in flight: each has its own transform buffer.
+        for (int frame = 0; frame < 3; ++frame) {
+            renderer->render(view);
+            const auto pixels = readBackPixels(tex);
+            EXPECT_EQ(litAt(pixels, 51, 32), right) << "load " << load << ", frame " << frame << ": the quad at x = 0.6";
+            EXPECT_EQ(litAt(pixels, 13, 32), !right) << "load " << load << ", frame " << frame << ": the quad at x = -0.6";
+        }
+    }
+    renderer->clearCameraOverride();
+}
+
 // Each instance renders at its own transform: two quads (x = -0.6 near
 // column 13, x = 0.6 near column 51), nothing at the mesh's own position.
 TEST_F(OffscreenRenderTest, GltfInstancesDrawAtTheirTransforms) {
