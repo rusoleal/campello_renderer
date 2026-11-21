@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.32.0] - 2026-11-21
+
+### Added
+- **Equirectangular environments from memory, turned about the up axis.** `loadEquirectangularEnvironmentMap(data, size, faceSize, rotation)` decodes an encoded image in memory (EXR, HDR, PNG, JPEG: a map embedded in a document, or fetched); the path overload gained `rotation` too. `rotation` turns the map about the world's up axis (`setEnvironmentUpAxis()`), radians counter-clockwise seen from above: with Z up the image's centre column faces +X at 0 and +Y at a quarter turn (for a photographed sky whose north isn't the scene's +Y). New test `EquirectangularMapFromMemoryTurnsAboutTheUpAxis`.
+
 ## [0.31.1] - 2026-11-21
 
 ### Fixed
