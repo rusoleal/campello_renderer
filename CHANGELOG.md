@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.33.1] - 2026-11-21
+
+### Fixed
+- **Large environments stalled `setEnvironmentMap()` for seconds.** The GGX-prefiltered specular cube map (`bakeIblResources()`) was made at the environment's own size: 2048 per face for an 8192x4096 panorama, 512 samples per texel down its mips, 3.6 s on an Intel UHD 630. It's now at most 512 per face (`kMaxPrefilteredSize`; the built-in map already was): 1.05 s there, most of it the samples reading the 2048 source. The skybox still draws the sharp map, and every backend's shader reads the prefiltered map's mip count from the texture, so roughness maps to the same blur.
+
 ## [0.33.0] - 2026-11-21
 
 ### Added
