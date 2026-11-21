@@ -120,7 +120,7 @@ struct LightsUniform {
     pad0: u32,
     pad1: u32,
     pad2: u32,
-    lights: array<Light, 4>,
+    lights: array<Light, 8>,
 }
 
 @group(0) @binding(0)  var baseColorTexture: texture_2d<f32>;
@@ -779,7 +779,7 @@ fn fs_main(vIn: VertexOut, @builtin(front_facing) frontFacing: bool) -> @locatio
     }
     var totalDiffuse = vec3f(0.0);
     var totalSpecular = vec3f(0.0);
-    for (var i = 0u; i < min(lights.count, 4u); i++) {
+    for (var i = 0u; i < min(lights.count, 8u); i++) {
         let light = lights.lights[i];
         var lightDir: vec3f;
         var attenuation = 1.0;

@@ -190,7 +190,7 @@ cbuffer LightsUniform : register(b0, space1) {
     uint  _lpad0;
     uint  _lpad1;
     uint  _lpad2;
-    Light lights[4];
+    Light lights[8];
 };
 
 // Byte-exact mirror of default.frag's CameraUniforms (kCameraUniformSize, 464
@@ -807,7 +807,7 @@ float4 pixelMain(PixelIn input, bool isFrontFace : SV_IsFrontFace) : SV_Target {
     float thickness = thicknessFactor;
     if (hasThicknessTexture > 0.5) {
         float2 thickUV = selectUV(uv0, input.uv1, texCoord1Mask, kUV1Thickness);
-        thickness *= thicknessTexture.Sample(baseColorSampler, thickUV).r;
+        thickness *= thicknessTexture.Sample(baseColorSampler, thickUV).g;  // G, per KHR_materials_volume
     }
 
     // Every early return and the discard stay below the material texture samples above.
@@ -1044,7 +1044,7 @@ float4 pixelMain(PixelIn input, bool isFrontFace : SV_IsFrontFace) : SV_Target {
     float3 totalClearcoat = float3(0.0, 0.0, 0.0);
 
     uint activeLightCount = lightCount;
-    for (uint i = 0; i < activeLightCount && i < 4u; i++) {
+    for (uint i = 0; i < activeLightCount && i < 8u; i++) {
         Light light = lights[i];
 
         float3 lightDir;
