@@ -35,6 +35,7 @@ What worked at v0.7.0. `CHANGELOG.md` lists everything that has landed since (th
 ## Bugs / Upstream Blockers
 
 - [ ] **Thickness texture read from R on Metal and Vulkan** — KHR_materials_volume stores thickness in the G channel (WebGPU since v0.30.0 and DirectX read G). Fix both shaders and rebuild their headers (Metal needs a Mac).
+- [ ] **Metal: the file's point lights don't light the quad in `FifthLightInSceneOrderStillLights`** — on macOS CI red and green both read 192 (the ambient level), so none of its five point lights (four dim, one red, a unit in front of the quad on its normal's side) reaches it, while DirectX and WebGPU light it red. The test is skipped on Apple until this is understood; no other test covers punctual lights on Metal.
 - [ ] **4 punctual lights on Metal and Vulkan** — `LightsUniform` holds `kMaxLights` = 8 (528 bytes, strongest first) and the DirectX and WebGPU shaders read them all; `default.metal` / `default.frag` (and `rt_effects.metal`) still declare and loop over 4. Raise them to 8 and rebuild the headers (Metal needs a Mac).
 - [ ] **Vulkan vertex input not applied** — `campello_gpu` Vulkan backend hardcodes `vertexBindingDescriptionCount = 0`, so vertex buffer layouts passed via `createDefaultPipelines()` are ignored. Fix upstream in `campello_gpu`. Tracked in the Vulkan `createDefaultPipelines` path.
 - [ ] **DirectX rendering nonfunctional** — DXIL binaries not compiled; `kDefaultDirectXVertShaderSize == 0` causes early return. `pipelineFlat` and `pipelineTextured` remain null on Windows.
