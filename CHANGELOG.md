@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.31.0] - 2026-11-21
 
 ### Changed
 - **8 punctual lights** (was 4): `LightsUniform` holds `kMaxLights` = 8 lights (528 bytes), strongest first. The DirectX and WebGPU shaders read all 8; the Metal and Vulkan shaders still read the first 4 (the strongest) until they're updated. A larger uniform buffer than a shader declares is valid on every API.
