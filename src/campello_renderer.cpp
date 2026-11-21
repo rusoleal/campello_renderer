@@ -1493,8 +1493,12 @@ void Renderer::bakeIblResources() {
     // 2) GGX-prefiltered specular cubemap — derived from the current
     // environmentMap's sharp (mip 0) faces; rebaked every time the
     // environment changes. Standardized to rgba16float regardless of
-    // environmentMap's own format (varies by loader).
-    uint32_t envSize = environmentMap->getWidth();
+    // environmentMap's own format (varies by loader). At most
+    // kMaxPrefilteredSize per face: the skybox draws the sharp map itself,
+    // and 512 samples per texel of a 2048 map's mips took 3.6 s on an
+    // Intel UHD 630 (the shaders read the mip count from the texture).
+    constexpr uint32_t kMaxPrefilteredSize = 512;
+    uint32_t envSize = std::min(environmentMap->getWidth(), kMaxPrefilteredSize);
     if (envSize > 0) {
         uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2((double)envSize));
         prefilteredEnvironmentMap = device->createTexture(
