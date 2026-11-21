@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.33.0] - 2026-11-21
+
+### Added
+- **Large environment maps without stalling the app.** `prepareEquirectangularEnvironmentMap(data, size, upAxis, faceSize, rotation)` does the slow part of `loadEquirectangularEnvironmentMap()` (decoding and resampling into cube faces: about 8 s for an 8192x4096 EXR on one core) without the GPU, so it runs on any thread; `createEnvironmentMap(faces)` uploads the result (with its mip chain) for `setEnvironmentMap()`. The six faces now bake on threads of their own where there are threads (not on WebAssembly without pthreads). The test `EquirectangularMapFromMemoryTurnsAboutTheUpAxis` prepares a map on another thread.
+
 ## [0.32.0] - 2026-11-21
 
 ### Added
