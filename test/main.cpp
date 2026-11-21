@@ -3544,6 +3544,64 @@ static std::string translatedQuadGltf(float x) {
     return json;
 }
 
+// A quad lit by five point lights in front of it: four dim white ones, then,
+// fifth in scene order, a bright red one. The shaders used to take the first
+// four lights in scene order, leaving the red one out; the renderer now keeps
+// eight, strongest first (shaders that take four get the strongest four).
+static std::string fiveLightsQuadGltf() {
+    std::string json = kGltfInstancedQuad;
+    const auto replace = [&json](const std::string& from, const std::string& to) {
+        const size_t at = json.find(from);
+        if (at != std::string::npos) json.replace(at, from.size(), to);
+    };
+    replace(R"("extensionsUsed": ["EXT_mesh_gpu_instancing"],)",
+            R"("extensionsUsed": ["KHR_lights_punctual"],
+    "extensions": {"KHR_lights_punctual": {"lights": [
+        {"type": "point", "intensity": 0.001}, {"type": "point", "intensity": 0.001},
+        {"type": "point", "intensity": 0.001}, {"type": "point", "intensity": 0.001},
+        {"type": "point", "intensity": 4, "color": [1, 0, 0]}]}},)");
+    replace(R"("scenes": [{"nodes": [0]}],)", R"("scenes": [{"nodes": [0, 1, 2, 3, 4, 5]}],)");
+    std::string lights;
+    for (int i = 0; i < 5; ++i) {
+        lights += R"(, {"translation": [0, 0, -1], "extensions": {"KHR_lights_punctual": {"light": )" +
+                  std::to_string(i) + "}}}";
+    }
+    replace(R"({"mesh": 0, "extensions": {"EXT_mesh_gpu_instancing": {"attributes": {"TRANSLATION": 2}}}})",
+            R"({"mesh": 0})" + lights);
+    replace(R"("doubleSided": true, "emissiveFactor": [1, 1, 1],)", R"("doubleSided": true,)");
+    replace(R"("pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1]})",
+            R"("pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0, "roughnessFactor": 1})");
+    return json;
+}
+
+TEST_F(OffscreenRenderTest, FifthLightInSceneOrderStillLights) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    renderer->setIBLEnabled(false);
+    auto asset = GLTF::loadGLTF(fiveLightsQuadGltf(), kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    ASSERT_TRUE(asset->khrLightsPunctual);
+    ASSERT_EQ(asset->khrLightsPunctual->size(), 5u);
+    renderer->setAsset(asset);
+    // The camera half a unit behind the quad's plane (z = -0.5), looking at it;
+    // the lights a unit in front of the quad, on the camera's side.
+    const float view[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0.5f, 1};
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    renderer->setCameraMatrices(view, identity);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto target = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+    renderer->render(target);
+    const auto pixels = readBackPixels(tex);
+    const size_t at = (32u * 64u + 32u) * 4u;
+    ASSERT_GE(pixels.size(), at + 4);
+    const int red = pixels[at], green = pixels[at + 1];
+    EXPECT_GT(red - green, 60) << "red " << red << ", green " << green << ": the red light (fifth) isn't lighting the quad";
+    renderer->clearCameraOverride();
+}
+
 // Loading another asset draws it at its own transforms. On WebGPU the
 // transform buffers' bind groups were cached by the buffer's address and kept
 // past setScene(): a new buffer at a freed one's address drew with the old

@@ -34,8 +34,8 @@ What worked at v0.7.0. `CHANGELOG.md` lists everything that has landed since (th
 
 ## Bugs / Upstream Blockers
 
-- [ ] **Thickness texture read from R on Metal, Vulkan and DirectX** — KHR_materials_volume stores thickness in the G channel (WebGPU reads G since v0.30.0). Fix the three shaders and rebuild their headers (Metal needs a Mac).
-- [ ] **4 punctual lights per draw** — every backend's LightsUniform holds 4 (272 bytes); the strongest are kept since v0.30.0. Raising it means all shaders and the uniform size (Metal needs a Mac).
+- [ ] **Thickness texture read from R on Metal and Vulkan** — KHR_materials_volume stores thickness in the G channel (WebGPU since v0.30.0 and DirectX read G). Fix both shaders and rebuild their headers (Metal needs a Mac).
+- [ ] **4 punctual lights on Metal and Vulkan** — `LightsUniform` holds `kMaxLights` = 8 (528 bytes, strongest first) and the DirectX and WebGPU shaders read them all; `default.metal` / `default.frag` (and `rt_effects.metal`) still declare and loop over 4. Raise them to 8 and rebuild the headers (Metal needs a Mac).
 - [ ] **Vulkan vertex input not applied** — `campello_gpu` Vulkan backend hardcodes `vertexBindingDescriptionCount = 0`, so vertex buffer layouts passed via `createDefaultPipelines()` are ignored. Fix upstream in `campello_gpu`. Tracked in the Vulkan `createDefaultPipelines` path.
 - [ ] **DirectX rendering nonfunctional** — DXIL binaries not compiled; `kDefaultDirectXVertShaderSize == 0` causes early return. `pipelineFlat` and `pipelineTextured` remain null on Windows.
 - [ ] **No acceleration structure compacted-size query** in `campello_gpu`, so the path tracer can't compact its BLASes (memory).

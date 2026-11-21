@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **8 punctual lights** (was 4): `LightsUniform` holds `kMaxLights` = 8 lights (528 bytes), strongest first. The DirectX and WebGPU shaders read all 8; the Metal and Vulkan shaders still read the first 4 (the strongest) until they're updated. A larger uniform buffer than a shader declares is valid on every API.
+
+### Fixed
+- **DirectX: the thickness texture is read from its G channel**, as KHR_materials_volume says (it read R). Same as WebGPU since v0.30.0; Metal and Vulkan still read R.
+
 ## [0.30.0] - 2026-11-20
 
 ### Added

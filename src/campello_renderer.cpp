@@ -115,6 +115,12 @@ static void trimWebGpuMaterialEntries(systems::leal::campello_gpu::BindGroupDesc
 }
 #endif
 
+// Punctual lights per draw: LightsUniform is a 16-byte header and 64 bytes a light.
+// The DirectX and WebGPU shaders read all of them; shaders that take fewer
+// read the first ones, which are the strongest (see the light upload).
+static constexpr uint32_t kMaxLights = 8;
+static constexpr uint32_t kLightsUniformSize = 16 + kMaxLights * 64;
+
 #include "environments/default_environment.h"
 
 #include <campello_image/image.hpp>
@@ -1085,7 +1091,7 @@ void Renderer::ensureBindGroupLayout() {
     lightsEntry.visibility = GPU::ShaderStage::fragment;
     lightsEntry.type       = GPU::EntryObjectType::buffer;
     lightsEntry.data.buffer.hasDinamicOffaset = false;
-    lightsEntry.data.buffer.minBindingSize    = 272; // 16-byte header + 4 lights * 64 bytes
+    lightsEntry.data.buffer.minBindingSize    = kLightsUniformSize;
     lightsEntry.data.buffer.type              = GPU::EntryObjectBufferType::uniform;
     bglDesc.entries.push_back(lightsEntry);
 
@@ -1352,7 +1358,7 @@ void Renderer::ensureVulkanPbrBindGroupLayouts() {
     // --- Set 1: per-frame lights/camera/environment/scene-color ---
     if (!vulkanFrameBindGroupLayout) {
         GPU::BindGroupLayoutDescriptor frameDesc{};
-        addBuf(frameDesc, 0, 272);                          // LightsUniform
+        addBuf(frameDesc, 0, kLightsUniformSize);           // LightsUniform
         addBuf(frameDesc, 1, kCameraUniformSize);           // CameraUniforms + clip planes
         addTex(frameDesc, 2, GPU::TextureType::ttCube);     // environmentMap (prefiltered specular — see bakeIblResources())
         addSamp(frameDesc, 3);                              // environmentSampler
@@ -2336,9 +2342,9 @@ void Renderer::setScene(uint32_t index) {
     // Frame-in-flight buffers: lights, camera, and fences.
     for (uint32_t f = 0; f < kMaxFramesInFlight; ++f) {
         if (!frameResources[f].lightsUniformBuffer) {
-            frameResources[f].lightsUniformBuffer = device->createBuffer(272, GPU::BufferUsage::uniform);
-            uint8_t zeros[272] = {0};
-            frameResources[f].lightsUniformBuffer->upload(0, 272, zeros);
+            frameResources[f].lightsUniformBuffer = device->createBuffer(kLightsUniformSize, GPU::BufferUsage::uniform);
+            uint8_t zeros[kLightsUniformSize] = {0};
+            frameResources[f].lightsUniformBuffer->upload(0, kLightsUniformSize, zeros);
         }
         if (!frameResources[f].cameraPositionBuffer) {
             frameResources[f].cameraPositionBuffer = device->createBuffer(kCameraUniformSize, GPU::BufferUsage::uniform);
@@ -2477,7 +2483,7 @@ void Renderer::setScene(uint32_t index) {
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout  = vulkanFrameBindGroupLayout;
             bgDesc.entries = {
-                {0, GPU::BufferBinding{frameResources[f].lightsUniformBuffer, 0, 272}},
+                {0, GPU::BufferBinding{frameResources[f].lightsUniformBuffer, 0, kLightsUniformSize}},
                 {1, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, kCameraUniformSize}},
                 {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
                 {3, environmentSampler},
@@ -2499,7 +2505,7 @@ void Renderer::setScene(uint32_t index) {
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout  = bindGroupLayout;
             bgDesc.entries = {
-                {10, GPU::BufferBinding{frameResources[f].lightsUniformBuffer, 0, 272}},
+                {10, GPU::BufferBinding{frameResources[f].lightsUniformBuffer, 0, kLightsUniformSize}},
                 {18, GPU::BufferBinding{frameResources[f].cameraPositionBuffer, 0, kCameraUniformSize}},
                 {22, defaultTexture},
             };
@@ -7297,13 +7303,11 @@ void Renderer::renderToTarget(
     // ------------------------------------------------------------------
     // 3. Upload KHR_lights_punctual lights to uniform buffer (binding 10).
     //
-    // Uniform buffer layout (256 bytes):
+    // Uniform buffer layout (kLightsUniformSize = 528 bytes):
     //   [0]:      uint32_t lightCount
     //   [4-15]:   padding (12 bytes)
     //   [16-79]:  Light 0 (64 bytes: position, color, direction, spot angles)
-    //   [80-143]: Light 1
-    //   [144-207]: Light 2
-    //   [208-271]: Light 3
+    //   ...       Lights 1-7, 64 bytes each, strongest first
     // ------------------------------------------------------------------
     {
         if (lightsUniformBuffer) {
@@ -7317,14 +7321,14 @@ void Renderer::renderToTarget(
             struct LightsUniform {
                 uint32_t count;
                 float padding[3];
-                LightData lights[4];
+                LightData lights[kMaxLights];
             };
             
             LightsUniform lightsData = {};
             lightsData.count = 0;
             
             if (punctualLightsEnabled && asset && asset->khrLightsPunctual && !asset->khrLightsPunctual->empty()) {
-                // Collect the scene's lights; the shaders take 4 (below).
+                // Collect the scene's lights; the shaders take kMaxLights (below).
                 std::vector<LightData> collected;
                 
                 auto countLights = [&](auto&& self, uint64_t nodeIndex, 
@@ -7411,18 +7415,18 @@ void Renderer::renderToTarget(
                         countLights(countLights, rootIdx, M4::identity());
                     }
                 }
-                // More than the shaders take: keep the strongest. Directional
-                // lights (lux) first, then point and spot lights (candela) by
-                // intensity times their brightest channel; ties keep scene order.
+                // Strongest first: shaders that take fewer than kMaxLights
+                // (Metal, Vulkan: 4) read the first ones, and past kMaxLights the
+                // rest are left out. Directional lights (lux) first, then point
+                // and spot lights (candela) by intensity times their brightest
+                // channel; ties keep scene order.
                 auto strength = [](const LightData &ld) {
                     if (ld.position[3] < 0.5f) return std::numeric_limits<float>::infinity();
                     return ld.color[3] * std::max({ld.color[0], ld.color[1], ld.color[2]});
                 };
-                if (collected.size() > 4) {
-                    std::stable_sort(collected.begin(), collected.end(),
-                                     [&](const LightData &a, const LightData &b) { return strength(a) > strength(b); });
-                }
-                const size_t kept = std::min(collected.size(), size_t(4));
+                std::stable_sort(collected.begin(), collected.end(),
+                                 [&](const LightData &a, const LightData &b) { return strength(a) > strength(b); });
+                const size_t kept = std::min(collected.size(), size_t(kMaxLights));
                 for (size_t i = 0; i < kept; ++i) lightsData.lights[i] = collected[i];
                 lightsData.count = (uint32_t)kept;
             }
@@ -7445,6 +7449,7 @@ void Renderer::renderToTarget(
                 ld.spotAngles[0] = ld.spotAngles[1] = ld.spotAngles[2] = ld.spotAngles[3] = 0.0f;
             }
 
+            static_assert(sizeof(LightsUniform) == kLightsUniformSize);
             lightsUniformBuffer->upload(0, sizeof(LightsUniform), &lightsData);
             // (lights debug removed)
         }
@@ -7616,7 +7621,7 @@ void Renderer::renderToTarget(
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
-            {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+            {0, GPU::BufferBinding{lightsUniformBuffer, 0, kLightsUniformSize}},
             {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
             {3, environmentSampler},
@@ -7637,7 +7642,7 @@ void Renderer::renderToTarget(
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = bindGroupLayout;
         bgDesc.entries = {
-            {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+            {10, GPU::BufferBinding{lightsUniformBuffer, 0, kLightsUniformSize}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
             {29, shadowMapBinding()},  // sun shadows (fragmentMain_textured)
@@ -7902,7 +7907,7 @@ void Renderer::renderToTarget(
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout = vulkanFrameBindGroupLayout;
             bgDesc.entries = {
-                {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+                {0, GPU::BufferBinding{lightsUniformBuffer, 0, kLightsUniformSize}},
                 {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
                 {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
                 {3, environmentSampler},
@@ -7922,7 +7927,7 @@ void Renderer::renderToTarget(
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout = bindGroupLayout;
             bgDesc.entries = {
-                {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+                {10, GPU::BufferBinding{lightsUniformBuffer, 0, kLightsUniformSize}},
                 {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
                 {22, opaqueSceneTexture[currentFrameIndex]},
                 // See the other frame-bind-group construction site's comment
@@ -10798,7 +10803,7 @@ void Renderer::render(const RenderScene& scene,
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
-            {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+            {0, GPU::BufferBinding{lightsUniformBuffer, 0, kLightsUniformSize}},
             {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
             {3, environmentSampler},
@@ -10819,7 +10824,7 @@ void Renderer::render(const RenderScene& scene,
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = bindGroupLayout;
         bgDesc.entries = {
-            {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+            {10, GPU::BufferBinding{lightsUniformBuffer, 0, kLightsUniformSize}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
             {29, shadowMapBinding()},  // sun shadows (fragmentMain_textured)
@@ -10848,10 +10853,10 @@ void Renderer::render(const RenderScene& scene,
         struct LightsUniformGPU {
             uint32_t count;
             float padding[3];
-            LightDataGPU lights[4];
+            LightDataGPU lights[kMaxLights];
         };
         LightsUniformGPU lightsData = {};
-        lightsData.count = (uint32_t)std::min(scene.lights.size(), size_t(4));
+        lightsData.count = (uint32_t)std::min(scene.lights.size(), size_t(kMaxLights));
         bool shadowAssigned = false;
         for (size_t i = 0; i < lightsData.count; ++i) {
             auto &l = scene.lights[i];
@@ -10890,6 +10895,7 @@ void Renderer::render(const RenderScene& scene,
             lightsData.lights[0].color[2] = 1.0f;
             lightsData.lights[0].color[3] = 5.0f;
         }
+        static_assert(sizeof(LightsUniformGPU) == kLightsUniformSize);
         lightsUniformBuffer->upload(0, sizeof(LightsUniformGPU), &lightsData);
     }
 
@@ -11324,7 +11330,7 @@ void Renderer::render(const RenderScene& scene,
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = vulkanFrameBindGroupLayout;
         bgDesc.entries = {
-            {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+            {0, GPU::BufferBinding{lightsUniformBuffer, 0, kLightsUniformSize}},
             {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
             {3, environmentSampler},
@@ -11345,7 +11351,7 @@ void Renderer::render(const RenderScene& scene,
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = bindGroupLayout;
         bgDesc.entries = {
-            {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+            {10, GPU::BufferBinding{lightsUniformBuffer, 0, kLightsUniformSize}},
             {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
             {22, scTex},
             {29, shadowMapBinding()},  // sun shadows (fragmentMain_textured)
@@ -11639,7 +11645,7 @@ void Renderer::render(const RenderScene& scene,
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout = vulkanFrameBindGroupLayout;
             bgDesc.entries = {
-                {0, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+                {0, GPU::BufferBinding{lightsUniformBuffer, 0, kLightsUniformSize}},
                 {1, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
                 {2, prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap},
                 {3, environmentSampler},
@@ -11659,7 +11665,7 @@ void Renderer::render(const RenderScene& scene,
             GPU::BindGroupDescriptor bgDesc{};
             bgDesc.layout = bindGroupLayout;
             bgDesc.entries = {
-                {10, GPU::BufferBinding{lightsUniformBuffer, 0, 272}},
+                {10, GPU::BufferBinding{lightsUniformBuffer, 0, kLightsUniformSize}},
                 {18, GPU::BufferBinding{cameraPositionBuffer, 0, kCameraUniformSize}},
                 {22, opaqueSceneTexture[currentFrameIndex]},
                 // See the other frame-bind-group construction site's comment
