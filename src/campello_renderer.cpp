@@ -9127,20 +9127,31 @@ namespace {
 } // anonymous namespace
 
 std::shared_ptr<systems::leal::campello_gpu::Texture>
-Renderer::loadEquirectangularEnvironmentMap(const std::string &path, uint32_t faceSize)
+Renderer::loadEquirectangularEnvironmentMap(const std::string &path, uint32_t faceSize, float rotation)
 {
     namespace Img = systems::leal::campello_image;
 
     auto img = Img::Image::fromFile(path.c_str());
     if (!img) return nullptr;
 
-    return convertEquirectangularImageToCubemap(img, faceSize);
+    return convertEquirectangularImageToCubemap(img, faceSize, 1.0f, rotation);
+}
+
+std::shared_ptr<systems::leal::campello_gpu::Texture>
+Renderer::loadEquirectangularEnvironmentMap(const uint8_t *data, size_t size, uint32_t faceSize, float rotation)
+{
+    namespace Img = systems::leal::campello_image;
+
+    auto img = Img::Image::fromMemory(data, size);
+    if (!img) return nullptr;
+
+    return convertEquirectangularImageToCubemap(img, faceSize, 1.0f, rotation);
 }
 
 std::shared_ptr<systems::leal::campello_gpu::Texture>
 Renderer::convertEquirectangularImageToCubemap(
     const std::shared_ptr<systems::leal::campello_image::Image> &img, uint32_t faceSize,
-    float intensityScale)
+    float intensityScale, float rotation)
 {
     namespace GPU = systems::leal::campello_gpu;
     namespace Img = systems::leal::campello_image;
@@ -9188,6 +9199,10 @@ Renderer::convertEquirectangularImageToCubemap(
 
     const float twoPi = 2.0f * static_cast<float>(M_PI);
     const float pi    = static_cast<float>(M_PI);
+    // The map turned by `rotation` about the up axis: each direction reads
+    // the map where it was before the turn (the inverse rotation).
+    const float turnCos = std::cos(rotation);
+    const float turnSin = std::sin(rotation);
 
     // Generate each cubemap face by sampling the equirectangular map.
     for (int face = 0; face < 6; ++face) {
@@ -9210,6 +9225,20 @@ Renderer::convertEquirectangularImageToCubemap(
 
                 float len = std::sqrt(dx*dx + dy*dy + dz*dz);
                 if (len > 0.0f) { dx /= len; dy /= len; dz /= len; }
+
+                // Undo the turn: right-handed about the up axis (Z up:
+                // +X towards +Y; Y up: +X towards -Z), by -rotation.
+                if (rotation != 0.0f) {
+                    if (environmentUpAxis == UpAxis::z) {
+                        const float x = dx, y = dy;
+                        dx =  turnCos * x + turnSin * y;
+                        dy = -turnSin * x + turnCos * y;
+                    } else {
+                        const float x = dx, z = dz;
+                        dx = turnCos * x - turnSin * z;
+                        dz = turnSin * x + turnCos * z;
+                    }
+                }
 
                 // Z up: the same direction in the map's own Y-up frame
                 // (a -90 degree turn about X takes +Z to +Y).

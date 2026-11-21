@@ -1729,6 +1729,59 @@ TEST_F(OffscreenRenderTest, EnvironmentUpAxisTurnsTheSky) {
     device->waitForIdle();
 }
 
+// An equirectangular map from memory, turned about the up axis: a Radiance
+// HDR whose middle quarter of columns (the +X side) is red and the rest blue.
+TEST_F(OffscreenRenderTest, EquirectangularMapFromMemoryTurnsAboutTheUpAxis) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    using Renderer = systems::leal::campello_renderer::Renderer;
+    namespace GPU = systems::leal::campello_gpu;
+    const uint32_t W = 32, H = 16;
+    std::string hdr = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y " + std::to_string(H) + " +X " + std::to_string(W) + "\n";
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            const bool middle = x >= W * 3 / 8 && x < W * 5 / 8;
+            const char pixel[4] = {char(middle ? 128 : 0), 0, char(middle ? 0 : 128), char(129)};  // 1.0
+            hdr.append(pixel, 4);
+        }
+    }
+    const auto halfToFloat = [](uint16_t h) {
+        const uint32_t exponent = (h >> 10) & 31, mantissa = h & 1023;
+        return exponent == 0 ? std::ldexp(float(mantissa), -24) : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+    };
+    // Red minus blue at the middle of a cube face: > 0 red, < 0 blue.
+    constexpr uint32_t FACE = 16;
+    const auto redness = [&](const std::shared_ptr<GPU::Texture>& cube, uint32_t face) {
+        device->waitForIdle();
+        std::vector<uint16_t> raw(size_t(FACE) * FACE * 4);
+        EXPECT_TRUE(cube->download(0, face, raw.data(), raw.size() * 2));
+        const size_t i = (size_t(FACE / 2) * FACE + FACE / 2) * 4;
+        return halfToFloat(raw[i]) - halfToFloat(raw[i + 2]);
+    };
+    const auto* bytes = reinterpret_cast<const uint8_t*>(hdr.data());
+    const float quarter = 0.5f * float(M_PI);
+
+    // Faces: 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z (world axes).
+    auto plain = renderer->loadEquirectangularEnvironmentMap(bytes, hdr.size(), FACE);
+    ASSERT_NE(plain, nullptr);
+    EXPECT_GT(redness(plain, 0), 0.5f);
+    EXPECT_LT(redness(plain, 4), -0.5f);
+    // Y up: a quarter turn counter-clockwise seen from above takes +X to -Z.
+    auto turnedY = renderer->loadEquirectangularEnvironmentMap(bytes, hdr.size(), FACE, quarter);
+    ASSERT_NE(turnedY, nullptr);
+    EXPECT_LT(redness(turnedY, 0), -0.5f);
+    EXPECT_GT(redness(turnedY, 5), 0.5f);
+    // Z up: the same turn takes +X to +Y.
+    renderer->setEnvironmentUpAxis(Renderer::UpAxis::z);
+    auto turnedZ = renderer->loadEquirectangularEnvironmentMap(bytes, hdr.size(), FACE, quarter);
+    ASSERT_NE(turnedZ, nullptr);
+    EXPECT_LT(redness(turnedZ, 0), -0.5f);
+    EXPECT_GT(redness(turnedZ, 2), 0.5f);
+    // Not an image: nothing.
+    const uint8_t junk[4] = {1, 2, 3, 4};
+    EXPECT_EQ(renderer->loadEquirectangularEnvironmentMap(junk, sizeof(junk)), nullptr);
+    device->waitForIdle();
+}
+
 TEST_F(OffscreenRenderTest, MultipleConsecutiveRenders) {
     if (!device) GTEST_SKIP() << "No GPU device available";
     auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);

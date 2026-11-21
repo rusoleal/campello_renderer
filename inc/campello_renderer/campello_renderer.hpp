@@ -1460,9 +1460,17 @@ namespace systems::leal::campello_renderer {
         // Load a single equirectangular image (2:1 aspect ratio) and convert
         // it to a cubemap on the CPU. Supports PNG, JPEG, HDR, EXR.
         // faceSize is the desired size of each cubemap face; 0 means auto
-        // (half the equirectangular height). Returns nullptr on failure.
+        // (half the equirectangular height). rotation turns the map about
+        // the world's up axis (setEnvironmentUpAxis()), radians
+        // counter-clockwise seen from above: with Z up, the image's centre
+        // column faces +X at 0 and +Y at a quarter turn. Returns nullptr on
+        // failure.
         std::shared_ptr<systems::leal::campello_gpu::Texture> loadEquirectangularEnvironmentMap(
-            const std::string &path, uint32_t faceSize = 0);
+            const std::string &path, uint32_t faceSize = 0, float rotation = 0.0f);
+        // The same from an encoded image in memory (a map embedded in a
+        // document, or fetched): `size` bytes at `data`.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> loadEquirectangularEnvironmentMap(
+            const uint8_t *data, size_t size, uint32_t faceSize = 0, float rotation = 0.0f);
 
         // The world's up axis for equirectangular environments: their zenith
         // (top row) is drawn towards +Y (default, glTF) or +Z (CAD, BIM, IFC).
@@ -1846,7 +1854,7 @@ namespace systems::leal::campello_renderer {
         // means for a user's own loaded HDRI.
         std::shared_ptr<systems::leal::campello_gpu::Texture> convertEquirectangularImageToCubemap(
             const std::shared_ptr<systems::leal::campello_image::Image> &img, uint32_t faceSize,
-            float intensityScale = 1.0f);
+            float intensityScale = 1.0f, float rotation = 0.0f);
 
         // Decodes the embedded default skybox (a small real photo, not a flat
         // placeholder) so IBL has something plausible to reflect out of the box.
