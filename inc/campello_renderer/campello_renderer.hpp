@@ -1046,6 +1046,10 @@ namespace systems::leal::campello_renderer {
 
         // View-projection matrix recomputed from the active camera each frame.
         systems::leal::vector_math::Matrix4<double> vpMatrix;
+        systems::leal::vector_math::Matrix4<double> lastViewMatrix = systems::leal::vector_math::Matrix4<double>::identity();
+        /// pick(): each primitive's triangles (object space, xyz per vertex, 3 vertices per triangle).
+        mutable std::unordered_map<const systems::leal::gltf::Primitive*, std::vector<float>> pickTriangles;
+        const std::vector<float>& pickGeometry(const systems::leal::gltf::Primitive& primitive) const;
 
         // Approximate bounding radius of the current scene (computed in setScene()).
         float boundsRadius = 1.0f;
@@ -1354,6 +1358,31 @@ namespace systems::leal::campello_renderer {
         void reuploadMaterialSlot(uint32_t uniformSlot,
                                   const systems::leal::gltf::Material& material,
                                   const systems::leal::gltf::GLTF& asset);
+
+        /// The asset's material `materialIndex` was changed in place (its
+        /// factors, KHR_texture_transform, ...): re-uploads its uniforms.
+        void materialChanged(uint64_t materialIndex);
+
+        /// What pick() hit.
+        struct PickResult {
+            int64_t node = -1;           ///< the glTF node hit, -1 when none
+            double point[3] = {0, 0, 0}; ///< world-space hit point
+            double rayOrigin[3] = {0, 0, 0};
+            double distance = 0;         ///< from rayOrigin to point
+        };
+        /// The node whose geometry the ray through (x, y) hits first, in the
+        /// last rendered frame (camera and node transforms). x, y in 0..1 of
+        /// the rendered image, from its top left. KHR_node_selectability:
+        /// unselectable nodes (selectable false on the node or an ancestor)
+        /// are skipped; visibility doesn't matter. Triangles of each node's
+        /// mesh in their rest pose (no skinning or morphing; one instance).
+        PickResult pick(double x, double y) const;
+
+        /// A node's world matrix in the last rendered frame (row-major, as
+        /// vector_math). False when there's no such node.
+        bool getNodeWorldMatrix(uint64_t nodeIndex, systems::leal::vector_math::Matrix4<double>& out) const;
+        /// The view matrix of the last rendered frame (row-major).
+        const systems::leal::vector_math::Matrix4<double>& getLastViewMatrix() const { return lastViewMatrix; }
 
         void setCamera(uint32_t index);
         void setScene(uint32_t index);

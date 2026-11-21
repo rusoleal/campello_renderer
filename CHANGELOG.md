@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **KHR_interactivity support** (with gltf v0.8.0's `InteractivityRuntime`, which executes the behavior graph):
+  - `InteractivityObjectModel` (new header `campello_renderer/interactivity.hpp`) is the runtime's host. It reads and writes the glTF Asset Object Model on the renderer's asset, in place, so the next frame shows each change:
+    - nodes: translation, rotation, scale; matrix and globalMatrix (read-only); visibility, selectability and hoverability;
+    - materials: factors, plus `KHR_texture_transform` offset, rotation and scale (created on first write);
+    - punctual lights: color, intensity, range;
+    - the active camera's position and rotation (read-only).
+    
+    `flush()` re-uploads the materials that changed. `onLog` and `onEventSent` forward `debug/log` and `event/send`.
+  - `Renderer::pick(x, y)`: the node hit first by the ray through a point of the last rendered frame, with its hit point, ray origin and distance. It is a CPU raycast against each mesh's triangles, Draco included, in rest pose. Following KHR_node_selectability, unselectable nodes and their subtrees are skipped and visibility is ignored.
+  - `Renderer::materialChanged(index)`, `getNodeWorldMatrix()` and `getLastViewMatrix()`.
+
+### Fixed
+- **KHR_node_visibility was ignored.** A node with `visible: false` was drawn. Now it and its subtree are hidden, lights included.
+
+### Changed
+- gltf v0.8.0.
+
 ## [0.33.1] - 2026-11-21
 
 ### Fixed

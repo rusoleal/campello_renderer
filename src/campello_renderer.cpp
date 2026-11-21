@@ -925,6 +925,7 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         quantizedLayout.reset();
         quantizedLayoutDetected = false;
         dracoPrimitiveBuffers.clear();
+        pickTriangles.clear();
         deinterleavedBuffers.clear();
         widenedIndexBuffers.clear();
         color0Buffers.clear();
@@ -7228,6 +7229,7 @@ void Renderer::renderToTarget(
 
         vpMatrix = proj * view;
     }
+    lastViewMatrix = view;
 
     updateFrustumPlanes();
 
@@ -7351,6 +7353,7 @@ void Renderer::renderToTarget(
                                        const VM::Matrix4<double>& parentWorld) -> void {
                     if (!asset->nodes || nodeIndex >= asset->nodes->size()) return;
                     auto &node = (*asset->nodes)[nodeIndex];
+                    if (!node.visible) return;  // KHR_node_visibility: lights too
                     VM::Matrix4<double> world = parentWorld * nodeLocalMatrix(node);
                     
                     if (node.light >= 0 && node.light < (int64_t)asset->khrLightsPunctual->size()) {
@@ -8280,10 +8283,13 @@ void Renderer::gatherVisibleDraws(uint64_t nodeIndex)
         return;
     }
 
+    auto &node = (*asset->nodes)[nodeIndex];
+    // KHR_node_visibility: a hidden node hides its whole subtree.
+    if (!node.visible) return;
+
     if (nodeIndex < visibleNodeMask.size()) {
         visibleNodeMask[nodeIndex] = 1;
     }
-    auto &node = (*asset->nodes)[nodeIndex];
 
     if (node.mesh >= 0) {
         updateVisibleInstances(nodeIndex);
@@ -12516,5 +12522,203 @@ void Renderer::renderPrimitive(
     } else {
         rpe->draw(draw.mesh->vertexCount, instanceCount, 0, drawFirstInstance());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Interactivity support: material updates, picking (KHR_node_selectability)
+// ---------------------------------------------------------------------------
+
+void Renderer::materialChanged(uint64_t materialIndex) {
+    if (!asset || !asset->materials || materialIndex >= asset->materials->size() || !materialUniformBuffer) return;
+    reuploadMaterialSlot((uint32_t)(materialIndex + 1), (*asset->materials)[materialIndex], *asset);
+}
+
+bool Renderer::getNodeWorldMatrix(uint64_t nodeIndex, systems::leal::vector_math::Matrix4<double>& out) const {
+    if (nodeIndex >= nodeWorldMatrices.size()) return false;
+    out = nodeWorldMatrices[nodeIndex];
+    return true;
+}
+
+namespace {
+
+// An accessor's elements as floats (normalized integers mapped to -1..1 or 0..1).
+std::vector<float> accessorFloats(const systems::leal::gltf::Accessor& acc, const std::vector<uint8_t>& bytes) {
+    using CT = systems::leal::gltf::ComponentType;
+    const size_t n = acc.count * gltfTypeCount(acc.type);
+    std::vector<float> out(n);
+    const size_t size = gltfComponentSize(acc.componentType);
+    if (bytes.size() < n * size) return {};
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t* p = bytes.data() + i * size;
+        float v = 0;
+        switch (acc.componentType) {
+            case CT::ctFloat: std::memcpy(&v, p, 4); break;
+            case CT::ctByte: { int8_t x; std::memcpy(&x, p, 1); v = acc.normalized ? std::max(x / 127.0f, -1.0f) : x; break; }
+            case CT::ctUnsignedByte: { uint8_t x = *p; v = acc.normalized ? x / 255.0f : x; break; }
+            case CT::ctShort: { int16_t x; std::memcpy(&x, p, 2); v = acc.normalized ? std::max(x / 32767.0f, -1.0f) : x; break; }
+            case CT::ctUnsignedShort: { uint16_t x; std::memcpy(&x, p, 2); v = acc.normalized ? x / 65535.0f : x; break; }
+            case CT::ctUnsignedInt: { uint32_t x; std::memcpy(&x, p, 4); v = (float)x; break; }
+            default: return {};
+        }
+        out[i] = v;
+    }
+    return out;
+}
+
+std::vector<uint32_t> accessorIndices(const systems::leal::gltf::Accessor& acc, const std::vector<uint8_t>& bytes) {
+    const size_t size = gltfComponentSize(acc.componentType);
+    std::vector<uint32_t> out(acc.count);
+    if (bytes.size() < acc.count * size) return {};
+    for (size_t i = 0; i < acc.count; ++i) {
+        uint32_t x = 0;
+        std::memcpy(&x, bytes.data() + i * size, size);  // little-endian
+        out[i] = x;
+    }
+    return out;
+}
+
+// Ray/triangle (Möller-Trumbore, both faces): the distance along `dir`, or -1.
+double rayTriangle(const double o[3], const double d[3], const double* a, const double* b, const double* c) {
+    const double e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+    const double e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+    const double p[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+    const double det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+    if (std::fabs(det) < 1e-12) return -1;
+    const double inv = 1.0 / det;
+    const double t0[3] = {o[0] - a[0], o[1] - a[1], o[2] - a[2]};
+    const double u = (t0[0] * p[0] + t0[1] * p[1] + t0[2] * p[2]) * inv;
+    if (u < 0 || u > 1) return -1;
+    const double q[3] = {t0[1] * e1[2] - t0[2] * e1[1], t0[2] * e1[0] - t0[0] * e1[2], t0[0] * e1[1] - t0[1] * e1[0]};
+    const double v = (d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) * inv;
+    if (v < 0 || u + v > 1) return -1;
+    const double t = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
+    return t > 0 ? t : -1;
+}
+
+// Row-major M * (x, y, z, w).
+void transformPoint(const systems::leal::vector_math::Matrix4<double>& m, const double in[4], double out[4]) {
+    for (int r = 0; r < 4; ++r)
+        out[r] = m.data[r * 4] * in[0] + m.data[r * 4 + 1] * in[1] + m.data[r * 4 + 2] * in[2] + m.data[r * 4 + 3] * in[3];
+}
+
+}  // namespace
+
+const std::vector<float>& Renderer::pickGeometry(const systems::leal::gltf::Primitive& primitive) const {
+    auto found = pickTriangles.find(&primitive);
+    if (found != pickTriangles.end()) return found->second;
+    std::vector<float>& tris = pickTriangles[&primitive];
+    using PM = systems::leal::gltf::PrimitiveMode;
+    if (primitive.mode != PM::pmTriangles && primitive.mode != PM::pmTriangleStrip && primitive.mode != PM::pmTriangleFan)
+        return tris;
+
+    std::vector<float> positions;
+    std::vector<uint32_t> indices;
+    bool indexed = false;
+    const auto& draco = primitive.khrDracoMeshCompression;
+    if (draco && draco->decodedAttributes.count("POSITION")) {
+        const auto& bytes = draco->decodedAttributes.at("POSITION");
+        positions.resize(bytes.size() / sizeof(float));
+        std::memcpy(positions.data(), bytes.data(), positions.size() * sizeof(float));
+        indices = draco->decodedIndices;
+        indexed = true;
+    } else {
+        const auto it = primitive.attributes.find("POSITION");
+        if (it == primitive.attributes.end() || !asset->accessors || it->second >= asset->accessors->size()) return tris;
+        const auto& acc = (*asset->accessors)[it->second];
+        if (gltfTypeCount(acc.type) != 3) return tris;
+        positions = accessorFloats(acc, resolveAccessorBytes(acc, *asset));
+        if (primitive.indices >= 0 && (size_t)primitive.indices < asset->accessors->size()) {
+            const auto& iacc = (*asset->accessors)[(size_t)primitive.indices];
+            indices = accessorIndices(iacc, resolveAccessorBytes(iacc, *asset));
+            indexed = true;
+        }
+    }
+    const size_t vertexCount = positions.size() / 3;
+    if (!indexed) {
+        indices.resize(vertexCount);
+        for (size_t i = 0; i < vertexCount; ++i) indices[i] = (uint32_t)i;
+    }
+    auto addTriangle = [&](uint32_t a, uint32_t b, uint32_t c) {
+        if (a >= vertexCount || b >= vertexCount || c >= vertexCount) return;
+        for (uint32_t v : {a, b, c})
+            for (int k = 0; k < 3; ++k) tris.push_back(positions[v * 3 + k]);
+    };
+    if (primitive.mode == PM::pmTriangles) {
+        for (size_t i = 0; i + 2 < indices.size(); i += 3) addTriangle(indices[i], indices[i + 1], indices[i + 2]);
+    } else if (primitive.mode == PM::pmTriangleStrip) {
+        for (size_t i = 0; i + 2 < indices.size(); ++i) addTriangle(indices[i], indices[i + 1], indices[i + 2]);
+    } else {
+        for (size_t i = 1; i + 1 < indices.size(); ++i) addTriangle(indices[0], indices[i], indices[i + 1]);
+    }
+    return tris;
+}
+
+Renderer::PickResult Renderer::pick(double x, double y) const {
+    PickResult result;
+    if (!asset || !asset->nodes || !asset->scenes || sceneIndex >= asset->scenes->size()) return result;
+    const auto& scene = (*asset->scenes)[sceneIndex];
+    if (!scene.nodes) return result;
+
+    // The ray: two points of the pixel's line unprojected (any depth
+    // convention: both depths are inside -1..1 and 0..1).
+    const auto inverseViewProj = vpMatrix.inverted();
+    const double ndcX = 2.0 * x - 1.0, ndcY = 1.0 - 2.0 * y;
+    double nearPoint[4], farPoint[4];
+    const double n4[4] = {ndcX, ndcY, 0.1, 1.0}, f4[4] = {ndcX, ndcY, 0.6, 1.0};
+    transformPoint(inverseViewProj, n4, nearPoint);
+    transformPoint(inverseViewProj, f4, farPoint);
+    if (nearPoint[3] == 0 || farPoint[3] == 0) return result;
+    double origin[3], dir[3];
+    for (int k = 0; k < 3; ++k) {
+        origin[k] = nearPoint[k] / nearPoint[3];
+        dir[k] = farPoint[k] / farPoint[3] - origin[k];
+    }
+    const double len = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    if (!(len > 0) || !std::isfinite(len)) return result;
+    for (double& c : dir) c /= len;
+    // From the camera (perspective) rather than the near point.
+    const auto cameraWorld = lastViewMatrix.inverted();
+    const double eye[3] = {cameraWorld.data[3], cameraWorld.data[7], cameraWorld.data[11]};
+    const double back = (origin[0] - eye[0]) * dir[0] + (origin[1] - eye[1]) * dir[1] + (origin[2] - eye[2]) * dir[2];
+    if (back > 0) for (int k = 0; k < 3; ++k) origin[k] -= dir[k] * back;
+    for (int k = 0; k < 3; ++k) result.rayOrigin[k] = origin[k];
+
+    double best = std::numeric_limits<double>::infinity();
+    std::vector<uint64_t> stack(scene.nodes->rbegin(), scene.nodes->rend());
+    std::vector<char> seen(asset->nodes->size(), 0);
+    while (!stack.empty()) {
+        const uint64_t index = stack.back();
+        stack.pop_back();
+        if (index >= asset->nodes->size() || seen[index]) continue;
+        seen[index] = 1;
+        const auto& node = (*asset->nodes)[index];
+        if (!node.selectable) continue;  // the node and its subtree
+        for (auto it = node.children.rbegin(); it != node.children.rend(); ++it) stack.push_back(*it);
+        if (node.mesh < 0 || !asset->meshes || (size_t)node.mesh >= asset->meshes->size() || index >= nodeWorldMatrices.size())
+            continue;
+        const auto& world = nodeWorldMatrices[index];
+        for (const auto& primitive : (*asset->meshes)[(size_t)node.mesh].primitives) {
+            const auto& tris = pickGeometry(primitive);
+            for (size_t t = 0; t + 8 < tris.size(); t += 9) {
+                double v[3][3];
+                for (int k = 0; k < 3; ++k) {
+                    const double local[4] = {tris[t + k * 3], tris[t + k * 3 + 1], tris[t + k * 3 + 2], 1.0};
+                    double w[4];
+                    transformPoint(world, local, w);
+                    v[k][0] = w[0]; v[k][1] = w[1]; v[k][2] = w[2];
+                }
+                const double d = rayTriangle(origin, dir, v[0], v[1], v[2]);
+                if (d > 0 && d < best) {
+                    best = d;
+                    result.node = (int64_t)index;
+                }
+            }
+        }
+    }
+    if (result.node >= 0) {
+        result.distance = best;
+        for (int k = 0; k < 3; ++k) result.point[k] = origin[k] + dir[k] * best;
+    }
+    return result;
 }
 
