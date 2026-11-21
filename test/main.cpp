@@ -3544,6 +3544,32 @@ static std::string translatedQuadGltf(float x) {
     return json;
 }
 
+// Supersampled (SSAA 2x), the whole scene is filtered down to the output:
+// the quad at x = 0.6 shows on the right. The downsample pass took the
+// scene's (doubled) viewport and scissor: WebGPU rejected the frame, and a
+// viewport twice the output's size would show only its top-left quarter.
+TEST_F(OffscreenRenderTest, SupersampledFrameShowsTheWholeScene) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+    renderer->setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    renderer->setSkyboxEnabled(false);
+    renderer->setSsaaScale(2.0f);
+    auto asset = GLTF::loadGLTF(translatedQuadGltf(0.6f), kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    renderer->setAsset(asset);
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    renderer->setCameraMatrices(identity, identity);
+    auto tex = makeOffscreenTexture(64, 64);
+    auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+    for (int frame = 0; frame < 2; ++frame) renderer->render(view);
+    const auto pixels = readBackPixels(tex);
+    EXPECT_TRUE(litAt(pixels, 51, 32)) << "the quad at x = 0.6";
+    EXPECT_FALSE(litAt(pixels, 13, 32)) << "nothing at x = -0.6";
+    renderer->setSsaaScale(1.0f);
+    renderer->clearCameraOverride();
+}
+
 // A quad lit by five point lights in front of it: four dim white ones, then,
 // fifth in scene order, a bright red one. The shaders used to take the first
 // four lights in scene order, leaving the red one out; the renderer now keeps

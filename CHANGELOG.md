@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Supersampling (`setSsaaScale()` > 1) showed only part of the scene, and WebGPU dropped the frame.** The SSAA downsample and FXAA passes draw into the output but took the supersampled scene's viewport and scissor (`setupViewport()`): twice the output's size at 2x. WebGPU rejected the scissor ("not contained in the render area") and dropped every supersampled frame; on D3D12 the scene was drawn at the wrong scale (the test's quad, on the right, was missing). They now use the output's size (`setupOutputViewport()`). WebGPU also rejected the opaque pass, which bound the scene colour texture (its attachment when supersampling) as a texture: it now binds the placeholder there, as DirectX does (`kSceneColorPlaceholder`). New test `SupersampledFrameShowsTheWholeScene` (fails without the fix on D3D12).
+
 ## [0.31.0] - 2026-11-21
 
 ### Changed

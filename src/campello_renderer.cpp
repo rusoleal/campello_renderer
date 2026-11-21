@@ -121,6 +121,17 @@ static void trimWebGpuMaterialEntries(systems::leal::campello_gpu::BindGroupDesc
 static constexpr uint32_t kMaxLights = 8;
 static constexpr uint32_t kLightsUniformSize = 16 + kMaxLights * 64;
 
+// The opaque passes bind a placeholder for the scene colour (frame binding 4)
+// where a texture can't be a pass's colour attachment and sampled in it:
+// sceneColorTexture is the attachment with TAA, FXAA or SSAA. D3D12 rejects a
+// render target bound as a shader resource, and WebGPU a writable usage beside
+// another in the same pass (it dropped every supersampled frame).
+#if CAMPELLO_RENDERER_DIRECTX || defined(__EMSCRIPTEN__)
+static constexpr bool kSceneColorPlaceholder = true;
+#else
+static constexpr bool kSceneColorPlaceholder = false;
+#endif
+
 #include "environments/default_environment.h"
 
 #include <campello_image/image.hpp>
@@ -7612,11 +7623,11 @@ void Renderer::renderToTarget(
 #if CAMPELLO_RENDERER_PBR_BIND_GROUPS
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
-        // The scene colour placeholder for the opaque passes. On DirectX the default
-        // texture: sceneColorTexture can be this pass's colour attachment (TAA, FXAA,
-        // SSAA) and D3D12 rejects a render target bound as a shader resource.
+        // The scene colour placeholder for the opaque passes. On DirectX and WebGPU
+        // the default texture (kSceneColorPlaceholder): sceneColorTexture can be
+        // this pass's colour attachment (TAA, FXAA, SSAA).
         // Transmissive draws get the opaque scene copy before the transparent pass.
-        std::shared_ptr<GPU::Texture> scTex = (CAMPELLO_RENDERER_DIRECTX || !sceneColorTexture[currentFrameIndex])
+        std::shared_ptr<GPU::Texture> scTex = (kSceneColorPlaceholder || !sceneColorTexture[currentFrameIndex])
                                                   ? defaultTexture : sceneColorTexture[currentFrameIndex];
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = vulkanFrameBindGroupLayout;
@@ -7793,6 +7804,16 @@ void Renderer::renderToTarget(
             const float sh = (float)sceneTargetHeight();
             rpe->setViewport(0.0f, 0.0f, sw, sh, 0.0f, 1.0f);
             rpe->setScissorRect(0.0f, 0.0f, sw, sh);
+        }
+    };
+    // The passes that draw into the output (the SSAA downsample, FXAA): its
+    // size, not the supersampled scene's. WebGPU rejected the larger scissor
+    // (the frame was dropped); elsewhere the larger viewport would show only
+    // part of the scene.
+    auto setupOutputViewport = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe) {
+        if (renderWidth > 0 && renderHeight > 0) {
+            rpe->setViewport(0.0f, 0.0f, (float)renderWidth, (float)renderHeight, 0.0f, 1.0f);
+            rpe->setScissorRect(0.0f, 0.0f, (float)renderWidth, (float)renderHeight);
         }
     };
 
@@ -8022,7 +8043,7 @@ void Renderer::renderToTarget(
 
         auto dsRpe = encoder->beginRenderPass(dsRpDesc);
         if (dsRpe) {
-            setupViewport(dsRpe);
+            setupOutputViewport(dsRpe);
             dsRpe->setPipeline(pipelineDownsample);
             dsRpe->setBindGroup(0, downsampleBindGroup[currentFrameIndex]);
             dsRpe->draw(3);
@@ -8075,7 +8096,7 @@ void Renderer::renderToTarget(
 
         auto fxaaRpe = encoder->beginRenderPass(fxaaRpDesc);
         if (fxaaRpe) {
-            setupViewport(fxaaRpe);
+            setupOutputViewport(fxaaRpe);
             fxaaRpe->setPipeline(pipelineFxaa);
             fxaaRpe->setBindGroup(0, fxaaBindGroup[currentFrameIndex]);
             fxaaRpe->draw(3);
@@ -10794,11 +10815,11 @@ void Renderer::render(const RenderScene& scene,
 #if CAMPELLO_RENDERER_PBR_BIND_GROUPS
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
-        // The scene colour placeholder for the opaque passes. On DirectX the default
-        // texture: sceneColorTexture can be this pass's colour attachment (TAA, FXAA,
-        // SSAA) and D3D12 rejects a render target bound as a shader resource.
+        // The scene colour placeholder for the opaque passes. On DirectX and WebGPU
+        // the default texture (kSceneColorPlaceholder): sceneColorTexture can be
+        // this pass's colour attachment (TAA, FXAA, SSAA).
         // Transmissive draws get the opaque scene copy before the transparent pass.
-        std::shared_ptr<GPU::Texture> scTex = (CAMPELLO_RENDERER_DIRECTX || !sceneColorTexture[currentFrameIndex])
+        std::shared_ptr<GPU::Texture> scTex = (kSceneColorPlaceholder || !sceneColorTexture[currentFrameIndex])
                                                   ? defaultTexture : sceneColorTexture[currentFrameIndex];
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = vulkanFrameBindGroupLayout;
@@ -11321,11 +11342,11 @@ void Renderer::render(const RenderScene& scene,
 #if CAMPELLO_RENDERER_PBR_BIND_GROUPS
     if (vulkanFrameBindGroupLayout && frameBindGroup[currentFrameIndex] &&
         environmentMap && environmentSampler && fxaaSampler) {
-        // The scene colour placeholder for the opaque passes. On DirectX the default
-        // texture: sceneColorTexture can be this pass's colour attachment (TAA, FXAA,
-        // SSAA) and D3D12 rejects a render target bound as a shader resource.
+        // The scene colour placeholder for the opaque passes. On DirectX and WebGPU
+        // the default texture (kSceneColorPlaceholder): sceneColorTexture can be
+        // this pass's colour attachment (TAA, FXAA, SSAA).
         // Transmissive draws get the opaque scene copy before the transparent pass.
-        std::shared_ptr<GPU::Texture> scTex = (CAMPELLO_RENDERER_DIRECTX || !sceneColorTexture[currentFrameIndex])
+        std::shared_ptr<GPU::Texture> scTex = (kSceneColorPlaceholder || !sceneColorTexture[currentFrameIndex])
                                                   ? defaultTexture : sceneColorTexture[currentFrameIndex];
         GPU::BindGroupDescriptor bgDesc{};
         bgDesc.layout = vulkanFrameBindGroupLayout;
