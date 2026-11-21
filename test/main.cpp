@@ -3563,7 +3563,7 @@ static std::string fiveLightsQuadGltf() {
     replace(R"("scenes": [{"nodes": [0]}],)", R"("scenes": [{"nodes": [0, 1, 2, 3, 4, 5]}],)");
     std::string lights;
     for (int i = 0; i < 5; ++i) {
-        lights += R"(, {"translation": [0, 0, -1], "extensions": {"KHR_lights_punctual": {"light": )" +
+        lights += R"(, {"translation": [0, 0, 1], "extensions": {"KHR_lights_punctual": {"light": )" +
                   std::to_string(i) + "}}}";
     }
     replace(R"({"mesh": 0, "extensions": {"EXT_mesh_gpu_instancing": {"attributes": {"TRANSLATION": 2}}}})",
@@ -3586,11 +3586,13 @@ TEST_F(OffscreenRenderTest, FifthLightInSceneOrderStillLights) {
     ASSERT_TRUE(asset->khrLightsPunctual);
     ASSERT_EQ(asset->khrLightsPunctual->size(), 5u);
     renderer->setAsset(asset);
-    // The camera half a unit behind the quad's plane (z = -0.5), looking at it;
-    // the lights a unit in front of the quad, on the camera's side.
-    const float view[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0.5f, 1};
-    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-    renderer->setCameraMatrices(view, identity);
+    // The camera half a unit in front of the quad (z = 0.5, on its normal's
+    // side, as the lights a unit in front: backends that don't turn a
+    // double-sided back face to the light would leave it unlit), looking
+    // down -z. The projection keeps x and y and maps eye z = -0.5 to depth 0.5.
+    const float view[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, -0.5f, 1};
+    const float projection[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1};
+    renderer->setCameraMatrices(view, projection);
     auto tex = makeOffscreenTexture(64, 64);
     auto target = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
     renderer->render(target);
