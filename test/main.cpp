@@ -1776,9 +1776,24 @@ TEST_F(OffscreenRenderTest, EquirectangularMapFromMemoryTurnsAboutTheUpAxis) {
     ASSERT_NE(turnedZ, nullptr);
     EXPECT_LT(redness(turnedZ, 0), -0.5f);
     EXPECT_GT(redness(turnedZ, 2), 0.5f);
+    // Prepared on another thread (no GPU), then uploaded: the same map.
+    std::shared_ptr<Renderer::EnvironmentFaces> faces;
+    std::thread([&] {
+        faces = Renderer::prepareEquirectangularEnvironmentMap(bytes, hdr.size(), Renderer::UpAxis::z, FACE, quarter);
+    }).join();
+    ASSERT_NE(faces, nullptr);
+    EXPECT_EQ(faces->size, FACE);
+    EXPECT_TRUE(faces->halfFloat);
+    EXPECT_EQ(faces->pixels.size(), size_t(FACE) * FACE * 8 * 6);
+    auto uploaded = renderer->createEnvironmentMap(*faces);
+    ASSERT_NE(uploaded, nullptr);
+    EXPECT_LT(redness(uploaded, 0), -0.5f);
+    EXPECT_GT(redness(uploaded, 2), 0.5f);
     // Not an image: nothing.
     const uint8_t junk[4] = {1, 2, 3, 4};
     EXPECT_EQ(renderer->loadEquirectangularEnvironmentMap(junk, sizeof(junk)), nullptr);
+    EXPECT_EQ(Renderer::prepareEquirectangularEnvironmentMap(junk, sizeof(junk), Renderer::UpAxis::z), nullptr);
+    EXPECT_EQ(renderer->createEnvironmentMap(Renderer::EnvironmentFaces{}), nullptr);
     device->waitForIdle();
 }
 

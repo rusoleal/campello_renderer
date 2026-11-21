@@ -1472,6 +1472,25 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::Texture> loadEquirectangularEnvironmentMap(
             const uint8_t *data, size_t size, uint32_t faceSize = 0, float rotation = 0.0f);
 
+        /// An equirectangular map as the six faces of a cube map, made on the
+        /// CPU: +X, -X, +Y, -Y, +Z, -Z, each `size` x `size` pixels of RGBA
+        /// (half floats, or 8-bit for 8-bit images).
+        struct EnvironmentFaces {
+            uint32_t size = 0;
+            bool halfFloat = false;
+            std::vector<uint8_t> pixels;
+        };
+        /// The slow part of loadEquirectangularEnvironmentMap() (decoding and
+        /// resampling; seconds for an 8K map), without the GPU: callable from
+        /// any thread, so an app can keep drawing while a large map loads.
+        /// The faces bake on threads of their own where there are threads.
+        /// nullptr if the bytes don't decode.
+        static std::shared_ptr<EnvironmentFaces> prepareEquirectangularEnvironmentMap(
+            const uint8_t *data, size_t size, UpAxis upAxis, uint32_t faceSize = 0, float rotation = 0.0f);
+        /// Uploads prepared faces as a cube map (with its mip chain) for
+        /// setEnvironmentMap(). nullptr if they're empty.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> createEnvironmentMap(const EnvironmentFaces &faces);
+
         // The world's up axis for equirectangular environments: their zenith
         // (top row) is drawn towards +Y (default, glTF) or +Z (CAD, BIM, IFC).
         // Applies to loadEquirectangularEnvironmentMap() and the built-in
@@ -1855,6 +1874,10 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::Texture> convertEquirectangularImageToCubemap(
             const std::shared_ptr<systems::leal::campello_image::Image> &img, uint32_t faceSize,
             float intensityScale = 1.0f, float rotation = 0.0f);
+        // Its CPU half (prepareEquirectangularEnvironmentMap()).
+        static std::shared_ptr<EnvironmentFaces> bakeEquirectangularFaces(
+            const std::shared_ptr<systems::leal::campello_image::Image> &img, uint32_t faceSize,
+            UpAxis upAxis, float intensityScale, float rotation);
 
         // Decodes the embedded default skybox (a small real photo, not a flat
         // placeholder) so IBL has something plausible to reflect out of the box.

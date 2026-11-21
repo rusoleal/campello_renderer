@@ -24,6 +24,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <thread>
 #include <unordered_set>
 
 #if defined(__APPLE__)
@@ -9148,12 +9149,11 @@ Renderer::loadEquirectangularEnvironmentMap(const uint8_t *data, size_t size, ui
     return convertEquirectangularImageToCubemap(img, faceSize, 1.0f, rotation);
 }
 
-std::shared_ptr<systems::leal::campello_gpu::Texture>
-Renderer::convertEquirectangularImageToCubemap(
+std::shared_ptr<Renderer::EnvironmentFaces>
+Renderer::bakeEquirectangularFaces(
     const std::shared_ptr<systems::leal::campello_image::Image> &img, uint32_t faceSize,
-    float intensityScale, float rotation)
+    UpAxis upAxis, float intensityScale, float rotation)
 {
-    namespace GPU = systems::leal::campello_gpu;
     namespace Img = systems::leal::campello_image;
 
     if (!img) return nullptr;
@@ -9169,33 +9169,17 @@ Renderer::convertEquirectangularImageToCubemap(
     // Cap at 2048 to avoid unexpectedly huge GPU textures.
     if (fsize > 2048) fsize = 2048;
 
-    GPU::PixelFormat fmt = GPU::PixelFormat::rgba8unorm;
-    switch (img->getFormat()) {
-        case Img::ImageFormat::rgba8:   fmt = GPU::PixelFormat::rgba8unorm; break;
-        case Img::ImageFormat::rgba16f: fmt = GPU::PixelFormat::rgba16float; break;
-        // Half floats, as in loadEnvironmentMap(): rgba32float is not
-        // filterable without float32-filterable (missing on Adreno).
-        case Img::ImageFormat::rgba32f: fmt = GPU::PixelFormat::rgba16float; break;
-    }
+    // Half floats, as in loadEnvironmentMap(): rgba32float is not
+    // filterable without float32-filterable (missing on Adreno).
     const Img::ImageFormat storeFormat = img->getFormat() == Img::ImageFormat::rgba32f
         ? Img::ImageFormat::rgba16f : img->getFormat();
 
-    // Full mip chain so roughness-based IBL sampling can select a blurred
-    // level instead of always reading the sharpest (mip 0) reflection.
-    uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2((double)fsize));
-
-    auto tex = device->createTexture(
-        GPU::TextureType::ttCube, fmt,
-        fsize, fsize, 1, mipLevels, 1,
-        (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
-                            uint32_t(GPU::TextureUsage::copyDst) |
-                            uint32_t(GPU::TextureUsage::copySrc)));
-    if (!tex) return nullptr;
-
-    // Allocate one face buffer.
-    size_t bytesPerPixel = (storeFormat == Img::ImageFormat::rgba8) ? 4 : 8;
-    size_t bytesPerFace = fsize * fsize * bytesPerPixel;
-    std::vector<uint8_t> faceData(bytesPerFace);
+    auto out = std::make_shared<EnvironmentFaces>();
+    out->size = fsize;
+    out->halfFloat = storeFormat != Img::ImageFormat::rgba8;
+    const size_t bytesPerPixel = out->halfFloat ? 8 : 4;
+    const size_t bytesPerFace = size_t(fsize) * fsize * bytesPerPixel;
+    out->pixels.resize(bytesPerFace * 6);
 
     const float twoPi = 2.0f * static_cast<float>(M_PI);
     const float pi    = static_cast<float>(M_PI);
@@ -9204,8 +9188,10 @@ Renderer::convertEquirectangularImageToCubemap(
     const float turnCos = std::cos(rotation);
     const float turnSin = std::sin(rotation);
 
-    // Generate each cubemap face by sampling the equirectangular map.
-    for (int face = 0; face < 6; ++face) {
+    // Each face by sampling the equirectangular map, on threads of its own
+    // where there are threads.
+    const auto bakeFace = [&](int face) {
+        uint8_t *faceData = out->pixels.data() + size_t(face) * bytesPerFace;
         for (uint32_t y = 0; y < fsize; ++y) {
             for (uint32_t x = 0; x < fsize; ++x) {
                 // Map pixel to [-1, 1] with pixel-center offset.
@@ -9229,20 +9215,20 @@ Renderer::convertEquirectangularImageToCubemap(
                 // Undo the turn: right-handed about the up axis (Z up:
                 // +X towards +Y; Y up: +X towards -Z), by -rotation.
                 if (rotation != 0.0f) {
-                    if (environmentUpAxis == UpAxis::z) {
-                        const float x = dx, y = dy;
-                        dx =  turnCos * x + turnSin * y;
-                        dy = -turnSin * x + turnCos * y;
+                    if (upAxis == UpAxis::z) {
+                        const float wx = dx, wy = dy;
+                        dx =  turnCos * wx + turnSin * wy;
+                        dy = -turnSin * wx + turnCos * wy;
                     } else {
-                        const float x = dx, z = dz;
-                        dx = turnCos * x - turnSin * z;
-                        dz = turnSin * x + turnCos * z;
+                        const float wx = dx, wz = dz;
+                        dx = turnCos * wx - turnSin * wz;
+                        dz = turnSin * wx + turnCos * wz;
                     }
                 }
 
                 // Z up: the same direction in the map's own Y-up frame
                 // (a -90 degree turn about X takes +Z to +Y).
-                if (environmentUpAxis == UpAxis::z) {
+                if (upAxis == UpAxis::z) {
                     const float worldY = dy;
                     dy = dz;
                     dz = -worldY;
@@ -9261,16 +9247,64 @@ Renderer::convertEquirectangularImageToCubemap(
                 color.r *= intensityScale;
                 color.g *= intensityScale;
                 color.b *= intensityScale;
-                storePixel(faceData.data(), static_cast<int>(y * fsize + x), color, storeFormat);
+                storePixel(faceData, static_cast<int>(y * fsize + x), color, storeFormat);
             }
         }
+    };
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    for (int face = 0; face < 6; ++face) bakeFace(face);
+#else
+    {
+        std::vector<std::thread> threads;
+        for (int face = 1; face < 6; ++face) threads.emplace_back(bakeFace, face);
+        bakeFace(0);
+        for (auto &t : threads) t.join();
+    }
+#endif
+    return out;
+}
+
+std::shared_ptr<Renderer::EnvironmentFaces>
+Renderer::prepareEquirectangularEnvironmentMap(const uint8_t *data, size_t size, UpAxis upAxis,
+                                               uint32_t faceSize, float rotation)
+{
+    namespace Img = systems::leal::campello_image;
+    auto img = Img::Image::fromMemory(data, size);
+    if (!img) return nullptr;
+    return bakeEquirectangularFaces(img, faceSize, upAxis, 1.0f, rotation);
+}
+
+std::shared_ptr<systems::leal::campello_gpu::Texture>
+Renderer::createEnvironmentMap(const EnvironmentFaces &faces)
+{
+    namespace GPU = systems::leal::campello_gpu;
+
+    const uint32_t fsize = faces.size;
+    const size_t bytesPerPixel = faces.halfFloat ? 8 : 4;
+    const size_t bytesPerFace = size_t(fsize) * fsize * bytesPerPixel;
+    if (fsize == 0 || faces.pixels.size() < bytesPerFace * 6) return nullptr;
+    const GPU::PixelFormat fmt = faces.halfFloat ? GPU::PixelFormat::rgba16float : GPU::PixelFormat::rgba8unorm;
+
+    // Full mip chain so roughness-based IBL sampling can select a blurred
+    // level instead of always reading the sharpest (mip 0) reflection.
+    uint32_t mipLevels = 1 + (uint32_t)std::floor(std::log2((double)fsize));
+
+    auto tex = device->createTexture(
+        GPU::TextureType::ttCube, fmt,
+        fsize, fsize, 1, mipLevels, 1,
+        (GPU::TextureUsage)(uint32_t(GPU::TextureUsage::textureBinding) |
+                            uint32_t(GPU::TextureUsage::copyDst) |
+                            uint32_t(GPU::TextureUsage::copySrc)));
+    if (!tex) return nullptr;
+
+    for (int face = 0; face < 6; ++face) {
         // Upload this face to the GPU cubemap.
         auto encoder = device->createCommandEncoder();
         if (encoder) {
             auto staging = device->createBuffer(bytesPerFace, GPU::BufferUsage::copySrc);
             if (staging) {
-                staging->upload(0, bytesPerFace, faceData.data());
+                staging->upload(0, bytesPerFace, const_cast<uint8_t *>(faces.pixels.data()) + size_t(face) * bytesPerFace);
                 uint64_t bytesPerRow = fsize * bytesPerPixel;
                 encoder->copyBufferToTexture(staging, 0, bytesPerRow, tex, 0, face);
                 auto fence = device->createFence();
@@ -9291,6 +9325,15 @@ Renderer::convertEquirectangularImageToCubemap(
     }
 
     return tex;
+}
+
+std::shared_ptr<systems::leal::campello_gpu::Texture>
+Renderer::convertEquirectangularImageToCubemap(
+    const std::shared_ptr<systems::leal::campello_image::Image> &img, uint32_t faceSize,
+    float intensityScale, float rotation)
+{
+    auto faces = bakeEquirectangularFaces(img, faceSize, environmentUpAxis, intensityScale, rotation);
+    return faces ? createEnvironmentMap(*faces) : nullptr;
 }
 
 // ---------------------------------------------------------------------------
