@@ -1049,6 +1049,8 @@ namespace systems::leal::campello_renderer {
         systems::leal::vector_math::Matrix4<double> lastViewMatrix = systems::leal::vector_math::Matrix4<double>::identity();
         /// pick(): each primitive's triangles (object space, xyz per vertex, 3 vertices per triangle).
         mutable std::unordered_map<const systems::leal::gltf::Primitive*, std::vector<float>> pickTriangles;
+        // Each pickTriangles entry's bounds: min xyz, max xyz.
+        mutable std::unordered_map<const systems::leal::gltf::Primitive*, std::array<float, 6>> pickBounds;
         const std::vector<float>& pickGeometry(const systems::leal::gltf::Primitive& primitive) const;
 
         // Approximate bounding radius of the current scene (computed in setScene()).

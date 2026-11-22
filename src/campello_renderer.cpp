@@ -929,6 +929,7 @@ void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
         quantizedLayoutDetected = false;
         dracoPrimitiveBuffers.clear();
         pickTriangles.clear();
+        pickBounds.clear();
         deinterleavedBuffers.clear();
         widenedIndexBuffers.clear();
         color0Buffers.clear();
@@ -12632,6 +12633,23 @@ double rayTriangle(const double o[3], const double d[3], const double* a, const 
     return t > 0 ? t : -1;
 }
 
+// Whether the ray o + t d enters the box [lo, hi] with t in [0, tMax].
+bool rayBox(const double o[3], const double d[3], const float* lo, const float* hi, double tMax) {
+    double t0 = 0, t1 = tMax;
+    for (int k = 0; k < 3; ++k) {
+        if (std::fabs(d[k]) < 1e-300) {
+            if (o[k] < lo[k] || o[k] > hi[k]) return false;
+            continue;
+        }
+        double a = (lo[k] - o[k]) / d[k], b = (hi[k] - o[k]) / d[k];
+        if (a > b) std::swap(a, b);
+        t0 = std::max(t0, a);
+        t1 = std::min(t1, b);
+        if (t0 > t1) return false;
+    }
+    return true;
+}
+
 // Row-major M * (x, y, z, w).
 void transformPoint(const systems::leal::vector_math::Matrix4<double>& m, const double in[4], double out[4]) {
     for (int r = 0; r < 4; ++r)
@@ -12734,18 +12752,35 @@ Renderer::PickResult Renderer::pick(double x, double y, PickFilter filter) const
         for (auto it = node.children.rbegin(); it != node.children.rend(); ++it) stack.push_back(*it);
         if (node.mesh < 0 || !asset->meshes || (size_t)node.mesh >= asset->meshes->size() || index >= nodeWorldMatrices.size())
             continue;
-        const auto& world = nodeWorldMatrices[index];
+        // The ray in the node's space (its parameter t stays the world
+        // distance): no vertex is transformed, and boxes reject most meshes.
+        const auto toLocal = nodeWorldMatrices[index].inverted();
+        bool finite = true;
+        for (double m : toLocal.data) finite = finite && std::isfinite(m);
+        if (!finite) continue;  // scaled to nothing
+        const double o4[4] = {origin[0], origin[1], origin[2], 1.0}, d4[4] = {dir[0], dir[1], dir[2], 0.0};
+        double lo4[4], ld4[4];
+        transformPoint(toLocal, o4, lo4);
+        transformPoint(toLocal, d4, ld4);
         for (const auto& primitive : (*asset->meshes)[(size_t)node.mesh].primitives) {
             const auto& tris = pickGeometry(primitive);
+            if (tris.empty()) continue;
+            auto bounds = pickBounds.find(&primitive);
+            if (bounds == pickBounds.end()) {
+                std::array<float, 6> b = {tris[0], tris[1], tris[2], tris[0], tris[1], tris[2]};
+                for (size_t i = 0; i + 2 < tris.size(); i += 3)
+                    for (int k = 0; k < 3; ++k) {
+                        b[k] = std::min(b[k], tris[i + k]);
+                        b[3 + k] = std::max(b[3 + k], tris[i + k]);
+                    }
+                bounds = pickBounds.emplace(&primitive, b).first;
+            }
+            if (!rayBox(lo4, ld4, bounds->second.data(), bounds->second.data() + 3, best)) continue;
             for (size_t t = 0; t + 8 < tris.size(); t += 9) {
                 double v[3][3];
-                for (int k = 0; k < 3; ++k) {
-                    const double local[4] = {tris[t + k * 3], tris[t + k * 3 + 1], tris[t + k * 3 + 2], 1.0};
-                    double w[4];
-                    transformPoint(world, local, w);
-                    v[k][0] = w[0]; v[k][1] = w[1]; v[k][2] = w[2];
-                }
-                const double d = rayTriangle(origin, dir, v[0], v[1], v[2]);
+                for (int k = 0; k < 3; ++k)
+                    for (int c = 0; c < 3; ++c) v[k][c] = tris[t + k * 3 + c];
+                const double d = rayTriangle(lo4, ld4, v[0], v[1], v[2]);
                 if (d > 0 && d < best) {
                     best = d;
                     result.node = (int64_t)index;
