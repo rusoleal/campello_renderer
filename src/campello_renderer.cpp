@@ -10031,6 +10031,7 @@ std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::proceduralTextur
         options.width = size;
         options.height = size;
         options.images = procedural::imageResolver(asset);
+        if (!procedural::canWaitForThreads()) options.threads = 1;
         auto result = std::make_shared<cp::BakeResult>(cp::bake(graph, options));
         if (!result->ok()) {
             std::cerr << "[Renderer] KHR_texture_procedurals graph " << index << " (" << graph.name
@@ -10104,6 +10105,7 @@ std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::compressedTextur
     options.mipmaps = true;
     options.wrap = true;  // textures repeat across surfaces
     options.effort = 0;   // the fastest: encoded at run time
+    options.threaded = procedural::canWaitForThreads();
     const auto data = CI::compressRGBA8(rgba, width, height, target, options);
     if (!data) return nullptr;
     auto texture = device->createTexture(GPU::TextureType::tt2d, textureDataFormatToPixelFormat(data->getFormat(), srgb),

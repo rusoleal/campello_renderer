@@ -10,6 +10,9 @@
   - `pick()` is faster on large models: the ray goes into each node's space (no vertex is transformed) and is tested against each mesh's bounds first. Needle's MiniChess (432k triangles) no longer slows down while the mouse hovers it.
   - Tests: `ObjectModelPosesAnimationsAndReleasesThem`, and hover picking in `PickFindsTheNearestSelectableNode`.
 
+### Fixed
+- **Web: KHR_texture_procedurals models froze the page on machines with more than 4 cores** (Chrome on macOS: 100% CPU, no logs). The bake started one thread per core and the texture encoder its own pool, then waited for them on the browser's main thread; a Web Worker beyond Emscripten's pre-started pool only starts once the main thread yields, so the wait never ended. On the main thread both now run single-threaded, as the environment bake already did.
+
 ### Changed
 - gltf v0.9.0.
 

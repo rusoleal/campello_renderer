@@ -7,6 +7,10 @@
 #include <cstring>
 #include <iostream>
 
+#if defined(__EMSCRIPTEN_PTHREADS__)
+#include <emscripten/threading.h>  // emscripten_is_main_browser_thread()
+#endif
+
 namespace systems::leal::campello_renderer {
 
 namespace cp = systems::leal::campello_procedural;
@@ -104,6 +108,14 @@ cp::ImageResolver imageResolver(const gl::GLTF& asset) {
     };
 }
 
+bool canWaitForThreads() {
+#if defined(__EMSCRIPTEN_PTHREADS__)
+    return !emscripten_is_main_browser_thread();
+#else
+    return true;
+#endif
+}
+
 }  // namespace procedural
 
 std::vector<uint8_t> bakeProceduralTexture(const gl::GLTF& asset, const gl::ProceduralGraph& graph,
@@ -113,6 +125,7 @@ std::vector<uint8_t> bakeProceduralTexture(const gl::GLTF& asset, const gl::Proc
     options.height = static_cast<uint32_t>(std::max(1, height));
     options.outputs = {outputName};
     options.images = procedural::imageResolver(asset);
+    if (!procedural::canWaitForThreads()) options.threads = 1;
     const auto result = cp::bake(procedural::toGraph(graph), options);
     if (!result.ok() || result.images.empty()) {
         std::cerr << "[bakeProceduralTexture] graph \"" << graph.name << "\": " << result.error << std::endl;
