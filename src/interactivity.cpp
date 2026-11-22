@@ -7,6 +7,7 @@
 #include <gltf/gltf.hpp>
 
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace systems::leal::campello_renderer {
@@ -263,6 +264,41 @@ bool InteractivityObjectModel::access(const std::string& pointer, Sig type, Valu
             if (seg[4] == "intensity") return floats(type, Sig::Float, &light.intensity, get, set);
             if (seg[4] == "range") return floats(type, Sig::Float, &light.range, get, set);
             return false;
+        }
+        if (n == 5 && seg[1] == "KHR_interactivity" && seg[2] == "activeCamera" && get && type == Sig::Float &&
+            (seg[3] == "perspective" || seg[3] == "orthographic")) {
+            // From the last frame's projection (row-major, depth 0..1, either
+            // forward axis; reversed depth too). The other projection's values
+            // are NaN, as are all of them before the first frame.
+            const auto& p = renderer_.getLastProjectionMatrix().data;
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            const bool perspective = p[15] == 0.0 && p[14] != 0.0;
+            const bool orthographic = p[15] != 0.0 && p[14] == 0.0 && p[0] != 0.0;
+            double value = nan;
+            if (seg[3] == "perspective" && perspective && p[0] != 0.0 && p[5] != 0.0) {
+                // Depth d ahead: z = s*d, w = d, ndc = p10*s + p11/d.
+                const double s = p[14], a = p[10] * s, b = p[11];
+                const double d0 = a != 0.0 ? -b / a : nan;                         // ndc 0
+                const double d1 = 1.0 - a != 0.0 ? b / (1.0 - a) : std::numeric_limits<double>::infinity();  // ndc 1
+                if (seg[4] == "yfov") value = 2.0 * std::atan(1.0 / std::abs(p[5]));
+                else if (seg[4] == "aspectRatio") value = std::abs(p[5] / p[0]);
+                else if (seg[4] == "znear") value = std::isnan(d0) ? nan : std::min(std::abs(d0), std::abs(d1));
+                else if (seg[4] == "zfar") value = std::isnan(d0) ? nan : std::max(std::abs(d0), std::abs(d1));
+                else return false;
+            } else if (seg[3] == "orthographic" && orthographic && p[10] != 0.0 && p[5] != 0.0) {
+                // ndc = p10*z + p11 (w = 1).
+                const double z0 = -p[11] / p[10], z1 = (1.0 - p[11]) / p[10];
+                if (seg[4] == "xmag") value = 1.0 / std::abs(p[0]);
+                else if (seg[4] == "ymag") value = 1.0 / std::abs(p[5]);
+                else if (seg[4] == "znear") value = std::min(std::abs(z0), std::abs(z1));
+                else if (seg[4] == "zfar") value = std::max(std::abs(z0), std::abs(z1));
+                else return false;
+            } else if (!(seg[4] == "yfov" || seg[4] == "aspectRatio" || seg[4] == "xmag" || seg[4] == "ymag" ||
+                         seg[4] == "znear" || seg[4] == "zfar")) {
+                return false;
+            }
+            *get = Value::ofFloat(value);
+            return true;
         }
         if (n == 4 && seg[1] == "KHR_interactivity" && seg[2] == "activeCamera" && get) {
             const auto camera = renderer_.getLastViewMatrix().inverted();

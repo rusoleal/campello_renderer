@@ -1047,6 +1047,7 @@ namespace systems::leal::campello_renderer {
         // View-projection matrix recomputed from the active camera each frame.
         systems::leal::vector_math::Matrix4<double> vpMatrix;
         systems::leal::vector_math::Matrix4<double> lastViewMatrix = systems::leal::vector_math::Matrix4<double>::identity();
+        systems::leal::vector_math::Matrix4<double> lastProjectionMatrix = systems::leal::vector_math::Matrix4<double>(0.0);
         /// pick(): each primitive's triangles (object space, xyz per vertex, 3 vertices per triangle).
         mutable std::unordered_map<const systems::leal::gltf::Primitive*, std::vector<float>> pickTriangles;
         // Each pickTriangles entry's bounds: min xyz, max xyz.
@@ -1391,6 +1392,8 @@ namespace systems::leal::campello_renderer {
         bool getNodeWorldMatrix(uint64_t nodeIndex, systems::leal::vector_math::Matrix4<double>& out) const;
         /// The view matrix of the last rendered frame (row-major).
         const systems::leal::vector_math::Matrix4<double>& getLastViewMatrix() const { return lastViewMatrix; }
+        /// The projection matrix of the last rendered frame (row-major; all zeros before the first frame).
+        const systems::leal::vector_math::Matrix4<double>& getLastProjectionMatrix() const { return lastProjectionMatrix; }
 
         void setCamera(uint32_t index);
         void setScene(uint32_t index);

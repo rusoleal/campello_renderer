@@ -210,6 +210,35 @@ TEST_F(InteractivityRenderTest, ObjectModelReadsAndWritesTheAsset) {
     EXPECT_NEAR(v.f[2], 5.0, 1e-6);
     ASSERT_TRUE(model.getPointer("/extensions/KHR_interactivity/activeCamera/rotation", Sig::Float4, v));
     EXPECT_NEAR(std::fabs(v.f[3]), 1.0, 1e-6);
+
+    // Its projection: the default camera's perspective (60 degrees, the
+    // square target's aspect, 0.1..1000); orthographic values are NaN.
+    const char* cam = "/extensions/KHR_interactivity/activeCamera/";
+    auto get = [&](const std::string& p) {
+        Value f;
+        EXPECT_TRUE(model.getPointer(cam + p, Sig::Float, f)) << p;
+        return f.f[0];
+    };
+    EXPECT_NEAR(get("perspective/yfov"), 60.0 * std::acos(-1.0) / 180.0, 1e-6);
+    EXPECT_NEAR(get("perspective/aspectRatio"), 1.0, 1e-6);
+    EXPECT_NEAR(get("perspective/znear"), 0.1, 1e-6);
+    EXPECT_NEAR(get("perspective/zfar"), 1000.0, 1e-3);
+    EXPECT_TRUE(std::isnan(get("orthographic/xmag")));
+    EXPECT_FALSE(model.getPointer(std::string(cam) + "perspective/fov", Sig::Float, v));
+
+    // An orthographic camera set by the application (column-major, WebGPU
+    // depth: 4 x 2 wide, 1..11 deep, looking down -Z).
+    const float view[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    const float oL = -2, oR = 2, oB = -1, oT = 1, zn = 1, zf = 11;
+    const float ortho[16] = {2 / (oR - oL), 0, 0, 0, 0, 2 / (oT - oB), 0, 0, 0, 0, -1 / (zf - zn), 0,
+                             0, 0, -zn / (zf - zn), 1};
+    renderer->setCameraMatrices(view, ortho);
+    renderAndRead(0, 0);
+    EXPECT_NEAR(get("orthographic/xmag"), 2.0, 1e-6);
+    EXPECT_NEAR(get("orthographic/ymag"), 1.0, 1e-6);
+    EXPECT_NEAR(get("orthographic/znear"), 1.0, 1e-5);
+    EXPECT_NEAR(get("orthographic/zfar"), 11.0, 1e-5);
+    EXPECT_TRUE(std::isnan(get("perspective/yfov")));
 }
 
 }  // namespace interactivity_test

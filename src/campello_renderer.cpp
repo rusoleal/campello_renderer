@@ -7234,6 +7234,7 @@ void Renderer::renderToTarget(
         vpMatrix = proj * view;
     }
     lastViewMatrix = view;
+    lastProjectionMatrix = proj;
 
     updateFrustumPlanes();
 
