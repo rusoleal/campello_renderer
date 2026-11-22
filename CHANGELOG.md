@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-11-22
+
 ### Added
 - **KHR_interactivity support** (with gltf v0.8.0's `InteractivityRuntime`, which executes the behavior graph):
   - `InteractivityObjectModel` (new header `campello_renderer/interactivity.hpp`) is the runtime's host. It reads and writes the glTF Asset Object Model on the renderer's asset, in place, so the next frame shows each change:
