@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project(campello_renderer VERSION 0.34.0)
+project(campello_renderer VERSION 0.35.0)
 
 configure_file(src/campello_renderer_config.h.in campello_renderer_config.h)
 

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-11-22
+
 ### Added
 - **KHR_interactivity animations and hover** (with gltf's runtime, which now runs animation/*, variable/pointer interpolation and hover events):
   - `Renderer::poseAnimation(index, time)` shows an animation at a time the application decides, and holds it there on every `update()` until `releaseAnimation(index)`, which keeps the values it set (morph weights are copied to the nodes). `InteractivityObjectModel` plays animation/start this way (`applyAnimation`, `animationStopped`).
