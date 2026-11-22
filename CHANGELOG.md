@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changed
+- gltf v0.10.0: the asset structure pointers (`.length`, node, mesh, scene and skin references) and OkLCh colour operations.
+
+### Added
+- **KHR_interactivity: the active camera's projection.** `InteractivityObjectModel` answers `/extensions/KHR_interactivity/activeCamera/perspective/{yfov,aspectRatio,znear,zfar}` and `orthographic/{xmag,ymag,znear,zfar}`, worked out from the last frame's projection (the file's camera, the default one, or `setCameraMatrices()`); the other projection's values are NaN, as the specification says. `getLastProjectionMatrix()`. Khronos' ActiveCamera reads them.
+
 ## [0.35.0] - 2026-11-22
 
 ### Added
