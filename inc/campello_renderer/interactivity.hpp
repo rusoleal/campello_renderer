@@ -23,6 +23,7 @@ class Renderer;
  * Supported pointers (types as the glTF Asset Object Model):
  * - /nodes/{}/translation (float3), rotation (float4), scale (float3): nodes
  *   without an authored matrix; matrix and globalMatrix (float4x4, read-only)
+ * - /nodes/{}/weights/{} (float): one morph target weight
  * - /nodes/{}/extensions/KHR_node_visibility/visible,
  *   KHR_node_selectability/selectable, KHR_node_hoverability/hoverable (bool)
  * - /materials/{}/alphaCutoff, emissiveFactor, pbrMetallicRoughness/

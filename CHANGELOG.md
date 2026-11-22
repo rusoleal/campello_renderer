@@ -5,6 +5,7 @@
 ### Added
 - **KHR_interactivity animations and hover** (with gltf's runtime, which now runs animation/*, variable/pointer interpolation and hover events):
   - `Renderer::poseAnimation(index, time)` shows an animation at a time the application decides, and holds it there on every `update()` until `releaseAnimation(index)`, which keeps the values it set (morph weights are copied to the nodes). `InteractivityObjectModel` plays animation/start this way (`applyAnimation`, `animationStopped`).
+  - `InteractivityObjectModel` reads and writes `/nodes/{}/weights/{}`, one morph target weight (the node's; its mesh's until first written). Needle's MiniChess keeps its engine's memory there.
   - `pick(x, y, PickFilter::hoverable)` follows KHR_node_hoverability instead of selectability (onHoverIn and onHoverOut).
   - Tests: `ObjectModelPosesAnimationsAndReleasesThem`, and hover picking in `PickFindsTheNearestSelectableNode`.
 

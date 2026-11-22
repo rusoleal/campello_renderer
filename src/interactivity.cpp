@@ -189,6 +189,23 @@ bool InteractivityObjectModel::access(const std::string& pointer, Sig type, Valu
             }
             return false;
         }
+        // One morph target weight: the node's (its mesh's until written).
+        uint64_t k = 0;
+        if (n == 4 && p == "weights" && index(seg[3], k)) {
+            if (node.mesh < 0 || !asset->meshes || (size_t)node.mesh >= asset->meshes->size()) return false;
+            const auto& mesh = (*asset->meshes)[(size_t)node.mesh];
+            const size_t targets = mesh.primitives.empty() ? 0 : mesh.primitives[0].targets.size();
+            if (k >= targets) return false;
+            if (node.weights.size() < targets) {
+                std::vector<GLTF_REAL_NUMBER_TYPE> w(targets, 0);
+                for (size_t t = 0; t < targets; ++t) {
+                    if (t < node.weights.size()) w[t] = node.weights[t];
+                    else if (t < mesh.weights.size()) w[t] = mesh.weights[t];
+                }
+                node.weights = std::move(w);
+            }
+            return floats(type, Sig::Float, &node.weights[k], get, set);
+        }
         if (n == 5 && p == "extensions") {
             if (seg[3] == "KHR_node_visibility" && seg[4] == "visible") return boolean(type, node.visible, get, set);
             if (seg[3] == "KHR_node_selectability" && seg[4] == "selectable") return boolean(type, node.selectable, get, set);
