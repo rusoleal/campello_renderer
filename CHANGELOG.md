@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-11-22
+
 ### Changed
 - gltf v0.10.0: the asset structure pointers (`.length`, node, mesh, scene and skin references) and OkLCh colour operations.
 
