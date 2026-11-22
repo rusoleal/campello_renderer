@@ -143,6 +143,14 @@ bool InteractivityObjectModel::setPointer(const std::string& pointer, const Valu
     return access(pointer, value.type, nullptr, &value);
 }
 
+void InteractivityObjectModel::applyAnimation(int64_t animation, double time) {
+    if (animation >= 0) renderer_.poseAnimation((uint32_t)animation, time);
+}
+
+void InteractivityObjectModel::animationStopped(int64_t animation) {
+    if (animation >= 0) renderer_.releaseAnimation((uint32_t)animation);
+}
+
 void InteractivityObjectModel::flush() {
     for (const uint64_t m : dirtyMaterials_) renderer_.materialChanged(m);
     dirtyMaterials_.clear();

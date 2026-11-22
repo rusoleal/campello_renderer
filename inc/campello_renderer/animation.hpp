@@ -17,6 +17,9 @@ public:
         bool playing = false;
         bool loop = true;
         double duration = 0.0;
+        // Held at `time` by poseAnimation() (KHR_interactivity drives it):
+        // sampled on every update(), not advanced.
+        bool posed = false;
     };
 
     struct AnimatedTRS {
@@ -66,6 +69,11 @@ public:
     bool isAnimationLooping(uint32_t animationIndex) const;
 
     void setAnimationTime(uint32_t animationIndex, double time);
+    // Hold an animation at `time` (seconds, any value within its keyframes),
+    // sampled by every update() until releaseAnimation(); stops its playback.
+    void poseAnimation(uint32_t animationIndex, double time);
+    void releaseAnimation(uint32_t animationIndex);
+    bool isAnimationPosed(uint32_t animationIndex) const;
     double getAnimationTime(uint32_t animationIndex) const;
 
     // Queries.

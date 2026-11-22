@@ -66,6 +66,10 @@ void GltfAnimator::update(double dt) {
         AnimationState &state = pair.second;
 
         if (animIndex < 0 || (size_t)animIndex >= asset->animations->size()) continue;
+        if (state.posed) {
+            sampleAnimation(animIndex, (float)state.time);
+            continue;
+        }
         if (!state.playing) continue;
 
         state.time += dt;
@@ -329,6 +333,25 @@ void GltfAnimator::setAnimationTime(uint32_t animationIndex, double time) {
     if (!asset || !asset->animations || animationIndex >= asset->animations->size()) return;
     auto &state = animationStates[(int32_t)animationIndex];
     state.time = std::max(0.0, std::min(time, state.duration));
+}
+
+void GltfAnimator::poseAnimation(uint32_t animationIndex, double time) {
+    if (!asset || !asset->animations || animationIndex >= asset->animations->size()) return;
+    auto &state = animationStates[(int32_t)animationIndex];
+    initDuration((int32_t)animationIndex);
+    state.playing = false;
+    state.posed = true;
+    state.time = time;
+}
+
+void GltfAnimator::releaseAnimation(uint32_t animationIndex) {
+    auto it = animationStates.find((int32_t)animationIndex);
+    if (it != animationStates.end()) it->second.posed = false;
+}
+
+bool GltfAnimator::isAnimationPosed(uint32_t animationIndex) const {
+    auto it = animationStates.find((int32_t)animationIndex);
+    return it != animationStates.end() && it->second.posed;
 }
 
 double GltfAnimator::getAnimationTime(uint32_t animationIndex) const {

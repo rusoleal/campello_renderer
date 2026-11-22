@@ -9628,6 +9628,30 @@ double Renderer::getAnimationTime(uint32_t animationIndex) const {
     return animator ? animator->getAnimationTime(animationIndex) : 0.0;
 }
 
+void Renderer::poseAnimation(uint32_t animationIndex, double time) {
+    if (!animator) return;
+    animator->poseAnimation(animationIndex, time);
+    update(0.0);  // samples it and writes the scene now
+}
+
+void Renderer::releaseAnimation(uint32_t animationIndex) {
+    if (!animator || !animator->isAnimationPosed(animationIndex)) return;
+    // Node TRS and KHR_animation_pointer values are already written to the
+    // asset; morph weights are the animator's: keep them on the nodes.
+    if (asset && asset->animations && asset->nodes && animationIndex < asset->animations->size()) {
+        const auto& weights = animator->getAnimatedWeights();
+        for (const auto& channel : (*asset->animations)[animationIndex].channels) {
+            if (channel.target.path != "weights" || channel.target.node < 0) continue;
+            const auto node = (uint64_t)channel.target.node;
+            const auto found = weights.find(node);
+            if (node >= asset->nodes->size() || found == weights.end()) continue;
+            auto& target = (*asset->nodes)[node].weights;
+            target.assign(found->second.begin(), found->second.end());
+        }
+    }
+    animator->releaseAnimation(animationIndex);
+}
+
 // ---------------------------------------------------------------------------
 // Draco decompressed buffer upload
 // ---------------------------------------------------------------------------
@@ -12666,7 +12690,7 @@ const std::vector<float>& Renderer::pickGeometry(const systems::leal::gltf::Prim
     return tris;
 }
 
-Renderer::PickResult Renderer::pick(double x, double y) const {
+Renderer::PickResult Renderer::pick(double x, double y, PickFilter filter) const {
     PickResult result;
     if (!asset || !asset->nodes || !asset->scenes || sceneIndex >= asset->scenes->size()) return result;
     const auto& scene = (*asset->scenes)[sceneIndex];
@@ -12705,7 +12729,8 @@ Renderer::PickResult Renderer::pick(double x, double y) const {
         if (index >= asset->nodes->size() || seen[index]) continue;
         seen[index] = 1;
         const auto& node = (*asset->nodes)[index];
-        if (!node.selectable) continue;  // the node and its subtree
+        // The node and its subtree.
+        if (filter == PickFilter::selectable ? !node.selectable : !node.hoverable) continue;
         for (auto it = node.children.rbegin(); it != node.children.rend(); ++it) stack.push_back(*it);
         if (node.mesh < 0 || !asset->meshes || (size_t)node.mesh >= asset->meshes->size() || index >= nodeWorldMatrices.size())
             continue;
