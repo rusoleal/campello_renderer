@@ -62,6 +62,7 @@ add_library(${PROJECT_NAME} SHARED
     src/realtime_effects.cpp
     src/animation.cpp
     src/procedural_texture_baker.cpp
+    src/interactivity.cpp
 )
 
 # Procedural textures (KHR_texture_procedurals): graphs baked by
@@ -214,6 +215,7 @@ if(CAMPELLO_RENDERER_BUILD_TEST)
 
     add_executable(${PROJECT_NAME}_test
         test/main.cpp
+        test/interactivity.cpp
     )
     set_target_properties(${PROJECT_NAME}_test PROPERTIES UNITY_BUILD ON)
     target_link_libraries(${PROJECT_NAME}_test
