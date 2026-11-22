@@ -10,6 +10,9 @@
   - `pick()` is faster on large models: the ray goes into each node's space (no vertex is transformed) and is tested against each mesh's bounds first. Needle's MiniChess (432k triangles) no longer slows down while the mouse hovers it.
   - Tests: `ObjectModelPosesAnimationsAndReleasesThem`, and hover picking in `PickFindsTheNearestSelectableNode`.
 
+### Changed
+- gltf v0.9.0.
+
 ## [0.34.0] - 2026-11-22
 
 ### Added
