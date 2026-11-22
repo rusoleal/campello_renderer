@@ -15,6 +15,7 @@
   - `Renderer::materialChanged(index)`, `getNodeWorldMatrix()` and `getLastViewMatrix()`.
 
 ### Fixed
+- **The web viewer froze when a model loaded (since v0.32.0).** `bakeEquirectangularFaces()` (the environment's cube faces, baked in `setScene()`) started five threads and joined them. On the web, on the browser's main thread, a thread beyond the pre-started Web Worker pool only starts once the main thread yields, so `join()` waited forever. There it now bakes the faces inline, as before v0.32.0; other threads still bake in parallel.
 - **KHR_node_visibility was ignored.** A node with `visible: false` was drawn. Now it and its subtree are hidden, lights included.
 
 ### Changed

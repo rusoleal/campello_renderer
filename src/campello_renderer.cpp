@@ -64,6 +64,9 @@
 #else
 #define CAMPELLO_RENDERER_WEBGPU 0
 #endif
+#if defined(__EMSCRIPTEN_PTHREADS__)
+#include <emscripten/threading.h>  // emscripten_is_main_browser_thread()
+#endif
 // Skinning and morph targets in their own vertex stages, which meshPipeline()
 // picks only for draws that deform, with the joint palettes and morph
 // targets as bind groups 2 and 3 (bindSkin(), bindMorph()): Vulkan and
@@ -9265,6 +9268,16 @@ Renderer::bakeEquirectangularFaces(
 #if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
     for (int face = 0; face < 6; ++face) bakeFace(face);
 #else
+#if defined(__EMSCRIPTEN_PTHREADS__)
+    // The browser's main thread can't wait for threads it starts: a Web
+    // Worker that isn't in the pre-started pool only starts once the main
+    // thread yields, so join() would wait forever (a model's setScene()
+    // froze the page). Inline there.
+    if (emscripten_is_main_browser_thread()) {
+        for (int face = 0; face < 6; ++face) bakeFace(face);
+        return out;
+    }
+#endif
     {
         std::vector<std::thread> threads;
         for (int face = 1; face < 6; ++face) threads.emplace_back(bakeFace, face);
