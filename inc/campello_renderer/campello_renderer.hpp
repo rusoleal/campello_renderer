@@ -1049,6 +1049,8 @@ namespace systems::leal::campello_renderer {
         systems::leal::vector_math::Matrix4<double> lastViewMatrix = systems::leal::vector_math::Matrix4<double>::identity();
         /// pick(): each primitive's triangles (object space, xyz per vertex, 3 vertices per triangle).
         mutable std::unordered_map<const systems::leal::gltf::Primitive*, std::vector<float>> pickTriangles;
+        // Each pickTriangles entry's bounds: min xyz, max xyz.
+        mutable std::unordered_map<const systems::leal::gltf::Primitive*, std::array<float, 6>> pickBounds;
         const std::vector<float>& pickGeometry(const systems::leal::gltf::Primitive& primitive) const;
 
         // Approximate bounding radius of the current scene (computed in setScene()).
@@ -1363,6 +1365,11 @@ namespace systems::leal::campello_renderer {
         /// factors, KHR_texture_transform, ...): re-uploads its uniforms.
         void materialChanged(uint64_t materialIndex);
 
+        /// Which nodes pick() can hit.
+        enum class PickFilter {
+            selectable, ///< KHR_node_selectability (clicks, KHR_interactivity's onSelect)
+            hoverable,  ///< KHR_node_hoverability (onHoverIn, onHoverOut)
+        };
         /// What pick() hit.
         struct PickResult {
             int64_t node = -1;           ///< the glTF node hit, -1 when none
@@ -1372,11 +1379,12 @@ namespace systems::leal::campello_renderer {
         };
         /// The node whose geometry the ray through (x, y) hits first, in the
         /// last rendered frame (camera and node transforms). x, y in 0..1 of
-        /// the rendered image, from its top left. KHR_node_selectability:
-        /// unselectable nodes (selectable false on the node or an ancestor)
-        /// are skipped; visibility doesn't matter. Triangles of each node's
-        /// mesh in their rest pose (no skinning or morphing; one instance).
-        PickResult pick(double x, double y) const;
+        /// the rendered image, from its top left. KHR_node_selectability (or,
+        /// with PickFilter::hoverable, KHR_node_hoverability): nodes that
+        /// aren't (false on the node or an ancestor) are skipped; visibility
+        /// doesn't matter. Triangles of each node's mesh in their rest pose
+        /// (no skinning or morphing; one instance).
+        PickResult pick(double x, double y, PickFilter filter = PickFilter::selectable) const;
 
         /// A node's world matrix in the last rendered frame (row-major, as
         /// vector_math). False when there's no such node.
@@ -1465,6 +1473,14 @@ namespace systems::leal::campello_renderer {
         // Per-animation time control.
         void setAnimationTime(uint32_t animationIndex, double time);  // Seek to specific time
         double getAnimationTime(uint32_t animationIndex) const;       // Get current time
+
+        /// Shows animation `animationIndex` at `time` seconds (within its
+        /// keyframes) now, and keeps it there on every update() until
+        /// releaseAnimation(): for an application that decides the time
+        /// itself (KHR_interactivity's animation/start). Stops its playback.
+        void poseAnimation(uint32_t animationIndex, double time);
+        /// Ends poseAnimation(): the properties it animated keep their values.
+        void releaseAnimation(uint32_t animationIndex);
 
         // Scene presentation controls (clear color, lighting layers).
         void setClearColor(float r, float g, float b, float a);

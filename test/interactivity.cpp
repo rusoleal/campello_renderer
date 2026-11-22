@@ -22,6 +22,7 @@ using Value = systems::leal::gltf::InteractivityRuntimeValue;
 // Two emissive 2x2 quads facing +Z: "Back" (node 0) at z=0 and its child
 // "Front" (node 1) at z=0.5, half the size. Node 2 has an authored matrix.
 // The renderer's default camera looks at the origin from (0, 0, 5).
+// Animation 0 moves Back from x=0 to x=2 in 2 s.
 const char* kQuads = R"({
     "asset": {"version": "2.0"},
     "extensionsUsed": ["KHR_texture_transform", "KHR_node_visibility", "KHR_node_selectability"],
@@ -39,10 +40,15 @@ const char* kQuads = R"({
     "textures": [{}],
     "accessors": [
         {"bufferView": 0, "componentType": 5126, "count": 4, "type": "VEC3", "min": [-1, -1, 0], "max": [1, 1, 0]},
-        {"bufferView": 1, "componentType": 5123, "count": 6, "type": "SCALAR"}
+        {"bufferView": 1, "componentType": 5123, "count": 6, "type": "SCALAR"},
+        {"bufferView": 2, "componentType": 5126, "count": 2, "type": "SCALAR", "min": [0], "max": [2]},
+        {"bufferView": 3, "componentType": 5126, "count": 2, "type": "VEC3"}
     ],
-    "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 48}, {"buffer": 0, "byteOffset": 48, "byteLength": 12}],
-    "buffers": [{"uri": "data:application/octet-stream;base64,AACAvwAAgL8AAAAAAACAPwAAgL8AAAAAAACAPwAAgD8AAAAAAACAvwAAgD8AAAAAAAABAAIAAAACAAMA", "byteLength": 60}]
+    "animations": [{"channels": [{"sampler": 0, "target": {"node": 0, "path": "translation"}}],
+                    "samplers": [{"input": 2, "output": 3}]}],
+    "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 48}, {"buffer": 0, "byteOffset": 48, "byteLength": 12},
+                    {"buffer": 0, "byteOffset": 60, "byteLength": 8}, {"buffer": 0, "byteOffset": 68, "byteLength": 24}],
+    "buffers": [{"uri": "data:application/octet-stream;base64,AACAvwAAgL8AAAAAAACAPwAAgL8AAAAAAACAPwAAgD8AAAAAAACAvwAAgD8AAAAAAAABAAIAAAACAAMAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAA=", "byteLength": 92}]
 })";
 
 std::shared_ptr<GLTF> loadQuads() {
@@ -132,6 +138,28 @@ TEST_F(InteractivityRenderTest, PickFindsTheNearestSelectableNode) {
     (*asset->nodes)[0].selectable = true;
     (*asset->nodes)[1].visible = false;
     EXPECT_EQ(renderer->pick(0.5, 0.5).node, 1);
+
+    // Hover picking reads KHR_node_hoverability instead.
+    (*asset->nodes)[1].hoverable = false;
+    EXPECT_EQ(renderer->pick(0.5, 0.5, Renderer::PickFilter::hoverable).node, 0);
+    EXPECT_EQ(renderer->pick(0.5, 0.5).node, 1);
+}
+
+TEST_F(InteractivityRenderTest, ObjectModelPosesAnimationsAndReleasesThem) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    InteractivityObjectModel model(*renderer);
+    auto x = [&] { return (*asset->nodes)[0].translation.data[0]; };
+    model.applyAnimation(0, 1.0);  // animation/start, on a tick
+    EXPECT_NEAR(x(), 1.0, 1e-6);
+    renderer->update(0.5);  // held, not advanced
+    EXPECT_NEAR(x(), 1.0, 1e-6);
+    model.applyAnimation(0, 2.0);
+    EXPECT_NEAR(x(), 2.0, 1e-6);
+    model.animationStopped(0);  // the properties keep their values
+    renderer->update(0.5);
+    EXPECT_NEAR(x(), 2.0, 1e-6);
+    EXPECT_FALSE(renderer->isAnimationPlaying(0));
+    EXPECT_NO_THROW(renderAndRead(0, 0));
 }
 
 TEST_F(InteractivityRenderTest, ObjectModelReadsAndWritesTheAsset) {

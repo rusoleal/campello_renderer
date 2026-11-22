@@ -23,6 +23,7 @@ class Renderer;
  * Supported pointers (types as the glTF Asset Object Model):
  * - /nodes/{}/translation (float3), rotation (float4), scale (float3): nodes
  *   without an authored matrix; matrix and globalMatrix (float4x4, read-only)
+ * - /nodes/{}/weights/{} (float): one morph target weight
  * - /nodes/{}/extensions/KHR_node_visibility/visible,
  *   KHR_node_selectability/selectable, KHR_node_hoverability/hoverable (bool)
  * - /materials/{}/alphaCutoff, emissiveFactor, pbrMetallicRoughness/
@@ -35,6 +36,9 @@ class Renderer;
  * - /extensions/KHR_lights_punctual/lights/{}/color, intensity, range
  * - /extensions/KHR_interactivity/activeCamera/position (float3), rotation
  *   (float4), read-only: the last rendered frame's camera
+ *
+ * animation/start plays glTF animations with Renderer::poseAnimation() at the
+ * time the runtime decides (the application must not play them itself).
  *
  * Material changes are re-uploaded by flush(): call it after the runtime's
  * start(), tick(), select() or receive() (once per frame is enough).
@@ -53,6 +57,11 @@ public:
                    const std::map<std::string, systems::leal::gltf::InteractivityRuntimeValue>& values) override {
         if (onEventSent) onEventSent(eventIndex, values);
     }
+
+    /// animation/start: the animation at `time`, through Renderer::poseAnimation().
+    void applyAnimation(int64_t animation, double time) override;
+    /// The graph stopped it: Renderer::releaseAnimation().
+    void animationStopped(int64_t animation) override;
 
     /// Re-uploads the materials pointer/set changed since the last flush().
     void flush();

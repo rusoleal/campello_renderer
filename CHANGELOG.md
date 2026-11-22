@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+- **KHR_interactivity animations and hover** (with gltf's runtime, which now runs animation/*, variable/pointer interpolation and hover events):
+  - `Renderer::poseAnimation(index, time)` shows an animation at a time the application decides, and holds it there on every `update()` until `releaseAnimation(index)`, which keeps the values it set (morph weights are copied to the nodes). `InteractivityObjectModel` plays animation/start this way (`applyAnimation`, `animationStopped`).
+  - `InteractivityObjectModel` reads and writes `/nodes/{}/weights/{}`, one morph target weight (the node's; its mesh's until first written). Needle's MiniChess keeps its engine's memory there.
+  - `pick(x, y, PickFilter::hoverable)` follows KHR_node_hoverability instead of selectability (onHoverIn and onHoverOut).
+  - `pick()` is faster on large models: the ray goes into each node's space (no vertex is transformed) and is tested against each mesh's bounds first. Needle's MiniChess (432k triangles) no longer slows down while the mouse hovers it.
+  - Tests: `ObjectModelPosesAnimationsAndReleasesThem`, and hover picking in `PickFindsTheNearestSelectableNode`.
+
+### Fixed
+- **Web: KHR_texture_procedurals models froze the page on machines with more than 4 cores** (Chrome on macOS: 100% CPU, no logs). The bake started one thread per core and the texture encoder its own pool, then waited for them on the browser's main thread; a Web Worker beyond Emscripten's pre-started pool only starts once the main thread yields, so the wait never ended. On the main thread both now run single-threaded, as the environment bake already did.
+
+### Changed
+- gltf v0.9.0.
+
 ## [0.34.0] - 2026-11-22
 
 ### Added
