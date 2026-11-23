@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- **Decoding images off the device's thread.** `Renderer::imageDecoder()` returns a function that decodes an asset's images on any thread (PNG, JPEG and WebP to RGBA; KTX2 / Basis Universal transcoded to the formats this device samples, chosen when the function is made); `setAsset(asset, decoded)` then only uploads them, and decodes any image the function didn't. Decoding was most of `setAsset()`'s time for a textured model, on the thread that owns the device (the browser's main thread on the web): in campello_web_viewer, DamagedHelmet's upload went from 1.4 s to 0.5 s and the KTX2 StainedGlassLamp's from 1.7 s to 0.4 s, the decoding moving to its loading thread. The function touches no GPU state and doesn't refer to the renderer. Tests `ImageDecoderTest.*`.
+
 ## [0.36.0] - 2026-11-22
 
 ### Changed
