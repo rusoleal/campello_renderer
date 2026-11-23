@@ -6,6 +6,7 @@
 #include <campello_gpu/texture.hpp>
 #include <gltf/gltf.hpp>
 
+#include <campello_image/texture_encoder.hpp>
 #include <gtest/gtest.h>
 
 #include <array>
@@ -49,12 +50,11 @@ std::shared_ptr<GLTF> loadRedQuad() {
 // The centre pixel of the asset rendered at 32x32 (black clear colour),
 // with its images decoded beforehand on another thread or not.
 // (Without its texture the quad would be white.)
-std::array<uint8_t, 4> renderCentre(const std::shared_ptr<systems::leal::campello_gpu::Device>& device, bool decodeFirst) {
+std::array<uint8_t, 4> renderCentre(const std::shared_ptr<systems::leal::campello_gpu::Device>& device,
+                                    const std::shared_ptr<GLTF>& asset, bool decodeFirst) {
     using namespace systems::leal::campello_gpu;
     constexpr uint32_t kSize = 32;
     Renderer renderer(device);
-    auto asset = loadRedQuad();
-    EXPECT_NE(asset, nullptr);
     if (decodeFirst) {
         auto decoder = renderer.imageDecoder();
         std::shared_ptr<DecodedImages> decoded;
@@ -86,8 +86,8 @@ std::array<uint8_t, 4> renderCentre(const std::shared_ptr<systems::leal::campell
 TEST(ImageDecoderTest, ImagesDecodedOnAnotherThreadRenderAsWhenDecodedBySetAsset) {
     auto device = systems::leal::campello_gpu::Device::createDefaultDevice(nullptr);
     if (!device) GTEST_SKIP() << "no GPU device";
-    const auto ahead = renderCentre(device, true);
-    const auto here = renderCentre(device, false);
+    const auto ahead = renderCentre(device, loadRedQuad(), true);
+    const auto here = renderCentre(device, loadRedQuad(), false);
     EXPECT_GT(ahead[0], 200) << "red expected";
     EXPECT_LT(ahead[1], 40);
     EXPECT_LT(ahead[2], 40);
@@ -104,6 +104,61 @@ TEST(ImageDecoderTest, DecodesWithoutADevice) {
     renderer.setAsset(asset, decoded);  // no device: nothing is uploaded, nothing breaks
     renderer.setAsset(nullptr, decoded);
     EXPECT_EQ(renderer.getAsset(), nullptr);
+}
+
+// The red quad with its texture as a KTX2 file and only KHR_texture_basisu
+// naming it (no "source", as KTX2-only assets have).
+std::string base64(const std::vector<uint8_t>& bytes) {
+    static const char* abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    for (size_t i = 0; i < bytes.size(); i += 3) {
+        const uint32_t n = (uint32_t)bytes[i] << 16 | (i + 1 < bytes.size() ? (uint32_t)bytes[i + 1] << 8 : 0) |
+                           (i + 2 < bytes.size() ? bytes[i + 2] : 0);
+        out += abc[n >> 18 & 63];
+        out += abc[n >> 12 & 63];
+        out += i + 1 < bytes.size() ? abc[n >> 6 & 63] : '=';
+        out += i + 2 < bytes.size() ? abc[n & 63] : '=';
+    }
+    return out;
+}
+
+std::shared_ptr<GLTF> loadRedKtx2Quad() {
+    std::vector<uint8_t> red(4 * 4 * 4);
+    for (size_t i = 0; i < red.size(); i += 4) {
+        red[i] = 255;
+        red[i + 3] = 255;
+    }
+    systems::leal::campello_image::EncodeOptions options;
+    options.threaded = false;
+    const auto ktx2 = systems::leal::campello_image::encodeKtx2(red.data(), 4, 4, options);
+    if (ktx2.empty()) return nullptr;
+    std::string json = kRedQuad;
+    const auto at = json.find("\"textures\": [{\"source\": 0}]");
+    json.replace(at, std::string("\"textures\": [{\"source\": 0}]").size(),
+                 "\"textures\": [{\"extensions\": {\"KHR_texture_basisu\": {\"source\": 0}}}]");
+    const auto image = json.find("data:image/png;base64,");
+    const auto end = json.find('"', image);
+    json.replace(image, end - image, "data:image/ktx2;base64," + base64(ktx2));
+    json.replace(json.find("\"KHR_materials_unlit\"]"), std::string("\"KHR_materials_unlit\"]").size(),
+                 "\"KHR_materials_unlit\", \"KHR_texture_basisu\"]");
+    return GLTF::loadGLTF(json, [](const std::string&) {
+        return std::async(std::launch::deferred, [] { return std::vector<uint8_t>{}; });
+    });
+}
+
+TEST(ImageDecoderTest, Ktx2OnlyTexturesAreSampled) {
+    if (!systems::leal::campello_image::canEncode()) GTEST_SKIP() << "no KTX2 encoder";
+    auto device = systems::leal::campello_gpu::Device::createDefaultDevice(nullptr);
+    if (!device) GTEST_SKIP() << "no GPU device";
+    for (const bool decodeFirst : {false, true}) {
+        auto asset = loadRedKtx2Quad();
+        ASSERT_NE(asset, nullptr);
+        const auto centre = renderCentre(device, asset, decodeFirst);
+        // Without its KTX2 texture the quad would be white.
+        EXPECT_GT(centre[0], 200) << "decodeFirst " << decodeFirst;
+        EXPECT_LT(centre[1], 40) << "decodeFirst " << decodeFirst;
+        EXPECT_LT(centre[2], 40) << "decodeFirst " << decodeFirst;
+    }
 }
 
 }  // namespace image_decoder_test

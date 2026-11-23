@@ -2707,8 +2707,11 @@ void Renderer::setScene(uint32_t index) {
 
                 auto &gt = (*asset->textures)[texIdx];
 
-                // Get image (prefer WebP)
-                int64_t imgIdx = (gt.ext_texture_webp >= 0) ? gt.ext_texture_webp : gt.source;
+                // The image: KTX2 (KHR_texture_basisu) first, then WebP, as
+                // the uploads above (a texture with only an extension's
+                // image has no source).
+                int64_t imgIdx = (gt.khr_texture_basisu >= 0) ? gt.khr_texture_basisu
+                                 : (gt.ext_texture_webp >= 0) ? gt.ext_texture_webp : gt.source;
                 if (imgIdx >= 0 && imgIdx < (int64_t)gpuTextures.size() && gpuTextures[imgIdx]) {
                     outTex = gpuTextures[imgIdx];
                 }

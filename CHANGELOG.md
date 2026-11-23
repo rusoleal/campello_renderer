@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Textures that only KHR_texture_basisu names (KTX2 without a PNG/JPEG fallback) are sampled.** They were decoded and uploaded, but a scene's materials looked their image up through `source` and EXT_texture_webp only, found nothing, and drew with the default white texture: Khronos' StainedGlassLamp (glTF-KTX-BasisU) rendered white. Test `ImageDecoderTest.Ktx2OnlyTexturesAreSampled` (a quad textured by a KTX2 image encoded at run time, drawn red, with and without imageDecoder()).
+
 ## [0.37.0] - 2026-11-23
 
 ### Added
