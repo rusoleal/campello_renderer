@@ -28,6 +28,12 @@
 
 namespace systems::leal::campello_image { class Image; }
 
+namespace systems::leal::campello_renderer {
+    /// An asset's images decoded ahead of Renderer::setAsset() (see
+    /// Renderer::imageDecoder()); opaque.
+    struct DecodedImages;
+}
+
 namespace systems::leal::campello_procedural {
     struct BakeResult;
 }
@@ -318,6 +324,10 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::Device> device;
         std::shared_ptr<systems::leal::gltf::GLTF> asset;
         std::string assetBasePath;
+        // Images decoded ahead of setAsset() (imageDecoder()); each is
+        // released once uploaded.
+        std::shared_ptr<DecodedImages> decodedImages;
+        void setAssetImpl(std::shared_ptr<systems::leal::gltf::GLTF> asset);
         uint32_t sceneIndex  = 0;
         uint32_t cameraIndex = 0;
         std::vector<std::shared_ptr<Image>> images;
@@ -1340,7 +1350,19 @@ namespace systems::leal::campello_renderer {
         ~Renderer();
 
         void setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset);
+        /// setAsset() with images decoded beforehand by imageDecoder()'s
+        /// function; those it lacks are decoded here, as by setAsset(asset).
+        void setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset, std::shared_ptr<DecodedImages> decoded);
         std::shared_ptr<systems::leal::gltf::GLTF> getAsset();
+
+        /// A function that decodes an asset's images on any thread, so that
+        /// setAsset() only uploads them: PNG, JPEG and WebP to RGBA, KTX2 /
+        /// Basis Universal transcoded to the formats this device samples.
+        /// Decoding is most of setAsset()'s time for a textured model, and it
+        /// blocks the thread that owns the device. The function touches no
+        /// GPU state and doesn't refer to the renderer (it may outlive it);
+        /// external image URIs resolve against getAssetBasePath() as it is now.
+        std::function<std::shared_ptr<DecodedImages>(const systems::leal::gltf::GLTF&)> imageDecoder() const;
 
         // Sets the base directory for resolving relative external image URIs
         // in .gltf files (e.g. "textures/baseColor.png"). Must be called before

@@ -781,6 +781,85 @@ static systems::leal::campello_image::TextureFormat basisTargetFormatFor(
     return TextureFormat::rgba8;
 }
 
+}  // anonymous namespace
+
+struct systems::leal::campello_renderer::DecodedImages {
+    // By image index: PNG/JPEG/WebP as RGBA, and KTX2/Basis transcoded for
+    // `textureSrgb` (the colour space the format was chosen for).
+    std::vector<std::shared_ptr<systems::leal::campello_image::Image>> images;
+    std::vector<std::shared_ptr<systems::leal::campello_image::TextureData>> textures;
+    std::vector<char> textureSrgb;
+};
+
+namespace {
+
+namespace {
+
+// The images an asset's materials use as colour (sampled as sRGB) and the
+// ones KHR_texture_basisu names (KTX2/Basis).
+void classifyImages(const systems::leal::gltf::GLTF& asset, std::unordered_set<int64_t>& srgb,
+                    std::unordered_set<int64_t>& basisu) {
+    if (!asset.textures) return;
+    for (auto& tex : *asset.textures)
+        if (tex.khr_texture_basisu >= 0) basisu.insert(tex.khr_texture_basisu);
+    if (!asset.materials) return;
+    auto imageOf = [&](int64_t texIdx) -> int64_t {
+        if (texIdx < 0 || (size_t)texIdx >= asset.textures->size()) return -1;
+        auto& gt = (*asset.textures)[(size_t)texIdx];
+        if (gt.khr_texture_basisu >= 0) return gt.khr_texture_basisu;
+        if (gt.ext_texture_webp >= 0) return gt.ext_texture_webp;
+        return gt.source;
+    };
+    for (auto& mat : *asset.materials) {
+        if (mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture)
+            srgb.insert(imageOf(mat.pbrMetallicRoughness->baseColorTexture->index));
+        if (mat.emissiveTexture) srgb.insert(imageOf(mat.emissiveTexture->index));
+        if (mat.khrMaterialsSpecular && mat.khrMaterialsSpecular->specularColorTexture)
+            srgb.insert(imageOf(mat.khrMaterialsSpecular->specularColorTexture->index));
+        if (mat.khrMaterialsSheen && mat.khrMaterialsSheen->sheenColorTexture)
+            srgb.insert(imageOf(mat.khrMaterialsSheen->sheenColorTexture->index));
+    }
+    srgb.erase(-1);
+}
+
+// An image's encoded bytes: in the image (data: URIs, files the loader
+// read), in a buffer view, or nothing (an external file: `path` names it).
+const uint8_t* encodedBytes(const systems::leal::gltf::GLTF& asset, const systems::leal::gltf::Image& image,
+                            size_t& length, const std::string& basePath, std::string& path) {
+    length = 0;
+    if (!image.data.empty()) {
+        length = image.data.size();
+        return image.data.data();
+    }
+    if (image.bufferView != -1 && asset.bufferViews && asset.buffers) {
+        auto& view = (*asset.bufferViews)[(size_t)image.bufferView];
+        auto& buffer = (*asset.buffers)[view.buffer];
+        if (buffer.data.empty()) return nullptr;
+        length = view.byteLength;
+        return buffer.data.data() + view.byteOffset;
+    }
+    if (!image.uri.empty()) {
+        path = image.uri;
+        if (!basePath.empty() && path.find(':') == std::string::npos && path.front() != '/') path = basePath + path;
+    }
+    return nullptr;
+}
+
+std::shared_ptr<systems::leal::campello_image::Image> takeDecodedImage(
+    const std::shared_ptr<systems::leal::campello_renderer::DecodedImages>& decoded, int64_t index) {
+    if (!decoded || index < 0 || (size_t)index >= decoded->images.size()) return nullptr;
+    return std::move(decoded->images[(size_t)index]);
+}
+
+std::shared_ptr<systems::leal::campello_image::TextureData> takeDecodedTexture(
+    const std::shared_ptr<systems::leal::campello_renderer::DecodedImages>& decoded, int64_t index, bool srgb) {
+    if (!decoded || index < 0 || (size_t)index >= decoded->textures.size()) return nullptr;
+    if ((decoded->textureSrgb[(size_t)index] != 0) != srgb) return nullptr;  // transcoded for the other colour space
+    return std::move(decoded->textures[(size_t)index]);
+}
+
+}  // namespace
+
 static systems::leal::campello_gpu::PixelFormat textureDataFormatToPixelFormat(
     systems::leal::campello_image::TextureFormat tfmt,
     bool wantsSrgb)
@@ -891,7 +970,53 @@ Renderer::~Renderer() {
 // Asset / scene / camera
 // ---------------------------------------------------------------------------
 
+std::function<std::shared_ptr<DecodedImages>(const systems::leal::gltf::GLTF&)> Renderer::imageDecoder() const {
+    using systems::leal::campello_image::Image;
+    using systems::leal::campello_image::TextureData;
+    const auto srgbTarget = basisTargetFormatFor(device, true);
+    const auto linearTarget = basisTargetFormatFor(device, false);
+    const std::string basePath = assetBasePath;
+    return [srgbTarget, linearTarget, basePath](const systems::leal::gltf::GLTF& asset) {
+        auto decoded = std::make_shared<DecodedImages>();
+        const size_t count = asset.images ? asset.images->size() : 0;
+        decoded->images.resize(count);
+        decoded->textures.resize(count);
+        decoded->textureSrgb.assign(count, 0);
+        std::unordered_set<int64_t> srgb, basisu;
+        classifyImages(asset, srgb, basisu);
+        for (size_t i = 0; i < count; ++i) {
+            const auto& image = (*asset.images)[i];
+            size_t length = 0;
+            std::string path;
+            const uint8_t* bytes = encodedBytes(asset, image, length, basePath, path);
+            if (basisu.count((int64_t)i)) {
+                const bool colour = srgb.count((int64_t)i) > 0;
+                const auto target = colour ? srgbTarget : linearTarget;
+                decoded->textureSrgb[i] = colour ? 1 : 0;
+                decoded->textures[i] = bytes ? TextureData::fromMemory(bytes, length, target)
+                                       : !path.empty() ? TextureData::fromFile(path.c_str(), target)
+                                                       : nullptr;
+            } else {
+                decoded->images[i] = bytes ? Image::fromMemory(bytes, length)
+                                     : !path.empty() ? Image::fromFile(path.c_str())
+                                                     : nullptr;
+            }
+        }
+        return decoded;
+    };
+}
+
+void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset, std::shared_ptr<DecodedImages> decoded) {
+    decodedImages = asset ? std::move(decoded) : nullptr;
+    setAssetImpl(std::move(asset));
+    decodedImages.reset();  // what setScene() didn't use (other scenes) is decoded again when needed
+}
+
 void Renderer::setAsset(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
+    setAsset(std::move(asset), nullptr);
+}
+
+void Renderer::setAssetImpl(std::shared_ptr<systems::leal::gltf::GLTF> asset) {
     // Replacing the active asset drops the shared_ptrs to every GPU buffer,
     // texture, and bind group the previous asset owned (below, and via
     // setScene() -> allocateGpuResources()), which destroys the underlying
@@ -1873,35 +1998,7 @@ void Renderer::setScene(uint32_t index) {
     // gpuTextures persists across setScene() calls.
     std::unordered_set<int64_t> srgbImageIndices;
     std::unordered_set<int64_t> basisuImageIndices;
-    if (asset->textures && asset->materials) {
-        auto imageIndexForTex = [&](int64_t texIdx) -> int64_t {
-            if (texIdx < 0 || (size_t)texIdx >= asset->textures->size()) return -1;
-            auto &gt = (*asset->textures)[(size_t)texIdx];
-            if (gt.khr_texture_basisu >= 0) return gt.khr_texture_basisu;
-            if (gt.ext_texture_webp >= 0) return gt.ext_texture_webp;
-            return gt.source;
-        };
-        for (auto &mat : *asset->materials) {
-            if (mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->baseColorTexture)
-                srgbImageIndices.insert(imageIndexForTex(mat.pbrMetallicRoughness->baseColorTexture->index));
-            if (mat.emissiveTexture)
-                srgbImageIndices.insert(imageIndexForTex(mat.emissiveTexture->index));
-            // KHR_materials_specular: specularColorTexture is sRGB-encoded
-            if (mat.khrMaterialsSpecular && mat.khrMaterialsSpecular->specularColorTexture)
-                srgbImageIndices.insert(imageIndexForTex(mat.khrMaterialsSpecular->specularColorTexture->index));
-            // KHR_materials_sheen: sheenColorTexture is sRGB-encoded; roughness texture is linear
-            if (mat.khrMaterialsSheen && mat.khrMaterialsSheen->sheenColorTexture)
-                srgbImageIndices.insert(imageIndexForTex(mat.khrMaterialsSheen->sheenColorTexture->index));
-        }
-        srgbImageIndices.erase(-1); // remove sentinel from any unresolved lookups
-
-        // Collect image indices that are KHR_texture_basisu targets.
-        for (auto &tex : *asset->textures) {
-            if (tex.khr_texture_basisu >= 0) {
-                basisuImageIndices.insert(tex.khr_texture_basisu);
-            }
-        }
-    }
+    classifyImages(*asset, srgbImageIndices, basisuImageIndices);
 
     namespace GPU = systems::leal::campello_gpu;
 
@@ -1937,8 +2034,10 @@ void Renderer::setScene(uint32_t index) {
                     // KHR_texture_basisu path — use TextureData for GPU-compressed upload.
                     // ------------------------------------------------------------------
                     const auto basisTargetFormat = basisTargetFormatFor(device, wantsSrgb);
-                    std::shared_ptr<systems::leal::campello_image::TextureData> texData;
-                    if (image.data.size() > 0) {
+                    std::shared_ptr<systems::leal::campello_image::TextureData> texData =
+                        takeDecodedTexture(decodedImages, a, wantsSrgb);  // imageDecoder()
+                    if (texData) {
+                    } else if (image.data.size() > 0) {
                         texData = systems::leal::campello_image::TextureData::fromMemory(
                             image.data.data(), image.data.size(), basisTargetFormat);
                     } else if (image.bufferView != -1) {
@@ -1970,6 +2069,24 @@ void Renderer::setScene(uint32_t index) {
                                 gpuTextures[a] = texture;
                             }
                         }
+                    }
+                } else if (auto img = takeDecodedImage(decodedImages, a)) {
+                    // Decoded beforehand (imageDecoder()): upload only.
+                    auto fmt = imageFormatToPixelFormat(img->getFormat(), wantsSrgb);
+                    uint32_t mipLevels = 1 + (uint32_t)std::floor(
+                        std::log2((double)std::max(img->getWidth(), img->getHeight())));
+                    auto texture = device->createTexture(
+                        GPU::TextureType::tt2d, fmt,
+                        img->getWidth(), img->getHeight(), 1, mipLevels, 1,
+                        (GPU::TextureUsage)((uint32_t)GPU::TextureUsage::textureBinding |
+                                            (uint32_t)GPU::TextureUsage::copyDst |
+                                            (uint32_t)GPU::TextureUsage::copySrc |
+                                            // See the data:uri texture-creation site below.
+                                            (mipLevels > 1 ? (uint32_t)GPU::TextureUsage::renderTarget : 0u)));
+                    if (texture != nullptr) {
+                        texture->upload(0, img->getDataSize(), const_cast<void*>(img->getData()));
+                        gpuTextures[a] = texture;
+                        if (mipLevels > 1) texturesNeedingMips.push_back(texture);
                     }
                 } else if (image.data.size() > 0) {
                     // Data:uri images are already decoded by the gltf library.
@@ -10333,7 +10450,9 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
             // ------------------------------------------------------------
             std::shared_ptr<systems::leal::campello_image::TextureData> texData;
             const auto basisTargetFormat = basisTargetFormatFor(device, srgb);
-            if (!image.data.empty()) {
+            if (sceneAsset) texData = takeDecodedTexture(decodedImages, imageIndex, srgb);  // imageDecoder()
+            if (texData) {
+            } else if (!image.data.empty()) {
                 texData = systems::leal::campello_image::TextureData::fromMemory(
                     image.data.data(), image.data.size(), basisTargetFormat);
             } else if (image.bufferView != -1 && asset.bufferViews && asset.buffers) {
@@ -10403,7 +10522,9 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
         }
 
         std::shared_ptr<systems::leal::campello_image::Image> img;
-        if (!image.data.empty()) {
+        if (sceneAsset) img = takeDecodedImage(decodedImages, imageIndex);  // imageDecoder()
+        if (img) {
+        } else if (!image.data.empty()) {
             img = systems::leal::campello_image::Image::fromMemory(
                 image.data.data(), image.data.size());
         } else if (image.bufferView != -1 && asset.bufferViews && asset.buffers) {

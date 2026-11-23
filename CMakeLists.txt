@@ -216,6 +216,7 @@ if(CAMPELLO_RENDERER_BUILD_TEST)
     add_executable(${PROJECT_NAME}_test
         test/main.cpp
         test/interactivity.cpp
+        test/image_decoder.cpp
     )
     set_target_properties(${PROJECT_NAME}_test PROPERTIES UNITY_BUILD ON)
     target_link_libraries(${PROJECT_NAME}_test
