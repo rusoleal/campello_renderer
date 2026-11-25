@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.37.2] - 2026-11-25
+
 ### Fixed
 - **Web builds are static.** The library was declared `SHARED` everywhere; emsdk 7 builds that as a side module (`libcampello_renderer.so`) the page has to fetch and load at runtime, where older releases quietly built a static library. It is now `STATIC` under Emscripten, so it links into the app's own `.wasm`, as gltf (0.12.1) and campello_image (0.11.1) now do. Native platforms still build a shared library.
 
