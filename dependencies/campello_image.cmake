@@ -10,11 +10,11 @@ endif()
 
 include(FetchContent)
 
-message(STATUS "Fetching campello_image v0.6.0 from GitHub")
+message(STATUS "Fetching campello_image v0.11.1 from GitHub")
 FetchContent_Declare(
         extern_campello_image
         GIT_REPOSITORY https://github.com/rusoleal/campello_image
-        GIT_TAG        v0.7.0
+        GIT_TAG        v0.11.1
 )
 
 if(NOT extern_campello_image_POPULATED)

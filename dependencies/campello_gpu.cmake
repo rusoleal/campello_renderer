@@ -8,12 +8,12 @@ if(TARGET campello_gpu)
     return()
 endif()
 
-message(STATUS "Fetching campello_gpu v0.33.2 from GitHub")
+message(STATUS "Fetching campello_gpu v0.38.0 from GitHub")
 include(FetchContent)
 FetchContent_Declare(
         extern_campello_gpu
         GIT_REPOSITORY https://github.com/rusoleal/campello_gpu
-        GIT_TAG        v0.34.0
+        GIT_TAG        v0.38.0
 )
 
 if(NOT extern_campello_gpu_POPULATED)

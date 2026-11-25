@@ -20,11 +20,11 @@ if(EXISTS "${GLTF_LOCAL_PATH}/CMakeLists.txt")
             SOURCE_DIR ${GLTF_LOCAL_PATH}
     )
 else()
-    message(STATUS "Fetching gltf v0.10.0 from GitHub")
+    message(STATUS "Fetching gltf v0.12.1 from GitHub")
     FetchContent_Declare(
             extern_gltf
             GIT_REPOSITORY https://github.com/rusoleal/gltf
-            GIT_TAG        v0.10.0
+            GIT_TAG        v0.12.1
     )
 endif()
 
