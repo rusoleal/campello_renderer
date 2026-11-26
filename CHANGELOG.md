@@ -9,6 +9,9 @@
 ### Fixed
 - **`/nodes/N/globalMatrix` was the last frame's.** A graph that moved a parent with `pointer/set` and then read a child's `globalMatrix` saw the old transform. It is now computed from the nodes' current transforms.
 
+### Changed
+- gltf v0.13.0 (KHR_interactivity runtime fixes from Khronos' test set; asset capability pointers).
+
 ## [0.37.2] - 2026-11-25
 
 ### Fixed
