@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+- **`InteractivityObjectModel`: material extension pointers.** The factors of KHR_materials_transmission, clearcoat, sheen, specular, volume, iridescence, anisotropy and diffuse_transmission, `KHR_materials_dispersion/dispersion`, and the `KHR_texture_transform` offset, rotation and scale of these extensions' textures. A material that doesn't use the extension doesn't resolve them.
+- **`InteractivityObjectModel`: `spot/innerConeAngle` and `spot/outerConeAngle`** of KHR_lights_punctual spot lights. Other light types don't resolve them, so a `pointer/set` takes its `err` flow.
+
+### Fixed
+- **`/nodes/N/globalMatrix` was the last frame's.** A graph that moved a parent with `pointer/set` and then read a child's `globalMatrix` saw the old transform. It is now computed from the nodes' current transforms.
+
 ## [0.37.2] - 2026-11-25
 
 ### Fixed

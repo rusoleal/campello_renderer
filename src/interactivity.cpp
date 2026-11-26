@@ -91,6 +91,12 @@ bool authoredMatrix(const VM::Matrix4<T>& m) {
     return false;
 }
 
+// A node's local transform: its authored matrix, else its TRS.
+VM::Matrix4<double> localMatrix(const G::Node& node) {
+    if (authoredMatrix(node.matrix)) return node.matrix;
+    return VM::Matrix4<double>::compose(node.translation, node.rotation, node.scale);
+}
+
 // The unit quaternion (x, y, z, w) of a rotation matrix m[row][col].
 void quaternionFromMatrix(const double m[3][3], double q[4]) {
     const double trace = m[0][0] + m[1][1] + m[2][2];
@@ -132,6 +138,74 @@ bool textureTransform(G::TextureInfo* info, const std::string& prop, Sig type, V
     return floats(type, propType, &t.rotation, get, set);
 }
 
+// A property of one of a material's KHR_materials_* extensions: a factor
+// (`data`, of `type`) or a texture slot. Empty when the material doesn't use
+// the extension or it has no such property.
+struct MaterialExtensionProperty {
+    GLTF_REAL_NUMBER_TYPE* data = nullptr;
+    Sig type = Sig::Float;
+    G::TextureInfo* texture = nullptr;
+};
+
+MaterialExtensionProperty materialExtensionProperty(G::Material& m, const std::string& extension, const std::string& name) {
+    MaterialExtensionProperty out;
+    auto factor = [&](GLTF_REAL_NUMBER_TYPE* data, Sig type = Sig::Float) {
+        out.data = data;
+        out.type = type;
+    };
+    auto texture = [&](const auto& slot) { out.texture = slot.get(); };
+    if (extension == "KHR_materials_transmission" && m.khrMaterialsTransmission) {
+        auto& e = *m.khrMaterialsTransmission;
+        if (name == "transmissionFactor") factor(&e.transmissionFactor);
+        else if (name == "transmissionTexture") texture(e.transmissionTexture);
+    } else if (extension == "KHR_materials_clearcoat" && m.khrMaterialsClearcoat) {
+        auto& e = *m.khrMaterialsClearcoat;
+        if (name == "clearcoatFactor") factor(&e.clearcoatFactor);
+        else if (name == "clearcoatRoughnessFactor") factor(&e.clearcoatRoughnessFactor);
+        else if (name == "clearcoatTexture") texture(e.clearcoatTexture);
+        else if (name == "clearcoatRoughnessTexture") texture(e.clearcoatRoughnessTexture);
+        else if (name == "clearcoatNormalTexture") texture(e.clearcoatNormalTexture);
+    } else if (extension == "KHR_materials_sheen" && m.khrMaterialsSheen) {
+        auto& e = *m.khrMaterialsSheen;
+        if (name == "sheenColorFactor") factor(e.sheenColorFactor.data, Sig::Float3);
+        else if (name == "sheenRoughnessFactor") factor(&e.sheenRoughnessFactor);
+        else if (name == "sheenColorTexture") texture(e.sheenColorTexture);
+        else if (name == "sheenRoughnessTexture") texture(e.sheenRoughnessTexture);
+    } else if (extension == "KHR_materials_specular" && m.khrMaterialsSpecular) {
+        auto& e = *m.khrMaterialsSpecular;
+        if (name == "specularFactor") factor(&e.specularFactor);
+        else if (name == "specularColorFactor") factor(e.specularColorFactor.data, Sig::Float3);
+        else if (name == "specularTexture") texture(e.specularTexture);
+        else if (name == "specularColorTexture") texture(e.specularColorTexture);
+    } else if (extension == "KHR_materials_volume" && m.khrMaterialsVolume) {
+        auto& e = *m.khrMaterialsVolume;
+        if (name == "thicknessFactor") factor(&e.thicknessFactor);
+        else if (name == "attenuationDistance") factor(&e.attenuationDistance);
+        else if (name == "attenuationColor") factor(e.attenuationColor.data, Sig::Float3);
+        else if (name == "thicknessTexture") texture(e.thicknessTexture);
+    } else if (extension == "KHR_materials_iridescence" && m.khrMaterialsIridescence) {
+        auto& e = *m.khrMaterialsIridescence;
+        if (name == "iridescenceFactor") factor(&e.iridescenceFactor);
+        else if (name == "iridescenceIor") factor(&e.iridescenceIor);
+        else if (name == "iridescenceThicknessMinimum") factor(&e.iridescenceThicknessMinimum);
+        else if (name == "iridescenceThicknessMaximum") factor(&e.iridescenceThicknessMaximum);
+        else if (name == "iridescenceTexture") texture(e.iridescenceTexture);
+        else if (name == "iridescenceThicknessTexture") texture(e.iridescenceThicknessTexture);
+    } else if (extension == "KHR_materials_anisotropy" && m.khrMaterialsAnisotropy) {
+        auto& e = *m.khrMaterialsAnisotropy;
+        if (name == "anisotropyStrength") factor(&e.anisotropyStrength);
+        else if (name == "anisotropyRotation") factor(&e.anisotropyRotation);
+        else if (name == "anisotropyTexture") texture(e.anisotropyTexture);
+    } else if (extension == "KHR_materials_diffuse_transmission" && m.khrMaterialsDiffuseTransmission) {
+        auto& e = *m.khrMaterialsDiffuseTransmission;
+        if (name == "diffuseTransmissionFactor") factor(&e.diffuseTransmissionFactor);
+        else if (name == "diffuseTransmissionColorFactor") factor(e.diffuseTransmissionColorFactor.data, Sig::Float3);
+        else if (name == "diffuseTransmissionTexture") texture(e.diffuseTransmissionTexture);
+        else if (name == "diffuseTransmissionColorTexture") texture(e.diffuseTransmissionColorTexture);
+    }
+    return out;
+}
+
 }  // namespace
 
 InteractivityObjectModel::InteractivityObjectModel(Renderer& renderer) : renderer_(renderer) {}
@@ -157,6 +231,18 @@ void InteractivityObjectModel::flush() {
     dirtyMaterials_.clear();
 }
 
+const std::vector<int64_t>& InteractivityObjectModel::parentsOf(const G::GLTF& asset) {
+    const size_t count = asset.nodes ? asset.nodes->size() : 0;
+    if (parentsAsset_ != &asset || parents_.size() != count) {
+        parentsAsset_ = &asset;
+        parents_.assign(count, -1);
+        for (size_t p = 0; p < count; ++p)
+            for (const auto c : (*asset.nodes)[p].children)
+                if (c < count) parents_[c] = (int64_t)p;
+    }
+    return parents_;
+}
+
 bool InteractivityObjectModel::access(const std::string& pointer, Sig type, Value* get, const Value* set) {
     auto asset = renderer_.getAsset();
     if (!asset) return false;
@@ -178,14 +264,17 @@ bool InteractivityObjectModel::access(const std::string& pointer, Sig type, Valu
             }
             if (p == "matrix") {
                 if (!get) return false;
-                return matrix(type, authoredMatrix(node.matrix)
-                                        ? node.matrix
-                                        : VM::Matrix4<GLTF_REAL_NUMBER_TYPE>::compose(node.translation, node.rotation, node.scale),
-                              get, set);
+                return matrix(type, localMatrix(node), get, set);
             }
             if (p == "globalMatrix") {
-                VM::Matrix4<double> world;
-                if (!get || !renderer_.getNodeWorldMatrix(i, world)) return false;
+                // From the nodes' current transforms, not the last frame's: a
+                // pointer/set of an ancestor shows at once.
+                if (!get) return false;
+                const auto& parents = parentsOf(*asset);
+                VM::Matrix4<double> world = localMatrix(node);
+                size_t steps = 0;
+                for (int64_t up = parents[i]; up >= 0 && steps < parents.size(); up = parents[(size_t)up], ++steps)
+                    world = localMatrix((*asset->nodes)[(size_t)up]) * world;
                 return matrix(type, world, get, set);
             }
             return false;
@@ -248,6 +337,16 @@ bool InteractivityObjectModel::access(const std::string& pointer, Sig type, Valu
                 ok = floats(type, Sig::Float, &m.khrMaterialsEmissiveStrength, get, set);
             else if (seg[3] == "KHR_materials_ior" && seg[4] == "ior")
                 ok = floats(type, Sig::Float, &m.khrMaterialsIor, get, set);
+            else if (seg[3] == "KHR_materials_dispersion" && seg[4] == "dispersion")
+                ok = floats(type, Sig::Float, &m.khrMaterialsDispersion, get, set);
+            else {
+                const MaterialExtensionProperty prop = materialExtensionProperty(m, seg[3], seg[4]);
+                if (prop.data) ok = floats(type, prop.type, prop.data, get, set);
+            }
+        } else if (n == 8 && p == "extensions" && seg[5] == "extensions" && seg[6] == "KHR_texture_transform") {
+            // .../extensions/KHR_materials_<x>/<x>Texture/extensions/KHR_texture_transform/<prop>
+            const MaterialExtensionProperty prop = materialExtensionProperty(m, seg[3], seg[4]);
+            if (prop.texture) ok = textureTransform(prop.texture, seg[7], type, get, set);
         }
         if (slot && rest && n == rest + 3 && seg[rest] == "extensions" && seg[rest + 1] == "KHR_texture_transform")
             ok = textureTransform(slot, seg[rest + 2], type, get, set);
@@ -263,6 +362,15 @@ bool InteractivityObjectModel::access(const std::string& pointer, Sig type, Valu
             if (seg[4] == "color") return floats(type, Sig::Float3, light.color.data, get, set);
             if (seg[4] == "intensity") return floats(type, Sig::Float, &light.intensity, get, set);
             if (seg[4] == "range") return floats(type, Sig::Float, &light.range, get, set);
+            return false;
+        }
+        // /extensions/KHR_lights_punctual/lights/{}/spot/innerConeAngle, outerConeAngle: spot lights only.
+        if (n == 6 && seg[1] == "KHR_lights_punctual" && seg[2] == "lights" && index(seg[3], i) && seg[4] == "spot") {
+            if (!asset->khrLightsPunctual || i >= asset->khrLightsPunctual->size()) return false;
+            auto& light = (*asset->khrLightsPunctual)[i];
+            if (light.type != G::KHRLightPunctualType::spot) return false;
+            if (seg[5] == "innerConeAngle") return floats(type, Sig::Float, &light.innerConeAngle, get, set);
+            if (seg[5] == "outerConeAngle") return floats(type, Sig::Float, &light.outerConeAngle, get, set);
             return false;
         }
         if (n == 5 && seg[1] == "KHR_interactivity" && seg[2] == "activeCamera" && get && type == Sig::Float &&

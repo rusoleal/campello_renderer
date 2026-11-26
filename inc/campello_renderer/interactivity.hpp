@@ -11,6 +11,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace systems::leal::campello_renderer {
 
@@ -22,18 +23,24 @@ class Renderer;
  *
  * Supported pointers (types as the glTF Asset Object Model):
  * - /nodes/{}/translation (float3), rotation (float4), scale (float3): nodes
- *   without an authored matrix; matrix and globalMatrix (float4x4, read-only)
+ *   without an authored matrix; matrix and globalMatrix (float4x4, read-only;
+ *   globalMatrix from the nodes' current transforms)
  * - /nodes/{}/weights/{} (float): one morph target weight
  * - /nodes/{}/extensions/KHR_node_visibility/visible,
  *   KHR_node_selectability/selectable, KHR_node_hoverability/hoverable (bool)
  * - /materials/{}/alphaCutoff, emissiveFactor, pbrMetallicRoughness/
  *   baseColorFactor, metallicFactor, roughnessFactor, normalTexture/scale,
  *   occlusionTexture/strength, extensions/KHR_materials_emissive_strength/
- *   emissiveStrength, KHR_materials_ior/ior
+ *   emissiveStrength, KHR_materials_ior/ior, KHR_materials_dispersion/
+ *   dispersion, and the factors of KHR_materials_transmission, clearcoat,
+ *   sheen, specular, volume, iridescence, anisotropy and diffuse_transmission
+ *   (of a material that uses the extension)
  * - KHR_texture_transform offset (float2), rotation (float), scale (float2)
  *   of a material's baseColorTexture, metallicRoughnessTexture,
- *   normalTexture, occlusionTexture and emissiveTexture
- * - /extensions/KHR_lights_punctual/lights/{}/color, intensity, range
+ *   normalTexture, occlusionTexture and emissiveTexture, and of its
+ *   KHR_materials_* extensions' textures
+ * - /extensions/KHR_lights_punctual/lights/{}/color, intensity, range, and
+ *   spot/innerConeAngle, spot/outerConeAngle of spot lights
  * - /extensions/KHR_interactivity/activeCamera/position (float3), rotation
  *   (float4), read-only: the last rendered frame's camera
  *
@@ -77,8 +84,13 @@ private:
                 systems::leal::gltf::InteractivityRuntimeValue* get,
                 const systems::leal::gltf::InteractivityRuntimeValue* set);
 
+    /// Each node's parent (-1 for roots), for globalMatrix.
+    const std::vector<int64_t>& parentsOf(const systems::leal::gltf::GLTF& asset);
+
     Renderer& renderer_;
     std::set<uint64_t> dirtyMaterials_;
+    const systems::leal::gltf::GLTF* parentsAsset_ = nullptr;
+    std::vector<int64_t> parents_;
 };
 
 }  // namespace systems::leal::campello_renderer
