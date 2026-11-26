@@ -749,6 +749,11 @@ namespace systems::leal::campello_renderer {
         std::shared_ptr<systems::leal::campello_gpu::Sampler>          environmentSampler;
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        environmentBindGroup;
         bool skyboxEnabled = true;
+        float skyboxBlur = 0.0f;
+        std::shared_ptr<systems::leal::campello_gpu::Sampler> skyboxSampler;
+        std::shared_ptr<systems::leal::campello_gpu::Texture> backgroundMap;
+        // What the sky draws now, and at which mip level.
+        std::shared_ptr<systems::leal::campello_gpu::Texture> skyboxSource(float &lod) const;
         UpAxis environmentUpAxis = UpAxis::y;
         bool environmentIsBuiltin = false;  // environmentMap is createBuiltinDefaultEnvironmentMap()'s
         bool iblEnabled = true;
@@ -811,6 +816,9 @@ namespace systems::leal::campello_renderer {
         // Per-frame uniform buffer for skybox: invVP (64) + screenSize (8) + cameraPos (12) + pad = 96 bytes.
         std::shared_ptr<systems::leal::campello_gpu::Buffer>           skyboxUniformBuffer[kMaxFramesInFlight];
         std::shared_ptr<systems::leal::campello_gpu::BindGroup>        skyboxBindGroup[kMaxFramesInFlight];
+        // The cube map each skyboxBindGroup was made with (rebuilt when the
+        // sky's source changes: environment, prefiltered map, background).
+        std::shared_ptr<systems::leal::campello_gpu::Texture> skyboxBoundTexture[kMaxFramesInFlight];
 
         // FXAA / SSAA resources — intermediate scene texture + per-frame bind groups.
         // sceneColorTexture/View are per-frame-in-flight (not single instances): the
@@ -1578,6 +1586,26 @@ namespace systems::leal::campello_renderer {
         /// The environment cube map (before prefiltering), or nullptr.
         std::shared_ptr<systems::leal::campello_gpu::Texture> getEnvironmentMap() const { return environmentMap; }
         bool getSkyboxEnabled() const { return skyboxEnabled; }
+
+        /// How blurred the environment is drawn behind the scene, 0 (sharp,
+        /// the default) to 1 (as the roughest reflection). Above 0 the sky
+        /// samples the GGX-prefiltered environment at blur * (its mip levels
+        /// - 1), as the Khronos glTF Sample Viewer does (it uses 0.6). Not
+        /// applied to a background map, nor on DirectX yet (sharp there).
+        void setSkyboxBlur(float blur);
+        float getSkyboxBlur() const { return skyboxBlur; }
+
+        /// A cube map drawn behind the scene instead of the environment, which
+        /// still lights it; nullptr (the default) draws the environment. See
+        /// prepareEquirectangularBackground() and createEnvironmentMap().
+        void setBackgroundMap(std::shared_ptr<systems::leal::campello_gpu::Texture> cubemap);
+        std::shared_ptr<systems::leal::campello_gpu::Texture> getBackgroundMap() const { return backgroundMap; }
+        /// prepareEquirectangularEnvironmentMap() for a background: an 8-bit
+        /// image (PNG, JPEG, WebP) is sRGB, so its faces are decoded to linear
+        /// half floats and look as the image does behind the scene (tone
+        /// mapped and exposed as the sky is). HDR and EXR images as they are.
+        static std::shared_ptr<EnvironmentFaces> prepareEquirectangularBackground(
+            const uint8_t *data, size_t size, UpAxis upAxis, uint32_t faceSize = 0, float rotation = 0.0f);
         /// A material's constants as uploaded: the 93 floats of its uniform
         /// slot (layout in buildSlotRaw()), or nullptr. For the path tracer.
         const float* materialUniforms(const GpuMaterial* material) const;
@@ -1947,7 +1975,7 @@ namespace systems::leal::campello_renderer {
         // Its CPU half (prepareEquirectangularEnvironmentMap()).
         static std::shared_ptr<EnvironmentFaces> bakeEquirectangularFaces(
             const std::shared_ptr<systems::leal::campello_image::Image> &img, uint32_t faceSize,
-            UpAxis upAxis, float intensityScale, float rotation);
+            UpAxis upAxis, float intensityScale, float rotation, bool decodeSrgb = false);
 
         // Decodes the embedded default skybox (a small real photo, not a flat
         // placeholder) so IBL has something plausible to reflect out of the box.

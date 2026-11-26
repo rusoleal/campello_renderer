@@ -14,7 +14,7 @@ fn vs_sky_fullscreen(@builtin(vertex_index) index: u32) -> @builtin(position) ve
 struct SkyboxUniforms {
     invVP: mat4x4f,
     screenSize: vec2f,
-    pad: vec2f,        // x = exposure in EV (as CameraUniforms.viewParams.x)
+    pad: vec2f,        // x = exposure in EV (as CameraUniforms.viewParams.x), y = mip level
     cameraPos: vec4f,
 }
 
@@ -49,7 +49,8 @@ fn fs_skybox(@builtin(position) position: vec4f) -> @location(0) vec4f {
     let ndc = vec2f((position.x / sky.screenSize.x) * 2.0 - 1.0, (1.0 - position.y / sky.screenSize.y) * 2.0 - 1.0);
     let worldFar = sky.invVP * vec4f(ndc, 1.0, 1.0);
     let worldDir = normalize(worldFar.xyz / worldFar.w - sky.cameraPos.xyz);
-    var color = textureSample(skyEnvMap, skyEnvSampler, worldDir).rgb;
+    // An explicit level: 0 is the sharp map, more a blurred one (setSkyboxBlur()).
+    var color = textureSampleLevel(skyEnvMap, skyEnvSampler, worldDir, sky.pad.y).rgb;
     color *= exp2(sky.pad.x);  // exposure
     return vec4f(linearToSRGBFast(toneMapKhronosPbrNeutral(color)), 1.0);
 }
