@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-11-26
+
 ### Added
 - **The sky drawn blurred: `setSkyboxBlur(0..1)`.** Above 0 the environment behind the scene is sampled from the GGX-prefiltered map at `blur * (mip levels - 1)`, as the Khronos glTF Sample Viewer draws its background (it uses 0.6). The default, 0, is the sharp map as before. The sky has a sampler of its own, with linear mip filtering. Not applied on DirectX yet, where the sky stays sharp: its shader needs rebuilding with dxc.
 - **A background independent of the lighting: `setBackgroundMap(cubemap)`.** A cube map drawn behind the scene instead of the environment, which still lights it; nullptr draws the environment again. `prepareEquirectangularBackground()` makes one from a panorama: an 8-bit image (PNG, JPEG, WebP) is decoded from sRGB to linear half floats, so it looks as the image does behind the scene; upload it with `createEnvironmentMap()`.
