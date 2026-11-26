@@ -20,7 +20,7 @@ layout(set = 0, binding = 1) uniform sampler     envSampler;
 layout(std140, set = 0, binding = 2) uniform SkyboxUniforms {
     mat4 invVP;
     vec2 screenSize;
-    vec2 _pad;      // x = exposure in EV (as CameraUniforms.viewParams.x)
+    vec2 _pad;      // x = exposure in EV (as CameraUniforms.viewParams.x), y = mip level
     vec4 cameraPos; // xyz used, w unused
 } u;
 
@@ -59,7 +59,8 @@ void main() {
     );
     vec4 worldFar = u.invVP * vec4(ndc, 1.0, 1.0);
     vec3 worldDir = normalize(worldFar.xyz / worldFar.w - u.cameraPos.xyz);
-    vec3 color = texture(samplerCube(envMap, envSampler), worldDir).rgb;
+    // An explicit level: 0 is the sharp map, more a blurred one (setSkyboxBlur()).
+    vec3 color = textureLod(samplerCube(envMap, envSampler), worldDir, u._pad.y).rgb;
 
     // Match the tonemapping + sRGB encoding every material's fragment shader
     // applies (default.frag) before writing to the 8-bit swapchain. The

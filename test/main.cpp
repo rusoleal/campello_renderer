@@ -138,7 +138,7 @@ static const char *kGltfWithBasisuTexture = R"({
 // ---------------------------------------------------------------------------
 
 TEST(VersionTest, ReturnsExpectedVersion) {
-    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.37.2");
+    EXPECT_EQ(systems::leal::campello_renderer::getVersion(), "0.38.0");
 }
 
 TEST(VersionTest, VersionIsNonEmpty) {
@@ -1794,6 +1794,108 @@ TEST_F(OffscreenRenderTest, EquirectangularMapFromMemoryTurnsAboutTheUpAxis) {
     EXPECT_EQ(renderer->loadEquirectangularEnvironmentMap(junk, sizeof(junk)), nullptr);
     EXPECT_EQ(Renderer::prepareEquirectangularEnvironmentMap(junk, sizeof(junk), Renderer::UpAxis::z), nullptr);
     EXPECT_EQ(renderer->createEnvironmentMap(Renderer::EnvironmentFaces{}), nullptr);
+    device->waitForIdle();
+}
+
+// A background: a panorama drawn behind the scene instead of the environment,
+// an 8-bit image decoded from sRGB; and the environment drawn blurred.
+TEST_F(OffscreenRenderTest, BackgroundMapAndSkyboxBlur) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+    using Renderer = systems::leal::campello_renderer::Renderer;
+
+    // A 4x2 PNG, every pixel sRGB 128 grey: as a background its faces are
+    // linear half floats (0.2158); as an environment, the bytes as they are.
+    static const uint8_t kGreyPng[] = {
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00,
+        0x00, 0x04, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x7f, 0xa8, 0x7d, 0x63, 0x00, 0x00, 0x00,
+        0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x68, 0x68, 0x68, 0xf8, 0x8f, 0x8c, 0x19, 0xd0, 0x05, 0x00,
+        0x4d, 0xb5, 0x13, 0xf9, 0x4b, 0x71, 0xda, 0xe5, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42,
+        0x60, 0x82};
+    const auto halfToFloat = [](uint16_t h) {
+        const uint32_t exponent = (h >> 10) & 31, mantissa = h & 1023;
+        return exponent == 0 ? std::ldexp(float(mantissa), -24) : std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+    };
+    auto background = Renderer::prepareEquirectangularBackground(kGreyPng, sizeof(kGreyPng), Renderer::UpAxis::y, 4);
+    ASSERT_NE(background, nullptr);
+    EXPECT_TRUE(background->halfFloat);
+    ASSERT_GE(background->pixels.size(), 8u);
+    uint16_t texel[4];
+    std::memcpy(texel, background->pixels.data(), sizeof texel);
+    EXPECT_NEAR(halfToFloat(texel[0]), 0.2158f, 0.002f);
+    EXPECT_NEAR(halfToFloat(texel[3]), 1.0f, 0.002f);
+    auto environment = Renderer::prepareEquirectangularEnvironmentMap(kGreyPng, sizeof(kGreyPng), Renderer::UpAxis::y, 4);
+    ASSERT_NE(environment, nullptr);
+    EXPECT_FALSE(environment->halfFloat);
+    EXPECT_EQ(environment->pixels[0], 128);
+    const uint8_t junk[4] = {1, 2, 3, 4};
+    EXPECT_EQ(Renderer::prepareEquirectangularBackground(junk, sizeof(junk), Renderer::UpAxis::y), nullptr);
+
+    // Blur is clamped to 0..1.
+    EXPECT_EQ(renderer->getSkyboxBlur(), 0.0f);
+    renderer->setSkyboxBlur(2.0f);
+    EXPECT_EQ(renderer->getSkyboxBlur(), 1.0f);
+    renderer->setSkyboxBlur(-1.0f);
+    EXPECT_EQ(renderer->getSkyboxBlur(), 0.0f);
+
+    auto asset = GLTF::loadGLTF(kGltfOneEmptyScene, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    auto tex = makeOffscreenTexture(64, 64);
+    ASSERT_NE(tex, nullptr);
+    auto view = tex->createView(systems::leal::campello_gpu::PixelFormat::rgba8unorm, 1);
+    ASSERT_NE(view, nullptr);
+    renderer->setAsset(asset);
+    renderer->resize(64, 64);
+    renderer->createDefaultPipelines(systems::leal::campello_gpu::PixelFormat::rgba8unorm);
+    renderer->setSkyboxEnabled(true);
+    // How much the sky varies across the middle row (standard deviation of
+    // its luma), and the middle pixel.
+    const auto draw = [&] {
+        renderer->render(view);
+        device->waitForIdle();
+        return readBackPixels(tex);
+    };
+    const auto rowSpread = [](const std::vector<uint8_t>& pixels) {
+        double sum = 0, sum2 = 0;
+        for (size_t x = 0; x < 64; ++x) {
+            const size_t i = (32 * 64 + x) * 4;
+            const double l = 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2];
+            sum += l;
+            sum2 += l * l;
+        }
+        const double mean = sum / 64;
+        return std::sqrt(std::max(0.0, sum2 / 64 - mean * mean));
+    };
+    const double sharp = rowSpread(draw());
+    if (sharp < 2.0) {
+        device->waitForIdle();
+        GTEST_SKIP() << "This backend draws no skybox offscreen (spread " << sharp << ")";
+    }
+    renderer->setSkyboxBlur(1.0f);
+    const double blurred = rowSpread(draw());
+#if !defined(_WIN32)  // DirectX draws the sky sharp until its shader reads the level
+    EXPECT_LT(blurred, sharp * 0.5) << "sharp " << sharp << ", blurred " << blurred;
+#else
+    (void)blurred;
+#endif
+
+    // A red background replaces the sky (blur doesn't apply to it); without
+    // it, the environment again.
+    Renderer::EnvironmentFaces red;
+    red.size = 4;
+    red.halfFloat = false;
+    for (int i = 0; i < 4 * 4 * 6; ++i) red.pixels.insert(red.pixels.end(), {255, 0, 0, 255});
+    auto redMap = renderer->createEnvironmentMap(red);
+    ASSERT_NE(redMap, nullptr);
+    renderer->setBackgroundMap(redMap);
+    EXPECT_EQ(renderer->getBackgroundMap(), redMap);
+    auto pixels = draw();
+    const size_t mid = (32 * 64 + 32) * 4;
+    EXPECT_GT(pixels[mid], 180);
+    EXPECT_LT(pixels[mid + 1], 40);
+    EXPECT_LT(pixels[mid + 2], 40);
+    renderer->setBackgroundMap(nullptr);
+    pixels = draw();
+    EXPECT_FALSE(pixels[mid] > 180 && pixels[mid + 1] < 40 && pixels[mid + 2] < 40);
     device->waitForIdle();
 }
 

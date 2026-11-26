@@ -1818,7 +1818,7 @@ vertex SkyboxOut skyboxVertex(uint vertexID [[vertex_id]]) {
 struct SkyboxUniforms {
     float4x4 invVP;
     float2   screenSize;
-    float2   _pad;        // x = exposure in EV (as CameraUniforms::viewParams.x)
+    float2   _pad;        // x = exposure in EV (as CameraUniforms::viewParams.x), y = mip level
     float4   cameraPos;  // w ignored — float3 would pad to 16 bytes anyway
 };
 
@@ -1833,7 +1833,8 @@ fragment float4 skyboxFragment(SkyboxOut in [[stage_in]],
     );
     float4 worldFar = u.invVP * float4(ndc, 1.0, 1.0);
     float3 worldDir = normalize(worldFar.xyz / worldFar.w - u.cameraPos.xyz);
-    float3 color = envMap.sample(envSampler, worldDir).rgb;
+    // An explicit level: 0 is the sharp map, more a blurred one (setSkyboxBlur()).
+    float3 color = envMap.sample(envSampler, worldDir, level(u._pad.y)).rgb;
 
     // Match the tonemapping + sRGB encoding every material's fragment shader
     // applies (see fragmentMain_textured/_flat) before writing to the 8-bit

@@ -2452,6 +2452,20 @@ void Renderer::setScene(uint32_t index) {
         esd.maxAnisotropy = 1.0;
         environmentSampler = device->createSampler(esd);
     }
+    if (!skyboxSampler) {
+        // The sky picks a mip level (setSkyboxBlur()): linear between levels,
+        // which environmentSampler doesn't do (on Metal it reads mip 0 only).
+        GPU::SamplerDescriptor ssd{};
+        ssd.addressModeU = GPU::WrapMode::clampToEdge;
+        ssd.addressModeV = GPU::WrapMode::clampToEdge;
+        ssd.addressModeW = GPU::WrapMode::clampToEdge;
+        ssd.magFilter    = GPU::FilterMode::fmLinear;
+        ssd.minFilter    = GPU::FilterMode::fmLinearMipmapLinear;
+        ssd.lodMinClamp  = 0.0;
+        ssd.lodMaxClamp  = 1000.0;
+        ssd.maxAnisotropy = 1.0;
+        skyboxSampler = device->createSampler(ssd);
+    }
 
     // Bake the IBL precompute resources (BRDF LUT / prefiltered specular /
     // diffuse irradiance) for this lazily-created default environment. Must
@@ -7434,6 +7448,11 @@ void Renderer::renderToTarget(
             skyboxData[16] = (float)sceneTargetWidth();
             skyboxData[17] = (float)sceneTargetHeight();
             skyboxData[18] = exposureEv;
+            {
+                float lod = 0.0f;
+                skyboxSource(lod);
+                skyboxData[19] = lod;  // the mip level to sample
+            }
             // cameraPos at offset 80 (float3, 16-byte aligned)
             skyboxData[20] = cameraWorldPos[0];
             skyboxData[21] = cameraWorldPos[1];
@@ -7806,12 +7825,17 @@ void Renderer::renderToTarget(
 
     auto drawSkybox = [&](const std::shared_ptr<GPU::RenderPassEncoder> &rpe) {
         if (skyboxEnabled && pipelineSkybox && environmentMap && skyboxUniformBuffer[currentFrameIndex]) {
-            if (!skyboxBindGroup[currentFrameIndex] && skyboxBindGroupLayout) {
+            float skyLod = 0.0f;
+            const auto skyTexture = skyboxSource(skyLod);  // (the level is in the uniforms)
+            (void)skyLod;
+            if (skyboxBoundTexture[currentFrameIndex] != skyTexture) skyboxBindGroup[currentFrameIndex] = nullptr;
+            if (!skyboxBindGroup[currentFrameIndex] && skyboxBindGroupLayout && skyTexture) {
+                skyboxBoundTexture[currentFrameIndex] = skyTexture;
                 GPU::BindGroupDescriptor sbDesc{};
                 sbDesc.layout = skyboxBindGroupLayout;
                 sbDesc.entries = {
-                    {0, environmentMap},
-                    {1, environmentSampler},
+                    {0, skyTexture},
+                    {1, skyboxSampler ? skyboxSampler : environmentSampler},
                     {2, GPU::BufferBinding{skyboxUniformBuffer[currentFrameIndex], 0, 96}},
                 };
                 // persistent=true: unlike frameBindGroup/fxaaBindGroup (rebuilt
@@ -9287,7 +9311,7 @@ Renderer::loadEquirectangularEnvironmentMap(const uint8_t *data, size_t size, ui
 std::shared_ptr<Renderer::EnvironmentFaces>
 Renderer::bakeEquirectangularFaces(
     const std::shared_ptr<systems::leal::campello_image::Image> &img, uint32_t faceSize,
-    UpAxis upAxis, float intensityScale, float rotation)
+    UpAxis upAxis, float intensityScale, float rotation, bool decodeSrgb)
 {
     namespace Img = systems::leal::campello_image;
 
@@ -9306,7 +9330,9 @@ Renderer::bakeEquirectangularFaces(
 
     // Half floats, as in loadEnvironmentMap(): rgba32float is not
     // filterable without float32-filterable (missing on Adreno).
-    const Img::ImageFormat storeFormat = img->getFormat() == Img::ImageFormat::rgba32f
+    // An sRGB image decoded to linear needs more than 8 bits: half floats too.
+    const bool srgb = decodeSrgb && img->getFormat() == Img::ImageFormat::rgba8;
+    const Img::ImageFormat storeFormat = img->getFormat() == Img::ImageFormat::rgba32f || srgb
         ? Img::ImageFormat::rgba16f : img->getFormat();
 
     auto out = std::make_shared<EnvironmentFaces>();
@@ -9379,6 +9405,14 @@ Renderer::bakeEquirectangularFaces(
                 // Some equirectangular images have a vertical flip; if the result
                 // looks upside-down we can flip v here.
                 Float4 color = sampleEquirectangular(img.get(), eu, ev);
+                if (srgb) {
+                    const auto linear = [](float c) {
+                        return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+                    };
+                    color.r = linear(color.r);
+                    color.g = linear(color.g);
+                    color.b = linear(color.b);
+                }
                 color.r *= intensityScale;
                 color.g *= intensityScale;
                 color.b *= intensityScale;
@@ -9418,6 +9452,16 @@ Renderer::prepareEquirectangularEnvironmentMap(const uint8_t *data, size_t size,
     auto img = Img::Image::fromMemory(data, size);
     if (!img) return nullptr;
     return bakeEquirectangularFaces(img, faceSize, upAxis, 1.0f, rotation);
+}
+
+std::shared_ptr<Renderer::EnvironmentFaces>
+Renderer::prepareEquirectangularBackground(const uint8_t *data, size_t size, UpAxis upAxis,
+                                           uint32_t faceSize, float rotation)
+{
+    namespace Img = systems::leal::campello_image;
+    auto img = Img::Image::fromMemory(data, size);
+    if (!img) return nullptr;
+    return bakeEquirectangularFaces(img, faceSize, upAxis, 1.0f, rotation, /*decodeSrgb=*/true);
 }
 
 std::shared_ptr<systems::leal::campello_gpu::Texture>
@@ -9540,6 +9584,30 @@ void Renderer::setEnvironmentUpAxis(UpAxis axis) {
 
 void Renderer::setSkyboxEnabled(bool enabled) {
     skyboxEnabled = enabled;
+}
+
+void Renderer::setSkyboxBlur(float blur) {
+    skyboxBlur = std::isfinite(blur) ? std::clamp(blur, 0.0f, 1.0f) : 0.0f;
+}
+
+void Renderer::setBackgroundMap(std::shared_ptr<systems::leal::campello_gpu::Texture> cubemap) {
+    backgroundMap = std::move(cubemap);
+}
+
+std::shared_ptr<systems::leal::campello_gpu::Texture> Renderer::skyboxSource(float &lod) const {
+    lod = 0.0f;
+    if (backgroundMap) return backgroundMap;
+    if (skyboxBlur > 0.0f) {
+        // The GGX-prefiltered map (its mips go from sharp to roughness 1);
+        // without it, the environment's own (box-filtered) mips.
+        const auto &blurred = prefilteredEnvironmentMap ? prefilteredEnvironmentMap : environmentMap;
+        if (blurred) {
+            const uint32_t mips = blurred->getMipLevelCount();
+            lod = skyboxBlur * (float)(mips > 0 ? mips - 1 : 0);
+            return blurred;
+        }
+    }
+    return environmentMap;
 }
 
 void Renderer::setIBLEnabled(bool enabled) {
@@ -11731,17 +11799,27 @@ void Renderer::render(const RenderScene& scene,
                 skyboxData[16] = (float)sceneTargetWidth();
                 skyboxData[17] = (float)sceneTargetHeight();
                 skyboxData[18] = exposureEv;
+                {
+                    float lod = 0.0f;
+                    skyboxSource(lod);
+                    skyboxData[19] = lod;  // the mip level to sample
+                }
                 skyboxData[20] = cameraWorldPos[0];
                 skyboxData[21] = cameraWorldPos[1];
                 skyboxData[22] = cameraWorldPos[2];
                 skyboxUniformBuffer[currentFrameIndex]->upload(0, 96, reinterpret_cast<uint8_t*>(skyboxData));
             }
-            if (!skyboxBindGroup[currentFrameIndex] && skyboxBindGroupLayout) {
+            float skyLod = 0.0f;
+            const auto skyTexture = skyboxSource(skyLod);  // (the level is in the uniforms)
+            (void)skyLod;
+            if (skyboxBoundTexture[currentFrameIndex] != skyTexture) skyboxBindGroup[currentFrameIndex] = nullptr;
+            if (!skyboxBindGroup[currentFrameIndex] && skyboxBindGroupLayout && skyTexture) {
+                skyboxBoundTexture[currentFrameIndex] = skyTexture;
                 GPU::BindGroupDescriptor sbDesc{};
                 sbDesc.layout = skyboxBindGroupLayout;
                 sbDesc.entries = {
-                    {0, environmentMap},
-                    {1, environmentSampler},
+                    {0, skyTexture},
+                    {1, skyboxSampler ? skyboxSampler : environmentSampler},
                     {2, GPU::BufferBinding{skyboxUniformBuffer[currentFrameIndex], 0, 96}},
                 };
                 // persistent=true: unlike frameBindGroup/fxaaBindGroup (rebuilt
