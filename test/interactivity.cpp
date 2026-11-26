@@ -21,11 +21,16 @@ using Value = systems::leal::gltf::InteractivityRuntimeValue;
 
 // Two emissive 2x2 quads facing +Z: "Back" (node 0) at z=0 and its child
 // "Front" (node 1) at z=0.5, half the size. Node 2 has an authored matrix.
+// Two lights no node uses: a spot (light 0) and a point light (light 1).
 // The renderer's default camera looks at the origin from (0, 0, 5).
 // Animation 0 moves Back from x=0 to x=2 in 2 s.
 const char* kQuads = R"({
     "asset": {"version": "2.0"},
-    "extensionsUsed": ["KHR_texture_transform", "KHR_node_visibility", "KHR_node_selectability"],
+    "extensionsUsed": ["KHR_texture_transform", "KHR_node_visibility", "KHR_node_selectability", "KHR_lights_punctual",
+                       "KHR_materials_clearcoat"],
+    "extensions": {"KHR_lights_punctual": {"lights": [
+        {"type": "spot", "spot": {"innerConeAngle": 0.25, "outerConeAngle": 0.5}},
+        {"type": "point"}]}},
     "scene": 0,
     "scenes": [{"nodes": [0, 2]}],
     "nodes": [
@@ -36,7 +41,8 @@ const char* kQuads = R"({
     "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1, "material": 0}]}],
     "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 0, 0, 1],
                                             "baseColorTexture": {"index": 0}},
-                   "emissiveFactor": [1, 0, 0]}],
+                   "emissiveFactor": [1, 0, 0],
+                   "extensions": {"KHR_materials_clearcoat": {"clearcoatFactor": 0.5, "clearcoatTexture": {"index": 0}}}}],
     "textures": [{}],
     "accessors": [
         {"bufferView": 0, "componentType": 5126, "count": 4, "type": "VEC3", "min": [-1, -1, 0], "max": [1, 1, 0]},
@@ -188,6 +194,22 @@ TEST_F(InteractivityRenderTest, ObjectModelReadsAndWritesTheAsset) {
     ASSERT_TRUE(model.getPointer("/nodes/2/globalMatrix", Sig::Float4x4, v));
     EXPECT_DOUBLE_EQ(v.f[12], 9.0);
     EXPECT_FALSE(model.setPointer("/nodes/2/matrix", v));  // read-only
+    // globalMatrix follows a parent's change before the next frame.
+    const double up[3] = {0, 4, 0};
+    EXPECT_TRUE(model.setPointer("/nodes/0/translation", Value::ofFloats(Sig::Float3, up)));
+    ASSERT_TRUE(model.getPointer("/nodes/1/globalMatrix", Sig::Float4x4, v));
+    EXPECT_DOUBLE_EQ(v.f[12], 1.0);  // Front's own (1, 2, 3) plus Back's (0, 4, 0)
+    EXPECT_DOUBLE_EQ(v.f[13], 6.0);
+    EXPECT_DOUBLE_EQ(v.f[14], 3.0);
+
+    // Spot cone angles: spot lights only.
+    const std::string spot = "/extensions/KHR_lights_punctual/lights/0/spot/";
+    ASSERT_TRUE(model.getPointer(spot + "outerConeAngle", Sig::Float, v));
+    EXPECT_DOUBLE_EQ(v.f[0], 0.5);
+    EXPECT_TRUE(model.setPointer(spot + "innerConeAngle", Value::ofFloat(0.125)));
+    EXPECT_DOUBLE_EQ((*asset->khrLightsPunctual)[0].innerConeAngle, 0.125);
+    EXPECT_FALSE(model.getPointer("/extensions/KHR_lights_punctual/lights/1/spot/outerConeAngle", Sig::Float, v));
+    EXPECT_FALSE(model.setPointer("/extensions/KHR_lights_punctual/lights/1/spot/innerConeAngle", Value::ofFloat(0.1)));
 
     // Material factors and KHR_texture_transform (created on first write).
     const std::string offset = "/materials/0/pbrMetallicRoughness/baseColorTexture/extensions/KHR_texture_transform/offset";
@@ -202,6 +224,17 @@ TEST_F(InteractivityRenderTest, ObjectModelReadsAndWritesTheAsset) {
     EXPECT_TRUE(model.setPointer("/materials/0/pbrMetallicRoughness/metallicFactor", Value::ofFloat(0.25)));
     EXPECT_FALSE(model.setPointer("/materials/0/emissiveTexture/extensions/KHR_texture_transform/offset",
                                   Value::ofFloats(Sig::Float2, o)));  // no emissive texture
+    // KHR_materials_* factors and their textures' transforms.
+    const std::string clearcoat = "/materials/0/extensions/KHR_materials_clearcoat/";
+    ASSERT_TRUE(model.getPointer(clearcoat + "clearcoatFactor", Sig::Float, v));
+    EXPECT_DOUBLE_EQ(v.f[0], 0.5);
+    EXPECT_TRUE(model.setPointer(clearcoat + "clearcoatFactor", Value::ofFloat(0.75)));
+    EXPECT_DOUBLE_EQ((*asset->materials)[0].khrMaterialsClearcoat->clearcoatFactor, 0.75);
+    EXPECT_TRUE(model.setPointer(clearcoat + "clearcoatTexture/extensions/KHR_texture_transform/rotation", Value::ofFloat(1.5)));
+    EXPECT_DOUBLE_EQ((*asset->materials)[0].khrMaterialsClearcoat->clearcoatTexture->khrTextureTransform->rotation, 1.5);
+    EXPECT_FALSE(model.setPointer(clearcoat + "clearcoatRoughnessTexture/extensions/KHR_texture_transform/rotation",
+                                  Value::ofFloat(1.5)));  // no such texture
+    EXPECT_FALSE(model.getPointer("/materials/0/extensions/KHR_materials_sheen/sheenRoughnessFactor", Sig::Float, v));
     EXPECT_NO_THROW(model.flush());
     EXPECT_NO_THROW(renderAndRead(0, 0));
 
