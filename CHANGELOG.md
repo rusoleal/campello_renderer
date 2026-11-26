@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-11-26
+
 ### Added
 - **`InteractivityObjectModel`: material extension pointers.** The factors of KHR_materials_transmission, clearcoat, sheen, specular, volume, iridescence, anisotropy and diffuse_transmission, `KHR_materials_dispersion/dispersion`, and the `KHR_texture_transform` offset, rotation and scale of these extensions' textures. A material that doesn't use the extension doesn't resolve them.
 - **`InteractivityObjectModel`: `spot/innerConeAngle` and `spot/outerConeAngle`** of KHR_lights_punctual spot lights. Other light types don't resolve them, so a `pointer/set` takes its `err` flow.
