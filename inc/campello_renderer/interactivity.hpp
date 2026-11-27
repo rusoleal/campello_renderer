@@ -34,11 +34,16 @@ class Renderer;
  *   emissiveStrength, KHR_materials_ior/ior, KHR_materials_dispersion/
  *   dispersion, and the factors of KHR_materials_transmission, clearcoat,
  *   sheen, specular, volume, iridescence, anisotropy and diffuse_transmission
- *   (of a material that uses the extension)
+ *   (of a material that uses the extension), and KHR_materials_clearcoat/
+ *   clearcoatNormalTexture/scale
  * - KHR_texture_transform offset (float2), rotation (float), scale (float2)
  *   of a material's baseColorTexture, metallicRoughnessTexture,
  *   normalTexture, occlusionTexture and emissiveTexture, and of its
  *   KHR_materials_* extensions' textures
+ * - /cameras/{}/perspective/yfov, aspectRatio, znear, zfar and
+ *   /cameras/{}/orthographic/xmag, ymag, znear, zfar (float), of a camera of
+ *   that type; an undefined aspectRatio doesn't resolve until set, an
+ *   undefined zfar reads as infinity
  * - /extensions/KHR_lights_punctual/lights/{}/color, intensity, range, and
  *   spot/innerConeAngle, spot/outerConeAngle of spot lights
  * - /extensions/KHR_interactivity/activeCamera/position (float3), rotation
