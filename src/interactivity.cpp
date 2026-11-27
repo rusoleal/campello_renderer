@@ -343,6 +343,10 @@ bool InteractivityObjectModel::access(const std::string& pointer, Sig type, Valu
                 const MaterialExtensionProperty prop = materialExtensionProperty(m, seg[3], seg[4]);
                 if (prop.data) ok = floats(type, prop.type, prop.data, get, set);
             }
+        } else if (n == 6 && p == "extensions" && seg[3] == "KHR_materials_clearcoat" &&
+                   seg[4] == "clearcoatNormalTexture" && seg[5] == "scale") {
+            if (m.khrMaterialsClearcoat && m.khrMaterialsClearcoat->clearcoatNormalTexture)
+                ok = floats(type, Sig::Float, &m.khrMaterialsClearcoat->clearcoatNormalTexture->scale, get, set);
         } else if (n == 8 && p == "extensions" && seg[5] == "extensions" && seg[6] == "KHR_texture_transform") {
             // .../extensions/KHR_materials_<x>/<x>Texture/extensions/KHR_texture_transform/<prop>
             const MaterialExtensionProperty prop = materialExtensionProperty(m, seg[3], seg[4]);
@@ -352,6 +356,44 @@ bool InteractivityObjectModel::access(const std::string& pointer, Sig type, Valu
             ok = textureTransform(slot, seg[rest + 2], type, get, set);
         if (ok && set) dirtyMaterials_.insert(i);
         return ok;
+    }
+
+    // /cameras/{}/perspective/... and /cameras/{}/orthographic/...: the frame
+    // after a pointer/set renders with the new value (when it's the camera in use).
+    if (n == 4 && seg[0] == "cameras" && index(seg[1], i)) {
+        if (!asset->cameras || i >= asset->cameras->size() || type != Sig::Float) return false;
+        auto* camera = (*asset->cameras)[i].get();
+        const std::string& prop = seg[3];
+        if (seg[2] == "perspective") {
+            auto* persp = dynamic_cast<G::PerspectiveCamera*>(camera);
+            if (!persp) return false;
+            if (prop == "yfov") return floats(type, Sig::Float, &persp->yFov, get, set);
+            if (prop == "znear") return floats(type, Sig::Float, &persp->zNear, get, set);
+            if (prop == "aspectRatio" || prop == "zfar") {
+                // Optional: an undefined aspectRatio (the viewport's) doesn't
+                // resolve until written; an undefined zfar is infinite.
+                auto& field = prop == "zfar" ? persp->zFar : persp->aspectRatio;
+                if (get) {
+                    if (!field && prop == "aspectRatio") return false;
+                    *get = Value::ofFloat(field ? (double)*field : std::numeric_limits<double>::infinity());
+                }
+                if (set) {
+                    if (prop == "zfar" && !std::isfinite(set->f[0])) field.reset();  // infinite
+                    else field = (GLTF_REAL_NUMBER_TYPE)set->f[0];
+                }
+                return true;
+            }
+            return false;
+        }
+        if (seg[2] == "orthographic") {
+            auto* ortho = dynamic_cast<G::OrthographicCamera*>(camera);
+            if (!ortho) return false;
+            if (prop == "xmag") return floats(type, Sig::Float, &ortho->xMag, get, set);
+            if (prop == "ymag") return floats(type, Sig::Float, &ortho->yMag, get, set);
+            if (prop == "znear") return floats(type, Sig::Float, &ortho->zNear, get, set);
+            if (prop == "zfar") return floats(type, Sig::Float, &ortho->zFar, get, set);
+        }
+        return false;
     }
 
     // /extensions/...

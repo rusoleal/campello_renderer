@@ -9,7 +9,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <future>
+#include <limits>
 
 using namespace systems::leal::campello_renderer;
 using systems::leal::gltf::GLTF;
@@ -21,6 +23,8 @@ using Value = systems::leal::gltf::InteractivityRuntimeValue;
 
 // Two emissive 2x2 quads facing +Z: "Back" (node 0) at z=0 and its child
 // "Front" (node 1) at z=0.5, half the size. Node 2 has an authored matrix.
+// Two cameras no node uses: a perspective one without aspectRatio and zfar
+// (camera 0) and an orthographic one (camera 1).
 // Two lights no node uses: a spot (light 0) and a point light (light 1).
 // The renderer's default camera looks at the origin from (0, 0, 5).
 // Animation 0 moves Back from x=0 to x=2 in 2 s.
@@ -42,7 +46,10 @@ const char* kQuads = R"({
     "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 0, 0, 1],
                                             "baseColorTexture": {"index": 0}},
                    "emissiveFactor": [1, 0, 0],
-                   "extensions": {"KHR_materials_clearcoat": {"clearcoatFactor": 0.5, "clearcoatTexture": {"index": 0}}}}],
+                   "extensions": {"KHR_materials_clearcoat": {"clearcoatFactor": 0.5, "clearcoatTexture": {"index": 0},
+                                                                "clearcoatNormalTexture": {"index": 0, "scale": 2}}}}],
+    "cameras": [{"type": "perspective", "perspective": {"yfov": 0.5, "znear": 0.1}},
+                {"type": "orthographic", "orthographic": {"xmag": 2, "ymag": 1, "znear": 0.5, "zfar": 50}}],
     "textures": [{}],
     "accessors": [
         {"bufferView": 0, "componentType": 5126, "count": 4, "type": "VEC3", "min": [-1, -1, 0], "max": [1, 1, 0]},
@@ -235,6 +242,43 @@ TEST_F(InteractivityRenderTest, ObjectModelReadsAndWritesTheAsset) {
     EXPECT_FALSE(model.setPointer(clearcoat + "clearcoatRoughnessTexture/extensions/KHR_texture_transform/rotation",
                                   Value::ofFloat(1.5)));  // no such texture
     EXPECT_FALSE(model.getPointer("/materials/0/extensions/KHR_materials_sheen/sheenRoughnessFactor", Sig::Float, v));
+    ASSERT_TRUE(model.getPointer(clearcoat + "clearcoatNormalTexture/scale", Sig::Float, v));
+    EXPECT_DOUBLE_EQ(v.f[0], 2.0);
+    EXPECT_TRUE(model.setPointer(clearcoat + "clearcoatNormalTexture/scale", Value::ofFloat(0.5)));
+    EXPECT_DOUBLE_EQ((*asset->materials)[0].khrMaterialsClearcoat->clearcoatNormalTexture->scale, 0.5);
+    EXPECT_FALSE(model.setPointer(clearcoat + "clearcoatNormalTexture/scale", Value::ofFloats(Sig::Float2, o)));
+
+    // Cameras: of their own type; an undefined aspectRatio doesn't resolve
+    // until set, an undefined zfar is infinite (and setting it infinite
+    // undefines it again).
+    auto* persp = dynamic_cast<systems::leal::gltf::PerspectiveCamera*>((*asset->cameras)[0].get());
+    auto* orthoCam = dynamic_cast<systems::leal::gltf::OrthographicCamera*>((*asset->cameras)[1].get());
+    ASSERT_NE(persp, nullptr);
+    ASSERT_NE(orthoCam, nullptr);
+    ASSERT_TRUE(model.getPointer("/cameras/0/perspective/yfov", Sig::Float, v));
+    EXPECT_DOUBLE_EQ(v.f[0], 0.5);
+    EXPECT_TRUE(model.setPointer("/cameras/0/perspective/yfov", Value::ofFloat(1.0)));
+    EXPECT_DOUBLE_EQ(persp->yFov, 1.0);
+    EXPECT_FALSE(model.getPointer("/cameras/0/perspective/aspectRatio", Sig::Float, v));
+    EXPECT_TRUE(model.setPointer("/cameras/0/perspective/aspectRatio", Value::ofFloat(1.5)));
+    ASSERT_TRUE(model.getPointer("/cameras/0/perspective/aspectRatio", Sig::Float, v));
+    EXPECT_DOUBLE_EQ(v.f[0], 1.5);
+    ASSERT_TRUE(model.getPointer("/cameras/0/perspective/zfar", Sig::Float, v));
+    EXPECT_TRUE(std::isinf(v.f[0]));
+    EXPECT_TRUE(model.setPointer("/cameras/0/perspective/zfar", Value::ofFloat(100)));
+    ASSERT_TRUE(persp->zFar.has_value());
+    EXPECT_DOUBLE_EQ(*persp->zFar, 100.0);
+    EXPECT_TRUE(model.setPointer("/cameras/0/perspective/zfar",
+                                 Value::ofFloat(std::numeric_limits<double>::infinity())));
+    EXPECT_FALSE(persp->zFar.has_value());
+    EXPECT_FALSE(model.getPointer("/cameras/0/orthographic/xmag", Sig::Float, v));  // a perspective camera
+    EXPECT_FALSE(model.getPointer("/cameras/0/perspective/yfov", Sig::Float2, v));
+    EXPECT_TRUE(model.setPointer("/cameras/1/orthographic/ymag", Value::ofFloat(3)));
+    EXPECT_DOUBLE_EQ(orthoCam->yMag, 3.0);
+    ASSERT_TRUE(model.getPointer("/cameras/1/orthographic/zfar", Sig::Float, v));
+    EXPECT_DOUBLE_EQ(v.f[0], 50.0);
+    EXPECT_FALSE(model.getPointer("/cameras/1/perspective/yfov", Sig::Float, v));
+    EXPECT_FALSE(model.getPointer("/cameras/2/perspective/yfov", Sig::Float, v));
     EXPECT_NO_THROW(model.flush());
     EXPECT_NO_THROW(renderAndRead(0, 0));
 
