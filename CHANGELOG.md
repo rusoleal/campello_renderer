@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-11-27
+
 ### Added
 - **`InteractivityObjectModel`: writable cameras.** `/cameras/N/perspective/yfov`, `aspectRatio`, `znear`, `zfar` and `/cameras/N/orthographic/xmag`, `ymag`, `znear`, `zfar`, read and written on the asset, so the next frame through that camera uses them. A camera of the other type doesn't resolve them. An undefined `aspectRatio` doesn't resolve until set; an undefined `zfar` reads as infinity, and writing infinity undefines it.
 - **`InteractivityObjectModel`: `KHR_materials_clearcoat/clearcoatNormalTexture/scale`**, of a material that has that texture.
