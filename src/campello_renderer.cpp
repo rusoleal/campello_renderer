@@ -243,7 +243,14 @@ static std::vector<uint8_t> resolveAccessorBytes(
 // Must be a multiple of 256 for Metal vertex buffer offset alignment.
 static constexpr uint64_t kMaterialUniformStride = 512;
 
-// Low-level material uniform slot layout (93 floats = 372 bytes).
+// Floats in one material slot (layout in buildSlotRaw() and
+// buildMaterialSlotFromGltf()); must fit in kMaterialUniformStride.
+static constexpr int kMaterialSlotFloats = 120;
+static_assert(kMaterialSlotFloats * sizeof(float) <= kMaterialUniformStride, "material slot too large");
+
+// Low-level material uniform slot layout (kMaterialSlotFloats floats; the
+// first 93 here, the per-texture UV transforms at [96..119] in
+// buildMaterialSlotFromGltf()).
 // Must match the Metal shader struct exactly.
 static void buildSlotRaw(float bc[4], float r0[4], float r1[4],
                          float metallic, float roughness, float normalScale,
@@ -271,9 +278,9 @@ static void buildSlotRaw(float bc[4], float r0[4], float r1[4],
                          float texCoord1Mask,
                          float viewModeValue,
                          float environmentIntensityValue, float iblEnabledValue,
-                         float out[93]) {
+                         float out[kMaterialSlotFloats]) {
     // Zero initialize
-    for (int i = 0; i < 93; i++) out[i] = 0.f;
+    for (int i = 0; i < kMaterialSlotFloats; i++) out[i] = 0.f;
     
     // [0-11] float4s at offsets 0, 16, 32
     out[0]  = bc[0]; out[1]  = bc[1]; out[2]  = bc[2];  out[3]  = bc[3];
@@ -441,12 +448,12 @@ static void computeUvTransformRows(const std::shared_ptr<systems::leal::gltf::KH
     }
 }
 
-// Read a gltf::Material and fill a 93-float uniform slot.
+// Read a gltf::Material and fill a uniform slot (kMaterialSlotFloats floats).
 static void buildMaterialSlotFromGltf(const systems::leal::gltf::Material& mat,
                                       float viewModeValue,
                                       float environmentIntensityValue,
                                       float iblEnabledValue,
-                                      float out[93]) {
+                                      float out[kMaterialSlotFloats]) {
     // Base color factor.
     float bc[4] = {1.f, 1.f, 1.f, 1.f};
     float metallic = 1.f;
@@ -630,8 +637,12 @@ static void buildMaterialSlotFromGltf(const systems::leal::gltf::Material& mat,
     // only have vertex data for TEXCOORD_0/1, so any texCoord > 0 maps to
     // our TEXCOORD_1 slot. Bit layout must match kUV1* in the Metal shader.
     uint32_t texCoord1Mask = 0;
+    // KHR_texture_transform's texCoord, when set, overrides the texture's.
     auto usesUV1 = [](const auto &texInfo) -> bool {
-        return texInfo && texInfo->texCoord > 0;
+        if (!texInfo) return false;
+        const auto &xf = texInfo->khrTextureTransform;
+        const int64_t texCoord = xf && xf->texCoord >= 0 ? xf->texCoord : (int64_t)texInfo->texCoord;
+        return texCoord > 0;
     };
     if (mat.pbrMetallicRoughness) {
         if (usesUV1(mat.pbrMetallicRoughness->baseColorTexture)) texCoord1Mask |= (1u << 0);
@@ -687,6 +698,24 @@ static void buildMaterialSlotFromGltf(const systems::leal::gltf::Material& mat,
                  viewModeValue,
                  environmentIntensityValue, iblEnabledValue,
                  out);
+
+    // KHR_texture_transform of the metallic-roughness, occlusion and
+    // emissive textures, each its own (a material may tile or place them
+    // differently from its base color): float4 rows at offsets 384..464.
+    {
+        float r0[4], r1[4];
+        auto put = [&](int at) {
+            for (int k = 0; k < 4; ++k) { out[at + k] = r0[k]; out[at + 4 + k] = r1[k]; }
+        };
+        computeUvTransformRows((mat.pbrMetallicRoughness && mat.pbrMetallicRoughness->metallicRoughnessTexture)
+                                   ? mat.pbrMetallicRoughness->metallicRoughnessTexture->khrTextureTransform : nullptr,
+                               r0, r1);
+        put(96);   // 384: metallicRoughnessUvTransformRow0/Row1
+        computeUvTransformRows(mat.occlusionTexture ? mat.occlusionTexture->khrTextureTransform : nullptr, r0, r1);
+        put(104);  // 416: occlusionUvTransformRow0/Row1
+        computeUvTransformRows(mat.emissiveTexture ? mat.emissiveTexture->khrTextureTransform : nullptr, r0, r1);
+        put(112);  // 448: emissiveUvTransformRow0/Row1
+    }
     // Offset 88 (_padding / _pad0 in the shaders): double-sided flag, so
     // section caps (clip planes) only paint back faces of closed, single-
     // sided surfaces.
@@ -7659,7 +7688,7 @@ void Renderer::renderToTarget(
             float attenuationColor[3] = {1.f, 1.f, 1.f};
             float normalRow0[4] = {1.f, 0.f, 0.f, 0.f}; // w=0 → identity fast path
             float normalRow1[4] = {0.f, 1.f, 0.f, 0.f};
-            float slot[93];
+            float slot[kMaterialSlotFloats];
             buildSlotRaw(bc, row0, row1, 1.f, 1.f, 1.f, 0.f, 0.5f, 0.f, 0.f, 0.f, 0.f, 1.f,
                       emissive, 1.5f, 1.f, 0.f, 0.f, specularColor,
                       sheenColor, 0.f, 0.f, 0.f,
@@ -7676,7 +7705,7 @@ void Renderer::renderToTarget(
 
         if (asset->materials) {
             for (size_t i = 0; i < asset->materials->size(); ++i) {
-                float slot[93];
+                float slot[kMaterialSlotFloats];
                 buildMaterialSlotFromGltf((*asset->materials)[i],
                                           (float)viewMode,
                                           environmentIntensity,
@@ -10100,7 +10129,7 @@ GpuMesh* Renderer::uploadMesh(const systems::leal::gltf::Primitive& primitive,
 }
 
 
-// Writes one material's 93 floats at `offset` into the material uniform
+// Writes one material's kMaterialSlotFloats floats at `offset` into the material uniform
 // buffer and its CPU shadow (the shadow refills the buffer when it grows).
 void Renderer::rememberMaterialBufferBindGroup(const std::string& key,
                                                const systems::leal::campello_gpu::BindGroupDescriptor& descriptor,
@@ -10164,9 +10193,9 @@ uint32_t Renderer::drawMaterialFeatures(uint32_t uniformSlot) const {
 }
 
 void Renderer::writeMaterialUniform(uint64_t offset, const float* slotIn) {
-    constexpr uint64_t size = 93 * sizeof(float);
+    constexpr uint64_t size = kMaterialSlotFloats * sizeof(float);
     if (!materialUniformBuffer) return;
-    float slot[93];
+    float slot[kMaterialSlotFloats];
     std::memcpy(slot, slotIn, size);
     // World mapping (floats 81-82, the padding after dispersion) isn't part
     // of the glTF material: re-applied whenever the slot is (re)written.
@@ -10389,7 +10418,7 @@ void Renderer::uploadWithMips(const std::shared_ptr<systems::leal::campello_gpu:
 const float* Renderer::materialUniforms(const GpuMaterial* material) const {
     if (!material) return nullptr;
     const uint64_t offset = (uint64_t)material->uniformSlot * kMaterialUniformStride;
-    if (materialUniformShadow.size() < offset + 93 * sizeof(float)) return nullptr;
+    if (materialUniformShadow.size() < offset + kMaterialSlotFloats * sizeof(float)) return nullptr;
     return reinterpret_cast<const float*>(materialUniformShadow.data() + offset);
 }
 
@@ -10401,9 +10430,9 @@ void Renderer::setMaterialWorldMapping(GpuMaterial* material, float repeatSize) 
         materialWorldMappings.erase(material->uniformSlot);
     }
     const uint64_t offset = (uint64_t)material->uniformSlot * kMaterialUniformStride;
-    constexpr uint64_t size = 93 * sizeof(float);
+    constexpr uint64_t size = kMaterialSlotFloats * sizeof(float);
     if (materialUniformShadow.size() < offset + size) return;
-    float slot[93];
+    float slot[kMaterialSlotFloats];
     std::memcpy(slot, materialUniformShadow.data() + offset, size);
     slot[81] = 0.0f;  // set again by writeMaterialUniform() when on
     slot[82] = 0.0f;
@@ -10458,7 +10487,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
         // (renderToTarget()) writes the slots per frame, so a RenderScene
         // draw before (or without) a glTF render() read an empty slot.
         {
-            float slot[93];
+            float slot[kMaterialSlotFloats];
             buildMaterialSlotFromGltf(material, (float)viewMode, environmentIntensity, iblEnabled ? 1.f : 0.f, slot);
             writeMaterialUniform((uint64_t)mat->uniformSlot * kMaterialUniformStride, slot);
         }
@@ -10864,7 +10893,7 @@ GpuMaterial* Renderer::uploadMaterial(const systems::leal::gltf::Material& mater
 
     // --- Upload material uniform data ---
     {
-        float slot[93];
+        float slot[kMaterialSlotFloats];
         buildMaterialSlotFromGltf(material,
                                   (float)viewMode,
                                   environmentIntensity,
@@ -10989,7 +11018,7 @@ void Renderer::reuploadMaterialSlot(uint32_t uniformSlot,
                                     const systems::leal::gltf::Material& material,
                                     const systems::leal::gltf::GLTF& /*asset*/) {
     if (!materialUniformBuffer) return;
-    float slot[93];
+    float slot[kMaterialSlotFloats];
     buildMaterialSlotFromGltf(material,
                               (float)viewMode,
                               environmentIntensity,

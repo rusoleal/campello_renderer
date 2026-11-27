@@ -73,6 +73,13 @@ layout(std140, set = 0, binding = 24) uniform MaterialUniforms {
     vec4  normalUvTransformRow0;     // 336  independent KHR_texture_transform for normalTexture
     vec4  normalUvTransformRow1;     // 352
     float texCoord1Mask;             // 368
+    // KHR_texture_transform of these textures, each its own.
+    vec4  metallicRoughnessUvTransformRow0; // 384
+    vec4  metallicRoughnessUvTransformRow1; // 400
+    vec4  occlusionUvTransformRow0;  // 416
+    vec4  occlusionUvTransformRow1;  // 432
+    vec4  emissiveUvTransformRow0;   // 448
+    vec4  emissiveUvTransformRow1;   // 464
 } mat;
 
 layout(std140, set = 1, binding = 1) uniform CameraUniforms {
@@ -141,6 +148,13 @@ vec2 applyUvTransform(vec2 uv, vec4 row0, vec4 row1) {
     return vec2(dot(row0.xyz, uv3), dot(row1.xyz, uv3));
 }
 
+// A texture's coordinates: its UV set (by its bit in the mask), then its own
+// KHR_texture_transform when it has one (row0.w).
+vec2 textureUV(vec2 uv0, vec2 uv1, float packedMask, uint bit, vec4 row0, vec4 row1) {
+    vec2 uv = selectUV(uv0, uv1, packedMask, bit);
+    return row0.w > 0.5 ? applyUvTransform(uv, row0, row1) : uv;
+}
+
 void worldMappingFrame(vec3 P, vec3 N, float size, bool zUp, out vec2 uv, out vec3 T, out vec3 B) {
     vec3 U = zUp ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
     float nu = dot(N, U);
@@ -189,7 +203,8 @@ void main() {
     float roughness = 1.0;
     vec3 N = normalize(worldNormal);
     if (mat.unlit < 0.5) {
-        vec2 mrUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1MetallicRoughness);
+        vec2 mrUV = textureUV(texcoord0, fragTexcoord1, mat.texCoord1Mask, kUV1MetallicRoughness,
+                              mat.metallicRoughnessUvTransformRow0, mat.metallicRoughnessUvTransformRow1);
         vec4 mr = texture(sampler2D(metallicRoughnessTexture, metallicRoughnessSampler), mrUV);
         metallic = mr.b * mat.metallicFactor;
         roughness = clamp(mr.g * mat.roughnessFactor, 0.04, 1.0);

@@ -190,6 +190,13 @@ struct MaterialUniforms {
     // One bit per texture slot: set when that texture uses TEXCOORD_1
     // instead of TEXCOORD_0. See TexCoord1Bit_* constants below.
     float texCoord1Mask;
+    // KHR_texture_transform of these textures, each its own ([384..479]).
+    float4 metallicRoughnessUvTransformRow0;
+    float4 metallicRoughnessUvTransformRow1;
+    float4 occlusionUvTransformRow0;
+    float4 occlusionUvTransformRow1;
+    float4 emissiveUvTransformRow0;
+    float4 emissiveUvTransformRow1;
 };
 
 // Bit assignment for MaterialUniforms.texCoord1Mask — must match the order
@@ -214,6 +221,27 @@ constant uint kUV1Anisotropic      = 1u << 16;
 
 inline float2 selectUV(float2 uv0, float2 uv1, float packedMask, uint bit) {
     return (uint(packedMask) & bit) != 0 ? uv1 : uv0;
+}
+
+// The vertex stage's texcoord0 carries baseColorTexture's KHR_texture_transform
+// (rows r0, r1; r0.w: has one). This undoes it, giving TEXCOORD_0 as authored,
+// for textures with transforms of their own. Not for world-mapped UVs, which
+// carry no transform.
+inline float2 untransformedUV0(float2 uv, float4 r0, float4 r1) {
+    if (r0.w < 0.5) return uv;
+    const float det = r0.x * r1.y - r0.y * r1.x;
+    if (abs(det) < 1e-12) return uv;
+    const float2 d = uv - float2(r0.z, r1.z);
+    return float2(r1.y * d.x - r0.y * d.y, r0.x * d.y - r1.x * d.x) / det;
+}
+
+// A texture's coordinates: its UV set (by its bit in the mask), then its own
+// KHR_texture_transform when it has one (r0.w).
+inline float2 textureUV(float2 uv0, float2 uv1, float packedMask, uint bit, float4 r0, float4 r1) {
+    const float2 uv = selectUV(uv0, uv1, packedMask, bit);
+    if (r0.w < 0.5) return uv;
+    const float3 uv3 = float3(uv, 1.0);
+    return float2(dot(r0.xyz, uv3), dot(r1.xyz, uv3));
 }
 
 // Khronos PBR Neutral tone mapping — the glTF-Sample-Renderer's actual current
@@ -1100,8 +1128,13 @@ fragment float4 fragmentMain_textured(
         return baseColor;
     }
 
+    // TEXCOORD_0 as authored, for the textures with their own transforms.
+    const float2 rawUV0 = mat.worldMapping > 0.0
+        ? in.texcoord0 : untransformedUV0(in.texcoord0, mat.uvTransformRow0, mat.uvTransformRow1);
+
     // Metallic-roughness.
-    float2 mrUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1MetallicRoughness);
+    float2 mrUV = textureUV(rawUV0, in.texcoord1, mat.texCoord1Mask, kUV1MetallicRoughness,
+                            mat.metallicRoughnessUvTransformRow0, mat.metallicRoughnessUvTransformRow1);
     float4 mrSample = metallicRoughnessTexture.sample(metallicRoughnessSampler, mrUV);
     float metallic  = mrSample.b * mat.metallicFactor;
     float roughness = clamp(mrSample.g * mat.roughnessFactor, 0.04, 1.0);
@@ -1123,7 +1156,8 @@ fragment float4 fragmentMain_textured(
     // distinct from the main material's TEXCOORD_0.
     float occlusion = 1.0;
     if (mat.hasOcclusionTexture > 0.5) {
-        float2 occUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1Occlusion);
+        float2 occUV = textureUV(rawUV0, in.texcoord1, mat.texCoord1Mask, kUV1Occlusion,
+                                 mat.occlusionUvTransformRow0, mat.occlusionUvTransformRow1);
         float occ = occlusionTexture.sample(occlusionSampler, occUV).r;
         occlusion = mix(1.0, occ, mat.occlusionStrength);
     }
@@ -1131,7 +1165,8 @@ fragment float4 fragmentMain_textured(
     // Emissive.
     float3 emissive = mat.emissiveFactor.xyz;
     if (mat.hasEmissiveTexture > 0.5) {
-        float2 emisUV = selectUV(in.texcoord0, in.texcoord1, mat.texCoord1Mask, kUV1Emissive);
+        float2 emisUV = textureUV(rawUV0, in.texcoord1, mat.texCoord1Mask, kUV1Emissive,
+                                  mat.emissiveUvTransformRow0, mat.emissiveUvTransformRow1);
         emissive *= emissiveTexture.sample(emissiveSampler, emisUV).rgb;
     }
 
@@ -1783,7 +1818,10 @@ fragment GBufferFragmentOut gbufferFragment(
     float roughness = 1.0;
     float3 N = normalize(worldNormal);
     if (mat.unlit < 0.5) {
-        const float2 mrUV = selectUV(texcoord0, inRaw.texcoord1, mat.texCoord1Mask, kUV1MetallicRoughness);
+        const float2 rawUV0 = mat.worldMapping > 0.0
+            ? texcoord0 : untransformedUV0(texcoord0, mat.uvTransformRow0, mat.uvTransformRow1);
+        const float2 mrUV = textureUV(rawUV0, inRaw.texcoord1, mat.texCoord1Mask, kUV1MetallicRoughness,
+                                      mat.metallicRoughnessUvTransformRow0, mat.metallicRoughnessUvTransformRow1);
         const float4 mr = metallicRoughnessTexture.sample(metallicRoughnessSampler, mrUV);
         metallic = mr.b * mat.metallicFactor;
         roughness = clamp(mr.g * mat.roughnessFactor, 0.04, 1.0);

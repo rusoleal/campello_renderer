@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Each texture uses its own `KHR_texture_transform`.** Only the base colour texture and the normal map had theirs. The metallic-roughness, occlusion and emissive textures were sampled with no transform on WebGPU, and with the base colour texture's on Metal, Vulkan and DirectX. On the web, Khronos' ChronographWatch showed its backplate's roughness engraving ("KHRONOS GROUP", "CONNECTING SOFTWARE TO SILICON") 2 to 8 times too large. These three textures now have their own transforms in the material uniforms (offsets 384-479, inside the 512-byte slot), on every backend. `pointer/set` of their `KHR_texture_transform` (InteractivityObjectModel) now shows. Test `OffscreenRenderTest.EachTextureUsesItsOwnTextureTransform`.
+- **`KHR_texture_transform`'s `texCoord`** (an override of the texture's UV set) is honoured.
+
+### Known limitations
+- The material extensions' textures (clearcoat, sheen, specular, transmission, volume, iridescence, anisotropy) still use no transform on WebGPU and the base colour texture's elsewhere: their transforms don't fit in the 512-byte material slot.
+- DirectX: `shaders/directx/default.hlsl` has the fix, but `src/shaders/directx_default.h` needs rebuilding on Windows (`build_directx_shaders.ps1`, dxc). Until then DirectX keeps the old behaviour; the new uniforms come after every field it reads.
+
 ## [0.40.0] - 2026-11-27
 
 ### Added

@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <array>
 #include <functional>
 
 #if defined(__APPLE__)
@@ -9100,4 +9101,78 @@ TEST_F(OffscreenRenderTest, PositionOnlyMeshMatchesExplicitNormals) {
     for (int c = 0; c < 3; ++c) {
         EXPECT_NEAR(derived[static_cast<size_t>(c)], withNormals[static_cast<size_t>(c)], 3) << "channel " << c;
     }
+}
+
+// KHR_texture_transform per texture: a quad whose emissive, metallic-
+// roughness and occlusion textures are a 2x1 image, red | green, each with a
+// transform that keeps only its right (green) half: offset (0.5, 0), scale
+// (0.5, 1). The base colour texture has none. Every pixel then reads green,
+// left half too, in each texture's view; without the transforms the left half
+// read red (ChronographWatch's backplate showed its roughness texture's
+// engraving 2-8 times too large).
+static const char* kGltfPerTextureTransforms = R"({
+    "asset": {"version": "2.0"},
+    "extensionsUsed": ["KHR_texture_transform"],
+    "scene": 0,
+    "scenes": [{"nodes": [0]}],
+    "nodes": [{"mesh": 0}],
+    "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}, "indices": 3, "material": 0}]}],
+    "materials": [{
+        "pbrMetallicRoughness": {
+            "baseColorFactor": [0, 0, 0, 1],
+            "metallicRoughnessTexture": {"index": 0, "extensions": {"KHR_texture_transform": {"offset": [0.5, 0], "scale": [0.5, 1]}}}
+        },
+        "occlusionTexture": {"index": 0, "extensions": {"KHR_texture_transform": {"offset": [0.5, 0], "scale": [0.5, 1]}}},
+        "emissiveTexture": {"index": 0, "extensions": {"KHR_texture_transform": {"offset": [0.5, 0], "scale": [0.5, 1]}}},
+        "emissiveFactor": [1, 1, 1]
+    }],
+    "samplers": [{"magFilter": 9728, "minFilter": 9728, "wrapS": 33071, "wrapT": 33071}],
+    "images": [{"uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGP4z8DA8J8BAAf/Af8Bf4mnAAAAAElFTkSuQmCC"}],
+    "textures": [{"sampler": 0, "source": 0}],
+    "accessors": [
+        {"bufferView": 0, "componentType": 5126, "count": 4, "type": "VEC3", "min": [-1, -1, 0], "max": [1, 1, 0]},
+        {"bufferView": 1, "componentType": 5126, "count": 4, "type": "VEC3"},
+        {"bufferView": 2, "componentType": 5126, "count": 4, "type": "VEC2"},
+        {"bufferView": 3, "componentType": 5123, "count": 6, "type": "SCALAR"}
+    ],
+    "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 48}, {"buffer": 0, "byteOffset": 48, "byteLength": 48},
+                    {"buffer": 0, "byteOffset": 96, "byteLength": 32}, {"buffer": 0, "byteOffset": 128, "byteLength": 12}],
+    "buffers": [{"byteLength": 140, "uri": "data:application/octet-stream;base64,AACAvwAAgL8AAAAAAACAPwAAgL8AAAAAAACAPwAAgD8AAAAAAACAvwAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAgD8AAIA/AACAPwAAgD8AAAAAAAAAAAAAAAAAAAEAAgAAAAIAAwA="}]
+})";
+
+TEST_F(OffscreenRenderTest, EachTextureUsesItsOwnTextureTransform) {
+    if (!device) GTEST_SKIP() << "No GPU device available";
+#if defined(_WIN32)
+    // directx_default.h still holds the DXIL built before this fix: rebuild
+    // it with build_directx_shaders.ps1 (dxc), then remove this skip.
+    GTEST_SKIP() << "DirectX shaders not rebuilt yet";
+#endif
+    namespace GPU = systems::leal::campello_gpu;
+    auto asset = GLTF::loadGLTF(kGltfPerTextureTransforms, kNoOpLoader);
+    ASSERT_NE(asset, nullptr);
+    constexpr uint32_t kSize = 64;
+    renderer->setAsset(asset);
+    renderer->resize(kSize, kSize);
+    renderer->createDefaultPipelines(GPU::PixelFormat::rgba8unorm);
+    renderer->setSkyboxEnabled(false);
+    renderer->setClearColor(0.0f, 0.0f, 1.0f, 1.0f);
+    auto target = makeOffscreenTexture(kSize, kSize);
+    ASSERT_NE(target, nullptr);
+    auto view = target->createView(GPU::PixelFormat::rgba8unorm, 1);
+
+    // The default camera looks at the quad from (0, 0, 5): it covers the
+    // middle of the image. Read a pixel in its left half (u about 0.25).
+    auto leftHalf = [&](ViewMode mode) {
+        renderer->setViewMode(mode);
+        renderer->render(view);
+        const auto pixels = readBackPixels(target);
+        const size_t at = (size_t(kSize / 2) * kSize + kSize / 2 - 6) * 4;
+        return std::array<int, 3>{pixels[at], pixels[at + 1], pixels[at + 2]};
+    };
+    const auto emissive = leftHalf(ViewMode::emissive);
+    EXPECT_GT(emissive[1], 200) << "emissive: green";
+    EXPECT_LT(emissive[0], 40) << "emissive: not the image's red half";
+    // Roughness is the green channel (1 on the right half), occlusion the red (0 there).
+    EXPECT_GT(leftHalf(ViewMode::roughness)[0], 200) << "roughness 1, not 0.04";
+    EXPECT_LT(leftHalf(ViewMode::occlusion)[0], 40) << "occlusion 0, not 1";
 }
