@@ -176,6 +176,13 @@ cbuffer MaterialUniforms : register(b24) {
     float4 normalUvTransformRow0;     // 336  independent KHR_texture_transform for normalTexture
     float4 normalUvTransformRow1;     // 352
     float texCoord1Mask;              // 368
+    // KHR_texture_transform of these textures, each its own.
+    float4 metallicRoughnessUvTransformRow0; // 384
+    float4 metallicRoughnessUvTransformRow1; // 400
+    float4 occlusionUvTransformRow0;  // 416
+    float4 occlusionUvTransformRow1;  // 432
+    float4 emissiveUvTransformRow0;   // 448
+    float4 emissiveUvTransformRow1;   // 464
 };
 
 // --- Per-frame (bind group 1, space1: buffers 0/1) ---------------------------------------
@@ -635,6 +642,13 @@ float2 applyUvTransform(float2 uv, float4 row0, float4 row1) {
     return float2(dot(row0.xyz, uv3), dot(row1.xyz, uv3));
 }
 
+// A texture's coordinates: its UV set (by its bit in the mask), then its own
+// KHR_texture_transform when it has one (row0.w).
+float2 textureUV(float2 uv0, float2 uv1, float packedMask, uint bit, float4 row0, float4 row1) {
+    float2 uv = selectUV(uv0, uv1, packedMask, bit);
+    return row0.w > 0.5 ? applyUvTransform(uv, row0, row1) : uv;
+}
+
 // ---------------------------------------------------------------------------
 // Fragment (pixel) stage — main
 // ---------------------------------------------------------------------------
@@ -691,7 +705,8 @@ float4 pixelMain(PixelIn input, bool isFrontFace : SV_IsFrontFace) : SV_Target {
     }
 
     // Metallic-roughness.
-    float2 mrUV = selectUV(uv0, input.uv1, texCoord1Mask, kUV1MetallicRoughness);
+    float2 mrUV = textureUV(input.uv0, input.uv1, texCoord1Mask, kUV1MetallicRoughness,
+                            metallicRoughnessUvTransformRow0, metallicRoughnessUvTransformRow1);
     float4 mrSample = metallicRoughnessTexture.Sample(metallicRoughnessSampler, mrUV);
     float metallic  = mrSample.b * metallicFactor;
     float roughness = clamp(mrSample.g * roughnessFactor, 0.04, 1.0);
@@ -718,7 +733,8 @@ float4 pixelMain(PixelIn input, bool isFrontFace : SV_IsFrontFace) : SV_Target {
     // Occlusion.
     float occlusion = 1.0;
     if (hasOcclusionTexture > 0.5) {
-        float2 occUV = selectUV(uv0, input.uv1, texCoord1Mask, kUV1Occlusion);
+        float2 occUV = textureUV(input.uv0, input.uv1, texCoord1Mask, kUV1Occlusion,
+                                 occlusionUvTransformRow0, occlusionUvTransformRow1);
         float occ = occlusionTexture.Sample(occlusionSampler, occUV).r;
         occlusion = lerp(1.0, occ, occlusionStrength);
     }
@@ -726,7 +742,8 @@ float4 pixelMain(PixelIn input, bool isFrontFace : SV_IsFrontFace) : SV_Target {
     // Emissive.
     float3 emissive = emissiveFactor.xyz;
     if (hasEmissiveTexture > 0.5) {
-        float2 emisUV = selectUV(uv0, input.uv1, texCoord1Mask, kUV1Emissive);
+        float2 emisUV = textureUV(input.uv0, input.uv1, texCoord1Mask, kUV1Emissive,
+                                  emissiveUvTransformRow0, emissiveUvTransformRow1);
         emissive *= emissiveTexture.Sample(emissiveSampler, emisUV).rgb;
     }
 
@@ -2114,7 +2131,8 @@ GBufferOut gbufferPixel(GBufferPixelIn input, bool isFrontFace : SV_IsFrontFace)
     if (uvTransformRow0.w > 0.5) uv0 = applyUvTransform(texcoord0, uvTransformRow0, uvTransformRow1);
     float2 baseColorUV = (uvTransformRow0.w > 0.5) ? uv0 : selectUV(uv0, input.uv1, texCoord1Mask, kUV1BaseColor);
     float4 baseColor = baseColorTexture.Sample(baseColorSampler, baseColorUV) * baseColorFactor * input.color0;
-    float2 mrUV = selectUV(uv0, input.uv1, texCoord1Mask, kUV1MetallicRoughness);
+    float2 mrUV = textureUV(texcoord0, input.uv1, texCoord1Mask, kUV1MetallicRoughness,
+                            metallicRoughnessUvTransformRow0, metallicRoughnessUvTransformRow1);
     float4 mr = metallicRoughnessTexture.Sample(metallicRoughnessSampler, mrUV);
     float2 normalUV = (normalUvTransformRow0.w > 0.5)
         ? applyUvTransform(texcoord0, normalUvTransformRow0, normalUvTransformRow1)

@@ -90,6 +90,13 @@ struct MaterialUniforms {
     normalUvTransformRow0: vec4f,
     normalUvTransformRow1: vec4f,
     texCoord1Mask: f32,
+    // KHR_texture_transform of these textures, each its own (offset 384).
+    metallicRoughnessUvTransformRow0: vec4f,
+    metallicRoughnessUvTransformRow1: vec4f,
+    occlusionUvTransformRow0: vec4f,
+    occlusionUvTransformRow1: vec4f,
+    emissiveUvTransformRow0: vec4f,
+    emissiveUvTransformRow1: vec4f,
 }
 
 struct CameraUniforms {
@@ -442,6 +449,13 @@ fn transformUV(uv: vec2f, row0: vec4f, row1: vec4f) -> vec2f {
     return vec2f(dot(row0.xyz, uv3), dot(row1.xyz, uv3));
 }
 
+// A texture's coordinates: its UV set (TEXCOORD_0 or _1, by its bit in the
+// mask), then its own KHR_texture_transform when it has one (row0.w).
+fn textureUV(uv0: vec2f, uv1: vec2f, packedMask: f32, bit: u32, row0: vec4f, row1: vec4f) -> vec2f {
+    let uv = selectUV(uv0, uv1, packedMask, bit);
+    return select(uv, transformUV(uv, row0, row1), row0.w > 0.5);
+}
+
 // Khronos PBR Neutral tone mapping (as the Metal shader).
 fn toneMapKhronosPbrNeutral(colorIn: vec3f) -> vec3f {
     let startCompression = 0.8 - 0.04;
@@ -635,13 +649,10 @@ fn fs_main(vIn: VertexOut, @builtin(front_facing) frontFacing: bool) -> @locatio
     let cap = camera.clipInfo.y != 0u && !frontFacing && mat.doubleSided < 0.5;
     let capColor = vec4f(camera.capColor.rgb, 1.0);
 
-    // UVs: KHR_texture_transform on TEXCOORD_0, per-texture TEXCOORD_1 bits.
-    let hasTransform = mat.uvTransformRow0.w > 0.5;
-    var uv = v.texcoord0;
-    if (hasTransform) {
-        uv = transformUV(v.texcoord0, mat.uvTransformRow0, mat.uvTransformRow1);
-    }
-    let baseColorUV = select(selectUV(uv, v.texcoord1, mat.texCoord1Mask, kUV1BaseColor), uv, hasTransform);
+    // UVs: each texture's own set and KHR_texture_transform (textureUV).
+    let baseColorUV = textureUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1BaseColor,
+                                mat.uvTransformRow0, mat.uvTransformRow1);
+    let uv = baseColorUV;  // the UV debug view
     let baseColor = textureSample(baseColorTexture, baseColorSampler, baseColorUV) * mat.baseColorFactor * v.color0;
 
     if (mat.viewMode > 0.5) {
@@ -665,7 +676,8 @@ fn fs_main(vIn: VertexOut, @builtin(front_facing) frontFacing: bool) -> @locatio
 
     // Metallic-roughness.
     let mrSample = textureSample(metallicRoughnessTexture, metallicRoughnessSampler,
-                                 selectUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1MetallicRoughness));
+                                 textureUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1MetallicRoughness,
+                                           mat.metallicRoughnessUvTransformRow0, mat.metallicRoughnessUvTransformRow1));
     let metallic = mrSample.b * mat.metallicFactor;
     let roughness = clamp(mrSample.g * mat.roughnessFactor, 0.04, 1.0);
 
@@ -674,10 +686,8 @@ fn fs_main(vIn: VertexOut, @builtin(front_facing) frontFacing: bool) -> @locatio
     let B = normalize(worldBitangent);
     var N = normalize(worldNormal);
     if (mat.hasNormalTexture > 0.5) {
-        var normalUV = selectUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1Normal);
-        if (mat.normalUvTransformRow0.w > 0.5) {
-            normalUV = transformUV(v.texcoord0, mat.normalUvTransformRow0, mat.normalUvTransformRow1);
-        }
+        let normalUV = textureUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1Normal,
+                                 mat.normalUvTransformRow0, mat.normalUvTransformRow1);
         var ns = textureSample(normalTexture, normalSampler, normalUV).rgb * 2.0 - 1.0;
         ns = vec3f(ns.xy * mat.normalScale, ns.z);
         let n = normalize(ns);
@@ -687,14 +697,16 @@ fn fs_main(vIn: VertexOut, @builtin(front_facing) frontFacing: bool) -> @locatio
     var occlusion = 1.0;
     if (mat.hasOcclusionTexture > 0.5) {
         let occ = textureSample(occlusionTexture, occlusionSampler,
-                                selectUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1Occlusion)).r;
+                                textureUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1Occlusion,
+                                          mat.occlusionUvTransformRow0, mat.occlusionUvTransformRow1)).r;
         occlusion = mix(1.0, occ, mat.occlusionStrength);
     }
 
     var emissive = mat.emissiveFactor.xyz;
     if (mat.hasEmissiveTexture > 0.5) {
         emissive *= textureSample(emissiveTexture, emissiveSampler,
-                                  selectUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1Emissive)).rgb;
+                                  textureUV(v.texcoord0, v.texcoord1, mat.texCoord1Mask, kUV1Emissive,
+                                            mat.emissiveUvTransformRow0, mat.emissiveUvTransformRow1)).rgb;
     }
 
     // KHR_materials_transmission / _volume / _iridescence textures (sampled

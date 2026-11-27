@@ -1606,7 +1606,7 @@ namespace systems::leal::campello_renderer {
         /// mapped and exposed as the sky is). HDR and EXR images as they are.
         static std::shared_ptr<EnvironmentFaces> prepareEquirectangularBackground(
             const uint8_t *data, size_t size, UpAxis upAxis, uint32_t faceSize = 0, float rotation = 0.0f);
-        /// A material's constants as uploaded: the 93 floats of its uniform
+        /// A material's constants as uploaded: the floats of its uniform
         /// slot (layout in buildSlotRaw()), or nullptr. For the path tracer.
         const float* materialUniforms(const GpuMaterial* material) const;
 

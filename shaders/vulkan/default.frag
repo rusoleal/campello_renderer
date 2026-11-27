@@ -94,6 +94,13 @@ layout(std140, set = 0, binding = 24) uniform MaterialUniforms {
     vec4  normalUvTransformRow0;     // 336  independent KHR_texture_transform for normalTexture
     vec4  normalUvTransformRow1;     // 352
     float texCoord1Mask;             // 368
+    // KHR_texture_transform of these textures, each its own.
+    vec4  metallicRoughnessUvTransformRow0; // 384
+    vec4  metallicRoughnessUvTransformRow1; // 400
+    vec4  occlusionUvTransformRow0;  // 416
+    vec4  occlusionUvTransformRow1;  // 432
+    vec4  emissiveUvTransformRow0;   // 448
+    vec4  emissiveUvTransformRow1;   // 464
 } mat;
 
 // Material specialization (as default.metal's specializedMaterial()): the
@@ -261,6 +268,13 @@ vec2 selectUV(vec2 uv0, vec2 uv1, float packedMask, uint bit) {
 vec2 applyUvTransform(vec2 uv, vec4 row0, vec4 row1) {
     vec3 uv3 = vec3(uv, 1.0);
     return vec2(dot(row0.xyz, uv3), dot(row1.xyz, uv3));
+}
+
+// A texture's coordinates: its UV set (by its bit in the mask), then its own
+// KHR_texture_transform when it has one (row0.w).
+vec2 textureUV(vec2 uv0, vec2 uv1, float packedMask, uint bit, vec4 row0, vec4 row1) {
+    vec2 uv = selectUV(uv0, uv1, packedMask, bit);
+    return row0.w > 0.5 ? applyUvTransform(uv, row0, row1) : uv;
 }
 
 // --- BRDF helper functions (verbatim transliteration of default.metal) ---------
@@ -560,7 +574,8 @@ void main() {
     }
 
     // Metallic-roughness.
-    vec2 mrUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1MetallicRoughness);
+    vec2 mrUV = textureUV(texcoord0In, fragTexcoord1, mat.texCoord1Mask, kUV1MetallicRoughness,
+                          mat.metallicRoughnessUvTransformRow0, mat.metallicRoughnessUvTransformRow1);
     vec4 mrSample = texture(sampler2D(metallicRoughnessTexture, metallicRoughnessSampler), mrUV);
     float metallic  = mrSample.b * mat.metallicFactor;
     float roughness = clamp(mrSample.g * mat.roughnessFactor, 0.04, 1.0);
@@ -584,7 +599,8 @@ void main() {
     // Occlusion.
     float occlusion = 1.0;
     if (mat.hasOcclusionTexture > 0.5) {
-        vec2 occUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1Occlusion);
+        vec2 occUV = textureUV(texcoord0In, fragTexcoord1, mat.texCoord1Mask, kUV1Occlusion,
+                               mat.occlusionUvTransformRow0, mat.occlusionUvTransformRow1);
         float occ = texture(sampler2D(occlusionTexture, occlusionSampler), occUV).r;
         occlusion = mix(1.0, occ, mat.occlusionStrength);
     }
@@ -592,7 +608,8 @@ void main() {
     // Emissive.
     vec3 emissive = mat.emissiveFactor.xyz;
     if (mat.hasEmissiveTexture > 0.5) {
-        vec2 emisUV = selectUV(uv0, fragTexcoord1, mat.texCoord1Mask, kUV1Emissive);
+        vec2 emisUV = textureUV(texcoord0In, fragTexcoord1, mat.texCoord1Mask, kUV1Emissive,
+                                mat.emissiveUvTransformRow0, mat.emissiveUvTransformRow1);
         emissive *= texture(sampler2D(emissiveTexture, emissiveSampler), emisUV).rgb;
     }
 
