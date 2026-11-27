@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-11-27
+
 ### Fixed
 - **Each texture uses its own `KHR_texture_transform`.** Only the base colour texture and the normal map had theirs. The metallic-roughness, occlusion and emissive textures were sampled with no transform on WebGPU, and with the base colour texture's on Metal, Vulkan and DirectX. On the web, Khronos' ChronographWatch showed its backplate's roughness engraving ("KHRONOS GROUP", "CONNECTING SOFTWARE TO SILICON") 2 to 8 times too large. These three textures now have their own transforms in the material uniforms (offsets 384-479, inside the 512-byte slot), on every backend. `pointer/set` of their `KHR_texture_transform` (InteractivityObjectModel) now shows. Test `OffscreenRenderTest.EachTextureUsesItsOwnTextureTransform`.
 - **`KHR_texture_transform`'s `texCoord`** (an override of the texture's UV set) is honoured.
