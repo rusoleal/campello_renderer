@@ -20,6 +20,13 @@ Triggered on every push to main/master/develop branches and pull requests.
 - Uploads build artifacts
 - Uses Ninja generator where available for faster builds
 
+### DirectX shaders (`directx-shaders.yml`)
+
+Rebuilds `src/shaders/directx_default.h` and `directx_denoiser.h` from `shaders/directx/*.hlsl` with `build_directx_shaders.ps1` (dxc from the Windows SDK) on `windows-latest`, and commits them to the same branch.
+
+- Runs on a push to a branch named `dxil/...` that changes the HLSL, the script or this workflow, or by hand: Actions > DirectX shaders > Run workflow (any branch but main).
+- Its commit is pushed with the workflow's token, which doesn't start other workflows: push another commit, or re-run the build, to test the new headers.
+
 ### 2. Release Workflow (`release.yml`)
 
 Triggered on version tags (e.g., `v1.0.0`) or manually via workflow_dispatch.

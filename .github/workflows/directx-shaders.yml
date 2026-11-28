@@ -1,0 +1,56 @@
+# Rebuilds the embedded DirectX shaders (src/shaders/directx_*.h) from
+# shaders/directx/*.hlsl with dxc, on a Windows runner (the Windows SDK there
+# ships dxc), and commits the result to the same branch. For changes made
+# where there's no Windows machine with dxc.
+#
+# Runs on a push to a branch named dxil/... that changes the HLSL, or by hand
+# (Actions > DirectX shaders > Run workflow, on any branch but main). A commit
+# pushed by this workflow doesn't start other workflows (GitHub's rule for its
+# own token): push another commit afterwards, or re-run CI, to test it.
+name: DirectX shaders
+
+on:
+  push:
+    branches: ['dxil/**']
+    paths:
+      - 'shaders/directx/**'
+      - 'build_directx_shaders.ps1'
+      - '.github/workflows/directx-shaders.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: directx-shaders-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rebuild:
+    if: github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Compile with dxc
+        shell: pwsh
+        run: ./build_directx_shaders.ps1
+
+      - name: Commit the headers if they changed
+        shell: bash
+        run: |
+          # The script writes CRLF on Windows; the headers are LF.
+          sed -i 's/\r$//' src/shaders/directx_default.h src/shaders/directx_denoiser.h
+          git add src/shaders/directx_default.h src/shaders/directx_denoiser.h
+          if git diff --cached --quiet; then
+            echo "The DirectX headers are up to date."
+            exit 0
+          fi
+          git diff --cached --stat
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "build(directx): rebuild the DXIL headers from shaders/directx (dxc, windows-latest)"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
