@@ -1306,7 +1306,7 @@ SamplerState         skyboxEnvSampler : register(s1);
 cbuffer SkyboxUniforms : register(b2) {
     float4x4 invVP;
     float2   skyboxScreenSize;
-    float2   _skyboxPad;      // x = exposure in EV (as CameraUniforms.viewParams.x)
+    float2   _skyboxPad;      // x = exposure in EV (as CameraUniforms.viewParams.x), y = mip level (setSkyboxBlur)
     float4   skyboxCameraPos; // xyz used, w unused
 };
 
@@ -1317,7 +1317,9 @@ float4 skyboxPixel(FxaaOut input) : SV_Target {
     );
     float4 worldFar = mul(invVP, float4(ndc, 1.0, 1.0));
     float3 worldDir = normalize(worldFar.xyz / worldFar.w - skyboxCameraPos.xyz);
-    float3 color = skyboxEnvMap.Sample(skyboxEnvSampler, worldDir).rgb;
+    // At an explicit level: 0 sharp, higher the GGX-prefiltered map blurred
+    // (setSkyboxBlur), as the Metal, Vulkan and WebGPU skyboxes.
+    float3 color = skyboxEnvMap.SampleLevel(skyboxEnvSampler, worldDir, _skyboxPad.y).rgb;
 
     // Match the tonemapping + sRGB encoding pixelMain() applies before writing to the
     // 8-bit swapchain — the environment is genuine HDR, so returning it raw here hard-clips

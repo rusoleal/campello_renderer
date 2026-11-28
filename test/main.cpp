@@ -1873,11 +1873,7 @@ TEST_F(OffscreenRenderTest, BackgroundMapAndSkyboxBlur) {
     }
     renderer->setSkyboxBlur(1.0f);
     const double blurred = rowSpread(draw());
-#if !defined(_WIN32)  // DirectX draws the sky sharp until its shader reads the level
     EXPECT_LT(blurred, sharp * 0.5) << "sharp " << sharp << ", blurred " << blurred;
-#else
-    (void)blurred;
-#endif
 
     // A red background replaces the sky (blur doesn't apply to it); without
     // it, the environment again.
@@ -9142,11 +9138,6 @@ static const char* kGltfPerTextureTransforms = R"({
 
 TEST_F(OffscreenRenderTest, EachTextureUsesItsOwnTextureTransform) {
     if (!device) GTEST_SKIP() << "No GPU device available";
-#if defined(_WIN32)
-    // directx_default.h still holds the DXIL built before this fix: rebuild
-    // it with build_directx_shaders.ps1 (dxc), then remove this skip.
-    GTEST_SKIP() << "DirectX shaders not rebuilt yet";
-#endif
     namespace GPU = systems::leal::campello_gpu;
     auto asset = GLTF::loadGLTF(kGltfPerTextureTransforms, kNoOpLoader);
     ASSERT_NE(asset, nullptr);

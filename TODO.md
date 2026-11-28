@@ -9,7 +9,7 @@ What worked at v0.7.0. `CHANGELOG.md` lists everything that has landed since (th
 - `setScene(index)` — uploads GPU buffers, decodes + uploads textures via `campello_image`, builds per-texture bind groups from GLTF samplers, computes scene bounding radius, allocates material uniform buffer and per-node transform buffer
 - `setCamera(index)` — selects active GLTF camera
 - `resize(w, h)` — creates `depth32float` texture and view
-- `createDefaultPipelines(colorFormat)` — compiles flat + textured pipeline variants; Metal (macOS) fully implemented; Vulkan (Android) one variant (flat = textured workaround); DirectX stubs (nonfunctional)
+- `createDefaultPipelines(colorFormat)` — compiles flat + textured pipeline variants; Metal (macOS) fully implemented; Vulkan (Android) one variant (flat = textured workaround); DirectX (embedded DXIL, `build_directx_shaders.ps1`)
 - `render()` / `render(colorView)` — full scene graph traversal, per-node MVP, camera from GLTF or override, depth pass, POSITION + NORMAL + TEXCOORD_0 + TANGENT binding, fallback UV buffer, per-primitive pipeline selection, indexed + non-indexed draw
 - `setCameraMatrices(view, proj)` / `clearCameraOverride()` — external camera override
 - `getBoundsRadius()` — scene bounds
@@ -38,7 +38,6 @@ What worked at v0.7.0. `CHANGELOG.md` lists everything that has landed since (th
 - [ ] **Metal: the file's point lights don't light the quad in `FifthLightInSceneOrderStillLights`** — on macOS CI red and green both read 192 (the ambient level), so none of its five point lights (four dim, one red, a unit in front of the quad on its normal's side) reaches it, while DirectX and WebGPU light it red. The test is skipped on Apple until this is understood; no other test covers punctual lights on Metal.
 - [ ] **4 punctual lights on Metal and Vulkan** — `LightsUniform` holds `kMaxLights` = 8 (528 bytes, strongest first) and the DirectX and WebGPU shaders read them all; `default.metal` / `default.frag` (and `rt_effects.metal`) still declare and loop over 4. Raise them to 8 and rebuild the headers (Metal needs a Mac).
 - [ ] **Vulkan vertex input not applied** — `campello_gpu` Vulkan backend hardcodes `vertexBindingDescriptionCount = 0`, so vertex buffer layouts passed via `createDefaultPipelines()` are ignored. Fix upstream in `campello_gpu`. Tracked in the Vulkan `createDefaultPipelines` path.
-- [ ] **DirectX rendering nonfunctional** — DXIL binaries not compiled; `kDefaultDirectXVertShaderSize == 0` causes early return. `pipelineFlat` and `pipelineTextured` remain null on Windows.
 - [ ] **No acceleration structure compacted-size query** in `campello_gpu`, so the path tracer can't compact its BLASes (memory).
 - [ ] **Metal compute passes don't bind textures** — `campello_gpu`'s Metal `ComputePassEncoder::setBindGroup()` binds buffers and acceleration structures only. The path tracer's `environmentLuminance` kernel reads the environment cube, so it runs as a ray tracing pass (which binds textures) instead. Fix upstream, then move it back to a compute pipeline.
 
@@ -60,13 +59,10 @@ What worked at v0.7.0. `CHANGELOG.md` lists everything that has landed since (th
 - [ ] **Add `glslc` compile step to CMake** — automate SPIR-V compilation for Vulkan targets instead of embedding pre-compiled binaries.
 
 ### DirectX (Windows)
-- [ ] **Compile DXIL binaries** — HLSL source exists at `shaders/directx/default.hlsl`. Run:
-  ```
-  dxc -T vs_6_0 -E vertexMain default.hlsl -Fo default_vs.dxil
-  dxc -T ps_6_0 -E pixelMain  default.hlsl -Fo default_ps.dxil
-  ```
-  Then embed as byte arrays in `src/shaders/directx_default.h`.
-- [ ] **Add `dxc` compile step to CMake** — guard with `if(WIN32)`.
+- [x] **Embedded DXIL** — `build_directx_shaders.ps1` compiles `shaders/directx/*.hlsl` with dxc (Windows SDK) into `src/shaders/directx_default.h` and `directx_denoiser.h`, one line per entry point.
+- [x] **Rebuilding without a Windows machine** — `.github/workflows/directx-shaders.yml` runs the script on `windows-latest` and commits the headers to the branch: on a push to a `dxil/...` branch that changes the HLSL, or by hand (Actions > DirectX shaders > Run workflow). Its own commit doesn't start CI (GitHub's token rule): push another commit or re-run CI to test it.
+- [x] **Headers rebuilt for the sky blur (v0.39.0) and per-texture `KHR_texture_transform` (v0.41.0)** — by the workflow's first run (#60); their tests run on Windows again. A change to the HLSL needs the same: otherwise Windows keeps running the old DXIL.
+- [ ] **Add `dxc` compile step to CMake** — guard with `if(WIN32)`, so the headers can't fall behind the HLSL.
 
 ### Apple (macOS / iOS)
 - [x] **iOS SDK compile** — `build_metal_shaders.sh` compiles for macOS, iOS simulator, and iOS device SDKs.
@@ -481,7 +477,8 @@ The gltf library (v0.4.1) parses **23 extensions** into structured data. The ren
 
 ### KHR_texture_transform
 
-- [x] **`KHR_texture_transform`** — UV transform (T × R × S) baked into `materialUniformBuffer` as two float4 rows per material slot (48-byte stride). Applied in the vertex shader for Metal and Vulkan. DirectX HLSL also updated. Note: `texCoord` override field not yet respected (always applies to TEXCOORD_0).
+- [x] **`KHR_texture_transform`** — UV transform (T × R × S) as two float4 rows per texture in the material slot: base colour, normal (own rows), and since v0.41.0 metallic-roughness, occlusion and emissive, on every backend. The `texCoord` override is honoured (v0.41.0).
+- [ ] **The material extensions' textures** (clearcoat, sheen, specular, transmission, volume, iridescence, anisotropy) still have no transform of their own: none on WebGPU, the base colour texture's elsewhere. Their rows don't fit in the 512-byte slot (`kMaterialUniformStride`); a 1 KB slot would hold them.
 
 ### KHR_lights_punctual
 
@@ -594,7 +591,7 @@ The gltf library (v0.4.1) parses **23 extensions** into structured data. The ren
 ## CI / Testing
 
 - [ ] **Enable tests on Linux** — commented out; blocked by Vulkan vertex input gap upstream. Re-enable once `campello_gpu` Vulkan backend is fixed.
-- [ ] **Enable tests on Windows** — blocked by DXIL shaders and DLL symbol export (.lib) gaps.
+- [x] **Tests on Windows** — CI runs them on `windows-latest` (DirectX), Debug and Release.
 - [ ] **GPU-backed integration tests** — all current tests use `nullptr` device. Add macOS-only test suite using a real Metal device to verify render output (render to texture, compare pixel values).
 - [ ] **Test with KhronosGroup sample assets** — DamagedHelmet, Sponza, BoxAnimated.
 

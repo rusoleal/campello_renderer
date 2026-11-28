@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+- **DirectX draws the sky blurred** (`setSkyboxBlur`, v0.39.0): its skybox samples the map at the level the other backends use.
+- **DirectX's embedded shaders rebuilt** (`src/shaders/directx_*.h`), with the sky blur and per-texture `KHR_texture_transform` (v0.41.0). `BackgroundMapAndSkyboxBlur` and `EachTextureUsesItsOwnTextureTransform` run on Windows again.
+
+### Added
+- **`.github/workflows/directx-shaders.yml`**: rebuilds the DirectX headers with dxc on a Windows runner and commits them to the branch (on a push to a `dxil/...` branch that changes the HLSL, or by hand), for changes made without a Windows machine.
+
 ## [0.41.0] - 2026-11-27
 
 ### Fixed
