@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-11-28
+
 ### Fixed
 - **DirectX draws the sky blurred** (`setSkyboxBlur`, v0.39.0): its skybox samples the map at the level the other backends use.
 - **DirectX's embedded shaders rebuilt** (`src/shaders/directx_*.h`), with the sky blur and per-texture `KHR_texture_transform` (v0.41.0). `BackgroundMapAndSkyboxBlur` and `EachTextureUsesItsOwnTextureTransform` run on Windows again.
