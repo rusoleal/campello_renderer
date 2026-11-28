@@ -61,7 +61,7 @@ What worked at v0.7.0. `CHANGELOG.md` lists everything that has landed since (th
 ### DirectX (Windows)
 - [x] **Embedded DXIL** — `build_directx_shaders.ps1` compiles `shaders/directx/*.hlsl` with dxc (Windows SDK) into `src/shaders/directx_default.h` and `directx_denoiser.h`, one line per entry point.
 - [x] **Rebuilding without a Windows machine** — `.github/workflows/directx-shaders.yml` runs the script on `windows-latest` and commits the headers to the branch: on a push to a `dxil/...` branch that changes the HLSL, or by hand (Actions > DirectX shaders > Run workflow). Its own commit doesn't start CI (GitHub's token rule): push another commit or re-run CI to test it.
-- [ ] **A change to `default.hlsl` needs the headers rebuilt** — otherwise Windows keeps running the old DXIL. Pending: the sky blur (`setSkyboxBlur`, v0.39.0; the HLSL now samples at the level) and per-texture `KHR_texture_transform` (v0.41.0); their tests no longer skip Windows.
+- [x] **Headers rebuilt for the sky blur (v0.39.0) and per-texture `KHR_texture_transform` (v0.41.0)** — by the workflow's first run (#60); their tests run on Windows again. A change to the HLSL needs the same: otherwise Windows keeps running the old DXIL.
 - [ ] **Add `dxc` compile step to CMake** — guard with `if(WIN32)`, so the headers can't fall behind the HLSL.
 
 ### Apple (macOS / iOS)
